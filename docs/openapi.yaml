@@ -1,0 +1,385 @@
+openapi: 3.1.0
+info:
+  title: iCloud 隐私邮箱收件 API
+  version: 1.0.0
+  description: |
+    每个隐私邮箱使用独立的 API Key。服务端根据该 Key 绑定到唯一隐私邮箱，
+    只返回该隐私邮箱通过所属 iCloud 主号 IMAP 同步到的最新一封邮件。
+    邮件可用性按隐私邮箱自身的同步状态和同步时间独立判断，而不是直接使用主号的整体同步状态。
+servers:
+  - url: http://127.0.0.1:8080
+    description: 默认本地服务地址，可由 ICLOUD_API_ADDR 调整
+tags:
+  - name: Mail
+    description: 隐私邮箱收件接口
+  - name: Health
+    description: 服务健康检查
+
+paths:
+  /api/v1/mail/latest:
+    get:
+      tags:
+        - Mail
+      operationId: getLatestMail
+      summary: 获取当前隐私邮箱的最新一封邮件
+      description: |
+        使用隐私邮箱自己的 API Key 鉴权。Key 只会解析到它绑定的隐私邮箱，
+        因此响应不会包含同一主号下其他隐私邮箱的邮件。
+
+        隐私邮箱的同步状态语义如下：
+        - `pending`：新建、重新启用或配置重置后，尚待一次可确认的同步；
+        - `error`：最近一次同步未能确认该隐私邮箱的最新状态；
+        - `ok`：最近一次同步已确认有最新邮件，或已权威确认邮箱为空。
+
+        只有状态为 `ok`、`last_synced_at` 存在且距今不超过三倍轮询周期时，
+        才继续按最新邮件快照是否存在返回 200 或 404；其他情况返回 503。
+      security:
+        - aliasApiKey: []
+      responses:
+        "200":
+          description: 当前隐私邮箱最近一次同步成功且仍新鲜，已返回其保存的最新一封邮件
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LatestMailResponse"
+              examples:
+                latestMail:
+                  summary: 最新邮件
+                  value:
+                    data:
+                      alias: orders@example.icloud.com
+                      message:
+                        id: 9283641-1842
+                        message_id: "<message-1842@example.com>"
+                        received_at: "2026-08-06T12:30:45Z"
+                        sent_at: "2026-08-06T12:30:12Z"
+                        from:
+                          - name: Example Store
+                            email: notice@example.com
+                        to:
+                          - email: orders@example.icloud.com
+                        cc: []
+                        subject: 订单已确认
+                        text: 您的订单已确认。
+                        html: "<p>您的订单已确认。</p>"
+                        attachments: []
+                        has_attachments: false
+                        body_truncated: false
+                      synced_at: "2026-08-06T12:31:00Z"
+                      stale: false
+        "401":
+          description: Authorization 缺失、格式错误、Key 无效，或绑定的隐私邮箱/主号已停用
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: INVALID_API_KEY
+                  message: API Key 无效
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "404":
+          description: 当前隐私邮箱最近一次同步成功且仍新鲜，并已确认当前没有邮件快照
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: MAIL_NOT_FOUND
+                  message: 尚未收到邮件
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "429":
+          description: 此隐私邮箱 API Key 在当前限流窗口内请求过多
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: RATE_LIMITED
+                  message: 请求过于频繁
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "503":
+          description: |
+            当前隐私邮箱状态不是 ok、从未完成同步或最后同步时间已超过三倍轮询周期时返回 SYNC_UNAVAILABLE；
+            查询 Key 或最新邮件快照时数据库暂不可用则返回 DATABASE_UNAVAILABLE。
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                syncUnavailable:
+                  summary: 隐私邮箱同步状态不可用
+                  value:
+                    error:
+                      code: SYNC_UNAVAILABLE
+                      message: 邮箱同步暂不可用
+                      request_id: 6oe7j0x3x3pJv9Dv
+                databaseUnavailable:
+                  summary: 数据库查询暂不可用
+                  value:
+                    error:
+                      code: DATABASE_UNAVAILABLE
+                      message: 数据库暂不可用
+                      request_id: 6oe7j0x3x3pJv9Dv
+
+  /healthz:
+    get:
+      tags:
+        - Health
+      operationId: getHealth
+      summary: 检查服务及数据库是否可用
+      security: []
+      responses:
+        "200":
+          description: 服务与数据库连接正常
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+        "503":
+          description: 数据库当前不可用
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: DATABASE_UNAVAILABLE
+                  message: 数据库不可用
+                  request_id: 6oe7j0x3x3pJv9Dv
+
+components:
+  securitySchemes:
+    aliasApiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: icm_ + 43 位规范 Raw Base64URL
+      x-token-pattern: "^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+      description: |
+        后台为单个隐私邮箱生成的独立 Key。完整值固定为 47 个 ASCII 字符：
+        小写前缀 `icm_` 加 43 位无 `=` 填充的规范 Raw Base64URL，严格解码后为 32 字节。
+        精确格式正则为 `^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$`；最后一位的
+        受限字符集保证末尾填充位为零。服务端还会执行严格 Base64URL 解码和长度检查。
+        `icm_REPLACE_WITH_ALIAS_KEY` 仅为说明性占位值，其格式故意无效，直接发送会返回 401。
+
+  headers:
+    RequestID:
+      description: 服务端生成的请求追踪标识；错误响应体中的 request_id 与此值一致。
+      schema:
+        type: string
+      example: 6oe7j0x3x3pJv9Dv
+    NoStore:
+      description: 禁止客户端及中间缓存保存响应。
+      schema:
+        type: string
+        const: no-store
+      example: no-store
+
+  schemas:
+    LatestMailResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/LatestMailData"
+
+    LatestMailData:
+      type: object
+      additionalProperties: false
+      required:
+        - alias
+        - message
+        - synced_at
+        - stale
+      properties:
+        alias:
+          type: string
+          format: email
+          description: 当前 API Key 绑定的隐私邮箱地址。
+        message:
+          $ref: "#/components/schemas/MailMessage"
+        synced_at:
+          type: string
+          format: date-time
+          description: 这封邮件写入本地存储的 UTC 时间。
+        stale:
+          type: boolean
+          const: false
+          description: |
+            成功响应中恒为 false。若当前隐私邮箱状态不是 ok、last_synced_at 为空，
+            或最后同步距今超过三倍轮询周期，接口返回 503，而不会返回带 stale=true 的旧快照。
+
+    MailMessage:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - message_id
+        - received_at
+        - sent_at
+        - from
+        - to
+        - cc
+        - subject
+        - text
+        - html
+        - attachments
+        - has_attachments
+        - body_truncated
+      properties:
+        id:
+          type: string
+          pattern: "^[0-9]+-[0-9]+$"
+          description: 由 IMAP UIDVALIDITY 与 UID 组成的本地稳定标识。
+        message_id:
+          type: string
+          description: 邮件 Message-ID 头；邮件未提供时可能为空字符串。
+        received_at:
+          type: string
+          format: date-time
+          description: IMAP INTERNALDATE，统一以 UTC RFC 3339 格式返回。
+        sent_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: 邮件 Date 头的 UTC RFC 3339 时间；缺失或无效时为 null。
+        from:
+          type: array
+          items:
+            $ref: "#/components/schemas/MailAddress"
+        to:
+          type: array
+          items:
+            $ref: "#/components/schemas/MailAddress"
+        cc:
+          type: array
+          items:
+            $ref: "#/components/schemas/MailAddress"
+        subject:
+          type: string
+        text:
+          type: string
+          description: 解析后的纯文本正文；不存在时为空字符串。
+        html:
+          type: string
+          description: 解析后的 HTML 正文；不存在时为空字符串。
+        attachments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Attachment"
+        has_attachments:
+          type: boolean
+          description: attachments 是否至少包含一项。
+        body_truncated:
+          type: boolean
+          description: 原始邮件或正文是否因服务端大小上限被截断。
+
+    MailAddress:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+      properties:
+        name:
+          type: string
+          description: 显示名称；为空时该字段会被省略。
+        email:
+          type: string
+          format: email
+
+    Attachment:
+      type: object
+      additionalProperties: false
+      required:
+        - filename
+        - content_type
+        - size
+      properties:
+        filename:
+          type: string
+        content_type:
+          type: string
+        size:
+          type: integer
+          format: int64
+          minimum: 0
+          description: 附件大小，单位为字节。
+
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          const: ok
+
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          $ref: "#/components/schemas/APIError"
+
+    APIError:
+      type: object
+      additionalProperties: false
+      required:
+        - code
+        - message
+        - request_id
+      properties:
+        code:
+          type: string
+          description: 稳定、可供程序判断的错误码。
+          examples:
+            - INVALID_API_KEY
+        message:
+          type: string
+          description: 面向调用方的错误说明。
+        request_id:
+          type: string
+          description: 与 X-Request-ID 响应头相同的请求追踪标识。

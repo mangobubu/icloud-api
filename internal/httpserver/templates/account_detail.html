@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>{{template "head" .}}</head>
+<body>
+<div class="app-shell">
+  {{template "sidebar" .}}
+  <main class="main-area">
+    {{template "topbar" .}}
+    <div class="content">
+      {{template "flash" .}}
+      {{if .Secret}}
+      <section class="secret-box" aria-labelledby="secret-title">
+        <div><h2 id="secret-title">请立即保存 API Key</h2><p>完整 Key 只显示这一次，关闭页面后不再提供查看。</p></div>
+        <div class="secret-value"><code data-secret-value>{{.Secret}}</code><button class="button" type="button" data-copy="{{.Secret}}">复制</button></div>
+      </section>
+      {{end}}
+      <section class="section-block">
+        <div class="section-toolbar">
+          <div><h2>连接配置</h2><p>{{.Account.IMAPUsername}} · imap.mail.me.com:993</p></div>
+          <div class="button-row">
+            <form method="post" action="/admin/accounts/{{.Account.ID}}/sync"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="button" type="submit">立即同步</button></form>
+            <a class="button" href="/admin/accounts/{{.Account.ID}}/edit">编辑</a>
+          </div>
+        </div>
+        <dl class="detail-grid"><div><dt>状态</dt><dd>{{template "status" .Account}}</dd></div><div><dt>最近同步</dt><dd>{{timefmt .Account.LastSyncedAt}}</dd></div><div><dt>主号邮箱</dt><dd>{{.Account.Email}}</dd></div><div><dt>备注</dt><dd>{{or .Account.Name "-"}}</dd></div></dl>
+        {{if .Account.LastSyncError}}<div class="inline-error">最近错误：{{.Account.LastSyncError}}</div>{{end}}
+      </section>
+
+      <section class="section-block">
+        <div class="section-toolbar"><div><h2>隐私邮箱</h2><p>每个地址使用独立 API Key，只返回自己的最新一封邮件。</p></div></div>
+        {{if .Aliases}}
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>隐私邮箱</th><th>API Key</th><th>最新邮件</th><th>状态</th><th class="actions">操作</th></tr></thead>
+            <tbody>{{range .Aliases}}<tr>
+              <td data-label="隐私邮箱"><strong>{{.Address}}</strong>{{if .Label}}<small>{{.Label}}</small>{{end}}</td>
+              <td data-label="API Key"><code>{{.APIKeyPrefix}}…</code></td>
+              <td data-label="最新邮件">{{timefmt .LatestReceivedAt}}</td>
+              <td data-label="状态">{{template "alias-status" .}}</td>
+              <td data-label="操作" class="actions"><div class="button-row">
+                <form method="post" action="/admin/aliases/{{.ID}}/rotate"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small" type="submit" data-confirm="轮换后旧 Key 会立即失效。继续吗？">轮换 Key</button></form>
+                <form method="post" action="/admin/aliases/{{.ID}}/toggle"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>
+                <form method="post" action="/admin/aliases/{{.ID}}/delete"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small button-danger" type="submit" data-confirm="删除后该地址的 API Key 和最新邮件都会清除。继续吗？">删除</button></form>
+              </div></td>
+            </tr>{{end}}</tbody>
+          </table>
+        </div>
+        {{else}}<div class="empty empty-compact"><h3>尚未登记隐私邮箱</h3><p>添加一个已经转发到此主号的 Hide My Email 地址。</p></div>{{end}}
+
+        <form method="post" action="/admin/accounts/{{.Account.ID}}/aliases" class="inline-form panel-subtle">
+          <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+          <label class="field"><span>隐私邮箱地址</span><input type="email" name="address" required placeholder="random@icloud.com"></label>
+          <label class="field"><span>用途备注</span><input name="label" maxlength="100" placeholder="例如：登录验证码"></label>
+          <button class="button button-primary" type="submit">添加并生成 Key</button>
+        </form>
+      </section>
+
+      <section class="danger-zone">
+        <div><h2>删除主号</h2><p>同时删除其隐私邮箱、API Key 与本地最新邮件。</p></div>
+        <form method="post" action="/admin/accounts/{{.Account.ID}}/delete"><input type="hidden" name="csrf_token" value="{{.CSRF}}"><button class="button button-danger" type="submit" data-confirm="确定删除主号 {{.Account.Email}} 及其全部数据吗？">删除主号</button></form>
+      </section>
+    </div>
+  </main>
+</div>
+</body>
+</html>

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>{{template "head" .}}</head>
+<body>
+<div class="app-shell">
+  {{template "sidebar" .}}
+  <main class="main-area">
+    {{template "topbar" .}}
+    <div class="content">
+      <div class="section-toolbar"><div><h2>最近操作</h2><p>记录后台配置变更，不包含密码、完整 Key 或邮件内容。</p></div></div>
+      {{if .AuditLogs}}
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>时间</th><th>管理员</th><th>操作</th><th>对象</th><th>结果</th><th>请求编号</th></tr></thead>
+        <tbody>{{range .AuditLogs}}<tr><td data-label="时间">{{timevalue .CreatedAt}}</td><td data-label="管理员">{{or .Username "系统"}}</td><td data-label="操作">{{.Action}}</td><td data-label="对象">{{.ResourceType}} {{.ResourceID}}</td><td data-label="结果"><span class="status {{if eq .Result "success"}}status-ok{{else}}status-error{{end}}">{{if eq .Result "success"}}成功{{else}}失败{{end}}</span></td><td data-label="请求编号"><code>{{.RequestID}}</code></td></tr>{{end}}</tbody>
+      </table></div>
+      {{else}}<div class="empty"><h2>暂无操作记录</h2></div>{{end}}
+    </div>
+  </main>
+</div>
+</body>
+</html>

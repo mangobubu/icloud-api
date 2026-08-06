@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>{{template "head" .}}</head>
+<body>
+<div class="app-shell">
+  {{template "sidebar" .}}
+  <main class="main-area">
+    {{template "topbar" .}}
+    <div class="content">
+      {{template "flash" .}}
+      <div class="section-toolbar">
+        <div><h2>iCloud 主号</h2><p>隐私邮箱通过所属主号的 IMAP 收取邮件。</p></div>
+        <a class="button button-primary" href="/admin/accounts/new">添加主号</a>
+      </div>
+      {{if .Accounts}}
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>主号</th><th>状态</th><th>隐私邮箱</th><th>最近同步</th><th class="actions">操作</th></tr></thead>
+          <tbody>
+          {{range .Accounts}}
+            <tr>
+              <td data-label="主号"><strong>{{.Email}}</strong>{{if .Name}}<small>{{.Name}}</small>{{end}}</td>
+              <td data-label="状态">{{template "status" .}}</td>
+              <td data-label="隐私邮箱">{{.AliasCount}}</td>
+              <td data-label="最近同步">{{timefmt .LastSyncedAt}}</td>
+              <td data-label="操作" class="actions"><a class="button button-small" href="/admin/accounts/{{.ID}}">管理</a></td>
+            </tr>
+          {{end}}
+          </tbody>
+        </table>
+      </div>
+      {{else}}
+      <div class="empty"><h2>还没有主号</h2><p>添加一个 iCloud 主号及其 App 专用密码，然后登记隐私邮箱。</p><a class="button button-primary" href="/admin/accounts/new">添加第一个主号</a></div>
+      {{end}}
+    </div>
+  </main>
+</div>
+</body>
+</html>

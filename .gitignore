@@ -1,0 +1,15 @@
+/data/
+/*.db
+/*.db-shm
+/*.db-wal
+/*.key
+/icloud-api
+/icloud-api.exe
+/coverage.out
+/.idea/
+/.vscode/
+/.env
+/.env.*
+!/.env.example
+/.cache/
+**/.gocache/

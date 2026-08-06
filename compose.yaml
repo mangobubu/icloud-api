@@ -1,0 +1,52 @@
+services:
+  icloud-api:
+    # SQLite storage and the in-process sync coordinator require one writer instance.
+    container_name: icloud-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: icloud-api:local
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    ports:
+      - "127.0.0.1:${ICLOUD_API_PORT:-8080}:8080"
+    environment:
+      GIN_MODE: release
+      ICLOUD_API_ADDR: 0.0.0.0:8080
+      ICLOUD_API_DB: /app/data/icloud-api.db
+      ICLOUD_API_MASTER_KEY: ${ICLOUD_API_MASTER_KEY:?ICLOUD_API_MASTER_KEY is required}
+      ICLOUD_API_ADMIN_USER: ${ICLOUD_API_ADMIN_USER:-admin}
+      ICLOUD_API_ADMIN_PASSWORD: ${ICLOUD_API_ADMIN_PASSWORD:?ICLOUD_API_ADMIN_PASSWORD is required}
+      ICLOUD_API_COOKIE_SECURE: ${ICLOUD_API_COOKIE_SECURE:-false}
+      ICLOUD_API_SESSION_TTL: ${ICLOUD_API_SESSION_TTL:-8h}
+      ICLOUD_API_POLL_INTERVAL: ${ICLOUD_API_POLL_INTERVAL:-1m}
+      ICLOUD_API_IMAP_TIMEOUT: ${ICLOUD_API_IMAP_TIMEOUT:-25s}
+      # Per-account full sync deadline; accepted range is 10s through 30m.
+      ICLOUD_API_SYNC_TIMEOUT: ${ICLOUD_API_SYNC_TIMEOUT:-2m}
+      ICLOUD_API_SYNC_CONCURRENCY: ${ICLOUD_API_SYNC_CONCURRENCY:-3}
+      ICLOUD_API_SHUTDOWN_TIMEOUT: ${ICLOUD_API_SHUTDOWN_TIMEOUT:-10s}
+      ICLOUD_API_MAX_MESSAGE_BYTES: ${ICLOUD_API_MAX_MESSAGE_BYTES:-10485760}
+      ICLOUD_API_MAX_BODY_BYTES: ${ICLOUD_API_MAX_BODY_BYTES:-1048576}
+      ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS: ${ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS:-false}
+      ICLOUD_API_TRUSTED_PROXIES: ${ICLOUD_API_TRUSTED_PROXIES:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # Contains the SQLite database and its WAL/SHM sidecars.
+      - icloud_api_data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  icloud_api_data:

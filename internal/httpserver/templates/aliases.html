@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>{{template "head" .}}</head>
+<body>
+<div class="app-shell">
+  {{template "sidebar" .}}
+  <main class="main-area">
+    {{template "topbar" .}}
+    <div class="content">
+      {{template "flash" .}}
+      <div class="section-toolbar"><div><h2>全部隐私邮箱</h2><p>API Key 的权限始终固定在单个地址。</p></div></div>
+      {{if .Aliases}}
+      <div class="table-wrap"><table class="table">
+        <thead><tr><th>隐私邮箱</th><th>所属主号</th><th>Key 前缀</th><th>最近调用</th><th>最新邮件</th><th>状态</th></tr></thead>
+        <tbody>{{range .Aliases}}<tr>
+          <td data-label="隐私邮箱"><strong>{{.Address}}</strong>{{if .Label}}<small>{{.Label}}</small>{{end}}</td>
+          <td data-label="所属主号"><a href="/admin/accounts/{{.AccountID}}">{{.AccountEmail}}</a></td>
+          <td data-label="Key 前缀"><code>{{.APIKeyPrefix}}…</code></td>
+          <td data-label="最近调用">{{timefmt .LastAccessedAt}}</td>
+          <td data-label="最新邮件">{{timefmt .LatestReceivedAt}}</td>
+          <td data-label="状态">{{template "alias-status" .}}</td>
+        </tr>{{end}}</tbody>
+      </table></div>
+      {{else}}<div class="empty"><h2>还没有隐私邮箱</h2><p>进入某个主号详情页添加地址。</p><a class="button button-primary" href="/admin">查看主号</a></div>{{end}}
+    </div>
+  </main>
+</div>
+</body>
+</html>

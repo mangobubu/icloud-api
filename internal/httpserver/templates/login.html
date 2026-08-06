@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>{{template "head" .}}</head>
+<body class="login-page">
+  <main class="login-shell">
+    <div class="login-brand">
+      <span class="brand-mark" aria-hidden="true">iC</span>
+      <div><strong>iCloud 隐私邮箱</strong><small>后台管理</small></div>
+    </div>
+    <section class="login-panel" aria-labelledby="login-title">
+      <h1 id="login-title">登录</h1>
+      <p>使用管理员账号进入控制台。</p>
+      {{template "flash" .}}
+      <form method="post" action="/admin/login" class="stack-form">
+        <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+        <label class="field">
+          <span>用户名</span>
+          <input name="username" autocomplete="username" required autofocus value="{{.LoginUsername}}">
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input type="password" name="password" autocomplete="current-password" required>
+        </label>
+        <button class="button button-primary button-block" type="submit">登录</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
