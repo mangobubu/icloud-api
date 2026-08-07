@@ -474,6 +474,72 @@ func TestPasswordVersionRejectsLateSessionAndConcurrentPasswordChange(t *testing
 	}
 }
 
+func TestResetAdminCredentialsRevokesSessionsAtomically(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("successful reset", func(t *testing.T) {
+		db := openTestStore(t)
+		admin, err := db.CreateAdmin(ctx, "old-admin", "old-hash")
+		if err != nil {
+			t.Fatalf("create admin: %v", err)
+		}
+		tokenHash := []byte("session-before-reset")
+		if err := db.CreateSession(ctx, tokenHash, domain.Session{
+			AdminID: admin.ID, PasswordVersion: admin.PasswordVersion, CSRF: "csrf-before-reset",
+			ExpiresAt: time.Now().UTC().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+
+		if err := db.ResetAdminCredentialsAndRevokeSessions(ctx, admin.ID, admin.PasswordVersion, "new-admin", "new-hash"); err != nil {
+			t.Fatalf("reset admin credentials: %v", err)
+		}
+		updated, err := db.GetAdminByID(ctx, admin.ID)
+		if err != nil {
+			t.Fatalf("get reset admin: %v", err)
+		}
+		if updated.Username != "new-admin" || updated.PasswordHash != "new-hash" || updated.PasswordVersion != admin.PasswordVersion+1 {
+			t.Fatalf("reset admin = %#v", updated)
+		}
+		if _, err := db.GetSessionByHash(ctx, tokenHash); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("session after credentials reset error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("username conflict rolls back", func(t *testing.T) {
+		db := openTestStore(t)
+		if _, err := db.CreateAdmin(ctx, "first-admin", "first-hash"); err != nil {
+			t.Fatalf("create first admin: %v", err)
+		}
+		second, err := db.CreateAdmin(ctx, "second-admin", "second-hash")
+		if err != nil {
+			t.Fatalf("create second admin: %v", err)
+		}
+		tokenHash := []byte("session-that-must-survive")
+		if err := db.CreateSession(ctx, tokenHash, domain.Session{
+			AdminID: second.ID, PasswordVersion: second.PasswordVersion, CSRF: "csrf-before-conflict",
+			ExpiresAt: time.Now().UTC().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("create second admin session: %v", err)
+		}
+
+		if err := db.ResetAdminCredentialsAndRevokeSessions(ctx, second.ID, second.PasswordVersion, "first-admin", "changed-hash"); err == nil {
+			t.Fatal("conflicting credentials reset unexpectedly succeeded")
+		}
+		unchanged, err := db.GetAdminByID(ctx, second.ID)
+		if err != nil {
+			t.Fatalf("get second admin after rollback: %v", err)
+		}
+		if unchanged.Username != second.Username || unchanged.PasswordHash != second.PasswordHash || unchanged.PasswordVersion != second.PasswordVersion {
+			t.Fatalf("conflicting reset changed admin: %#v", unchanged)
+		}
+		if _, err := db.GetSessionByHash(ctx, tokenHash); err != nil {
+			t.Fatalf("conflicting reset revoked session: %v", err)
+		}
+	})
+}
+
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
 	db, err := store.Open(":memory:")

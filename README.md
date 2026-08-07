@@ -129,6 +129,14 @@ npm run dev
 
 首次初始化必须设置 `ICLOUD_API_ADMIN_PASSWORD`，应用不会生成或记录明文管理员密码。管理员用户名和密码只在数据库中没有管理员的首次启动时用于初始化；已有数据库不会因为修改环境变量而修改现有登录凭据。
 
+如果更换了 `.env` 中的管理员用户名或密码，已有数据卷中的管理员不会自动改密。为保留主号、隐私邮箱、邮件和审计数据，可在项目目录执行显式重置命令：
+
+```bash
+docker compose run --rm --no-deps icloud-api admin reset
+```
+
+命令使用当前 Compose 环境中的 `ICLOUD_API_ADMIN_USER` 和 `ICLOUD_API_ADMIN_PASSWORD`，在 SQLite 事务中更新管理员用户名和密码、递增凭据版本并注销旧后台会话，不会删除业务数据。数据库中只有一个管理员且用户名已经更换时，命令会把该唯一管理员改名；存在多个管理员且当前用户名不存在时，命令会拒绝执行以避免选错账号。执行前建议按“备份与恢复”章节先做一次停机备份。重置命令不会输出密码。
+
 服务会自动创建 SQLite 表结构。原生运行时，如果没有设置 `ICLOUD_API_MASTER_KEY`，应用才会在 `ICLOUD_API_MASTER_KEY_FILE` 指定的位置生成本地主密钥文件；Compose 部署始终使用环境变量中的主密钥。也可以先构建二进制：
 
 ```bash
@@ -147,8 +155,8 @@ Go 时长使用 `10s`、`1m`、`8h` 这类格式；正文大小使用字节数�
 | `ICLOUD_API_WEB_ROOT` | 空（镜像内为 `/app/web`） | Vue 生产构建目录；设置后 Go 会校验并提供其中的 `index.html` 和 `assets` |
 | `ICLOUD_API_MASTER_KEY_FILE` | `<数据库路径>.key` | 仅用于原生运行的文件回退；Compose 不设置此项 |
 | `ICLOUD_API_MASTER_KEY` | 空 | 32 字节 Base64 或十六进制主密钥；Compose 部署必填，设置后优先于文件 |
-| `ICLOUD_API_ADMIN_USER` | `admin` | 首次初始化的管理员用户名 |
-| `ICLOUD_API_ADMIN_PASSWORD` | 空 | 首次初始化的管理员密码，长度为 12 到 72 字节；Compose 部署必填 |
+| `ICLOUD_API_ADMIN_USER` | `admin` | 首次初始化或显式 `admin reset` 时使用的管理员用户名 |
+| `ICLOUD_API_ADMIN_PASSWORD` | 空 | 首次初始化或显式 `admin reset` 时使用的管理员密码，长度为 12 到 72 字节；Compose 部署必填 |
 | `ICLOUD_API_COOKIE_SECURE` | `false` | 是否只允许浏览器通过 HTTPS 发送后台会话 Cookie |
 | `ICLOUD_API_SESSION_TTL` | `8h` | 后台登录会话有效期 |
 | `ICLOUD_API_POLL_INTERVAL` | `1m` | IMAP 轮询间隔，最短 `10s` |

@@ -107,6 +107,40 @@ func (s *Store) ChangeAdminPasswordAndRevokeSessions(ctx context.Context, id, ex
 	return nil
 }
 
+// ResetAdminCredentialsAndRevokeSessions atomically replaces an administrator's
+// login name and password while invalidating every existing session.
+func (s *Store) ResetAdminCredentialsAndRevokeSessions(ctx context.Context, id, expectedVersion int64, username, passwordHash string) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin admin credentials reset: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE admins
+		SET username = ?, password_hash = ?, password_version = password_version + 1
+		WHERE id = ? AND password_version = ?`,
+		strings.TrimSpace(username), passwordHash, id, expectedVersion,
+	)
+	if err != nil {
+		return fmt.Errorf("reset admin credentials: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read admin credentials reset result: %w", err)
+	}
+	if changed == 0 {
+		return ErrCredentialsChanged
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM admin_sessions WHERE admin_id = ?`, id); err != nil {
+		return fmt.Errorf("revoke admin sessions: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit admin credentials reset: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) DeleteAdmin(ctx context.Context, id int64) error {
 	result, err := s.db.ExecContext(ctx, `DELETE FROM admins WHERE id = ?`, id)
 	if err != nil {

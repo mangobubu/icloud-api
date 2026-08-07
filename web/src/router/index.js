@@ -4,6 +4,7 @@ import { setUnauthorizedHandler } from "../api/client.js";
 import AdminLayout from "../layouts/AdminLayout.vue";
 import { useAuth } from "../stores/auth.js";
 import { setPageHeader } from "../stores/page.js";
+import { buildLoginRedirect } from "../utils/authFlow.js";
 
 const routes = [
   {
@@ -103,16 +104,10 @@ router.beforeEach(async (to) => {
     if (await auth.ensureSession()) {
       return true;
     }
-  } catch {
-    return {
-      name: "login",
-      query: { notice: "session_error", redirect: to.fullPath },
-    };
+  } catch (error) {
+    return buildLoginRedirect(error?.code, to.fullPath);
   }
-  return {
-    name: "login",
-    query: { notice: "session_expired", redirect: to.fullPath },
-  };
+  return buildLoginRedirect(auth.state.lastSessionErrorCode, to.fullPath);
 });
 
 router.afterEach((to) => {
@@ -121,14 +116,11 @@ router.afterEach((to) => {
   }
 });
 
-setUnauthorizedHandler(() => {
+setUnauthorizedHandler((error) => {
   const current = router.currentRoute.value;
-  auth.clearSession();
+  auth.clearSession({ errorCode: error?.code || "" });
   if (current.name !== "login") {
-    router.replace({
-      name: "login",
-      query: { notice: "session_expired", redirect: current.fullPath },
-    });
+    router.replace(buildLoginRedirect(error?.code, current.fullPath));
   }
 });
 

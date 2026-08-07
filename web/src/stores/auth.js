@@ -11,6 +11,7 @@ const state = reactive({
   username: "",
   csrfToken: "",
   sessionChecked: false,
+  lastSessionErrorCode: "",
 });
 
 let sessionPromise = null;
@@ -19,12 +20,14 @@ function applySession(session) {
   state.username = session?.username || "";
   state.csrfToken = session?.csrfToken || "";
   state.sessionChecked = true;
+  state.lastSessionErrorCode = "";
 }
 
-function clearSession({ checked = true } = {}) {
+function clearSession({ checked = true, errorCode = "" } = {}) {
   state.username = "";
   state.csrfToken = "";
   state.sessionChecked = checked;
+  state.lastSessionErrorCode = errorCode;
 }
 
 async function ensureSession({ force = false } = {}) {
@@ -41,7 +44,7 @@ async function ensureSession({ force = false } = {}) {
       return Boolean(state.username && state.csrfToken);
     })
     .catch((error) => {
-      clearSession();
+      clearSession({ errorCode: error?.code || "" });
       if (error?.status === 401) {
         return false;
       }
