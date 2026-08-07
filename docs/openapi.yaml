@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: iCloud 隐私邮箱收件 API
-  version: 1.1.0
+  version: 1.2.0
   description: |
     每个隐私邮箱使用独立的 API Key。服务端根据该 Key 绑定到唯一隐私邮箱，
     只返回该隐私邮箱通过所属 iCloud 主号 IMAP 同步到的最新邮件快照。
@@ -164,7 +164,9 @@ paths:
       summary: 通过可直接访问的链接获取最近一小时内的最新邮件
       description: |
         使用必填且只能出现一次的查询参数 `api_key` 鉴权；Bearer Header 不能替代该查询参数。
-        Key 只解析到它绑定的唯一隐私邮箱；接口不接受邮箱地址参数，也不会返回同一主号下其他隐私邮箱的邮件。
+        查询参数既接受隐私邮箱的原始 API Key，也接受管理端操作列复制的派生直达凭据。
+        两种凭据都只解析到它绑定的唯一隐私邮箱；接口不接受邮箱地址参数，也不会返回同一主号下其他隐私邮箱的邮件。
+        派生直达凭据不能用于 `/api/v1/mail/latest` 的 Bearer 鉴权，并会在隐私邮箱 API Key 轮换后失效。
 
         只有该隐私邮箱状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过三倍轮询周期，
         并且当前最新邮件快照的 IMAP INTERNALDATE 位于最近一小时内时才返回 200。
@@ -201,7 +203,7 @@ paths:
                 content: 您的验证码是 123456
                 time: "2026-08-07T20:30:45+08:00"
         "401":
-          description: api_key 查询参数缺失、格式错误、Key 无效，或绑定的隐私邮箱/主号已停用
+          description: api_key 查询参数缺失、格式错误、凭据无效，或绑定的隐私邮箱/主号已停用
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -334,7 +336,10 @@ components:
       name: api_key
       x-token-pattern: "^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
       description: |
-        `/api/v1/mail/recent` 使用的查询参数 Key，格式和 `aliasApiKey` 完全相同。
+        `/api/v1/mail/recent` 使用的查询参数凭据，格式和 `aliasApiKey` 完全相同。
+        可以使用隐私邮箱的原始 API Key，也可以使用管理端操作列复制的派生直达凭据。
+        派生凭据由服务端主密钥签名、不写入数据库、只对当前 API Key 状态有效，
+        不能用于 Bearer 接口；轮换隐私邮箱 API Key 会使此前复制的派生凭据失效。
         查询参数会进入浏览器历史，并可能被代理或外围监控记录、通过 Referer 泄露。
         本应用内置 HTTP 日志不记录查询字符串，但外围日志仍须删除或脱敏查询参数。
         完整 URL 必须按密钥保护，并且只能通过 HTTPS 使用。

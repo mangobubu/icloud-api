@@ -6,7 +6,7 @@
   {{template "sidebar" .}}
   <main class="main-area">
     {{template "topbar" .}}
-    <div class="content">
+    <div class="content" data-sync-poll-page="accounts" data-sync-poll-endpoint="/admin/api/v1/accounts">
       {{template "flash" .}}
       <div class="section-toolbar">
         <div><h2>iCloud 主号</h2><p>隐私邮箱通过所属主号的 IMAP 收取邮件。</p></div>
@@ -18,11 +18,11 @@
           <thead><tr><th>主号</th><th>状态</th><th>隐私邮箱</th><th>最近同步</th><th class="actions">操作</th></tr></thead>
           <tbody>
           {{range .Accounts}}
-            <tr>
+            <tr data-sync-record data-sync-kind="account" data-sync-id="{{.ID}}" data-sync-enabled="{{.Enabled}}" data-sync-status="{{.LastSyncStatus}}" data-sync-error="{{.LastSyncError}}" {{if .LastSyncedAt}}data-sync-at="{{.LastSyncedAt.Unix}}"{{end}}>
               <td data-label="主号"><strong>{{.Email}}</strong>{{if .Name}}<small>{{.Name}}</small>{{end}}</td>
-              <td data-label="状态">{{template "status" .}}</td>
+              <td data-label="状态" data-sync-status-cell>{{template "status" .}}</td>
               <td data-label="隐私邮箱">{{.AliasCount}}</td>
-              <td data-label="最近同步">{{timefmt .LastSyncedAt}}</td>
+              <td data-label="最近同步"><time data-sync-primary-time>{{timefmt .LastSyncedAt}}</time></td>
               <td data-label="操作" class="actions"><a class="button button-small" href="/admin/accounts/{{.ID}}">管理</a></td>
             </tr>
           {{end}}

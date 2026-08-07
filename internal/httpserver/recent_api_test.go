@@ -14,6 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"icloud-api/internal/domain"
+	"icloud-api/internal/secure"
 )
 
 func TestRecentMailDirectLinkReturnsCompactOwnedMessageInConfiguredTimezone(t *testing.T) {
@@ -278,6 +279,55 @@ func TestRecentMailDirectLinkRejectsDisabledAliasAndSyncFailure(t *testing.T) {
 			t.Fatal("sync failure exposed retained message")
 		}
 	})
+}
+
+func TestRecentMailDirectLinkAcceptsDerivedCredentialOnlyInQueryAndTracksRotation(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	mailboxes := env.createMailboxFixture(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	env.server.now = func() time.Time { return now }
+	setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-time.Minute), TextBody: "derived direct body", SyncedAt: now,
+	})
+
+	derived, err := env.server.cipher.DirectLinkToken(mailboxes.aliasA.ID, mailboxes.aliasA.APIKeyHash)
+	if err != nil {
+		t.Fatalf("derive direct-link credential: %v", err)
+	}
+	direct := directMailRequest(t, env, url.Values{"api_key": {derived}})
+	if direct.Code != http.StatusOK || !strings.Contains(direct.Body.String(), "derived direct body") {
+		t.Fatalf("derived direct-link response = %d; body=%s", direct.Code, direct.Body.String())
+	}
+
+	bearer := env.apiRequest(t, "/api/v1/mail/latest", derived)
+	assertAPIError(t, bearer, http.StatusUnauthorized, "INVALID_API_KEY")
+
+	_, rotatedHash, rotatedPrefix, err := secure.NewAPIKey()
+	if err != nil {
+		t.Fatalf("generate rotated API key: %v", err)
+	}
+	if _, err := env.store.RotateAliasAPIKey(context.Background(), mailboxes.aliasA.ID, rotatedHash, rotatedPrefix); err != nil {
+		t.Fatalf("rotate API key fixture: %v", err)
+	}
+	oldAfterRotation := directMailRequest(t, env, url.Values{"api_key": {derived}})
+	assertAPIError(t, oldAfterRotation, http.StatusUnauthorized, "INVALID_API_KEY")
+
+	rotatedDerived, err := env.server.cipher.DirectLinkToken(mailboxes.aliasA.ID, rotatedHash)
+	if err != nil {
+		t.Fatalf("derive rotated direct-link credential: %v", err)
+	}
+	current := directMailRequest(t, env, url.Values{"api_key": {rotatedDerived}})
+	if current.Code != http.StatusOK || !strings.Contains(current.Body.String(), "derived direct body") {
+		t.Fatalf("rotated derived direct-link response = %d; body=%s", current.Code, current.Body.String())
+	}
+
+	if err := env.store.SetAliasEnabled(context.Background(), mailboxes.aliasA.ID, false); err != nil {
+		t.Fatalf("disable alias fixture: %v", err)
+	}
+	disabled := directMailRequest(t, env, url.Values{"api_key": {rotatedDerived}})
+	assertAPIError(t, disabled, http.StatusUnauthorized, "INVALID_API_KEY")
 }
 
 func TestRecentMailDirectLinkReportsDatabaseFailure(t *testing.T) {

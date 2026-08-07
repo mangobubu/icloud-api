@@ -1,8 +1,8 @@
 <template>
   <section class="one-time-secret" aria-labelledby="one-time-secret-title">
     <div class="one-time-secret__copy">
-      <h2 id="one-time-secret-title">请立即保存 API Key 与直达链接</h2>
-      <p>完整凭据只显示这一次，关闭页面后不再提供查看。</p>
+      <h2 id="one-time-secret-title">请立即保存 API Key</h2>
+      <p>完整 API Key 只显示这一次；直达链接之后仍可在操作列复制。</p>
     </div>
     <div class="one-time-secret__values">
       <div class="one-time-secret__item">
@@ -40,48 +40,25 @@
 import { CopyDocument } from "@element-plus/icons-vue";
 import { computed, onBeforeUnmount, reactive, ref } from "vue";
 
-const props = defineProps({ value: { type: String, required: true } });
+import {
+  buildRecentMailDirectLink,
+  copyText,
+} from "../utils/clipboard.js";
+
+const props = defineProps({
+  value: { type: String, required: true },
+  directLinkPath: { type: String, required: true },
+});
 
 const directLink = computed(
-  () =>
-    `${window.location.origin}/api/v1/mail/recent?api_key=${encodeURIComponent(props.value)}`,
+  () => buildRecentMailDirectLink(props.directLinkPath),
 );
 const copyLabels = reactive({ key: "复制 Key", link: "复制链接" });
 const announcement = ref("");
 const resetTimers = { key: null, link: null };
 
-function fallbackCopy(text) {
-  const textarea = document.createElement("textarea");
-  textarea.value = text;
-  textarea.readOnly = true;
-  textarea.setAttribute("aria-hidden", "true");
-  textarea.style.position = "fixed";
-  textarea.style.left = "-9999px";
-  document.body.appendChild(textarea);
-  textarea.select();
-  try {
-    try {
-      return document.execCommand("copy");
-    } catch {
-      return false;
-    }
-  } finally {
-    textarea.remove();
-  }
-}
-
 async function copyValue(kind, value) {
-  let copied = false;
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(value);
-      copied = true;
-    } else {
-      copied = fallbackCopy(value);
-    }
-  } catch {
-    copied = fallbackCopy(value);
-  }
+  const copied = await copyText(value);
 
   const target = kind === "key" ? "API Key" : "直达链接";
   const idleLabel = kind === "key" ? "复制 Key" : "复制链接";

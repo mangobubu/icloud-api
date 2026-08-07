@@ -106,6 +106,13 @@ func Load() (Config, error) {
 	if cfg.SyncTimeout < 10*time.Second || cfg.SyncTimeout > 30*time.Minute {
 		return Config{}, fmt.Errorf("ICLOUD_API_SYNC_TIMEOUT 必须在 10s 到 30m 之间")
 	}
+	if cfg.SyncTimeout < 2*cfg.IMAPTimeout {
+		return Config{}, fmt.Errorf(
+			"ICLOUD_API_SYNC_TIMEOUT 必须至少为 ICLOUD_API_IMAP_TIMEOUT 的两倍（当前分别为 %s 和 %s）",
+			cfg.SyncTimeout,
+			cfg.IMAPTimeout,
+		)
+	}
 	if cfg.ShutdownTimeout < time.Second {
 		return Config{}, fmt.Errorf("ICLOUD_API_SHUTDOWN_TIMEOUT 不能短于 1s")
 	}

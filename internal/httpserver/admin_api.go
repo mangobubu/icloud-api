@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -93,6 +94,7 @@ type adminAPIAliasDTO struct {
 	Address          string  `json:"address"`
 	Label            string  `json:"label"`
 	APIKeyPrefix     string  `json:"api_key_prefix"`
+	DirectLinkPath   string  `json:"direct_link_path"`
 	Enabled          bool    `json:"enabled"`
 	LastSyncStatus   string  `json:"last_sync_status"`
 	LastSyncError    string  `json:"last_sync_error"`
@@ -185,7 +187,16 @@ func adminAPIAccountFromDomain(account domain.Account) adminAPIAccountDTO {
 	}
 }
 
-func adminAPIAliasFromDomain(alias domain.Alias) adminAPIAliasDTO {
+func (s *Server) adminAPIAliasFromDomain(alias domain.Alias) (adminAPIAliasDTO, error) {
+	token, err := s.cipher.DirectLinkToken(alias.ID, alias.APIKeyHash)
+	if err != nil {
+		return adminAPIAliasDTO{}, fmt.Errorf("生成隐私邮箱直达链接: %w", err)
+	}
+	query := url.Values{"api_key": {token}}
+	directLinkPath := (&url.URL{
+		Path:     "/api/v1/mail/recent",
+		RawQuery: query.Encode(),
+	}).String()
 	return adminAPIAliasDTO{
 		ID:               alias.ID,
 		AccountID:        alias.AccountID,
@@ -193,6 +204,7 @@ func adminAPIAliasFromDomain(alias domain.Alias) adminAPIAliasDTO {
 		Address:          alias.Address,
 		Label:            alias.Label,
 		APIKeyPrefix:     alias.APIKeyPrefix,
+		DirectLinkPath:   directLinkPath,
 		Enabled:          alias.Enabled,
 		LastSyncStatus:   alias.LastSyncStatus,
 		LastSyncError:    alias.LastSyncError,
@@ -201,7 +213,7 @@ func adminAPIAliasFromDomain(alias domain.Alias) adminAPIAliasDTO {
 		LatestReceivedAt: adminAPIOptionalTime(alias.LatestReceivedAt),
 		CreatedAt:        adminAPITime(alias.CreatedAt),
 		UpdatedAt:        adminAPITime(alias.UpdatedAt),
-	}
+	}, nil
 }
 
 func adminAPIAuditLogFromDomain(log domain.AuditLog) adminAPIAuditLogDTO {
@@ -240,12 +252,16 @@ func adminAPIAccountsFromDomain(accounts []domain.Account) []adminAPIAccountDTO 
 	return result
 }
 
-func adminAPIAliasesFromDomain(aliases []domain.Alias) []adminAPIAliasDTO {
+func (s *Server) adminAPIAliasesFromDomain(aliases []domain.Alias) ([]adminAPIAliasDTO, error) {
 	result := make([]adminAPIAliasDTO, 0, len(aliases))
 	for _, alias := range aliases {
-		result = append(result, adminAPIAliasFromDomain(alias))
+		dto, err := s.adminAPIAliasFromDomain(alias)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, dto)
 	}
-	return result
+	return result, nil
 }
 
 func (s *Server) adminAPILoginRequestGate() gin.HandlerFunc {
@@ -689,9 +705,13 @@ func (s *Server) adminAPIAccountDetail(ctx context.Context, id int64) (adminAPIA
 	if err != nil {
 		return adminAPIAccountDetailDTO{}, err
 	}
+	aliasDTOs, err := s.adminAPIAliasesFromDomain(aliases)
+	if err != nil {
+		return adminAPIAccountDetailDTO{}, err
+	}
 	return adminAPIAccountDetailDTO{
 		Account: adminAPIAccountFromDomain(account),
-		Aliases: adminAPIAliasesFromDomain(aliases),
+		Aliases: aliasDTOs,
 	}, nil
 }
 
@@ -747,11 +767,16 @@ func (s *Server) adminAPICreateAlias(c *gin.Context) {
 		}
 		return
 	}
+	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
 	session := mustSession(c)
 	s.audit(c, &session.AdminID, session.Username, "create", "alias", strconv.FormatInt(alias.ID, 10), "success", "")
 	c.Header("Cache-Control", "no-store")
 	c.Header("Location", fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID))
-	writeAdminAPIData(c, http.StatusCreated, adminAPIOneTimeKeyDTO{Alias: adminAPIAliasFromDomain(alias), APIKey: rawKey})
+	writeAdminAPIData(c, http.StatusCreated, adminAPIOneTimeKeyDTO{Alias: aliasDTO, APIKey: rawKey})
 }
 
 func (s *Server) adminAPIListAliases(c *gin.Context) {
@@ -773,7 +798,12 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	writeAdminAPIData(c, http.StatusOK, adminAPIAliasesFromDomain(aliases))
+	aliasDTOs, err := s.adminAPIAliasesFromDomain(aliases)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	writeAdminAPIData(c, http.StatusOK, aliasDTOs)
 }
 
 func (s *Server) adminAPIGetAlias(c *gin.Context) {
@@ -786,7 +816,12 @@ func (s *Server) adminAPIGetAlias(c *gin.Context) {
 		s.writeAdminAPIStoreReadError(c, err)
 		return
 	}
-	writeAdminAPIData(c, http.StatusOK, adminAPIAliasFromDomain(alias))
+	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	writeAdminAPIData(c, http.StatusOK, aliasDTO)
 }
 
 func (s *Server) adminAPIRotateAliasKey(c *gin.Context) {
@@ -808,10 +843,15 @@ func (s *Server) adminAPIRotateAliasKey(c *gin.Context) {
 		s.writeAdminAPIStoreReadError(c, err)
 		return
 	}
+	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
 	session := mustSession(c)
 	s.audit(c, &session.AdminID, session.Username, "rotate_key", "alias", strconv.FormatInt(id, 10), "success", "")
 	c.Header("Cache-Control", "no-store")
-	writeAdminAPIData(c, http.StatusOK, adminAPIOneTimeKeyDTO{Alias: adminAPIAliasFromDomain(alias), APIKey: rawKey})
+	writeAdminAPIData(c, http.StatusOK, adminAPIOneTimeKeyDTO{Alias: aliasDTO, APIKey: rawKey})
 }
 
 func (s *Server) adminAPIUpdateAlias(c *gin.Context) {
@@ -854,7 +894,12 @@ func (s *Server) adminAPIUpdateAlias(c *gin.Context) {
 	}
 	session := mustSession(c)
 	s.audit(c, &session.AdminID, session.Username, "toggle", "alias", strconv.FormatInt(id, 10), "success", "")
-	writeAdminAPIData(c, http.StatusOK, adminAPIAliasFromDomain(alias))
+	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	writeAdminAPIData(c, http.StatusOK, aliasDTO)
 }
 
 func (s *Server) adminAPIDeleteAlias(c *gin.Context) {

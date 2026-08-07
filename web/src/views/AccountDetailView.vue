@@ -18,14 +18,17 @@
 
     <template v-else-if="account">
       <div v-if="apiKey" ref="secretRegion" class="secret-region">
-        <OneTimeSecret :value="apiKey" />
+        <OneTimeSecret
+          :value="apiKey"
+          :direct-link-path="apiDirectLinkPath"
+        />
         <el-tooltip content="关闭 Key 提示" placement="left">
           <el-button
             class="secret-region__close"
             :icon="Close"
             circle
             aria-label="关闭 Key 提示"
-            @click="apiKey = ''"
+            @click="clearSecret"
           />
         </el-tooltip>
       </div>
@@ -62,7 +65,7 @@
           </div>
           <div>
             <dt>最近同步</dt>
-            <dd>{{ formatTime(account.lastSyncedAt) }}</dd>
+            <dd>{{ formatTime(account.lastSyncedAt, { seconds: true }) }}</dd>
           </div>
           <div>
             <dt>主号邮箱</dt>
@@ -113,21 +116,31 @@
                 <el-switch
                   :model-value="row.enabled"
                   :loading="Boolean(toggleLoading[row.id])"
-                  :disabled="Boolean(rotateLoading[row.id] || deleteLoading[row.id])"
+                  :disabled="Boolean(copyLoading[row.id] || rotateLoading[row.id] || deleteLoading[row.id])"
                   :aria-label="`启用隐私邮箱 ${row.address}`"
                   @change="(enabled) => toggleAlias(row, enabled)"
                 />
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="104" align="right">
+            <el-table-column label="操作" width="144" align="right">
               <template #default="{ row }">
                 <div class="icon-action-row">
+                  <el-tooltip content="复制邮件 API 直达链接" placement="top">
+                    <el-button
+                      :icon="CopyDocument"
+                      circle
+                      :loading="Boolean(copyLoading[row.id])"
+                      :disabled="Boolean(!row.directLinkPath || toggleLoading[row.id] || rotateLoading[row.id] || deleteLoading[row.id])"
+                      :aria-label="`复制 ${row.address} 的邮件 API 直达链接`"
+                      @click="copyAliasDirectLink(row)"
+                    />
+                  </el-tooltip>
                   <el-tooltip content="轮换 API Key" placement="top">
                     <el-button
                       :icon="Key"
                       circle
                       :loading="Boolean(rotateLoading[row.id])"
-                      :disabled="Boolean(apiKey || toggleLoading[row.id] || deleteLoading[row.id])"
+                      :disabled="Boolean(apiKey || copyLoading[row.id] || toggleLoading[row.id] || deleteLoading[row.id])"
                       :aria-label="`轮换 ${row.address} 的 API Key`"
                       @click="rotateKey(row)"
                     />
@@ -139,7 +152,7 @@
                       :icon="Delete"
                       circle
                       :loading="Boolean(deleteLoading[row.id])"
-                      :disabled="Boolean(toggleLoading[row.id] || rotateLoading[row.id])"
+                      :disabled="Boolean(copyLoading[row.id] || toggleLoading[row.id] || rotateLoading[row.id])"
                       :aria-label="`删除隐私邮箱 ${row.address}`"
                       @click="removeAlias(row)"
                     />
@@ -174,18 +187,27 @@
                   <el-switch
                     :model-value="alias.enabled"
                     :loading="Boolean(toggleLoading[alias.id])"
-                    :disabled="Boolean(rotateLoading[alias.id] || deleteLoading[alias.id])"
+                    :disabled="Boolean(copyLoading[alias.id] || rotateLoading[alias.id] || deleteLoading[alias.id])"
                     :aria-label="`启用隐私邮箱 ${alias.address}`"
                     @change="(enabled) => toggleAlias(alias, enabled)"
                   />
                 </dd>
               </div>
             </dl>
-            <footer class="mobile-record__actions mobile-record__actions--split">
+            <footer class="mobile-record__actions mobile-record__actions--three">
+              <el-button
+                :icon="CopyDocument"
+                :loading="Boolean(copyLoading[alias.id])"
+                :disabled="Boolean(!alias.directLinkPath || toggleLoading[alias.id] || rotateLoading[alias.id] || deleteLoading[alias.id])"
+                :aria-label="`复制 ${alias.address} 的邮件 API 直达链接`"
+                @click="copyAliasDirectLink(alias)"
+              >
+                复制邮件 API 直达链接
+              </el-button>
               <el-button
                 :icon="Key"
                 :loading="Boolean(rotateLoading[alias.id])"
-                :disabled="Boolean(apiKey || toggleLoading[alias.id] || deleteLoading[alias.id])"
+                :disabled="Boolean(apiKey || copyLoading[alias.id] || toggleLoading[alias.id] || deleteLoading[alias.id])"
                 @click="rotateKey(alias)"
               >
                 轮换 Key
@@ -195,7 +217,7 @@
                 plain
                 :icon="Delete"
                 :loading="Boolean(deleteLoading[alias.id])"
-                :disabled="Boolean(toggleLoading[alias.id] || rotateLoading[alias.id])"
+                :disabled="Boolean(copyLoading[alias.id] || toggleLoading[alias.id] || rotateLoading[alias.id])"
                 @click="removeAlias(alias)"
               >
                 删除
@@ -281,6 +303,7 @@
 import {
   Back,
   Close,
+  CopyDocument,
   Delete,
   EditPen,
   Key,
@@ -325,11 +348,16 @@ import {
   oneTimeSecretNavigationMode,
 } from "../utils/asyncState.js";
 import {
+  buildRecentMailDirectLink,
+  copyText,
+} from "../utils/clipboard.js";
+import {
   confirmationCancelled,
   showRequestError,
   successMessage,
 } from "../utils/feedback.js";
 import { formatTime } from "../utils/format.js";
+import { createLiveRefresh } from "../utils/liveRefresh.js";
 
 const route = useRoute();
 const router = useRouter();
@@ -337,6 +365,7 @@ const auth = useAuth();
 const account = ref(null);
 const aliases = ref([]);
 const apiKey = ref("");
+const apiDirectLinkPath = ref("");
 const secretRegion = ref(null);
 const loading = ref(false);
 const loadError = ref(null);
@@ -345,6 +374,7 @@ const createLoading = ref(false);
 const accountDeleteLoading = ref(false);
 const aliasFormRef = ref(null);
 const aliasFormError = ref(null);
+const copyLoading = reactive({});
 const toggleLoading = reactive({});
 const rotateLoading = reactive({});
 const deleteLoading = reactive({});
@@ -432,36 +462,56 @@ function replaceAlias(updated) {
   );
 }
 
-async function loadDetail() {
+function detailMutationPending() {
+  return (
+    syncLoading.value ||
+    createLoading.value ||
+    accountDeleteLoading.value ||
+    aliasActionLock.hasAny()
+  );
+}
+
+function beginDetailMutation() {
+  detailGate.invalidate();
+}
+
+async function loadDetail({ silent = false } = {}) {
+  if (silent && (loading.value || detailMutationPending())) return;
   const accountId = detailRouteKey();
   const ticket = detailGate.begin(accountId);
-  loading.value = true;
-  loadError.value = null;
+  if (!silent) {
+    loading.value = true;
+    loadError.value = null;
+  }
   try {
     const detail = await getAccount(accountId);
     if (!detailGate.isCurrent(ticket, detailRouteKey())) return;
     account.value = detail.account;
     aliases.value = detail.aliases;
+    loadError.value = null;
     setPageHeader(
       detail.account.email,
       "管理 IMAP 连接、同步状态和所属隐私邮箱",
     );
   } catch (error) {
-    if (!detailGate.isCurrent(ticket, detailRouteKey())) return;
+    if (silent || !detailGate.isCurrent(ticket, detailRouteKey())) return;
     loadError.value = error;
   } finally {
-    if (detailGate.isCurrent(ticket, detailRouteKey())) {
+    if (!silent && detailGate.isCurrent(ticket, detailRouteKey())) {
       loading.value = false;
     }
   }
 }
 
-async function revealKey(value, accountId) {
-  if (!value || !isCurrentAccount(accountId)) return false;
+const liveRefresh = createLiveRefresh(() => loadDetail({ silent: true }));
+
+async function revealKey(value, directLinkPath, accountId) {
+  if (!value || !directLinkPath || !isCurrentAccount(accountId)) return false;
   apiKey.value = value;
+  apiDirectLinkPath.value = directLinkPath;
   await nextTick();
   if (!isCurrentAccount(accountId)) {
-    apiKey.value = "";
+    clearSecret();
     return false;
   }
   const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
@@ -474,6 +524,7 @@ async function revealKey(value, accountId) {
 
 async function syncNow() {
   if (syncLoading.value) return;
+  beginDetailMutation();
   const accountId = account.value.id;
   syncLoading.value = true;
   try {
@@ -493,6 +544,7 @@ async function syncNow() {
 
 async function addAlias() {
   if (apiKey.value || !createLock.acquire()) return;
+  beginDetailMutation();
   const accountId = account.value.id;
   let sessionInvalid = false;
   createLoading.value = true;
@@ -517,7 +569,9 @@ async function addAlias() {
     account.value = { ...account.value, aliasCount: aliases.value.length };
     Object.assign(aliasForm, { address: "", label: "" });
     aliasFormRef.value?.resetFields();
-    if (!(await revealKey(result.apiKey, accountId))) return;
+    if (!(await revealKey(result.apiKey, result.alias.directLinkPath, accountId))) {
+      return;
+    }
     successMessage("隐私邮箱已添加。");
   } catch (error) {
     sessionInvalid = isSessionInvalid(error);
@@ -532,6 +586,7 @@ async function addAlias() {
 
 async function rotateKey(alias) {
   if (apiKey.value || !aliasActionLock.acquire(alias.id)) return;
+  beginDetailMutation();
   const accountId = account.value.id;
   let sessionInvalid = false;
   rotateLoading[alias.id] = true;
@@ -550,7 +605,9 @@ async function rotateKey(alias) {
     const result = await rotateAlias(alias.id, auth.state.csrfToken);
     if (!isCurrentAccount(accountId)) return;
     replaceAlias(result.alias);
-    if (!(await revealKey(result.apiKey, accountId))) return;
+    if (!(await revealKey(result.apiKey, result.alias.directLinkPath, accountId))) {
+      return;
+    }
     successMessage("API Key 已轮换，旧 Key 已失效。");
   } catch (error) {
     if (confirmationCancelled(error)) return;
@@ -564,8 +621,39 @@ async function rotateKey(alias) {
   }
 }
 
+async function copyAliasDirectLink(alias) {
+  if (!alias.directLinkPath || !aliasActionLock.acquire(alias.id)) return;
+  const accountId = account.value.id;
+  copyLoading[alias.id] = true;
+  try {
+    const directLink = buildRecentMailDirectLink(alias.directLinkPath);
+    const copied = await copyText(directLink);
+    if (!isCurrentAccount(accountId)) return;
+    if (!copied) {
+      ElMessage({
+        type: "error",
+        message: "直达链接复制失败，请检查浏览器剪切板权限后重试。",
+        grouping: true,
+      });
+      return;
+    }
+    successMessage("邮件 API 直达链接已复制。");
+  } catch {
+    if (!isCurrentAccount(accountId)) return;
+    ElMessage({
+      type: "error",
+      message: "直达链接复制失败，请刷新页面后重试。",
+      grouping: true,
+    });
+  } finally {
+    delete copyLoading[alias.id];
+    aliasActionLock.release(alias.id);
+  }
+}
+
 async function toggleAlias(alias, enabled) {
   if (alias.enabled === enabled || !aliasActionLock.acquire(alias.id)) return;
+  beginDetailMutation();
   const accountId = account.value.id;
   toggleLoading[alias.id] = true;
   try {
@@ -588,6 +676,7 @@ async function toggleAlias(alias, enabled) {
 
 async function removeAlias(alias) {
   if (!aliasActionLock.acquire(alias.id)) return;
+  beginDetailMutation();
   const accountId = account.value.id;
   deleteLoading[alias.id] = true;
   try {
@@ -620,6 +709,7 @@ async function removeAlias(alias) {
 
 async function removeAccount() {
   if (!accountDeleteLock.acquire()) return;
+  beginDetailMutation();
   const accountId = account.value.id;
   const accountEmail = account.value.email;
   accountDeleteLoading.value = true;
@@ -638,7 +728,7 @@ async function removeAccount() {
     if (!isCurrentAccount(accountId)) return;
     await deleteAccount(accountId, auth.state.csrfToken);
     if (!isCurrentAccount(accountId)) return;
-    apiKey.value = "";
+    clearSecret();
     successMessage("主号及其全部数据已删除。");
     await router.replace({ name: "accounts" });
   } catch (error) {
@@ -657,6 +747,7 @@ function editAccount() {
 
 function clearSecret() {
   apiKey.value = "";
+  apiDirectLinkPath.value = "";
 }
 
 async function confirmSecretNavigation() {
@@ -724,10 +815,12 @@ onBeforeRouteUpdate(confirmSecretNavigation);
 onMounted(() => {
   window.addEventListener("beforeunload", protectSecretBeforeUnload);
   loadDetail();
+  liveRefresh.start({ immediate: false });
 });
 
 onBeforeUnmount(() => {
   viewActive = false;
+  liveRefresh.stop();
   detailGate.deactivate();
   window.removeEventListener("beforeunload", protectSecretBeforeUnload);
   clearSecret();

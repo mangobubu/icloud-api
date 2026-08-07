@@ -10,7 +10,7 @@
       </small>
       <small v-if="item.lastSyncedAt">
         {{ item.lastSyncStatus === "error" ? "尝试于" : "同步于" }}
-        {{ formatTime(item.lastSyncedAt) }}
+        {{ formatTime(item.lastSyncedAt, { seconds: true }) }}
       </small>
     </template>
   </div>

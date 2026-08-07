@@ -26,6 +26,17 @@ test("latest request gate rejects responses after deactivation", () => {
   assert.equal(gate.isCurrent(request, "account-a"), false);
 });
 
+test("latest request gate rejects a refresh invalidated by a later mutation", () => {
+  const gate = createLatestRequestGate();
+  const refresh = gate.begin("account-a");
+
+  gate.invalidate();
+
+  assert.equal(gate.isCurrent(refresh, "account-a"), false);
+  const afterMutation = gate.begin("account-a");
+  assert.equal(gate.isCurrent(afterMutation, "account-a"), true);
+});
+
 test("action lock rejects duplicate work until the first action releases", async () => {
   const lock = createActionLock();
   let releasePending;

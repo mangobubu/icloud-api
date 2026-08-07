@@ -119,6 +119,9 @@ func (f *fakeIMAPSession) fetch(seqset *imap.SeqSet, items []imap.FetchItem, ch 
 		source = f.headerByUID
 	}
 	for uid, raw := range source {
+		if seqset == nil || !seqset.Contains(uid) {
+			continue
+		}
 		responseSection := *requested
 		responseSection.Peek = false
 		if len(responseSection.Partial) == 2 {
@@ -262,15 +265,119 @@ func TestFetcherFetchLatest(t *testing.T) {
 		headerNames := make(map[string]struct{})
 		collectSearchHeaderNames(criteria, headerNames)
 		for _, weak := range weakRecipientHeaderFields {
-			if _, exists := headerNames[weak]; exists {
+			if containsSearchHeaderNameFold(headerNames, weak) {
 				t.Fatalf("default search included weak header %q", weak)
 			}
 		}
 		for _, strong := range strongRecipientHeaderFields {
-			if _, exists := headerNames[strong]; !exists {
+			if !containsSearchHeaderNameFold(headerNames, strong) {
 				t.Fatalf("default search omitted strong header %q", strong)
 			}
 		}
+		if !containsSearchHeaderNameFold(headerNames, icloudHMEHeaderField) {
+			t.Fatalf("default search omitted Apple HME header %q", icloudHMEHeaderField)
+		}
+	}
+}
+
+func TestFetcherFetchLatestRecognizesAppleHMERoute(t *testing.T) {
+	fixedNow := time.Date(2026, 8, 7, 8, 5, 0, 0, time.UTC)
+	const aliasAddress = "hidden.alias@icloud.com"
+	session := &fakeIMAPSession{
+		searchResults: [][]uint32{{42}},
+		headerByUID: map[uint32][]byte{
+			42: []byte("Original-Recipient: rfc822; primary@icloud.com\r\n" +
+				"To: Hide My Email <" + aliasAddress + ">\r\n" +
+				"X-ICLOUD-HME: p=" + aliasAddress + "; d=; f=primary@icloud.com; r=to; s=sender@example.com\r\n\r\n"),
+		},
+		bodyByUID: map[uint32][]byte{
+			42: []byte("Message-ID: <hme@example.com>\r\nSubject: HME\r\nTo: Hide My Email <" + aliasAddress + ">\r\n\r\nbody"),
+		},
+		internalDates: map[uint32]time.Time{42: fixedNow.Add(-time.Minute)},
+	}
+	fetcher := NewFetcher()
+	fetcher.now = func() time.Time { return fixedNow }
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		return session, nil
+	}
+
+	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
+		ID: 1, Email: "primary@icloud.com", Enabled: true,
+	}, "password", []domain.Alias{{ID: 7, AccountID: 1, Address: aliasAddress, Enabled: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := got[7]
+	if message.SnapshotState != domain.SnapshotFound || message.UID != 42 || message.Subject != "HME" {
+		t.Fatalf("HME snapshot = %#v, want UID 42 Found", message)
+	}
+	headerNames := make(map[string]struct{})
+	collectSearchHeaderNames(session.searchCriteria[0], headerNames)
+	if !containsSearchHeaderNameFold(headerNames, icloudHMEHeaderField) {
+		t.Fatalf("HME search omitted %q", icloudHMEHeaderField)
+	}
+	if len(session.fetchItems) != 2 {
+		t.Fatalf("HME FETCH calls = %d, want headers and body", len(session.fetchItems))
+	}
+	if !strings.Contains(string(session.fetchItems[0][1]), icloudHMEHeaderField) ||
+		!strings.Contains(string(session.fetchItems[0][1]), "To") {
+		t.Fatalf("HME header FETCH fields = %#v, want HME and To", session.fetchItems[0])
+	}
+}
+
+func TestFetcherFallbackRecognizesAppleHMERoute(t *testing.T) {
+	const aliasAddress = "hidden.alias@icloud.com"
+	session := &fakeIMAPSession{
+		searchResults:  [][]uint32{{}},
+		searchErrors:   []error{errors.New("Unexpected exception")},
+		messages:       1,
+		uidOnlyResults: []uint32{42},
+		headerByUID: map[uint32][]byte{
+			42: []byte("Original-Recipient: rfc822; primary@icloud.com\r\n" +
+				"To: Hide My Email <" + aliasAddress + ">\r\n" +
+				"X-ICLOUD-HME: p=" + aliasAddress + "; d=; f=primary@icloud.com; r=to\r\n\r\n"),
+		},
+		bodyByUID: map[uint32][]byte{42: []byte("Subject: fallback HME\r\n\r\nbody")},
+	}
+	fetcher := NewFetcher()
+	fetcher.MaxCandidates = 1
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		return session, nil
+	}
+
+	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
+		ID: 1, Email: "primary@icloud.com", Enabled: true,
+	}, "password", []domain.Alias{{ID: 7, AccountID: 1, Address: aliasAddress, Enabled: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message := got[7]; message.SnapshotState != domain.SnapshotFound || message.UID != 42 {
+		t.Fatalf("fallback HME snapshot = %#v, want UID 42 Found", message)
+	}
+}
+
+func TestFetcherMalformedAppleHMERouteStaysUnknown(t *testing.T) {
+	session := &fakeIMAPSession{
+		searchResults: [][]uint32{{42}},
+		headerByUID: map[uint32][]byte{
+			42: []byte("Original-Recipient: rfc822; primary@icloud.com\r\n" +
+				"To: Hide My Email <hidden.alias@icloud.com>\r\n" +
+				"X-ICLOUD-HME: f=primary@icloud.com; r=to\r\n\r\n"),
+		},
+	}
+	fetcher := NewFetcher()
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		return session, nil
+	}
+
+	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
+		ID: 1, Email: "primary@icloud.com", Enabled: true,
+	}, "password", []domain.Alias{{ID: 7, AccountID: 1, Address: "hidden.alias@icloud.com", Enabled: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message := got[7]; message.SnapshotState != domain.SnapshotUnknown || message.UID != 0 {
+		t.Fatalf("malformed HME snapshot = %#v, want Unknown", message)
 	}
 }
 
@@ -282,6 +389,15 @@ func collectSearchHeaderNames(criteria *imap.SearchCriteria, names map[string]st
 		collectSearchHeaderNames(pair[0], names)
 		collectSearchHeaderNames(pair[1], names)
 	}
+}
+
+func containsSearchHeaderNameFold(names map[string]struct{}, wanted string) bool {
+	for name := range names {
+		if strings.EqualFold(name, wanted) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestFetcherFallsBackToRecentUIDScanWhenRecipientSearchFails(t *testing.T) {
@@ -329,6 +445,136 @@ func TestFetcherFallsBackToRecentUIDScanWhenRecipientSearchFails(t *testing.T) {
 	}
 	if got := session.fetchSeqSets[0]; got != "17:20" {
 		t.Fatalf("fallback sequence range = %q, want 17:20", got)
+	}
+}
+
+func TestFetcherFallbackStopsAfterNewestHeaderBatchFindsWinner(t *testing.T) {
+	const candidateCount = candidateHeaderFetchBatch + 1
+	uidResults := make([]uint32, 0, candidateCount)
+	headers := make(map[uint32][]byte, candidateCount)
+	for uid := uint32(1); uid <= candidateCount; uid++ {
+		uidResults = append(uidResults, uid)
+		headers[uid] = []byte("X-Original-To: other@example.com\r\n\r\n")
+	}
+	headers[candidateCount] = []byte("X-Original-To: alias@example.com\r\n\r\n")
+	session := &fakeIMAPSession{
+		searchResults:  [][]uint32{nil},
+		searchErrors:   []error{errors.New("Unexpected exception")},
+		messages:       candidateCount,
+		uidOnlyResults: uidResults,
+		headerByUID:    headers,
+		bodyByUID: map[uint32][]byte{
+			candidateCount: []byte("Subject: newest batch winner\r\n\r\nbody"),
+		},
+	}
+	fetcher := NewFetcher()
+	fetcher.MaxCandidates = candidateCount
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		return session, nil
+	}
+
+	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
+		ID: 1, Email: "owner@icloud.com", Enabled: true,
+	}, "password", []domain.Alias{
+		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message := got[5]; message.SnapshotState != domain.SnapshotFound || message.UID != candidateCount {
+		t.Fatalf("fallback snapshot = %#v, want newest batch winner", message)
+	}
+	if len(session.fetchItems) != 3 {
+		t.Fatalf("fallback FETCH calls = %d, want UID discovery, one header batch, and body", len(session.fetchItems))
+	}
+}
+
+func TestFetcherFallbackStopsAfterUnresolvedNewestCandidate(t *testing.T) {
+	const candidateCount = candidateHeaderFetchBatch + 1
+	uidResults := make([]uint32, 0, candidateCount)
+	headers := make(map[uint32][]byte, candidateCount-1)
+	for uid := uint32(1); uid <= candidateCount; uid++ {
+		uidResults = append(uidResults, uid)
+		if uid != candidateCount {
+			headers[uid] = []byte("X-Original-To: alias@example.com\r\n\r\n")
+		}
+	}
+	session := &fakeIMAPSession{
+		searchResults:  [][]uint32{nil},
+		searchErrors:   []error{errors.New("Unexpected exception")},
+		messages:       candidateCount,
+		uidOnlyResults: uidResults,
+		headerByUID:    headers,
+	}
+	fetcher := NewFetcher()
+	fetcher.MaxCandidates = candidateCount
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		return session, nil
+	}
+
+	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
+		ID: 1, Email: "owner@icloud.com", Enabled: true,
+	}, "password", []domain.Alias{
+		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message := got[5]; message.SnapshotState != domain.SnapshotUnknown || message.UID != 0 {
+		t.Fatalf("fallback snapshot = %#v, want Unknown", message)
+	}
+	if len(session.fetchItems) != 2 {
+		t.Fatalf("fallback FETCH calls = %d, want UID discovery and one header batch", len(session.fetchItems))
+	}
+}
+
+func TestFetcherFallbackContinuesUntilEveryAliasIsTerminal(t *testing.T) {
+	const candidateCount = candidateHeaderFetchBatch + 1
+	uidResults := make([]uint32, 0, candidateCount)
+	headers := make(map[uint32][]byte, candidateCount)
+	for uid := uint32(1); uid <= candidateCount; uid++ {
+		uidResults = append(uidResults, uid)
+		headers[uid] = []byte("X-Original-To: other@example.com\r\n\r\n")
+	}
+	headers[candidateCount] = []byte("X-Original-To: a@example.com\r\n\r\n")
+	headers[1] = []byte("X-Original-To: b@example.com\r\n\r\n")
+	session := &fakeIMAPSession{
+		searchResults:  [][]uint32{nil},
+		searchErrors:   []error{errors.New("Unexpected exception")},
+		messages:       candidateCount,
+		uidOnlyResults: uidResults,
+		headerByUID:    headers,
+		bodyByUID: map[uint32][]byte{
+			candidateCount: []byte("Subject: alias a\r\n\r\nbody a"),
+			1:              []byte("Subject: alias b\r\n\r\nbody b"),
+		},
+	}
+	fetcher := NewFetcher()
+	fetcher.MaxCandidates = candidateCount
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		return session, nil
+	}
+
+	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
+		ID: 1, Email: "owner@icloud.com", Enabled: true,
+	}, "password", []domain.Alias{
+		{ID: 5, AccountID: 1, Address: "a@example.com", Enabled: true},
+		{ID: 6, AccountID: 1, Address: "b@example.com", Enabled: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message := got[5]; message.SnapshotState != domain.SnapshotFound || message.UID != candidateCount {
+		t.Fatalf("alias A snapshot = %#v, want first-batch winner", message)
+	}
+	if message := got[6]; message.SnapshotState != domain.SnapshotFound || message.UID != 1 {
+		t.Fatalf("alias B snapshot = %#v, want second-batch winner", message)
+	}
+	if len(session.fetchItems) != 4 {
+		t.Fatalf("fallback FETCH calls = %d, want discovery, two header batches, and body", len(session.fetchItems))
+	}
+	if session.fetchSeqSets[1] != "2:65" || session.fetchSeqSets[2] != "1" {
+		t.Fatalf("header batch UID sets = %q / %q, want newest batch then remaining UID", session.fetchSeqSets[1], session.fetchSeqSets[2])
 	}
 }
 

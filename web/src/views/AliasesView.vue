@@ -47,7 +47,7 @@
 
       <div class="data-panel desktop-data-table" :aria-busy="loading">
         <el-table :data="aliases" row-key="id" style="width: 100%">
-          <el-table-column label="隐私邮箱" min-width="240">
+          <el-table-column label="隐私邮箱" min-width="220">
             <template #default="{ row }">
               <div class="primary-stack">
                 <strong>{{ row.address }}</strong>
@@ -55,7 +55,7 @@
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="所属主号" min-width="210">
+          <el-table-column label="所属主号" min-width="190">
             <template #default="{ row }">
               <el-button
                 class="account-link"
@@ -67,17 +67,17 @@
               </el-button>
             </template>
           </el-table-column>
-          <el-table-column label="API Key" min-width="126">
+          <el-table-column label="API Key" min-width="120">
             <template #default="{ row }">
               <code class="key-prefix">{{ keyPrefix(row) }}</code>
             </template>
           </el-table-column>
-          <el-table-column label="最近调用" min-width="170">
+          <el-table-column label="最近调用" min-width="150">
             <template #default="{ row }">
               {{ formatTime(row.lastAccessedAt) }}
             </template>
           </el-table-column>
-          <el-table-column label="最新邮件" min-width="170">
+          <el-table-column label="最新邮件" min-width="150">
             <template #default="{ row }">
               {{ formatTime(row.latestReceivedAt) }}
             </template>
@@ -87,16 +87,28 @@
               <SyncStatus :item="row" details />
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="112" align="right">
+          <el-table-column label="操作" width="152" align="right" fixed="right">
             <template #default="{ row }">
-              <el-button
-                link
-                type="primary"
-                :icon="Setting"
-                @click="openAccount(row.accountId)"
-              >
-                管理
-              </el-button>
+              <div class="icon-action-row">
+                <el-tooltip content="复制邮件 API 直达链接" placement="top">
+                  <el-button
+                    :icon="CopyDocument"
+                    circle
+                    :loading="Boolean(copyLoading[row.id])"
+                    :disabled="!row.directLinkPath"
+                    :aria-label="`复制 ${row.address} 的邮件 API 直达链接`"
+                    @click="copyAliasDirectLink(row)"
+                  />
+                </el-tooltip>
+                <el-button
+                  link
+                  type="primary"
+                  :icon="Setting"
+                  @click="openAccount(row.accountId)"
+                >
+                  管理
+                </el-button>
+              </div>
             </template>
           </el-table-column>
         </el-table>
@@ -130,8 +142,21 @@
               <dd>{{ formatTime(alias.latestReceivedAt) }}</dd>
             </div>
           </dl>
-          <footer class="mobile-record__actions">
-            <el-button :icon="Setting" @click="openAccount(alias.accountId)">
+          <footer class="mobile-record__actions mobile-record__actions--direct-link">
+            <el-button
+              :icon="CopyDocument"
+              :loading="Boolean(copyLoading[alias.id])"
+              :disabled="!alias.directLinkPath"
+              :aria-label="`复制 ${alias.address} 的邮件 API 直达链接`"
+              @click="copyAliasDirectLink(alias)"
+            >
+              复制邮件 API 直达链接
+            </el-button>
+            <el-button
+              :icon="Setting"
+              :aria-label="`管理 ${alias.address} 所属主号`"
+              @click="openAccount(alias.accountId)"
+            >
               管理所属主号
             </el-button>
           </footer>
@@ -142,8 +167,9 @@
 </template>
 
 <script setup>
-import { Refresh, Setting } from "@element-plus/icons-vue";
-import { onMounted, ref } from "vue";
+import { CopyDocument, Refresh, Setting } from "@element-plus/icons-vue";
+import { ElMessage } from "element-plus";
+import { onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import { getAliases } from "../api/admin.js";
@@ -151,27 +177,80 @@ import EmptyState from "../components/EmptyState.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncStatus from "../components/SyncStatus.vue";
+import { createActionLock } from "../utils/asyncState.js";
+import {
+  buildRecentMailDirectLink,
+  copyText,
+} from "../utils/clipboard.js";
+import { successMessage } from "../utils/feedback.js";
 import { formatTime } from "../utils/format.js";
+import { createLiveRefresh } from "../utils/liveRefresh.js";
 
 const router = useRouter();
 const aliases = ref([]);
 const loading = ref(false);
 const loadError = ref(null);
+const copyLoading = reactive({});
+const copyLock = createActionLock();
+let refreshInFlight = false;
+let viewActive = true;
 
 function keyPrefix(alias) {
   return alias.apiKeyPrefix ? `${alias.apiKeyPrefix}…` : "-";
 }
 
-async function loadAliases() {
-  if (loading.value) return;
-  loading.value = true;
-  loadError.value = null;
+async function loadAliases({ silent = false } = {}) {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  if (!silent) {
+    loading.value = true;
+    loadError.value = null;
+  }
   try {
-    aliases.value = await getAliases();
+    const nextAliases = await getAliases();
+    if (!viewActive) return;
+    aliases.value = nextAliases;
+    loadError.value = null;
   } catch (error) {
-    loadError.value = error;
+    if (viewActive && !silent) {
+      loadError.value = error;
+    }
   } finally {
-    loading.value = false;
+    refreshInFlight = false;
+    if (!silent) {
+      loading.value = false;
+    }
+  }
+}
+
+const liveRefresh = createLiveRefresh(() => loadAliases({ silent: true }));
+
+async function copyAliasDirectLink(alias) {
+  if (!alias.directLinkPath || !copyLock.acquire(alias.id)) return;
+  copyLoading[alias.id] = true;
+  try {
+    const directLink = buildRecentMailDirectLink(alias.directLinkPath);
+    const copied = await copyText(directLink);
+    if (!viewActive) return;
+    if (!copied) {
+      ElMessage({
+        type: "error",
+        message: "直达链接复制失败，请检查浏览器剪切板权限后重试。",
+        grouping: true,
+      });
+      return;
+    }
+    successMessage("邮件 API 直达链接已复制。");
+  } catch {
+    if (!viewActive) return;
+    ElMessage({
+      type: "error",
+      message: "直达链接复制失败，请刷新页面后重试。",
+      grouping: true,
+    });
+  } finally {
+    delete copyLoading[alias.id];
+    copyLock.release(alias.id);
   }
 }
 
@@ -183,7 +262,15 @@ function openAccount(id) {
   router.push({ name: "account-detail", params: { id } });
 }
 
-onMounted(loadAliases);
+onMounted(() => {
+  loadAliases();
+  liveRefresh.start({ immediate: false });
+});
+
+onBeforeUnmount(() => {
+  viewActive = false;
+  liveRefresh.stop();
+});
 </script>
 
 <style scoped>

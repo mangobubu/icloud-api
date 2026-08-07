@@ -306,4 +306,301 @@
       input.remove();
     });
   });
+
+  var syncPollRoot = document.querySelector("[data-sync-poll-endpoint]");
+  var syncPollTimer = null;
+  var syncPollInFlight = false;
+  var syncPollController = null;
+  var syncPollingStopped = false;
+  var syncPollInterval = 5000;
+
+  function normalizedSyncItem(raw) {
+    raw = raw || {};
+    return {
+      id: raw.id,
+      enabled: Boolean(raw.enabled),
+      lastSyncStatus: raw.last_sync_status || "pending",
+      lastSyncError: raw.last_sync_error || "",
+      lastSyncedAt: raw.last_synced_at || null,
+    };
+  }
+
+  function initialSyncItem(record) {
+    return {
+      id: record.dataset.syncId,
+      enabled: record.dataset.syncEnabled === "true",
+      lastSyncStatus: record.dataset.syncStatus || "pending",
+      lastSyncError: record.dataset.syncError || "",
+      lastSyncedAt: record.dataset.syncAt || null,
+    };
+  }
+
+  function syncDate(value) {
+    if (!value) {
+      return null;
+    }
+    var date;
+    if (typeof value === "string" && /^\d+$/.test(value)) {
+      date = new Date(Number(value) * 1000);
+    } else {
+      date = new Date(value);
+    }
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  function twoDigits(value) {
+    return String(value).padStart(2, "0");
+  }
+
+  function formatSyncDate(date) {
+    return (
+      date.getFullYear() +
+      "-" +
+      twoDigits(date.getMonth() + 1) +
+      "-" +
+      twoDigits(date.getDate()) +
+      " " +
+      twoDigits(date.getHours()) +
+      ":" +
+      twoDigits(date.getMinutes()) +
+      ":" +
+      twoDigits(date.getSeconds())
+    );
+  }
+
+  function updateSyncTime(element, value) {
+    if (!element) {
+      return false;
+    }
+    var date = syncDate(value);
+    if (!date) {
+      element.textContent = "-";
+      element.removeAttribute("datetime");
+      return false;
+    }
+    element.textContent = formatSyncDate(date);
+    element.setAttribute("datetime", date.toISOString());
+    return true;
+  }
+
+  function compactSyncError(value) {
+    var normalized = String(value || "")
+      .trim()
+      .replace(/\s+/g, " ");
+    var characters = Array.from(normalized);
+    return characters.length <= 80
+      ? normalized
+      : characters.slice(0, 79).join("") + "…";
+  }
+
+  function syncStatusPresentation(item) {
+    if (!item.enabled) {
+      return { label: "已停用", className: "status-muted" };
+    }
+    if (item.lastSyncStatus === "ok") {
+      return { label: "正常", className: "status-ok" };
+    }
+    if (item.lastSyncStatus === "error") {
+      return { label: "同步异常", className: "status-error" };
+    }
+    return { label: "待同步", className: "status-pending" };
+  }
+
+  function renderSyncStatus(container, item) {
+    if (!container) {
+      return;
+    }
+    var presentation = syncStatusPresentation(item);
+    var status = document.createElement("span");
+    status.className = "status " + presentation.className;
+    status.textContent = presentation.label;
+    container.replaceChildren(status);
+
+    if (!container.hasAttribute("data-sync-details") || !item.enabled) {
+      return;
+    }
+    if (item.lastSyncStatus === "error" && item.lastSyncError) {
+      var error = document.createElement("small");
+      error.textContent = "错误：" + compactSyncError(item.lastSyncError);
+      container.appendChild(error);
+    }
+    if (
+      (item.lastSyncStatus === "ok" || item.lastSyncStatus === "error") &&
+      item.lastSyncedAt
+    ) {
+      var detail = document.createElement("small");
+      detail.appendChild(
+        document.createTextNode(
+          item.lastSyncStatus === "error" ? "尝试于 " : "同步于 "
+        )
+      );
+      var time = document.createElement("time");
+      if (updateSyncTime(time, item.lastSyncedAt)) {
+        detail.appendChild(time);
+        container.appendChild(detail);
+      }
+    }
+  }
+
+  function updateSyncError(record, message) {
+    var container = record.querySelector("[data-sync-error-container]");
+    if (!container) {
+      return;
+    }
+    var text = container.querySelector("[data-sync-error-text]");
+    if (text) {
+      text.textContent = message || "";
+    }
+    container.hidden = !message;
+  }
+
+  function updateSyncRecord(record, item) {
+    record.dataset.syncEnabled = String(item.enabled);
+    record.dataset.syncStatus = item.lastSyncStatus;
+    record.dataset.syncError = item.lastSyncError;
+    if (item.lastSyncedAt) {
+      record.dataset.syncAt = item.lastSyncedAt;
+    } else {
+      delete record.dataset.syncAt;
+    }
+    renderSyncStatus(record.querySelector("[data-sync-status-cell]"), item);
+    updateSyncTime(
+      record.querySelector("[data-sync-primary-time]"),
+      item.lastSyncedAt
+    );
+    updateSyncError(record, item.lastSyncError);
+  }
+
+  function syncItemsFromPayload(page, data) {
+    if (page === "accounts" && Array.isArray(data)) {
+      return data.map(function (item) {
+        return { kind: "account", item: normalizedSyncItem(item) };
+      });
+    }
+    if (page === "aliases" && Array.isArray(data)) {
+      return data.map(function (item) {
+        return { kind: "alias", item: normalizedSyncItem(item) };
+      });
+    }
+    if (page === "account-detail" && data && data.account) {
+      var items = [
+        { kind: "account", item: normalizedSyncItem(data.account) },
+      ];
+      (Array.isArray(data.aliases) ? data.aliases : []).forEach(function (item) {
+        items.push({ kind: "alias", item: normalizedSyncItem(item) });
+      });
+      return items;
+    }
+    return [];
+  }
+
+  function applySyncPayload(payload) {
+    var records = new Map();
+    syncPollRoot.querySelectorAll("[data-sync-record]").forEach(function (record) {
+      records.set(
+        record.dataset.syncKind + ":" + record.dataset.syncId,
+        record
+      );
+    });
+    syncItemsFromPayload(syncPollRoot.dataset.syncPollPage, payload.data).forEach(
+      function (entry) {
+        var record = records.get(entry.kind + ":" + entry.item.id);
+        if (record) {
+          updateSyncRecord(record, entry.item);
+        }
+      }
+    );
+  }
+
+  function syncPageIsVisible() {
+    return document.visibilityState !== "hidden";
+  }
+
+  function clearSyncPollTimer() {
+    if (syncPollTimer !== null) {
+      window.clearTimeout(syncPollTimer);
+      syncPollTimer = null;
+    }
+  }
+
+  function scheduleSyncPoll(delay) {
+    clearSyncPollTimer();
+    if (
+      !syncPollRoot ||
+      syncPollingStopped ||
+      syncPollInFlight ||
+      !syncPageIsVisible()
+    ) {
+      return;
+    }
+    syncPollTimer = window.setTimeout(runSyncPoll, delay);
+  }
+
+  function runSyncPoll() {
+    syncPollTimer = null;
+    if (
+      !syncPollRoot ||
+      syncPollingStopped ||
+      syncPollInFlight ||
+      !syncPageIsVisible()
+    ) {
+      return;
+    }
+    syncPollInFlight = true;
+    syncPollController = new AbortController();
+    window
+      .fetch(syncPollRoot.dataset.syncPollEndpoint, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: syncPollController.signal,
+      })
+      .then(function (response) {
+        if (response.status === 401 || response.status === 403) {
+          syncPollingStopped = true;
+        }
+        if (!response.ok) {
+          throw new Error("sync poll failed");
+        }
+        return response.json();
+      })
+      .then(function (payload) {
+        if (payload && payload.data !== undefined) {
+          applySyncPayload(payload);
+        }
+      })
+      .catch(function (error) {
+        if (error.name !== "AbortError") {
+          return;
+        }
+      })
+      .finally(function () {
+        syncPollInFlight = false;
+        syncPollController = null;
+        scheduleSyncPoll(syncPollInterval);
+      });
+  }
+
+  if (syncPollRoot) {
+    syncPollRoot.querySelectorAll("[data-sync-record]").forEach(function (record) {
+      updateSyncRecord(record, initialSyncItem(record));
+    });
+    scheduleSyncPoll(syncPollInterval);
+
+    document.addEventListener("visibilitychange", function () {
+      if (!syncPageIsVisible()) {
+        clearSyncPollTimer();
+        if (syncPollController) {
+          syncPollController.abort();
+        }
+        return;
+      }
+      scheduleSyncPoll(0);
+    });
+    window.addEventListener("pagehide", clearSyncPollTimer);
+    window.addEventListener("pageshow", function () {
+      scheduleSyncPoll(0);
+    });
+  }
 })();

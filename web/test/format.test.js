@@ -2,7 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { normalizeAccount, normalizeAlias } from "../src/api/admin.js";
-import { compactRunes, utf8Length } from "../src/utils/format.js";
+import { compactRunes, formatTime, utf8Length } from "../src/utils/format.js";
+
+test("sync timestamps can be rendered with second precision", () => {
+  const value = new Date(2026, 7, 7, 9, 8, 7);
+
+  assert.equal(formatTime(value), "2026-08-07 09:08");
+  assert.equal(
+    formatTime(value, { seconds: true }),
+    "2026-08-07 09:08:07",
+  );
+});
 
 test("UTF-8 password length counts bytes", () => {
   assert.equal(utf8Length("password1234"), 12);
@@ -27,12 +37,17 @@ test("admin DTO normalizers expose only the frontend contract", () => {
     id: 9,
     address: "relay@icloud.com",
     api_key_prefix: "icm_prefix",
+    direct_link_path: "/api/v1/mail/recent?api_key=icm_full_key",
     api_key_hash: "must-not-propagate",
     enabled: true,
   });
 
   assert.equal(account.email, "primary@icloud.com");
   assert.equal(alias.apiKeyPrefix, "icm_prefix");
+  assert.equal(
+    alias.directLinkPath,
+    "/api/v1/mail/recent?api_key=icm_full_key",
+  );
   assert.equal("passwordCiphertext" in account, false);
   assert.equal("apiKeyHash" in alias, false);
 });

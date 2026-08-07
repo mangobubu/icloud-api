@@ -256,6 +256,7 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 		aliasCandidateUIDs,
 		aliasCandidatesTruncated,
 		aliasAddresses,
+		account.Email,
 		settings.maxHeaderBytes,
 		settings.allowWeakRecipientHeaders,
 	)
@@ -673,6 +674,7 @@ func findAliasWinners(
 	aliasCandidates map[int64][]uint32,
 	aliasCandidatesTruncated map[int64]bool,
 	aliases map[string][]int64,
+	accountEmail string,
 	maxHeaderBytes int,
 	allowWeak bool,
 ) (map[int64]uint32, map[int64]struct{}, error) {
@@ -684,7 +686,7 @@ func findAliasWinners(
 		Peek: true,
 		BodyPartName: imap.BodyPartName{
 			Specifier: imap.HeaderSpecifier,
-			Fields:    recipientSearchHeaderFields(allowWeak),
+			Fields:    recipientHeaderFieldsForFetch(),
 		},
 		Partial: []int{0, maxHeaderBytes + 1},
 	}
@@ -717,12 +719,31 @@ func findAliasWinners(
 			if parseErr != nil {
 				return nil
 			}
-			aliasID, determinate := classifyRecipientAlias(parsed.Header, aliases, allowWeak)
+			aliasID, determinate := classifyRecipientAlias(parsed.Header, aliases, accountEmail, allowWeak)
 			resolutions[message.Uid] = candidateHeaderResolution{aliasID: aliasID, determinate: determinate}
 			return nil
 		})
 		if err != nil {
 			return nil, nil, fmt.Errorf("fetch candidate headers: %w", err)
+		}
+		for _, uid := range uids[start:end] {
+			if _, resolved := resolutions[uid]; !resolved {
+				// Preserve the fail-closed behavior for a response that omitted
+				// a requested UID or did not include a readable header.
+				resolutions[uid] = candidateHeaderResolution{}
+			}
+		}
+		// Candidate UIDs are ordered newest first. Once every alias has a
+		// terminal resolution, older candidates cannot change the result and
+		// there is no reason to issue more IMAP FETCH commands.
+		terminalAliases := 0
+		for aliasID, candidates := range aliasCandidates {
+			if aliasResolutionTerminal(aliasID, candidates, resolutions) {
+				terminalAliases++
+			}
+		}
+		if terminalAliases == len(aliasCandidates) {
+			break
 		}
 	}
 
@@ -750,6 +771,27 @@ func findAliasWinners(
 		}
 	}
 	return winners, empty, nil
+}
+
+// aliasResolutionTerminal reports whether the currently fetched prefix is
+// enough to make an alias result final. A malformed or missing header is
+// terminally indeterminate because accepting an older candidate would violate
+// the newest-message invariant.
+func aliasResolutionTerminal(
+	aliasID int64,
+	candidates []uint32,
+	resolutions map[uint32]candidateHeaderResolution,
+) bool {
+	for _, uid := range candidates {
+		resolution, fetched := resolutions[uid]
+		if !fetched {
+			return false
+		}
+		if !resolution.determinate || resolution.aliasID == aliasID {
+			return true
+		}
+	}
+	return true
 }
 
 type fetchedMessage struct {

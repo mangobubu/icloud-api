@@ -63,6 +63,19 @@ func TestAdminAliasPagesRenderPerAliasSyncStatus(t *testing.T) {
 		}
 	}
 
+	accountsResponse := env.request(t, http.MethodGet, "/admin", nil, []*http.Cookie{session})
+	if accountsResponse.Code != http.StatusOK {
+		t.Fatalf("GET /admin status = %d, want %d; body=%s", accountsResponse.Code, http.StatusOK, accountsResponse.Body.String())
+	}
+	accountsBody := accountsResponse.Body.String()
+	if !strings.Contains(accountsBody, `data-sync-poll-page="accounts" data-sync-poll-endpoint="/admin/api/v1/accounts"`) {
+		t.Fatalf("GET /admin omitted account sync polling metadata: %s", accountsBody)
+	}
+	accountRow := aliasStatusTableRow(t, accountsBody, account.Email)
+	assertAliasStatusFragment(t, accountRow, `data-sync-record data-sync-kind="account"`)
+	assertAliasStatusFragment(t, accountRow, `data-sync-status-cell`)
+	assertAliasStatusFragment(t, accountRow, `data-sync-primary-time`)
+
 	targets := []string{
 		fmt.Sprintf("/admin/accounts/%d", account.ID),
 		"/admin/aliases",
@@ -74,16 +87,29 @@ func TestAdminAliasPagesRenderPerAliasSyncStatus(t *testing.T) {
 				t.Fatalf("GET %s status = %d, want %d; body=%s", target, response.Code, http.StatusOK, response.Body.String())
 			}
 			body := response.Body.String()
+			expectedEndpoint := "/admin/api/v1/aliases"
+			if target != "/admin/aliases" {
+				expectedEndpoint = fmt.Sprintf("/admin/api/v1/accounts/%d", account.ID)
+			}
+			if !strings.Contains(body, `data-sync-poll-endpoint="`+expectedEndpoint+`"`) {
+				t.Fatalf("GET %s omitted sync polling endpoint %q", target, expectedEndpoint)
+			}
 
 			pendingRow := aliasStatusTableRow(t, body, "pending-status@icloud.com")
 			assertAliasStatusFragment(t, pendingRow, `status-pending">待同步</span>`)
+			assertAliasStatusFragment(t, pendingRow, `data-sync-record data-sync-kind="alias"`)
 			if strings.Contains(pendingRow, "同步于") {
 				t.Fatalf("pending alias unexpectedly rendered a sync time: %s", pendingRow)
+			}
+			if strings.Contains(pendingRow, "data-sync-at=") {
+				t.Fatalf("pending alias unexpectedly exposed a sync timestamp: %s", pendingRow)
 			}
 
 			okRow := aliasStatusTableRow(t, body, "ok-status@icloud.com")
 			assertAliasStatusFragment(t, okRow, `status-ok">正常</span>`)
 			assertAliasStatusFragment(t, okRow, "同步于 "+formatOptionalTime(&syncedAt))
+			assertAliasStatusFragment(t, okRow, fmt.Sprintf(`data-sync-at="%d"`, syncedAt.Unix()))
+			assertAliasStatusFragment(t, okRow, `data-sync-status-cell data-sync-details`)
 
 			errorRow := aliasStatusTableRow(t, body, "error-status@icloud.com")
 			assertAliasStatusFragment(t, errorRow, `status-error">同步异常</span>`)
@@ -105,7 +131,7 @@ func aliasStatusTableRow(t *testing.T, body, marker string) string {
 	if markerIndex < 0 {
 		t.Fatalf("response does not contain alias %q", marker)
 	}
-	start := strings.LastIndex(body[:markerIndex], "<tr>")
+	start := strings.LastIndex(body[:markerIndex], "<tr")
 	endOffset := strings.Index(body[markerIndex:], "</tr>")
 	if start < 0 || endOffset < 0 {
 		t.Fatalf("response does not contain a complete table row for alias %q", marker)

@@ -218,7 +218,7 @@ func (s *Server) apiKeyAuth() gin.HandlerFunc {
 		authorization := c.GetHeader("Authorization")
 		scheme, token, ok := strings.Cut(authorization, " ")
 		return token, ok && strings.EqualFold(scheme, "Bearer")
-	})
+	}, false)
 }
 
 func (s *Server) apiKeyQueryAuth() gin.HandlerFunc {
@@ -232,10 +232,13 @@ func (s *Server) apiKeyQueryAuth() gin.HandlerFunc {
 			return "", false
 		}
 		return apiKeys[0], true
-	})
+	}, true)
 }
 
-func (s *Server) apiKeyAuthWithToken(tokenFromRequest func(*gin.Context) (string, bool)) gin.HandlerFunc {
+func (s *Server) apiKeyAuthWithToken(
+	tokenFromRequest func(*gin.Context) (string, bool),
+	allowDirectLinkToken bool,
+) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		if !s.apiIPLimiter.Allow(c.ClientIP()) {
@@ -249,7 +252,7 @@ func (s *Server) apiKeyAuthWithToken(tokenFromRequest func(*gin.Context) (string
 			c.Abort()
 			return
 		}
-		binding, err := s.store.GetMailboxBindingByAPIKeyHash(c.Request.Context(), secure.HashToken(token))
+		binding, err := s.mailboxBindingForToken(c, token, allowDirectLinkToken)
 		if errors.Is(err, store.ErrNotFound) || err == nil && (!binding.Alias.Enabled || !binding.Account.Enabled) {
 			s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 			c.Abort()
@@ -269,6 +272,25 @@ func (s *Server) apiKeyAuthWithToken(tokenFromRequest func(*gin.Context) (string
 		c.Set(bindingKey, binding)
 		c.Next()
 	}
+}
+
+func (s *Server) mailboxBindingForToken(
+	c *gin.Context,
+	token string,
+	allowDirectLinkToken bool,
+) (domain.MailboxBinding, error) {
+	if allowDirectLinkToken && s.cipher != nil {
+		if aliasID, candidate := secure.DirectLinkTokenAliasID(token); candidate {
+			alias, err := s.store.GetAlias(c.Request.Context(), aliasID)
+			switch {
+			case err == nil && s.cipher.VerifyDirectLinkToken(token, aliasID, alias.APIKeyHash):
+				return s.store.GetMailboxBindingByAPIKeyHash(c.Request.Context(), alias.APIKeyHash)
+			case err != nil && !errors.Is(err, store.ErrNotFound):
+				return domain.MailboxBinding{}, err
+			}
+		}
+	}
+	return s.store.GetMailboxBindingByAPIKeyHash(c.Request.Context(), secure.HashToken(token))
 }
 
 func (s *Server) pageData(c *gin.Context, title, active string) PageData {

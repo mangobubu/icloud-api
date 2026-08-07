@@ -60,6 +60,7 @@ func TestSyncTimeoutDefault(t *testing.T) {
 
 func TestSyncTimeoutOverride(t *testing.T) {
 	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_IMAP_TIMEOUT", "5s")
 	t.Setenv("ICLOUD_API_SYNC_TIMEOUT", "17s")
 	cfg, err := Load()
 	if err != nil {
@@ -80,6 +81,29 @@ func TestSyncTimeoutValidation(t *testing.T) {
 				t.Fatalf("ICLOUD_API_SYNC_TIMEOUT=%q 错误 = %v", value, err)
 			}
 		})
+	}
+}
+
+func TestSyncTimeoutMustCoverTwoIMAPTimeouts(t *testing.T) {
+	for _, syncTimeout := range []string{"24s", "25s", "49s"} {
+		t.Run(syncTimeout, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_IMAP_TIMEOUT", "25s")
+			t.Setenv("ICLOUD_API_SYNC_TIMEOUT", syncTimeout)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_SYNC_TIMEOUT 必须至少为 ICLOUD_API_IMAP_TIMEOUT 的两倍") {
+				t.Fatalf("不一致的同步/IMAP 超时错误 = %v", err)
+			}
+		})
+	}
+}
+
+func TestSyncTimeoutAllowsTwiceIMAPTimeout(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_IMAP_TIMEOUT", "25s")
+	t.Setenv("ICLOUD_API_SYNC_TIMEOUT", "50s")
+	if _, err := Load(); err != nil {
+		t.Fatalf("两倍 IMAP 超时的同步总时限不应被拒绝: %v", err)
 	}
 }
 

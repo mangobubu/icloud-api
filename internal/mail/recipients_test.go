@@ -3,6 +3,7 @@ package mail
 import (
 	stdmail "net/mail"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -118,6 +119,110 @@ func TestOriginalRecipientRFC822Syntax(t *testing.T) {
 	}
 }
 
+func TestMatchingAliasIDsUsesAppleHMERouteBeforePhysicalRecipient(t *testing.T) {
+	header := stdmail.Header{
+		"Original-Recipient": {`rfc822; primary@icloud.com`},
+		"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+		icloudHMEHeaderField: {`p=hidden.alias@icloud.com; d=; f=primary@icloud.com; r=to; s=sender@example.com`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	for _, allowWeak := range []bool{false, true} {
+		if got := matchingAliasIDsForAccount(header, aliases, "primary@icloud.com", allowWeak); !reflect.DeepEqual(got, []int64{7}) {
+			t.Fatalf("allowWeak=%v HME matching = %#v, want [7]", allowWeak, got)
+		}
+	}
+}
+
+func TestMatchingAliasIDsHandlesRawAppleHeaderCasing(t *testing.T) {
+	header := stdmail.Header{
+		"Original-recipient": {`rfc822;primary@icloud.com`},
+		"To":                 {`Hide My Email <private.alias@icloud.com>`},
+		"X-Icloud-Hme":       {`p=private.alias@icloud.com; d=; f=primary@icloud.com; r=to; s=sender@example.com`},
+	}
+	aliases := map[string][]int64{"private.alias@icloud.com": {7}}
+	if got, determinate := classifyRecipientAlias(header, aliases, "PRIMARY@iCloud.com", false); !determinate || got != 7 {
+		t.Fatalf("raw Apple header classification = (%d, %v), want (7, true)", got, determinate)
+	}
+}
+
+func TestMatchingAliasIDsRejectsInvalidAppleHMERoutes(t *testing.T) {
+	tests := []struct {
+		name   string
+		hme    string
+		extra  string
+		values []string
+	}{
+		{name: "missing private address", hme: `d=; f=primary@icloud.com; r=to`},
+		{name: "missing forward address", hme: `p=hidden.alias@icloud.com; d=; r=to`},
+		{name: "missing recipient role", hme: `p=hidden.alias@icloud.com; d=; f=primary@icloud.com`},
+		{name: "duplicate private address", hme: `p=hidden.alias@icloud.com; p=other.alias@icloud.com; f=primary@icloud.com; r=to`},
+		{name: "display name is not an address parameter", hme: `p=Hidden Alias <hidden.alias@icloud.com>; f=primary@icloud.com; r=to`},
+		{name: "forward address mismatch", hme: `p=hidden.alias@icloud.com; f=other@icloud.com; r=to`},
+		{name: "recipient role mismatch", hme: `p=hidden.alias@icloud.com; f=primary@icloud.com; r=cc`, extra: "Cc: other@example.com\r\n"},
+		{name: "original recipient mismatch", hme: `p=hidden.alias@icloud.com; f=primary@icloud.com; r=to`, extra: "Original-Recipient: rfc822; other@icloud.com\r\n"},
+		{name: "malformed sender", hme: `p=hidden.alias@icloud.com; f=primary@icloud.com; r=to; s=not an address`},
+		{name: "trailing empty parameter", hme: `p=hidden.alias@icloud.com; f=primary@icloud.com; r=to;`},
+		{name: "duplicate HME fields", values: []string{
+			`p=hidden.alias@icloud.com; f=primary@icloud.com; r=to`,
+			`p=hidden.alias@icloud.com; f=primary@icloud.com; r=to`,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hmeValues := test.values
+			if hmeValues == nil {
+				hmeValues = []string{test.hme}
+			}
+			header := stdmail.Header{
+				"Original-Recipient": {`rfc822; primary@icloud.com`},
+				"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+				icloudHMEHeaderField: hmeValues,
+			}
+			if test.extra != "" {
+				parsed, err := stdmail.ReadMessage(strings.NewReader(test.extra + "\r\n"))
+				if err != nil {
+					t.Fatalf("parse extra headers: %v", err)
+				}
+				for key, values := range parsed.Header {
+					header[key] = values
+				}
+			}
+			if got, determinate := classifyRecipientAlias(header, map[string][]int64{
+				"hidden.alias@icloud.com": {7},
+			}, "primary@icloud.com", false); determinate || got != 0 {
+				t.Fatalf("classification = (%d, %v), want (0, false)", got, determinate)
+			}
+		})
+	}
+}
+
+func TestMatchingAliasIDsRejectsConflictingRegisteredAliasInAppleHMEHeaders(t *testing.T) {
+	header := stdmail.Header{
+		"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+		"Cc":                 {`other.alias@icloud.com`},
+		icloudHMEHeaderField: {`p=hidden.alias@icloud.com; d=; f=primary@icloud.com; r=to`},
+	}
+	aliases := map[string][]int64{
+		"hidden.alias@icloud.com": {7},
+		"other.alias@icloud.com":  {8},
+	}
+	if got, determinate := classifyRecipientAlias(header, aliases, "primary@icloud.com", false); determinate || got != 0 {
+		t.Fatalf("conflicting HME classification = (%d, %v), want (0, false)", got, determinate)
+	}
+}
+
+func TestMatchingAliasIDsAcceptsUnregisteredAppleHMEAddressAsDeterminateOther(t *testing.T) {
+	header := stdmail.Header{
+		"To":                 {`Hide My Email <unregistered.alias@icloud.com>`},
+		icloudHMEHeaderField: {`p=unregistered.alias@icloud.com; d=; f=primary@icloud.com; r=to`},
+	}
+	if got, determinate := classifyRecipientAlias(header, map[string][]int64{
+		"hidden.alias@icloud.com": {7},
+	}, "primary@icloud.com", false); !determinate || got != 0 {
+		t.Fatalf("unregistered HME classification = (%d, %v), want (0, true)", got, determinate)
+	}
+}
+
 func FuzzRecipientAddresses(f *testing.F) {
 	f.Add(`Alias <alias@example.com>`)
 	f.Add(`notalias@example.com, alias@example.com`)
@@ -134,5 +239,14 @@ func FuzzRecipientAddresses(f *testing.F) {
 			}
 			seen[address] = struct{}{}
 		}
+	})
+}
+
+func FuzzICloudHMEValue(f *testing.F) {
+	f.Add(`p=hidden.alias@icloud.com; d=; f=primary@icloud.com; r=to; s=sender@example.com`)
+	f.Add(`p=;f=;r=`)
+	f.Add(`p=hidden.alias@icloud.com; p=other.alias@icloud.com`)
+	f.Fuzz(func(t *testing.T, value string) {
+		_, _, _ = parseICloudHMERoute(stdmail.Header{icloudHMEHeaderField: {value}})
 	})
 }

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -283,12 +285,33 @@ func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T
 	}
 	firstKey := aliasPayload.Data.APIKey
 	aliasID := aliasPayload.Data.Alias.ID
+	if err := assertAdminDirectLinkPath(t, aliasPayload.Data.Alias, secure.HashToken(firstKey), env.cipher); err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(createAlias.Body.String(), "APIKeyHash") || strings.Contains(createAlias.Body.String(), "api_key_hash") {
 		t.Fatalf("create alias exposed API key hash: %s", createAlias.Body.String())
 	}
 
 	detail := env.request(t, http.MethodGet, accountPath, nil, "", []*http.Cookie{sessionCookie}, "")
 	aliases := env.request(t, http.MethodGet, "/admin/api/v1/aliases", nil, "", []*http.Cookie{sessionCookie}, "")
+	var detailPayload struct {
+		Data adminAPIAccountDetailDTO `json:"data"`
+	}
+	if err := json.Unmarshal(detail.Body.Bytes(), &detailPayload); err != nil || len(detailPayload.Data.Aliases) != 1 {
+		t.Fatalf("decode account detail aliases: err=%v body=%s", err, detail.Body.String())
+	}
+	if err := assertAdminDirectLinkPath(t, detailPayload.Data.Aliases[0], secure.HashToken(firstKey), env.cipher); err != nil {
+		t.Fatal(err)
+	}
+	var aliasesPayload struct {
+		Data []adminAPIAliasDTO `json:"data"`
+	}
+	if err := json.Unmarshal(aliases.Body.Bytes(), &aliasesPayload); err != nil || len(aliasesPayload.Data) != 1 {
+		t.Fatalf("decode aliases response: err=%v body=%s", err, aliases.Body.String())
+	}
+	if err := assertAdminDirectLinkPath(t, aliasesPayload.Data[0], secure.HashToken(firstKey), env.cipher); err != nil {
+		t.Fatal(err)
+	}
 	for name, response := range map[string]*httptest.ResponseRecorder{"detail": detail, "aliases": aliases} {
 		if response.Code != http.StatusOK {
 			t.Fatalf("GET %s status = %d; body=%s", name, response.Code, response.Body.String())
@@ -326,6 +349,12 @@ func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T
 	if err := json.Unmarshal(rotate.Body.Bytes(), &rotatePayload); err != nil || rotatePayload.Data.APIKey == "" || rotatePayload.Data.APIKey == firstKey {
 		t.Fatalf("rotated key payload: err=%v data=%#v", err, rotatePayload.Data)
 	}
+	if rotatePayload.Data.Alias.DirectLinkPath == aliasPayload.Data.Alias.DirectLinkPath {
+		t.Fatal("rotating API key did not change the derived direct-link path")
+	}
+	if err := assertAdminDirectLinkPath(t, rotatePayload.Data.Alias, secure.HashToken(rotatePayload.Data.APIKey), env.cipher); err != nil {
+		t.Fatal(err)
+	}
 
 	audit := env.request(t, http.MethodGet, "/admin/api/v1/audit?limit=20&offset=0", nil, "", []*http.Cookie{sessionCookie}, "")
 	if audit.Code != http.StatusOK || !strings.Contains(audit.Body.String(), `"items"`) || strings.Contains(audit.Body.String(), firstKey) {
@@ -340,6 +369,29 @@ func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T
 	if deleteAccount.Code != http.StatusNoContent {
 		t.Fatalf("delete account status = %d; body=%s", deleteAccount.Code, deleteAccount.Body.String())
 	}
+}
+
+func assertAdminDirectLinkPath(t *testing.T, alias adminAPIAliasDTO, apiKeyHash []byte, cipher *secure.Cipher) error {
+	t.Helper()
+	if alias.DirectLinkPath == "" {
+		return fmt.Errorf("alias %d omitted direct_link_path", alias.ID)
+	}
+	parsed, err := url.Parse(alias.DirectLinkPath)
+	if err != nil {
+		return fmt.Errorf("alias %d direct_link_path parse: %w", alias.ID, err)
+	}
+	if parsed.IsAbs() || parsed.Path != "/api/v1/mail/recent" {
+		return fmt.Errorf("alias %d direct_link_path = %q, want same-origin recent path", alias.ID, alias.DirectLinkPath)
+	}
+	token := parsed.Query().Get("api_key")
+	expectedQuery := url.Values{"api_key": []string{token}}.Encode()
+	if parsed.Query().Encode() != expectedQuery || token == "" {
+		return fmt.Errorf("alias %d direct_link_path has unexpected query: %q", alias.ID, parsed.RawQuery)
+	}
+	if !cipher.VerifyDirectLinkToken(token, alias.ID, apiKeyHash) {
+		return fmt.Errorf("alias %d direct_link_path credential does not verify", alias.ID)
+	}
+	return nil
 }
 
 func TestAdminAPIStrictJSONAndPasswordRevocation(t *testing.T) {

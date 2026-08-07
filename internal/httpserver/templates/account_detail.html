@@ -6,7 +6,7 @@
   {{template "sidebar" .}}
   <main class="main-area">
     {{template "topbar" .}}
-    <div class="content">
+    <div class="content" data-sync-poll-page="account-detail" data-sync-poll-endpoint="/admin/api/v1/accounts/{{.Account.ID}}">
       {{template "flash" .}}
       {{if .Secret}}
       <section class="secret-box" aria-labelledby="secret-title">
@@ -14,7 +14,7 @@
         <div class="secret-value"><code data-secret-value>{{.Secret}}</code><button class="button" type="button" data-copy="{{.Secret}}">复制</button></div>
       </section>
       {{end}}
-      <section class="section-block">
+      <section class="section-block" data-sync-record data-sync-kind="account" data-sync-id="{{.Account.ID}}" data-sync-enabled="{{.Account.Enabled}}" data-sync-status="{{.Account.LastSyncStatus}}" data-sync-error="{{.Account.LastSyncError}}" {{if .Account.LastSyncedAt}}data-sync-at="{{.Account.LastSyncedAt.Unix}}"{{end}}>
         <div class="section-toolbar">
           <div><h2>连接配置</h2><p>{{.Account.IMAPUsername}} · imap.mail.me.com:993</p></div>
           <div class="button-row">
@@ -22,8 +22,8 @@
             <a class="button" href="/admin/accounts/{{.Account.ID}}/edit">编辑</a>
           </div>
         </div>
-        <dl class="detail-grid"><div><dt>状态</dt><dd>{{template "status" .Account}}</dd></div><div><dt>最近同步</dt><dd>{{timefmt .Account.LastSyncedAt}}</dd></div><div><dt>主号邮箱</dt><dd>{{.Account.Email}}</dd></div><div><dt>备注</dt><dd>{{or .Account.Name "-"}}</dd></div></dl>
-        {{if .Account.LastSyncError}}<div class="inline-error">最近错误：{{.Account.LastSyncError}}</div>{{end}}
+        <dl class="detail-grid"><div><dt>状态</dt><dd data-sync-status-cell>{{template "status" .Account}}</dd></div><div><dt>最近同步</dt><dd><time data-sync-primary-time>{{timefmt .Account.LastSyncedAt}}</time></dd></div><div><dt>主号邮箱</dt><dd>{{.Account.Email}}</dd></div><div><dt>备注</dt><dd>{{or .Account.Name "-"}}</dd></div></dl>
+        <div class="inline-error" data-sync-error-container {{if not .Account.LastSyncError}}hidden{{end}}>最近错误：<span data-sync-error-text>{{.Account.LastSyncError}}</span></div>
       </section>
 
       <section class="section-block">
@@ -32,11 +32,11 @@
         <div class="table-wrap">
           <table class="table">
             <thead><tr><th>隐私邮箱</th><th>API Key</th><th>最新邮件</th><th>状态</th><th class="actions">操作</th></tr></thead>
-            <tbody>{{range .Aliases}}<tr>
+            <tbody>{{range .Aliases}}<tr data-sync-record data-sync-kind="alias" data-sync-id="{{.ID}}" data-sync-enabled="{{.Enabled}}" data-sync-status="{{.LastSyncStatus}}" data-sync-error="{{.LastSyncError}}" {{if .LastSyncedAt}}data-sync-at="{{.LastSyncedAt.Unix}}"{{end}}>
               <td data-label="隐私邮箱"><strong>{{.Address}}</strong>{{if .Label}}<small>{{.Label}}</small>{{end}}</td>
               <td data-label="API Key"><code>{{.APIKeyPrefix}}…</code></td>
               <td data-label="最新邮件">{{timefmt .LatestReceivedAt}}</td>
-              <td data-label="状态">{{template "alias-status" .}}</td>
+              <td data-label="状态" data-sync-status-cell data-sync-details>{{template "alias-status" .}}</td>
               <td data-label="操作" class="actions"><div class="button-row">
                 <form method="post" action="/admin/aliases/{{.ID}}/rotate"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small" type="submit" data-confirm="轮换后旧 Key 会立即失效。继续吗？">轮换 Key</button></form>
                 <form method="post" action="/admin/aliases/{{.ID}}/toggle"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>

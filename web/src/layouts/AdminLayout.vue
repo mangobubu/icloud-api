@@ -60,6 +60,7 @@ import { RouterLink, useRoute, useRouter } from "vue-router";
 import AppBrand from "../components/AppBrand.vue";
 import { useAuth } from "../stores/auth.js";
 import { usePageHeader } from "../stores/page.js";
+import { getActiveAdminSection } from "../utils/adminNavigation.js";
 import { showRequestError } from "../utils/feedback.js";
 
 const route = useRoute();
@@ -76,16 +77,7 @@ const menuItems = [
   { to: "/admin/security", label: "安全设置", icon: Lock, section: "security" },
 ];
 
-const activeSection = computed(() => {
-  if (
-    route.path.startsWith("/admin/accounts") ||
-    route.path === "/admin" ||
-    route.path === "/admin/"
-  ) {
-    return "accounts";
-  }
-  return menuItems.find((item) => route.path.startsWith(item.to))?.section || "";
-});
+const activeSection = computed(() => getActiveAdminSection(route.path));
 
 const AdminNavigation = defineComponent({
   emits: ["navigate"],

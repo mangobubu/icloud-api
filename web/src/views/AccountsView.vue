@@ -67,7 +67,9 @@
             <template #default="{ row }">{{ row.aliasCount }}</template>
           </el-table-column>
           <el-table-column label="最近同步" min-width="170">
-            <template #default="{ row }">{{ formatTime(row.lastSyncedAt) }}</template>
+            <template #default="{ row }">
+              {{ formatTime(row.lastSyncedAt, { seconds: true }) }}
+            </template>
           </el-table-column>
           <el-table-column label="操作" width="118" align="right">
             <template #default="{ row }">
@@ -101,7 +103,7 @@
             </div>
             <div>
               <dt>最近同步</dt>
-              <dd>{{ formatTime(account.lastSyncedAt) }}</dd>
+              <dd>{{ formatTime(account.lastSyncedAt, { seconds: true }) }}</dd>
             </div>
           </dl>
           <footer class="mobile-record__actions">
@@ -117,7 +119,7 @@
 
 <script setup>
 import { Plus, Refresh, Setting } from "@element-plus/icons-vue";
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import { getAccounts } from "../api/admin.js";
@@ -126,24 +128,40 @@ import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncStatus from "../components/SyncStatus.vue";
 import { formatTime } from "../utils/format.js";
+import { createLiveRefresh } from "../utils/liveRefresh.js";
 
 const router = useRouter();
 const accounts = ref([]);
 const loading = ref(false);
 const loadError = ref(null);
+let refreshInFlight = false;
+let viewActive = true;
 
-async function loadAccounts() {
-  if (loading.value) return;
-  loading.value = true;
-  loadError.value = null;
+async function loadAccounts({ silent = false } = {}) {
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  if (!silent) {
+    loading.value = true;
+    loadError.value = null;
+  }
   try {
-    accounts.value = await getAccounts();
+    const nextAccounts = await getAccounts();
+    if (!viewActive) return;
+    accounts.value = nextAccounts;
+    loadError.value = null;
   } catch (error) {
-    loadError.value = error;
+    if (viewActive && !silent) {
+      loadError.value = error;
+    }
   } finally {
-    loading.value = false;
+    refreshInFlight = false;
+    if (!silent) {
+      loading.value = false;
+    }
   }
 }
+
+const liveRefresh = createLiveRefresh(() => loadAccounts({ silent: true }));
 
 function openNewAccount() {
   router.push({ name: "account-new" });
@@ -153,5 +171,13 @@ function openAccount(id) {
   router.push({ name: "account-detail", params: { id } });
 }
 
-onMounted(loadAccounts);
+onMounted(() => {
+  loadAccounts();
+  liveRefresh.start({ immediate: false });
+});
+
+onBeforeUnmount(() => {
+  viewActive = false;
+  liveRefresh.stop();
+});
 </script>

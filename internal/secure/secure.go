@@ -3,10 +3,12 @@ package secure
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,10 +17,21 @@ import (
 	"strings"
 )
 
-const credentialAAD = "icloud-api/imap-credential/v1"
+const (
+	credentialAAD             = "icloud-api/imap-credential/v1"
+	directLinkKeyContext      = "icloud-api/direct-link/key/v1"
+	directLinkTokenContext    = "icloud-api/direct-link/token/v1"
+	directLinkTokenPrefix     = "icm_"
+	directLinkTokenVersion    = byte(1)
+	directLinkTokenHeaderSize = 12
+	directLinkTokenSize       = 32
+)
+
+var directLinkTokenMagic = [3]byte{'d', 'l', 't'}
 
 type Cipher struct {
-	aead cipher.AEAD
+	aead          cipher.AEAD
+	directLinkKey [sha256.Size]byte
 }
 
 func NewCipher(key []byte) (*Cipher, error) {
@@ -33,7 +46,11 @@ func NewCipher(key []byte) (*Cipher, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Cipher{aead: aead}, nil
+	directLinkKeyMAC := hmac.New(sha256.New, key)
+	_, _ = directLinkKeyMAC.Write([]byte(directLinkKeyContext))
+	var directLinkKey [sha256.Size]byte
+	copy(directLinkKey[:], directLinkKeyMAC.Sum(nil))
+	return &Cipher{aead: aead, directLinkKey: directLinkKey}, nil
 }
 
 func (c *Cipher) Encrypt(plaintext string) (string, error) {
@@ -125,6 +142,83 @@ func NewAPIKey() (raw string, hash []byte, prefix string, err error) {
 	hash = HashToken(raw)
 	prefix = raw[:12]
 	return raw, hash, prefix, nil
+}
+
+// DirectLinkToken deterministically derives a URL credential for one alias.
+// The credential embeds a versioned alias ID and authenticates the alias's
+// current API key hash, so rotating that API key invalidates prior links
+// without storing another secret.
+func (c *Cipher) DirectLinkToken(aliasID int64, apiKeyHash []byte) (string, error) {
+	if c == nil {
+		return "", errors.New("直达链接签名器不可用")
+	}
+	if aliasID < 1 {
+		return "", errors.New("隐私邮箱 ID 必须是正整数")
+	}
+	if len(apiKeyHash) != sha256.Size {
+		return "", errors.New("API Key 哈希必须是 32 字节")
+	}
+
+	payload := make([]byte, directLinkTokenSize)
+	copy(payload[:len(directLinkTokenMagic)], directLinkTokenMagic[:])
+	payload[len(directLinkTokenMagic)] = directLinkTokenVersion
+	binary.BigEndian.PutUint64(payload[4:directLinkTokenHeaderSize], uint64(aliasID))
+
+	mac := hmac.New(sha256.New, c.directLinkKey[:])
+	_, _ = mac.Write([]byte(directLinkTokenContext))
+	_, _ = mac.Write(payload[:directLinkTokenHeaderSize])
+	_, _ = mac.Write(apiKeyHash)
+	copy(payload[directLinkTokenHeaderSize:], mac.Sum(nil))
+
+	return directLinkTokenPrefix + base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+// DirectLinkTokenAliasID recognizes the versioned direct-link token envelope
+// and returns its untrusted alias ID. Call VerifyDirectLinkToken with the
+// current stored API key hash before accepting the credential.
+func DirectLinkTokenAliasID(token string) (int64, bool) {
+	payload, ok := directLinkTokenPayload(token)
+	if !ok {
+		return 0, false
+	}
+	encodedID := binary.BigEndian.Uint64(payload[4:directLinkTokenHeaderSize])
+	aliasID := int64(encodedID)
+	if aliasID < 1 || uint64(aliasID) != encodedID {
+		return 0, false
+	}
+	return aliasID, true
+}
+
+// VerifyDirectLinkToken authenticates a parsed token against the alias's
+// current API key hash using a constant-time MAC comparison.
+func (c *Cipher) VerifyDirectLinkToken(token string, aliasID int64, apiKeyHash []byte) bool {
+	payload, ok := directLinkTokenPayload(token)
+	if !ok || c == nil || len(apiKeyHash) != sha256.Size {
+		return false
+	}
+	parsedID, ok := DirectLinkTokenAliasID(token)
+	if !ok || parsedID != aliasID {
+		return false
+	}
+	expected, err := c.DirectLinkToken(aliasID, apiKeyHash)
+	if err != nil {
+		return false
+	}
+	expectedPayload, ok := directLinkTokenPayload(expected)
+	return ok && hmac.Equal(payload[directLinkTokenHeaderSize:], expectedPayload[directLinkTokenHeaderSize:])
+}
+
+func directLinkTokenPayload(token string) ([]byte, bool) {
+	if len(token) != len(directLinkTokenPrefix)+43 || !strings.HasPrefix(token, directLinkTokenPrefix) {
+		return nil, false
+	}
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(token[len(directLinkTokenPrefix):])
+	if err != nil || len(payload) != directLinkTokenSize ||
+		subtle.ConstantTimeCompare(payload[:len(directLinkTokenMagic)], directLinkTokenMagic[:]) != 1 ||
+		payload[len(directLinkTokenMagic)] != directLinkTokenVersion {
+		return nil, false
+	}
+	return payload, true
 }
 
 func HashToken(token string) []byte {

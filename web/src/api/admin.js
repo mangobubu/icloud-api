@@ -58,6 +58,13 @@ export function normalizeAlias(raw = {}) {
     label: firstDefined(raw, "label", "Label") || "",
     apiKeyPrefix:
       firstDefined(raw, "api_key_prefix", "apiKeyPrefix", "APIKeyPrefix") || "",
+    directLinkPath:
+      firstDefined(
+        raw,
+        "direct_link_path",
+        "directLinkPath",
+        "DirectLinkPath",
+      ) || "",
     enabled: Boolean(firstDefined(raw, "enabled", "Enabled")),
     lastSyncStatus:
       firstDefined(raw, "last_sync_status", "lastSyncStatus", "LastSyncStatus") ||
