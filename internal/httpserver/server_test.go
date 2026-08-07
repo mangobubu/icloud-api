@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -26,6 +27,127 @@ import (
 	"icloud-api/internal/store"
 )
 
+const testAdminSPAIndex = `<!doctype html><html><body><div id="spa-test-marker"></div></body></html>`
+
+func TestAdminSPARoutesAndSecurityHeaders(t *testing.T) {
+	env := newAdminSPAHTTPTestEnv(t)
+
+	root := env.request(t, http.MethodGet, "/", nil, nil)
+	if root.Code != http.StatusFound || root.Header().Get("Location") != "/admin/" {
+		t.Fatalf("GET / = %d Location=%q, want %d /admin/", root.Code, root.Header().Get("Location"), http.StatusFound)
+	}
+	rootHead := env.request(t, http.MethodHead, "/", nil, nil)
+	if rootHead.Code != http.StatusFound || rootHead.Header().Get("Location") != "/admin/" || rootHead.Body.Len() != 0 {
+		t.Fatalf("HEAD / = %d Location=%q body=%q, want empty %d /admin/", rootHead.Code, rootHead.Header().Get("Location"), rootHead.Body.String(), http.StatusFound)
+	}
+	admin := env.request(t, http.MethodGet, "/admin", nil, nil)
+	if admin.Code != http.StatusPermanentRedirect || admin.Header().Get("Location") != "/admin/" {
+		t.Fatalf("GET /admin = %d Location=%q, want %d /admin/", admin.Code, admin.Header().Get("Location"), http.StatusPermanentRedirect)
+	}
+
+	for _, target := range []string{
+		"/admin/",
+		"/admin/login",
+		"/admin/accounts/new",
+		"/admin/accounts/42",
+		"/admin/accounts/42/edit",
+		"/admin/aliases",
+		"/admin/audit",
+		"/admin/security",
+	} {
+		t.Run(target, func(t *testing.T) {
+			response := env.request(t, http.MethodGet, target, nil, nil)
+			if response.Code != http.StatusOK {
+				t.Fatalf("GET %s = %d, want %d; body=%s", target, response.Code, http.StatusOK, response.Body.String())
+			}
+			if response.Body.String() != testAdminSPAIndex {
+				t.Fatalf("GET %s did not return the Vue index: %s", target, response.Body.String())
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store, private" {
+				t.Fatalf("GET %s Cache-Control = %q", target, got)
+			}
+			if got := response.Header().Get("Content-Type"); !strings.HasPrefix(got, "text/html") {
+				t.Fatalf("GET %s Content-Type = %q", target, got)
+			}
+		})
+	}
+
+	head := env.request(t, http.MethodHead, "/admin/accounts/42", nil, nil)
+	if head.Code != http.StatusOK || head.Body.Len() != 0 {
+		t.Fatalf("HEAD SPA route = %d body=%q, want empty 200", head.Code, head.Body.String())
+	}
+
+	csp := admin.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "style-src 'self' 'unsafe-inline'") || !strings.Contains(csp, "font-src 'self' data:") {
+		t.Fatalf("Vue CSP is missing Element Plus allowances: %q", csp)
+	}
+	if strings.Contains(csp, "script-src 'self' 'unsafe-inline'") || strings.Contains(csp, "script-src 'self' 'unsafe-eval'") {
+		t.Fatalf("Vue CSP weakened the script policy: %q", csp)
+	}
+}
+
+func TestAdminSPAAssetsAndFallbackBoundaries(t *testing.T) {
+	env := newAdminSPAHTTPTestEnv(t)
+
+	asset := env.request(t, http.MethodGet, "/admin/assets/app-test.js", nil, nil)
+	if asset.Code != http.StatusOK || asset.Body.String() != "window.__SPA_TEST__ = true;\n" {
+		t.Fatalf("GET SPA asset = %d body=%q", asset.Code, asset.Body.String())
+	}
+	if got := asset.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+		t.Fatalf("SPA asset Cache-Control = %q", got)
+	}
+	if got := asset.Header().Get("Pragma"); got != "" {
+		t.Fatalf("SPA asset Pragma = %q, want empty", got)
+	}
+
+	assetHead := env.request(t, http.MethodHead, "/admin/assets/app-test.js", nil, nil)
+	if assetHead.Code != http.StatusOK || assetHead.Body.Len() != 0 {
+		t.Fatalf("HEAD SPA asset = %d body=%q, want empty 200", assetHead.Code, assetHead.Body.String())
+	}
+
+	for _, target := range []string{"/admin/assets", "/admin/assets/", "/admin/assets/missing.js"} {
+		response := env.request(t, http.MethodGet, target, nil, nil)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("GET %s = %d, want 404", target, response.Code)
+		}
+		if strings.Contains(response.Header().Get("Cache-Control"), "immutable") || strings.Contains(response.Body.String(), "spa-test-marker") {
+			t.Fatalf("GET %s cached or returned the SPA index: headers=%v body=%s", target, response.Header(), response.Body.String())
+		}
+	}
+
+	for _, target := range []string{"/admin/api", "/admin/api/v1/not-found", "/api", "/api/v1/not-found"} {
+		response := env.request(t, http.MethodGet, target, nil, nil)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("GET %s = %d, want 404", target, response.Code)
+		}
+		if got := response.Header().Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+			t.Fatalf("GET %s Content-Type = %q, want JSON; body=%s", target, got, response.Body.String())
+		}
+		if got := response.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+			t.Fatalf("GET %s Cache-Control = %q, want no-store", target, got)
+		}
+		assertAPIError(t, response, http.StatusNotFound, "NOT_FOUND")
+	}
+
+	post := env.request(t, http.MethodPost, "/admin/login", nil, nil)
+	if post.Code != http.StatusNotFound || strings.Contains(post.Body.String(), "spa-test-marker") {
+		t.Fatalf("POST legacy admin route = %d body=%s, want non-SPA 404", post.Code, post.Body.String())
+	}
+}
+
+func TestAdminSPARequiresCompleteBuild(t *testing.T) {
+	root := t.TempDir()
+	if _, err := loadAdminSPA(root); err == nil || !strings.Contains(err.Error(), "index.html") {
+		t.Fatalf("loadAdminSPA without index error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "index.html"), []byte(testAdminSPAIndex), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadAdminSPA(root); err == nil || !strings.Contains(err.Error(), "assets") {
+		t.Fatalf("loadAdminSPA without assets error = %v", err)
+	}
+}
+
 func TestAdminWithoutSessionRedirectsToLogin(t *testing.T) {
 	env := newHTTPTestEnv(t)
 
@@ -35,6 +157,21 @@ func TestAdminWithoutSessionRedirectsToLogin(t *testing.T) {
 	}
 	if location := response.Header().Get("Location"); location != "/admin/login" {
 		t.Fatalf("GET /admin Location = %q, want %q", location, "/admin/login")
+	}
+}
+
+func TestRouterMountsAdminJSONAPI(t *testing.T) {
+	env := newHTTPTestEnv(t)
+
+	response := env.request(t, http.MethodGet, "/admin/api/v1/auth/csrf", nil, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET admin API CSRF status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	if contentType := response.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "application/json") {
+		t.Fatalf("GET admin API CSRF Content-Type = %q, want application/json", contentType)
+	}
+	if cookie := requireResponseCookie(t, response, adminAPILoginCSRFCookie); cookie.Path != adminAPILoginCSRFPath {
+		t.Fatalf("admin API CSRF cookie Path = %q, want %q", cookie.Path, adminAPILoginCSRFPath)
 	}
 }
 
@@ -615,6 +752,26 @@ type httpTestEnv struct {
 const testSessionCSRF = "test-session-csrf"
 
 func newHTTPTestEnv(t *testing.T) *httpTestEnv {
+	return newHTTPTestEnvWithWebRoot(t, "")
+}
+
+func newAdminSPAHTTPTestEnv(t *testing.T) *httpTestEnv {
+	t.Helper()
+	webRoot := t.TempDir()
+	assetsRoot := filepath.Join(webRoot, "assets")
+	if err := os.MkdirAll(assetsRoot, 0o700); err != nil {
+		t.Fatalf("create SPA assets: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(webRoot, "index.html"), []byte(testAdminSPAIndex), 0o600); err != nil {
+		t.Fatalf("write SPA index: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(assetsRoot, "app-test.js"), []byte("window.__SPA_TEST__ = true;\n"), 0o600); err != nil {
+		t.Fatalf("write SPA asset: %v", err)
+	}
+	return newHTTPTestEnvWithWebRoot(t, webRoot)
+}
+
+func newHTTPTestEnvWithWebRoot(t *testing.T, webRoot string) *httpTestEnv {
 	t.Helper()
 	databasePath := filepath.Join(t.TempDir(), "httpserver-test.db")
 	db, err := store.Open(databasePath)
@@ -636,6 +793,7 @@ func newHTTPTestEnv(t *testing.T) *httpTestEnv {
 		SessionTTL:   time.Hour,
 		PollInterval: time.Minute,
 		GinMode:      "test",
+		WebRoot:      webRoot,
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err != nil {
 		t.Fatalf("create HTTP server: %v", err)

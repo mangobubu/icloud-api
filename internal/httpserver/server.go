@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -29,11 +30,18 @@ type Server struct {
 	logger      *slog.Logger
 	sync        func(int64) error
 	lockAccount func(context.Context, int64, func() error) error
+	adminSPA    *adminSPA
 
 	loginLimiter        *windowLimiter
 	loginRequestLimiter *windowLimiter
 	apiLimiter          *windowLimiter
 	apiIPLimiter        *windowLimiter
+}
+
+type adminSPA struct {
+	index        []byte
+	assets       fs.FS
+	assetHandler http.Handler
 }
 
 // SetAccountLocker makes account mutations share the sync manager's keyed
@@ -72,16 +80,53 @@ func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog
 	if logger == nil {
 		logger = slog.Default()
 	}
+	spa, err := loadAdminSPA(cfg.WebRoot)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		store:               st,
 		cipher:              cipher,
 		cfg:                 cfg,
 		logger:              logger,
 		sync:                syncFn,
+		adminSPA:            spa,
 		loginLimiter:        newWindowLimiter(8, 10*time.Minute),
 		loginRequestLimiter: newWindowLimiter(60, time.Minute),
 		apiLimiter:          newWindowLimiter(120, time.Minute),
 		apiIPLimiter:        newWindowLimiter(300, time.Minute),
+	}, nil
+}
+
+func loadAdminSPA(webRoot string) (*adminSPA, error) {
+	webRoot = strings.TrimSpace(webRoot)
+	if webRoot == "" {
+		return nil, nil
+	}
+
+	root := os.DirFS(webRoot)
+	index, err := fs.ReadFile(root, "index.html")
+	if err != nil {
+		return nil, fmt.Errorf("读取 Vue 管理端首页 %q: %w", webRoot, err)
+	}
+	if len(index) == 0 {
+		return nil, fmt.Errorf("Vue 管理端首页 %q 为空", webRoot)
+	}
+	assetInfo, err := fs.Stat(root, "assets")
+	if err != nil {
+		return nil, fmt.Errorf("读取 Vue 管理端资源目录 %q: %w", webRoot, err)
+	}
+	if !assetInfo.IsDir() {
+		return nil, fmt.Errorf("Vue 管理端资源路径 %q 不是目录", webRoot)
+	}
+	assets, err := fs.Sub(root, "assets")
+	if err != nil {
+		return nil, fmt.Errorf("打开 Vue 管理端资源目录 %q: %w", webRoot, err)
+	}
+	return &adminSPA{
+		index:        index,
+		assets:       assets,
+		assetHandler: http.FileServer(http.FS(assets)),
 	}, nil
 }
 
@@ -93,30 +138,54 @@ func (s *Server) Router() (*gin.Engine, error) {
 	}
 	router.Use(s.requestContext(), s.securityHeaders(), gin.Recovery())
 
+	router.GET("/healthz", s.health)
+	rootRedirect := func(c *gin.Context) {
+		target := "/admin"
+		if s.adminSPA != nil {
+			target = "/admin/"
+		}
+		c.Redirect(http.StatusFound, target)
+	}
+	router.GET("/", rootRedirect)
+	router.HEAD("/", rootRedirect)
+
+	api := router.Group("/api/v1")
+	api.Use(s.apiKeyAuth())
+	api.GET("/mail/latest", s.latestMail)
+
+	adminAPI := router.Group("/admin/api/v1")
+	s.registerAdminAPIRoutes(adminAPI)
+
+	if s.adminSPA == nil {
+		if err := s.registerLegacyAdmin(router); err != nil {
+			return nil, err
+		}
+	} else {
+		s.registerAdminSPA(router)
+	}
+
+	router.NoRoute(s.notFound)
+	return router, nil
+}
+
+func (s *Server) registerLegacyAdmin(router *gin.Engine) error {
 	tmpl, err := template.New("").Funcs(template.FuncMap{
 		"timefmt":          formatOptionalTime,
 		"timevalue":        func(value time.Time) string { return value.Local().Format("2006-01-02 15:04:05") },
 		"compactSyncError": compactSyncError,
 	}).ParseFS(webAssets, "templates/*.html")
 	if err != nil {
-		return nil, fmt.Errorf("解析后台模板: %w", err)
+		return fmt.Errorf("解析后台模板: %w", err)
 	}
 	router.SetHTMLTemplate(tmpl)
 	staticRoot, err := fs.Sub(webAssets, "static")
 	if err != nil {
-		return nil, fmt.Errorf("读取静态资源: %w", err)
+		return fmt.Errorf("读取静态资源: %w", err)
 	}
 	router.GET("/assets/*filepath", func(c *gin.Context) {
 		c.Header("Cache-Control", "public, max-age=3600")
 		http.StripPrefix("/assets", http.FileServer(http.FS(staticRoot))).ServeHTTP(c.Writer, c.Request)
 	})
-
-	router.GET("/healthz", s.health)
-	router.GET("/", func(c *gin.Context) { c.Redirect(http.StatusFound, "/admin") })
-
-	api := router.Group("/api/v1")
-	api.Use(s.apiKeyAuth())
-	api.GET("/mail/latest", s.latestMail)
 
 	router.GET("/admin/login", s.loginPage)
 	router.POST("/admin/login", s.loginRequestGate(), s.parseAdminForm(), s.login)
@@ -140,15 +209,76 @@ func (s *Server) Router() (*gin.Engine, error) {
 	admin.GET("/audit", s.auditPage)
 	admin.GET("/security", s.securityPage)
 	admin.POST("/security/password", s.changePassword)
+	return nil
+}
 
-	router.NoRoute(func(c *gin.Context) {
-		if len(c.Request.URL.Path) >= 5 && c.Request.URL.Path[:5] == "/api/" {
-			s.writeAPIError(c, http.StatusNotFound, "NOT_FOUND", "接口不存在")
-			return
-		}
-		c.String(http.StatusNotFound, "页面不存在")
-	})
-	return router, nil
+func (s *Server) registerAdminSPA(router *gin.Engine) {
+	redirect := func(c *gin.Context) {
+		c.Redirect(http.StatusPermanentRedirect, "/admin/")
+	}
+	router.GET("/admin", redirect)
+	router.HEAD("/admin", redirect)
+	router.GET("/admin/", s.serveAdminIndex)
+	router.HEAD("/admin/", s.serveAdminIndex)
+	router.GET("/admin/assets", s.pageNotFound)
+	router.HEAD("/admin/assets", s.pageNotFound)
+	router.GET("/admin/assets/*filepath", s.serveAdminAsset)
+	router.HEAD("/admin/assets/*filepath", s.serveAdminAsset)
+}
+
+func (s *Server) serveAdminIndex(c *gin.Context) {
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.Header("Cache-Control", "no-store, private")
+	if c.Request.Method == http.MethodHead {
+		c.Status(http.StatusOK)
+		return
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", s.adminSPA.index)
+}
+
+func (s *Server) serveAdminAsset(c *gin.Context) {
+	name := strings.TrimPrefix(c.Param("filepath"), "/")
+	if name == "" || !fs.ValidPath(name) {
+		s.pageNotFound(c)
+		return
+	}
+	info, err := fs.Stat(s.adminSPA.assets, name)
+	if err != nil || !info.Mode().IsRegular() {
+		s.pageNotFound(c)
+		return
+	}
+	c.Writer.Header().Del("Pragma")
+	c.Header("Cache-Control", "public, max-age=31536000, immutable")
+	http.StripPrefix("/admin/assets", s.adminSPA.assetHandler).ServeHTTP(c.Writer, c.Request)
+}
+
+func (s *Server) notFound(c *gin.Context) {
+	requestPath := c.Request.URL.Path
+	if pathWithin(requestPath, "/api") || pathWithin(requestPath, "/admin/api") {
+		c.Header("Cache-Control", "no-store")
+		s.writeAPIError(c, http.StatusNotFound, "NOT_FOUND", "接口不存在")
+		return
+	}
+	if s.adminSPA != nil &&
+		(c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) &&
+		strings.HasPrefix(requestPath, "/admin/") &&
+		!pathWithin(requestPath, "/admin/assets") {
+		s.serveAdminIndex(c)
+		return
+	}
+	s.pageNotFound(c)
+}
+
+func pathWithin(requestPath, prefix string) bool {
+	return requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/")
+}
+
+func (s *Server) pageNotFound(c *gin.Context) {
+	if c.Request.Method == http.MethodHead {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	c.String(http.StatusNotFound, "页面不存在")
 }
 
 func (s *Server) health(c *gin.Context) {

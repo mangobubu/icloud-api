@@ -11,6 +11,7 @@ import (
 type Config struct {
 	Addr                      string
 	DatabasePath              string
+	WebRoot                   string
 	MasterKeyFile             string
 	AdminUsername             string
 	AdminPassword             string
@@ -32,6 +33,7 @@ func Load() (Config, error) {
 	cfg := Config{
 		Addr:          env("ICLOUD_API_ADDR", "127.0.0.1:8080"),
 		DatabasePath:  env("ICLOUD_API_DB", "data/icloud-api.db"),
+		WebRoot:       strings.TrimSpace(os.Getenv("ICLOUD_API_WEB_ROOT")),
 		AdminUsername: env("ICLOUD_API_ADMIN_USER", "admin"),
 		AdminPassword: os.Getenv("ICLOUD_API_ADMIN_PASSWORD"),
 		GinMode:       env("GIN_MODE", "release"),

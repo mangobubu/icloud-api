@@ -9,6 +9,7 @@ import (
 var configEnvironment = []string{
 	"ICLOUD_API_ADDR",
 	"ICLOUD_API_DB",
+	"ICLOUD_API_WEB_ROOT",
 	"ICLOUD_API_MASTER_KEY_FILE",
 	"ICLOUD_API_ADMIN_USER",
 	"ICLOUD_API_ADMIN_PASSWORD",
@@ -24,6 +25,18 @@ var configEnvironment = []string{
 	"ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS",
 	"ICLOUD_API_TRUSTED_PROXIES",
 	"GIN_MODE",
+}
+
+func TestWebRootOverride(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_WEB_ROOT", "  /app/web  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebRoot != "/app/web" {
+		t.Fatalf("前端目录 = %q, want %q", cfg.WebRoot, "/app/web")
+	}
 }
 
 func clearConfigEnvironment(t *testing.T) {

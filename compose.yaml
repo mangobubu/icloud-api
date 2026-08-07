@@ -5,6 +5,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        DOCKER_HUB_MIRROR: ${DOCKER_HUB_MIRROR:-docker.m.daocloud.io}
+        GOPROXY: ${GOPROXY:-https://goproxy.cn}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-mirrors.aliyun.com}
     image: icloud-api:local
     restart: unless-stopped
     deploy:
@@ -15,6 +20,7 @@ services:
       GIN_MODE: release
       ICLOUD_API_ADDR: 0.0.0.0:8080
       ICLOUD_API_DB: /app/data/icloud-api.db
+      ICLOUD_API_WEB_ROOT: /app/web
       ICLOUD_API_MASTER_KEY: ${ICLOUD_API_MASTER_KEY:?ICLOUD_API_MASTER_KEY is required}
       ICLOUD_API_ADMIN_USER: ${ICLOUD_API_ADMIN_USER:-admin}
       ICLOUD_API_ADMIN_PASSWORD: ${ICLOUD_API_ADMIN_PASSWORD:?ICLOUD_API_ADMIN_PASSWORD is required}
@@ -29,7 +35,10 @@ services:
       ICLOUD_API_MAX_MESSAGE_BYTES: ${ICLOUD_API_MAX_MESSAGE_BYTES:-10485760}
       ICLOUD_API_MAX_BODY_BYTES: ${ICLOUD_API_MAX_BODY_BYTES:-1048576}
       ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS: ${ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS:-false}
-      ICLOUD_API_TRUSTED_PROXIES: ${ICLOUD_API_TRUSTED_PROXIES:-}
+      # The port is published on host loopback only. Trust the Docker bridge so
+      # the 1Panel proxy's X-Forwarded-For value can restore the client IP.
+      # Override this with the exact bridge gateway or CIDR when known.
+      ICLOUD_API_TRUSTED_PROXIES: ${ICLOUD_API_TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       # Contains the SQLite database and its WAL/SHM sidecars.
@@ -47,6 +56,5 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
 volumes:
   icloud_api_data:

@@ -1,6 +1,6 @@
 # iCloud 隐私邮箱收件 API
 
-这是一个使用 Go、Gin、iCloud IMAP 和 SQLite 构建的轻量收件服务。后台可以登记 iCloud 主号，并为主号绑定多个“隐藏邮件地址”（隐私邮箱）；服务定时通过该主号的同一个 IMAP 收件箱同步邮件。每个隐私邮箱拥有独立 API Key，调用者只能读取这个 Key 所属隐私邮箱的最新一封邮件。
+这是一个使用 Go、Gin、Vue 3、Element Plus、iCloud IMAP 和 SQLite 构建的轻量收件服务。Vue 管理端可以登记 iCloud 主号，并为主号绑定多个“隐藏邮件地址”（隐私邮箱）；Go API 服务定时通过该主号的同一个 IMAP 收件箱同步邮件。每个隐私邮箱拥有独立 API Key，调用者只能读取这个 Key 所属隐私邮箱的最新一封邮件。
 
 ## 权限与数据模型
 
@@ -44,7 +44,7 @@ App 专用密码只用于后台的 IMAP 密码字段。IMAP 连接固定使用 `
 
 ## 使用 Docker Compose 启动
 
-Docker 部署会使用非 root 用户运行进程，根文件系统为只读，并将 SQLite 数据库保存在持久化卷中。凭据主密钥必须通过环境变量单独提供，并与数据卷分离。项目不依赖 Redis 或 PostgreSQL。
+Compose 只启动一个 `icloud-api` 容器。根 Dockerfile 会先用 Node 构建 Vue 管理端，再编译 Go 服务，并把两者一起放入最终镜像；运行时只有一个 Go 进程、一个端口，由 Go 同时提供 Vue 静态资源、JSON API、SQLite 和 IMAP 同步。容器使用非 root 用户和只读根文件系统，SQLite 数据继续保存在原来的 `icloud_api_data` 持久化卷中。凭据主密钥必须通过环境变量单独提供，并与数据卷分离。项目不依赖 Nginx、Redis 或 PostgreSQL。
 
 在项目目录创建本机专用的 `.env`：
 
@@ -68,30 +68,46 @@ TZ=Asia/Shanghai
 ```bash
 docker compose up -d --build
 docker compose ps
-curl -fsS http://127.0.0.1:8080/healthz
+APP_ADDR="$(docker compose port icloud-api 8080)"
+curl -fsS "http://${APP_ADDR}/healthz"
 ```
 
-Docker 构建默认只使用大陆镜像源：基础镜像经由 DaoCloud（`docker.m.daocloud.io`）拉取，Go 模块使用七牛云 `Goproxy.cn`，Alpine 软件包使用阿里云镜像。Go 模块代理未配置海外直连回退，避免构建失败时绕过国内源；如需切换为企业内网镜像，可覆盖对应构建参数：
+`ICLOUD_API_PORT` 是这个单一容器发布到宿主回环地址的端口。后台页面、`/admin/api/`、`/api/` 和 `/healthz` 都由同一个端口提供，因此 1Panel 只需反代到 `127.0.0.1:${ICLOUD_API_PORT}`，不需要按路径配置多个上游。这里的 `${ICLOUD_API_PORT}` 指 `.env` 中的实际值；上面的 `docker compose port` 命令可直接取得当前映射地址，避免把非默认端口误写成 `8080`。
+
+1Panel 的反向代理必须保留浏览器访问时的外部主机名和协议。至少确认生成的 Nginx 配置包含以下请求头设置；非标准端口场景必须使用 `$http_host`，因为 `$host` 不保留端口。不要删除或改写浏览器发送的 `Origin`，否则后台登录和所有写操作会被同源 CSRF 校验拒绝为 `403`：
+
+```nginx
+proxy_set_header Host $http_host;
+proxy_set_header Origin $http_origin;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $scheme;
+```
+
+1Panel 从宿主机经回环发布端口访问容器时，应用看到的直接来源通常是 Docker bridge 网关。Compose 默认信任 RFC 1918 私有网段，以便从 `X-Forwarded-For` 恢复真实客户端 IP；因为端口只绑定 `127.0.0.1`，外部客户端不能直接绕过 1Panel 连接该端口。若已知实际网关地址或 bridge CIDR，建议通过 `ICLOUD_API_TRUSTED_PROXIES` 将范围收紧，然后重新创建容器。
+
+Docker 构建默认使用大陆镜像源：基础镜像经由 DaoCloud（`docker.m.daocloud.io`）拉取，Go 模块使用七牛云 `Goproxy.cn`，npm 使用 npmmirror，Alpine 软件包使用阿里云镜像。Go 模块代理未配置海外直连回退，避免构建失败时绕过国内源；如需切换为企业内网镜像，可覆盖对应构建参数：
 
 ```bash
 docker compose build \
   --build-arg DOCKER_HUB_MIRROR=registry.example.cn \
   --build-arg GOPROXY=https://goproxy.example.cn \
+  --build-arg NPM_REGISTRY=https://npm.example.cn \
   --build-arg ALPINE_MIRROR=mirrors.example.cn
 docker compose up -d
 ```
 
-后台地址为 `http://127.0.0.1:8080/admin`。查看启动日志：
+后台地址为 `http://127.0.0.1:${ICLOUD_API_PORT}/admin/`，其中端口取 `.env` 中的实际值（访问 `/admin` 会自动跳转）。查看启动日志：
 
 ```bash
 docker compose logs -f icloud-api
 ```
 
-生产部署只运行一个服务副本。禁止使用 `docker compose up --scale icloud-api=2`，也不要让多个进程或多台主机共享同一个 SQLite 文件；当前同步调度、进程内限流和 SQLite 写入模型均按单副本设计。
+前端请求和 API 请求都记录在同一个服务日志中。生产部署只运行一个服务副本；禁止使用 `docker compose up --scale icloud-api=2`，也不要让多个进程或多台主机共享同一个 SQLite 文件，当前同步调度、进程内限流和 SQLite 写入模型均按单副本设计。
 
 ## 从源码启动
 
-需要 Go 1.26 或与 `go.mod` 兼容的更新版本。首次启动前至少设置管理员密码：
+后端需要 Go 1.26 或与 `go.mod` 兼容的更新版本，前端需要 Node.js 22 或更新的 LTS 版本。首次启动前至少设置管理员密码：
 
 ```bash
 export ICLOUD_API_ADMIN_USER=admin
@@ -100,6 +116,16 @@ export ICLOUD_API_MASTER_KEY='请粘贴32字节Base64主密钥'
 export ICLOUD_API_ADDR=127.0.0.1:8080
 go run ./cmd/icloud-api
 ```
+
+另开一个终端启动 Vue 开发服务器；开发代理会把管理 API、收件 API和健康检查转发给上面的 Go 服务：
+
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+开发管理端默认位于 `http://127.0.0.1:5173/admin/`。如需在本地验证与 Docker 一致的单进程托管方式，先执行 `cd web && npm run build`，再从项目根目录设置 `ICLOUD_API_WEB_ROOT=web/dist` 后启动 Go 服务。生产环境使用前面的 Compose 构建，不需要在服务器上单独安装 Node.js，也不需要运行第二个 Web 服务。
 
 首次初始化必须设置 `ICLOUD_API_ADMIN_PASSWORD`，应用不会生成或记录明文管理员密码。管理员用户名和密码只在数据库中没有管理员的首次启动时用于初始化；已有数据库不会因为修改环境变量而修改现有登录凭据。
 
@@ -118,6 +144,7 @@ Go 时长使用 `10s`、`1m`、`8h` 这类格式；正文大小使用字节数�
 | --- | --- | --- |
 | `ICLOUD_API_ADDR` | `127.0.0.1:8080` | HTTP 监听地址；容器内设置为 `0.0.0.0:8080` |
 | `ICLOUD_API_DB` | `data/icloud-api.db` | SQLite 文件路径 |
+| `ICLOUD_API_WEB_ROOT` | 空（镜像内为 `/app/web`） | Vue 生产构建目录；设置后 Go 会校验并提供其中的 `index.html` 和 `assets` |
 | `ICLOUD_API_MASTER_KEY_FILE` | `<数据库路径>.key` | 仅用于原生运行的文件回退；Compose 不设置此项 |
 | `ICLOUD_API_MASTER_KEY` | 空 | 32 字节 Base64 或十六进制主密钥；Compose 部署必填，设置后优先于文件 |
 | `ICLOUD_API_ADMIN_USER` | `admin` | 首次初始化的管理员用户名 |
@@ -132,7 +159,7 @@ Go 时长使用 `10s`、`1m`、`8h` 这类格式；正文大小使用字节数�
 | `ICLOUD_API_MAX_MESSAGE_BYTES` | `10485760` | 单封邮件最多读取的原始字节数，默认 10 MiB |
 | `ICLOUD_API_MAX_BODY_BYTES` | `1048576` | 解析后正文总量上限，默认 1 MiB |
 | `ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS` | `false` | 是否在缺少投递头时允许用 `To`/`Cc` 归属邮件；详见安全事项 |
-| `ICLOUD_API_TRUSTED_PROXIES` | 空 | 逗号分隔的受信反向代理 IP/CIDR；仅填写实际代理地址，用于恢复客户端 IP 和限流 |
+| `ICLOUD_API_TRUSTED_PROXIES` | 空（Compose 默认使用私有网段） | 逗号分隔的受信反向代理 IP/CIDR；Compose 端口仅发布到宿主回环地址，默认信任 Docker bridge 可能使用的 RFC 1918 地址，已知实际网关或 CIDR 时应收紧 |
 | `GIN_MODE` | `release` | Gin 运行模式 |
 | `TZ` | 系统时区 | 后台页面的本地时间显示；API 时间始终使用 RFC 3339/UTC |
 
@@ -268,7 +295,8 @@ docker compose run --rm --no-deps --entrypoint sh icloud-api -c \
   'rm -f /app/data/icloud-api.db /app/data/icloud-api.db-shm /app/data/icloud-api.db-wal'
 docker compose cp --archive ./backup/icloud-api-data/. icloud-api:/app/data/
 docker compose start icloud-api
-curl -fsS http://127.0.0.1:8080/healthz
+APP_ADDR="$(docker compose port icloud-api 8080)"
+curl -fsS "http://${APP_ADDR}/healthz"
 ```
 
 启动恢复实例前，先通过 `ICLOUD_API_MASTER_KEY` 注入这份数据库原来使用的主密钥。数据库目录备份本身不携带该密钥。

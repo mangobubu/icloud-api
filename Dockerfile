@@ -1,6 +1,18 @@
 ARG DOCKER_HUB_MIRROR=docker.m.daocloud.io
 
-FROM ${DOCKER_HUB_MIRROR}/library/golang:1.26-alpine AS builder
+FROM ${DOCKER_HUB_MIRROR}/library/node:22-alpine AS web-builder
+
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
+WORKDIR /src/web
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund --registry="${NPM_REGISTRY}"
+
+COPY web/ ./
+RUN npm run build
+
+FROM ${DOCKER_HUB_MIRROR}/library/golang:1.26-alpine AS go-builder
 
 ARG GOPROXY=https://goproxy.cn
 ENV GOPROXY=${GOPROXY} \
@@ -30,7 +42,10 @@ RUN sed -i "s#dl-cdn.alpinelinux.org#${ALPINE_MIRROR}#g" /etc/apk/repositories \
 
 WORKDIR /app
 
-COPY --from=builder --chown=app:app /out/icloud-api /app/icloud-api
+COPY --from=go-builder --chown=app:app /out/icloud-api /app/icloud-api
+COPY --from=web-builder --chown=app:app /src/web/dist/ /app/web/
+
+ENV ICLOUD_API_WEB_ROOT=/app/web
 
 USER app
 
