@@ -87,6 +87,8 @@ func (s *Server) recentMail(c *gin.Context) {
 	content := message.TextBody
 	if strings.TrimSpace(content) == "" {
 		content = plainTextFromHTML(message.HTMLBody)
+	} else {
+		content = singleLinePlainText(content)
 	}
 	location := s.cfg.Timezone
 	if location == nil {

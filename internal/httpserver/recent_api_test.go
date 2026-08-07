@@ -32,7 +32,7 @@ func TestRecentMailDirectLinkReturnsCompactOwnedMessageInConfiguredTimezone(t *t
 	env.upsertMessage(t, domain.LatestMessage{
 		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
 		InternalDate: receivedAt,
-		TextBody:     "A compact body",
+		TextBody:     "  A compact\r\n\tbody  ",
 		HTMLBody:     "<p>A compact body</p>",
 		SyncedAt:     now,
 	})
@@ -106,10 +106,13 @@ func TestRecentMailDirectLinkExtractsPlainTextFromHTMLBody(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode compact response: %v", err)
 	}
-	wanted := "您的临时 ChatGPT 登录代码\n739638\n请勿与他人分享 & 使用。"
+	wanted := "您的临时 ChatGPT 登录代码 739638 请勿与他人分享 & 使用。"
 	content := decodeStringField(t, payload, "content")
 	if content != wanted {
 		t.Fatalf("content = %q, want extracted plain text %q", content, wanted)
+	}
+	if strings.ContainsAny(content, "\r\n") {
+		t.Fatalf("content contains line breaks: %q", content)
 	}
 	for _, forbidden := range []string{"<html", "<style", "color: red", "window.secret", "Ignored email title"} {
 		if strings.Contains(content, forbidden) {

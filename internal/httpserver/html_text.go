@@ -14,8 +14,7 @@ func plainTextFromHTML(source string) string {
 	// amplifying that configured limit when processing untrusted email HTML.
 	tokenizer.SetMaxBuf(len(source) + 1)
 
-	text := htmlTextWriter{maxBytes: len(source)}
-	text.output.Grow(min(len(source), 64<<10))
+	text := newPlainTextWriter(len(source))
 	var skippedTag string
 	skippedTagDepth := 0
 
@@ -60,14 +59,14 @@ func plainTextFromHTML(source string) string {
 				continue
 			}
 			if tag == "br" {
-				text.lineBreak()
+				text.space()
 				continue
 			}
 			if tag == "td" || tag == "th" {
 				text.space()
 			}
 			if isBlockHTMLElement(tag) {
-				text.lineBreak()
+				text.space()
 			}
 		case html.EndTagToken:
 			name, _ := tokenizer.TagName()
@@ -85,10 +84,16 @@ func plainTextFromHTML(source string) string {
 				text.space()
 			}
 			if isBlockHTMLElement(tag) {
-				text.lineBreak()
+				text.space()
 			}
 		}
 	}
+}
+
+func singleLinePlainText(source string) string {
+	text := newPlainTextWriter(len(source))
+	_ = text.write([]byte(source))
+	return text.String()
 }
 
 func htmlElementIsHidden(tokenizer *html.Tokenizer, hasAttributes bool) bool {
@@ -176,14 +181,19 @@ func isBlockHTMLElement(name string) bool {
 	}
 }
 
-type htmlTextWriter struct {
-	output           strings.Builder
-	maxBytes         int
-	pendingSpace     bool
-	pendingLineBreak bool
+type plainTextWriter struct {
+	output       strings.Builder
+	maxBytes     int
+	pendingSpace bool
 }
 
-func (w *htmlTextWriter) write(value []byte) bool {
+func newPlainTextWriter(maxBytes int) *plainTextWriter {
+	text := &plainTextWriter{maxBytes: maxBytes}
+	text.output.Grow(min(maxBytes, 64<<10))
+	return text
+}
+
+func (w *plainTextWriter) write(value []byte) bool {
 	for len(value) > 0 {
 		character, size := utf8.DecodeRune(value)
 		value = value[size:]
@@ -193,7 +203,7 @@ func (w *htmlTextWriter) write(value []byte) bool {
 		}
 
 		separatorBytes := 0
-		if w.pendingLineBreak || (w.pendingSpace && w.output.Len() > 0) {
+		if w.pendingSpace && w.output.Len() > 0 {
 			separatorBytes = 1
 		}
 		characterBytes := utf8.RuneLen(character)
@@ -206,29 +216,19 @@ func (w *htmlTextWriter) write(value []byte) bool {
 	return true
 }
 
-func (w *htmlTextWriter) space() {
-	if w.output.Len() > 0 && !w.pendingLineBreak {
+func (w *plainTextWriter) space() {
+	if w.output.Len() > 0 {
 		w.pendingSpace = true
 	}
 }
 
-func (w *htmlTextWriter) lineBreak() {
-	if w.output.Len() > 0 {
-		w.pendingLineBreak = true
-		w.pendingSpace = false
-	}
-}
-
-func (w *htmlTextWriter) flushSeparator() {
-	if w.pendingLineBreak {
-		w.output.WriteByte('\n')
-	} else if w.pendingSpace && w.output.Len() > 0 {
+func (w *plainTextWriter) flushSeparator() {
+	if w.pendingSpace && w.output.Len() > 0 {
 		w.output.WriteByte(' ')
 	}
-	w.pendingLineBreak = false
 	w.pendingSpace = false
 }
 
-func (w *htmlTextWriter) String() string {
+func (w *plainTextWriter) String() string {
 	return w.output.String()
 }

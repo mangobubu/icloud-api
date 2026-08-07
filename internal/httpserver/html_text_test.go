@@ -16,7 +16,7 @@ func TestPlainTextFromHTML(t *testing.T) {
 			html: `<center>Hello <strong>world</strong></center>
 				<p>Code<br>123456</p>
 				<table><tr><td>Column A</td><td>Column B</td></tr></table>`,
-			wanted: "Hello world\nCode\n123456\nColumn A Column B",
+			wanted: "Hello world Code 123456 Column A Column B",
 		},
 		{
 			name:   "keeps adjacent Chinese text together",
@@ -38,7 +38,7 @@ func TestPlainTextFromHTML(t *testing.T) {
 				<iframe><b>Ignored frame text</b></iframe><xmp><b>Ignored xmp text</b></xmp>
 				<textarea><b>Ignored form text</b></textarea>
 				</body></html>`,
-			wanted: "Visible text\nEmail fallback text",
+			wanted: "Visible text Email fallback text",
 		},
 		{
 			name: "omits common hidden email content",
@@ -50,7 +50,7 @@ func TestPlainTextFromHTML(t *testing.T) {
 				<div style="visibility: hidden">Invisible</div>
 				<div style="mso-hide: all">Outlook hidden</div>
 				<p>Visible last</p>`,
-			wanted: "Visible first\nVisible last",
+			wanted: "Visible first Visible last",
 		},
 		{
 			name:   "omits style text in malformed element context",
@@ -65,7 +65,7 @@ func TestPlainTextFromHTML(t *testing.T) {
 		{
 			name:   "treats self-closing raw elements with HTML semantics",
 			html:   `<p>Before</p><script/>alert("ignored")</script><p>After</p>`,
-			wanted: "Before\nAfter",
+			wanted: "Before After",
 		},
 		{
 			name:   "extracts text from truncated markup",
@@ -81,10 +81,25 @@ func TestPlainTextFromHTML(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := plainTextFromHTML(test.html); got != test.wanted {
+			got := plainTextFromHTML(test.html)
+			if got != test.wanted {
 				t.Fatalf("plainTextFromHTML() = %q, want %q", got, test.wanted)
 			}
+			if strings.ContainsAny(got, "\r\n") {
+				t.Fatalf("plainTextFromHTML() returned line breaks: %q", got)
+			}
 		})
+	}
+}
+
+func TestSingleLinePlainTextCollapsesWhitespace(t *testing.T) {
+	source := "  第一行\r\n第二行\t\u00a0第三行  "
+	got := singleLinePlainText(source)
+	if got != "第一行 第二行 第三行" {
+		t.Fatalf("singleLinePlainText() = %q, want single-line text", got)
+	}
+	if strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("singleLinePlainText() returned line breaks: %q", got)
 	}
 }
 
