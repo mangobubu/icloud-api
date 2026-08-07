@@ -71,6 +71,16 @@ docker compose ps
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
+Docker 构建默认只使用大陆镜像源：基础镜像经由 DaoCloud（`docker.m.daocloud.io`）拉取，Go 模块使用七牛云 `Goproxy.cn`，Alpine 软件包使用阿里云镜像。Go 模块代理未配置海外直连回退，避免构建失败时绕过国内源；如需切换为企业内网镜像，可覆盖对应构建参数：
+
+```bash
+docker compose build \
+  --build-arg DOCKER_HUB_MIRROR=registry.example.cn \
+  --build-arg GOPROXY=https://goproxy.example.cn \
+  --build-arg ALPINE_MIRROR=mirrors.example.cn
+docker compose up -d
+```
+
 后台地址为 `http://127.0.0.1:8080/admin`。查看启动日志：
 
 ```bash

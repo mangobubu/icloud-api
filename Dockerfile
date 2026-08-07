@@ -1,6 +1,10 @@
-# syntax=docker/dockerfile:1
+ARG DOCKER_HUB_MIRROR=docker.m.daocloud.io
 
-FROM golang:1.26-alpine AS builder
+FROM ${DOCKER_HUB_MIRROR}/library/golang:1.26-alpine AS builder
+
+ARG GOPROXY=https://goproxy.cn
+ENV GOPROXY=${GOPROXY} \
+    GOTOOLCHAIN=local
 
 WORKDIR /src
 
@@ -14,9 +18,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /out/icloud-api \
     ./cmd/icloud-api
 
-FROM alpine:3.22 AS runtime
+FROM ${DOCKER_HUB_MIRROR}/library/alpine:3.22 AS runtime
 
-RUN apk add --no-cache ca-certificates tzdata \
+ARG ALPINE_MIRROR=mirrors.aliyun.com
+RUN sed -i "s#dl-cdn.alpinelinux.org#${ALPINE_MIRROR}#g" /etc/apk/repositories \
+    && apk add --no-cache ca-certificates tzdata \
     && addgroup -S -g 10001 app \
     && adduser -S -D -H -u 10001 -G app app \
     && mkdir -p /app/data \
