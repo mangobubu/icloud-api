@@ -19,6 +19,7 @@ import (
 
 const (
 	credentialAAD             = "icloud-api/imap-credential/v1"
+	appleSessionAAD           = "icloud-api/apple-web-session/v1"
 	directLinkKeyContext      = "icloud-api/direct-link/key/v1"
 	directLinkTokenContext    = "icloud-api/direct-link/token/v1"
 	directLinkTokenPrefix     = "icm_"
@@ -54,18 +55,34 @@ func NewCipher(key []byte) (*Cipher, error) {
 }
 
 func (c *Cipher) Encrypt(plaintext string) (string, error) {
+	return c.encrypt("v1", credentialAAD, plaintext)
+}
+
+func (c *Cipher) EncryptAppleSession(plaintext string) (string, error) {
+	return c.encrypt("as1", appleSessionAAD, plaintext)
+}
+
+func (c *Cipher) encrypt(version, aad, plaintext string) (string, error) {
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return "", fmt.Errorf("生成随机数: %w", err)
 	}
-	ciphertext := c.aead.Seal(nil, nonce, []byte(plaintext), []byte(credentialAAD))
+	ciphertext := c.aead.Seal(nil, nonce, []byte(plaintext), []byte(aad))
 	payload := append(nonce, ciphertext...)
-	return "v1." + base64.RawURLEncoding.EncodeToString(payload), nil
+	return version + "." + base64.RawURLEncoding.EncodeToString(payload), nil
 }
 
 func (c *Cipher) Decrypt(value string) (string, error) {
+	return c.decrypt("v1", credentialAAD, value)
+}
+
+func (c *Cipher) DecryptAppleSession(value string) (string, error) {
+	return c.decrypt("as1", appleSessionAAD, value)
+}
+
+func (c *Cipher) decrypt(expectedVersion, aad, value string) (string, error) {
 	version, encoded, ok := strings.Cut(value, ".")
-	if !ok || version != "v1" {
+	if !ok || version != expectedVersion {
 		return "", errors.New("未知的凭据密文版本")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(encoded)
@@ -77,7 +94,7 @@ func (c *Cipher) Decrypt(value string) (string, error) {
 	}
 	nonce := payload[:c.aead.NonceSize()]
 	ciphertext := payload[c.aead.NonceSize():]
-	plaintext, err := c.aead.Open(nil, nonce, ciphertext, []byte(credentialAAD))
+	plaintext, err := c.aead.Open(nil, nonce, ciphertext, []byte(aad))
 	if err != nil {
 		return "", errors.New("凭据解密失败，请检查主密钥")
 	}

@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Migrate applies schema changes transactionally. Repeated calls are safe.
 func (s *Store) Migrate(ctx context.Context) error {
@@ -27,18 +27,25 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	statements := schemaV2
-	migrationName := "schema v2"
-	if current == 1 {
-		statements = migrateV1ToV2
-		migrationName = "migration v1 to v2"
+	var statements []string
+	var migrationName string
+	switch current {
+	case 0:
+		statements = schemaV3
+		migrationName = "schema v3"
+	case 1:
+		statements = append(append([]string{}, migrateV1ToV2...), migrateV2ToV3...)
+		migrationName = "migration v1 to v3"
+	case 2:
+		statements = migrateV2ToV3
+		migrationName = "migration v2 to v3"
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("apply %s: %w", migrationName, err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 2"); err != nil {
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
 		return fmt.Errorf("set schema version: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -128,6 +135,21 @@ var schemaV2 = []string{
 	`CREATE INDEX audit_logs_created_at_idx ON audit_logs(created_at DESC, id DESC)`,
 	`CREATE INDEX audit_logs_admin_id_idx ON audit_logs(admin_id)`,
 }
+
+var migrateV2ToV3 = []string{
+	`CREATE TABLE apple_web_sessions (
+		account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		session_ciphertext TEXT NOT NULL CHECK(length(trim(session_ciphertext)) > 0),
+		apple_id TEXT NOT NULL CHECK(length(trim(apple_id)) > 0),
+		region TEXT NOT NULL DEFAULT '',
+		authenticated INTEGER NOT NULL DEFAULT 0 CHECK(authenticated IN (0, 1)),
+		last_validated_at INTEGER,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`,
+}
+
+var schemaV3 = append(append([]string{}, schemaV2...), migrateV2ToV3...)
 
 var migrateV1ToV2 = []string{
 	`ALTER TABLE admins

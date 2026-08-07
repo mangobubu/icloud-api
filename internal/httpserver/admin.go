@@ -198,7 +198,7 @@ func (s *Server) createAlias(c *gin.Context) {
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrAliasLimit) {
-			s.renderAccountPage(c, accountID, http.StatusConflict, "此主号最多启用 256 个隐私邮箱。", "error", "")
+			s.renderAccountPage(c, accountID, http.StatusConflict, fmt.Sprintf("此主号最多启用 %d 个隐私邮箱。", domain.MaxEnabledAliasesPerAccount), "error", "")
 			return
 		}
 		s.renderAccountPage(c, accountID, http.StatusConflict, friendlyStoreError(err, "这个隐私邮箱已经登记。"), "error", "")
@@ -266,7 +266,7 @@ func (s *Server) toggleAlias(c *gin.Context) {
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrAliasLimit) {
-			s.renderAccountPage(c, alias.AccountID, http.StatusConflict, "此主号最多启用 256 个隐私邮箱。", "error", "")
+			s.renderAccountPage(c, alias.AccountID, http.StatusConflict, fmt.Sprintf("此主号最多启用 %d 个隐私邮箱。", domain.MaxEnabledAliasesPerAccount), "error", "")
 			return
 		}
 		s.renderPageError(c, err)

@@ -50,7 +50,11 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.PUT("/accounts/:id", s.adminAPIUpdateAccount)
 	protected.DELETE("/accounts/:id", s.adminAPIDeleteAccount)
 	protected.POST("/accounts/:id/sync", s.adminAPISyncAccount)
+	protected.POST("/accounts/:id/apple-auth", s.adminAPIStartAppleAuth)
+	protected.POST("/accounts/:id/apple-auth/verify", s.adminAPIVerifyAppleAuth)
+	protected.DELETE("/accounts/:id/apple-auth", s.adminAPIClearAppleAuth)
 	protected.POST("/accounts/:id/aliases", s.adminAPICreateAlias)
+	protected.POST("/accounts/:id/aliases/sync", s.adminAPISyncAppleAliases)
 
 	protected.GET("/aliases", s.adminAPIListAliases)
 	protected.GET("/aliases/:id", s.adminAPIGetAlias)
@@ -117,8 +121,9 @@ type adminAPIAuditLogDTO struct {
 }
 
 type adminAPIAccountDetailDTO struct {
-	Account adminAPIAccountDTO `json:"account"`
-	Aliases []adminAPIAliasDTO `json:"aliases"`
+	Account      adminAPIAccountDTO       `json:"account"`
+	Aliases      []adminAPIAliasDTO       `json:"aliases"`
+	AppleSession *adminAPIAppleSessionDTO `json:"apple_session"`
 }
 
 type adminAPIOneTimeKeyDTO struct {
@@ -709,9 +714,14 @@ func (s *Server) adminAPIAccountDetail(ctx context.Context, id int64) (adminAPIA
 	if err != nil {
 		return adminAPIAccountDetailDTO{}, err
 	}
+	appleSession, err := s.adminAPIAppleSession(ctx, id)
+	if err != nil {
+		return adminAPIAccountDetailDTO{}, err
+	}
 	return adminAPIAccountDetailDTO{
-		Account: adminAPIAccountFromDomain(account),
-		Aliases: aliasDTOs,
+		Account:      adminAPIAccountFromDomain(account),
+		Aliases:      aliasDTOs,
+		AppleSession: appleSession,
 	}, nil
 }
 
@@ -759,7 +769,7 @@ func (s *Server) adminAPICreateAlias(c *gin.Context) {
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrAliasLimit):
-			writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", "此主号最多启用 256 个隐私邮箱")
+			writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
 		case adminAPIUniqueConstraint(err):
 			writeAdminAPIError(c, http.StatusConflict, "ALIAS_EXISTS", "这个隐私邮箱已经登记")
 		default:
@@ -880,7 +890,7 @@ func (s *Server) adminAPIUpdateAlias(c *gin.Context) {
 			if errors.Is(err, store.ErrNotFound) {
 				writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
 			} else if errors.Is(err, store.ErrAliasLimit) {
-				writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", "此主号最多启用 256 个隐私邮箱")
+				writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
 			} else {
 				s.writeAdminAPIInternalError(c, err)
 			}

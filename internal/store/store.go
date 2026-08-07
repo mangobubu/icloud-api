@@ -16,11 +16,12 @@ import (
 
 var (
 	// ErrNotFound is returned when a requested row does not exist.
-	ErrNotFound              = sql.ErrNoRows
-	ErrAliasLimit            = errors.New("enabled alias limit reached")
-	ErrAccountIdentityLocked = errors.New("account identity is locked by aliases")
-	ErrCredentialsChanged    = errors.New("administrator credentials changed")
-	memoryID                 atomic.Uint64
+	ErrNotFound               = sql.ErrNoRows
+	ErrAliasLimit             = errors.New("enabled alias limit reached")
+	ErrAliasOwnershipConflict = errors.New("alias address belongs to another account")
+	ErrAccountIdentityLocked  = errors.New("account identity is locked by aliases")
+	ErrCredentialsChanged     = errors.New("administrator credentials changed")
+	memoryID                  atomic.Uint64
 )
 
 // Store owns the application's SQLite persistence layer.

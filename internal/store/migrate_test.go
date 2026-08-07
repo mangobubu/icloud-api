@@ -12,7 +12,7 @@ import (
 	"icloud-api/internal/store"
 )
 
-func TestMigrateV1ToV2(t *testing.T) {
+func TestMigrateV1ToV3(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -104,8 +104,8 @@ func TestMigrateV1ToV2(t *testing.T) {
 	if err := db.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatalf("read migrated schema version: %v", err)
 	}
-	if schemaVersion != 2 {
-		t.Fatalf("schema version = %d, want 2", schemaVersion)
+	if schemaVersion != 3 {
+		t.Fatalf("schema version = %d, want 3", schemaVersion)
 	}
 
 	var adminPasswordVersion, sessionPasswordVersion int64

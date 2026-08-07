@@ -794,6 +794,7 @@ func newHTTPTestEnvWithWebRoot(t *testing.T, webRoot string) *httpTestEnv {
 		PollInterval: time.Minute,
 		GinMode:      "test",
 		WebRoot:      webRoot,
+		OAuthToken:   "external-oauth-test-token-0123456789abcdef",
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	if err != nil {
 		t.Fatalf("create HTTP server: %v", err)

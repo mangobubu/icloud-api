@@ -103,6 +103,11 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	reenabled := currentEnabled == 0 && account.Enabled
 	identityChanged := hasAliases == 0 && (requestedEmail != domain.NormalizeEmail(currentEmail) ||
 		requestedUsername != strings.TrimSpace(currentUsername))
+	if identityChanged {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM apple_web_sessions WHERE account_id = ?`, account.ID); err != nil {
+			return domain.Account{}, fmt.Errorf("delete apple web session after account identity change: %w", err)
+		}
+	}
 	if passwordChanged || reenabled || identityChanged {
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM latest_messages
@@ -138,6 +143,13 @@ func (s *Store) getAccountAfterWrite(id int64) (domain.Account, error) {
 func (s *Store) GetAccount(ctx context.Context, id int64) (domain.Account, error) {
 	return scanAccount(s.db.QueryRowContext(ctx,
 		`SELECT `+accountColumns+` FROM accounts a WHERE a.id = ?`, id,
+	))
+}
+
+func (s *Store) GetAccountByEmail(ctx context.Context, email string) (domain.Account, error) {
+	return scanAccount(s.db.QueryRowContext(ctx,
+		`SELECT `+accountColumns+` FROM accounts a WHERE a.email = ? COLLATE NOCASE`,
+		domain.NormalizeEmail(email),
 	))
 }
 

@@ -33,6 +33,190 @@
         </el-tooltip>
       </div>
 
+      <el-dialog
+        v-model="appleAuthVisible"
+        class="apple-auth-dialog"
+        :title="appleAuthStep === 'verification' ? '输入双重认证验证码' : '登录 Apple 账户'"
+        width="min(520px, calc(100vw - 28px))"
+        :close-on-click-modal="false"
+        :close-on-press-escape="false"
+        :before-close="closeAppleAuthDialog"
+        destroy-on-close
+      >
+        <RequestAlert
+          v-if="appleAuthError"
+          :error="appleAuthError"
+          closable
+          @close="appleAuthError = null"
+        />
+
+        <el-form
+          v-if="appleAuthStep === 'login'"
+          ref="appleLoginFormRef"
+          class="dialog-form"
+          :model="appleLoginForm"
+          :rules="appleLoginRules"
+          label-position="top"
+          :disabled="appleAuthLoading"
+          @submit.prevent="submitAppleLogin"
+        >
+          <el-form-item label="Apple ID" prop="appleId">
+            <el-input
+              v-model="appleLoginForm.appleId"
+              autocomplete="username"
+              placeholder="name@icloud.com"
+            />
+          </el-form-item>
+          <el-form-item label="Apple 账户密码" prop="password">
+            <el-input
+              v-model="appleLoginForm.password"
+              type="password"
+              show-password
+              autocomplete="current-password"
+            />
+          </el-form-item>
+          <el-form-item label="Apple 服务区域" prop="region">
+            <el-select v-model="appleLoginForm.region" style="width: 100%">
+              <el-option label="全球" value="global" />
+              <el-option label="中国大陆" value="cn" />
+            </el-select>
+          </el-form-item>
+        </el-form>
+
+        <el-form
+          v-else
+          ref="appleVerificationFormRef"
+          class="dialog-form"
+          :model="appleVerificationForm"
+          :rules="appleVerificationRules"
+          label-position="top"
+          :disabled="appleAuthLoading"
+          @submit.prevent="submitAppleVerification"
+        >
+          <p class="dialog-form__lead">
+            请在受信任的 Apple 设备上查看验证码。
+          </p>
+          <el-form-item label="6 位验证码" prop="code">
+            <el-input
+              v-model="appleVerificationForm.code"
+              maxlength="6"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              placeholder="000000"
+            />
+          </el-form-item>
+        </el-form>
+
+        <template #footer>
+          <div class="dialog-actions">
+            <el-button :disabled="appleAuthLoading" @click="cancelAppleAuth">
+              取消
+            </el-button>
+            <el-button
+              v-if="appleAuthStep === 'verification'"
+              :disabled="appleAuthLoading"
+              @click="returnToAppleLogin"
+            >
+              返回登录
+            </el-button>
+            <el-button
+              type="primary"
+              :loading="appleAuthLoading"
+              @click="appleAuthStep === 'verification' ? submitAppleVerification() : submitAppleLogin()"
+            >
+              {{ appleAuthStep === "verification" ? "验证并同步" : "继续" }}
+            </el-button>
+          </div>
+        </template>
+      </el-dialog>
+
+      <el-dialog
+        v-model="batchSecretsVisible"
+        class="batch-secrets-dialog"
+        title="保存新隐私邮箱的 API Key"
+        width="min(960px, calc(100vw - 28px))"
+        :close-on-click-modal="false"
+        :close-on-press-escape="false"
+        :before-close="confirmBatchSecretsClose"
+      >
+        <el-alert
+          title="这些完整 API Key 只显示这一次，请下载 CSV 或逐项保存后再关闭。"
+          type="warning"
+          :closable="false"
+          show-icon
+        />
+        <el-alert
+          v-if="batchSummary.importedDisabledCount"
+          :title="`${batchSummary.importedDisabledCount} 个地址已导入，但因本地邮件处理容量暂未启用。`"
+          type="info"
+          :closable="false"
+          show-icon
+        />
+
+        <dl class="sync-summary-grid" aria-label="同步结果">
+          <div><dt>Apple 地址</dt><dd>{{ batchSummary.total }}</dd></div>
+          <div><dt>新建</dt><dd>{{ batchSummary.createdCount }}</dd></div>
+          <div><dt>已存在</dt><dd>{{ batchSummary.existingCount }}</dd></div>
+          <div><dt>Apple 已停用</dt><dd>{{ batchSummary.inactiveCount }}</dd></div>
+          <div>
+            <dt>因本地容量暂未启用</dt>
+            <dd>{{ batchSummary.importedDisabledCount }}</dd>
+          </div>
+          <div><dt>冲突</dt><dd>{{ batchSummary.conflictCount }}</dd></div>
+        </dl>
+
+        <div class="data-panel batch-secret-table">
+          <el-table :data="batchSecrets" row-key="address" style="width: 100%">
+            <el-table-column label="隐私邮箱" min-width="220">
+              <template #default="{ row }">
+                <strong class="batch-secret-value">{{ row.address }}</strong>
+              </template>
+            </el-table-column>
+            <el-table-column label="API Key" min-width="300">
+              <template #default="{ row }">
+                <div class="batch-secret-copy">
+                  <code>{{ row.apiKey }}</code>
+                  <el-tooltip content="复制 API Key" placement="top">
+                    <el-button
+                      :icon="CopyDocument"
+                      circle
+                      :aria-label="`复制 ${row.address} 的 API Key`"
+                      @click="copyBatchSecret(row.apiKey, 'API Key')"
+                    />
+                  </el-tooltip>
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="邮件 API 直达链接" min-width="360">
+              <template #default="{ row }">
+                <div class="batch-secret-copy">
+                  <code>{{ row.mailApiDirectLink }}</code>
+                  <el-tooltip content="复制直达链接" placement="top">
+                    <el-button
+                      :icon="CopyDocument"
+                      circle
+                      :aria-label="`复制 ${row.address} 的邮件 API 直达链接`"
+                      @click="copyBatchSecret(row.mailApiDirectLink, '直达链接')"
+                    />
+                  </el-tooltip>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
+
+        <template #footer>
+          <div class="dialog-actions dialog-actions--spread">
+            <el-button :icon="Download" @click="downloadBatchSecrets">
+              下载 CSV
+            </el-button>
+            <el-button type="primary" @click="closeBatchSecrets">
+              我已保存，关闭
+            </el-button>
+          </div>
+        </template>
+      </el-dialog>
+
       <RequestAlert
         v-if="loadError"
         :error="loadError"
@@ -43,7 +227,7 @@
       <section class="section-block" aria-labelledby="connection-title">
         <SectionHeader
           id="connection-title"
-          title="连接配置"
+          title="IMAP 邮件同步"
           :description="`${account.imapUsername} · ${account.imapHost}:${account.imapPort}`"
         >
           <template #actions>
@@ -52,7 +236,7 @@
               :loading="syncLoading"
               @click="syncNow"
             >
-              立即同步
+              同步邮件
             </el-button>
             <el-button :icon="EditPen" @click="editAccount">编辑</el-button>
           </template>
@@ -87,8 +271,49 @@
         <SectionHeader
           id="aliases-title"
           title="隐私邮箱"
-          description="每个地址使用独立 API Key，只返回自己的最新一封邮件。"
-        />
+          description="从 Apple 拉取 Hide My Email 地址目录；每个本地地址使用独立 API Key。"
+        >
+          <template #actions>
+            <el-button
+              v-if="appleSessionAuthenticated"
+              :icon="SwitchButton"
+              :loading="appleDisconnectLoading"
+              :disabled="oneTimeSecretVisible || aliasesSyncLoading"
+              @click="disconnectAppleSession"
+            >
+              退出 Apple 登录
+            </el-button>
+            <el-button
+              type="primary"
+              :icon="Refresh"
+              :loading="aliasesSyncLoading"
+              :disabled="oneTimeSecretVisible || appleDisconnectLoading"
+              @click="syncAliasesFromApple"
+            >
+              同步隐私邮箱
+            </el-button>
+          </template>
+        </SectionHeader>
+
+        <div class="apple-session-strip">
+          <div class="apple-session-strip__identity">
+            <el-tag :type="appleSessionAuthenticated ? 'success' : 'info'" effect="plain">
+              {{ appleSessionAuthenticated ? "Apple 已登录" : "Apple 未登录" }}
+            </el-tag>
+            <span v-if="appleSession?.appleId">{{ appleSession.appleId }}</span>
+            <span v-if="appleSessionAuthenticated">
+              {{ appleSession.region === "cn" ? "中国大陆" : "全球" }}
+            </span>
+          </div>
+          <div v-if="aliasSyncSummary" class="apple-session-strip__summary">
+            上次同步：共 {{ aliasSyncSummary.total }}，新建
+            {{ aliasSyncSummary.createdCount }}，已存在
+            {{ aliasSyncSummary.existingCount }}，Apple 已停用
+            {{ aliasSyncSummary.inactiveCount }}，因本地容量暂未启用
+            {{ aliasSyncSummary.importedDisabledCount }}，冲突
+            {{ aliasSyncSummary.conflictCount }}
+          </div>
+        </div>
 
         <div v-if="aliases.length" class="data-panel desktop-data-table">
           <el-table :data="aliases" row-key="id" style="width: 100%">
@@ -140,7 +365,7 @@
                       :icon="Key"
                       circle
                       :loading="Boolean(rotateLoading[row.id])"
-                      :disabled="Boolean(apiKey || copyLoading[row.id] || toggleLoading[row.id] || deleteLoading[row.id])"
+                      :disabled="Boolean(oneTimeSecretVisible || copyLoading[row.id] || toggleLoading[row.id] || deleteLoading[row.id])"
                       :aria-label="`轮换 ${row.address} 的 API Key`"
                       @click="rotateKey(row)"
                     />
@@ -207,7 +432,7 @@
               <el-button
                 :icon="Key"
                 :loading="Boolean(rotateLoading[alias.id])"
-                :disabled="Boolean(apiKey || copyLoading[alias.id] || toggleLoading[alias.id] || deleteLoading[alias.id])"
+                :disabled="Boolean(oneTimeSecretVisible || copyLoading[alias.id] || toggleLoading[alias.id] || deleteLoading[alias.id])"
                 @click="rotateKey(alias)"
               >
                 轮换 Key
@@ -240,7 +465,7 @@
           :model="aliasForm"
           :rules="aliasRules"
           label-position="top"
-          :disabled="Boolean(apiKey) || createLoading"
+          :disabled="oneTimeSecretVisible || createLoading"
           @submit.prevent="addAlias"
         >
           <RequestAlert
@@ -273,7 +498,7 @@
             type="primary"
             :icon="Plus"
             :loading="createLoading"
-            :disabled="Boolean(apiKey)"
+            :disabled="oneTimeSecretVisible"
           >
             添加并生成 Key
           </el-button>
@@ -305,13 +530,16 @@ import {
   Close,
   CopyDocument,
   Delete,
+  Download,
   EditPen,
   Key,
   Plus,
   Refresh,
+  SwitchButton,
 } from "@element-plus/icons-vue";
 import { ElMessage, ElMessageBox } from "element-plus";
 import {
+  computed,
   nextTick,
   onBeforeUnmount,
   onMounted,
@@ -330,10 +558,14 @@ import {
   createAlias,
   deleteAccount,
   deleteAlias,
+  deleteAppleSession,
   getAccount,
+  loginAppleSession,
   rotateAlias,
   setAliasEnabled,
   syncAccount,
+  syncAccountAliases,
+  verifyAppleSession,
 } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
 import OneTimeSecret from "../components/OneTimeSecret.vue";
@@ -364,16 +596,29 @@ const router = useRouter();
 const auth = useAuth();
 const account = ref(null);
 const aliases = ref([]);
+const appleSession = ref(null);
 const apiKey = ref("");
 const apiDirectLinkPath = ref("");
 const secretRegion = ref(null);
 const loading = ref(false);
 const loadError = ref(null);
 const syncLoading = ref(false);
+const aliasesSyncLoading = ref(false);
 const createLoading = ref(false);
 const accountDeleteLoading = ref(false);
+const appleDisconnectLoading = ref(false);
 const aliasFormRef = ref(null);
 const aliasFormError = ref(null);
+const appleAuthVisible = ref(false);
+const appleAuthStep = ref("login");
+const appleAuthLoading = ref(false);
+const appleAuthError = ref(null);
+const appleLoginFormRef = ref(null);
+const appleVerificationFormRef = ref(null);
+const aliasSyncSummary = ref(null);
+const batchSecretsVisible = ref(false);
+const batchSecrets = ref([]);
+const batchSummary = ref(emptySyncSummary());
 const copyLoading = reactive({});
 const toggleLoading = reactive({});
 const rotateLoading = reactive({});
@@ -382,10 +627,47 @@ const detailGate = createLatestRequestGate();
 const createLock = createActionLock();
 const aliasActionLock = createActionLock();
 const accountDeleteLock = createActionLock();
+const appleDisconnectLock = createActionLock();
 const secretNavigationLock = createActionLock();
 let viewActive = true;
+let resumeAliasSyncAfterAuth = false;
 
 const aliasForm = reactive({ address: "", label: "" });
+const appleLoginForm = reactive({ appleId: "", password: "", region: "global" });
+const appleVerificationForm = reactive({ code: "" });
+const appleAuthChallenge = reactive({ challengeId: "", flow: "" });
+const appleLoginRules = {
+  appleId: [{ required: true, message: "请填写 Apple ID", trigger: "blur" }],
+  password: [{ required: true, message: "请填写 Apple 账户密码", trigger: "blur" }],
+  region: [{ required: true, message: "请选择 Apple 服务区域", trigger: "change" }],
+};
+const appleVerificationRules = {
+  code: [
+    { required: true, message: "请填写验证码", trigger: "blur" },
+    {
+      pattern: /^\d{6}$/,
+      message: "请输入 6 位数字验证码",
+      trigger: ["blur", "change"],
+    },
+  ],
+};
+const appleSessionAuthenticated = computed(
+  () => appleSession.value?.status === "authenticated",
+);
+const oneTimeSecretVisible = computed(
+  () => Boolean(apiKey.value || batchSecrets.value.length),
+);
+
+function emptySyncSummary() {
+  return {
+    total: 0,
+    createdCount: 0,
+    existingCount: 0,
+    inactiveCount: 0,
+    importedDisabledCount: 0,
+    conflictCount: 0,
+  };
+}
 
 function detailRouteKey(id = route.params.id) {
   return String(id || "");
@@ -400,7 +682,11 @@ function isCurrentAccount(accountId) {
 }
 
 function hasPendingSecretRequest() {
-  return createLoading.value || Object.keys(rotateLoading).length > 0;
+  return (
+    createLoading.value ||
+    aliasesSyncLoading.value ||
+    Object.keys(rotateLoading).length > 0
+  );
 }
 
 function hasProtectedSecret() {
@@ -410,8 +696,16 @@ function hasProtectedSecret() {
 function secretNavigationMode() {
   return oneTimeSecretNavigationMode({
     requestPending: hasPendingSecretRequest(),
-    keyVisible: Boolean(apiKey.value),
+    keyVisible: oneTimeSecretVisible.value,
   });
+}
+
+function isAppleSessionInvalid(error) {
+  return (
+    error?.code === "APPLE_LOGIN_REQUIRED" ||
+    error?.code === "APPLE_AUTH_REQUIRED" ||
+    error?.code === "APPLE_SESSION_EXPIRED"
+  );
 }
 
 function isSessionInvalid(error) {
@@ -465,6 +759,9 @@ function replaceAlias(updated) {
 function detailMutationPending() {
   return (
     syncLoading.value ||
+    aliasesSyncLoading.value ||
+    appleAuthLoading.value ||
+    appleDisconnectLoading.value ||
     createLoading.value ||
     accountDeleteLoading.value ||
     aliasActionLock.hasAny()
@@ -488,6 +785,7 @@ async function loadDetail({ silent = false } = {}) {
     if (!detailGate.isCurrent(ticket, detailRouteKey())) return;
     account.value = detail.account;
     aliases.value = detail.aliases;
+    appleSession.value = detail.appleSession;
     loadError.value = null;
     setPageHeader(
       detail.account.email,
@@ -542,8 +840,351 @@ async function syncNow() {
   }
 }
 
+function resetAppleAuthForm() {
+  appleAuthError.value = null;
+  appleLoginForm.password = "";
+  appleVerificationForm.code = "";
+  Object.assign(appleAuthChallenge, { challengeId: "", flow: "" });
+}
+
+function openAppleLogin({ error = null, resumeSync = false } = {}) {
+  if (!account.value || oneTimeSecretVisible.value) return;
+  resumeAliasSyncAfterAuth = resumeSync;
+  appleAuthStep.value = "login";
+  appleAuthError.value = error;
+  appleLoginForm.appleId = appleSession.value?.appleId || account.value.email || "";
+  appleLoginForm.password = "";
+  appleLoginForm.region = appleSession.value?.region || "global";
+  appleVerificationForm.code = "";
+  Object.assign(appleAuthChallenge, { challengeId: "", flow: "" });
+  appleAuthVisible.value = true;
+  nextTick(() => appleLoginFormRef.value?.clearValidate());
+}
+
+function cancelAppleAuth() {
+  if (appleAuthLoading.value) return;
+  resumeAliasSyncAfterAuth = false;
+  appleAuthVisible.value = false;
+  resetAppleAuthForm();
+}
+
+function closeAppleAuthDialog(done) {
+  if (appleAuthLoading.value) return;
+  resumeAliasSyncAfterAuth = false;
+  resetAppleAuthForm();
+  done();
+}
+
+function returnToAppleLogin() {
+  if (appleAuthLoading.value) return;
+  appleAuthStep.value = "login";
+  appleAuthError.value = null;
+  appleLoginForm.password = "";
+  appleVerificationForm.code = "";
+  Object.assign(appleAuthChallenge, { challengeId: "", flow: "" });
+  nextTick(() => appleLoginFormRef.value?.clearValidate());
+}
+
+function mergedAppleSession(result) {
+  return {
+    status: result.status,
+    appleId: result.appleSession?.appleId || appleLoginForm.appleId.trim(),
+    region: result.appleSession?.region || appleLoginForm.region,
+    authenticatedAt: result.appleSession?.authenticatedAt || null,
+    expiresAt: result.appleSession?.expiresAt || null,
+  };
+}
+
+async function finishAppleAuthentication(result, accountId) {
+  if (!isCurrentAccount(accountId)) return;
+  appleSession.value = mergedAppleSession(result);
+  const shouldResumeSync = resumeAliasSyncAfterAuth;
+  resumeAliasSyncAfterAuth = false;
+  appleAuthVisible.value = false;
+  resetAppleAuthForm();
+  successMessage("Apple 账户已登录。");
+  if (shouldResumeSync) {
+    await nextTick();
+    await performAliasesSync();
+  }
+}
+
+async function submitAppleLogin() {
+  if (appleAuthLoading.value || !account.value) return;
+  const valid = await appleLoginFormRef.value?.validate().catch(() => false);
+  if (!valid) return;
+  const accountId = account.value.id;
+  beginDetailMutation();
+  appleAuthLoading.value = true;
+  appleAuthError.value = null;
+  try {
+    const result = await loginAppleSession(
+      accountId,
+      {
+        apple_id: appleLoginForm.appleId.trim(),
+        password: appleLoginForm.password,
+        region: appleLoginForm.region,
+      },
+      auth.state.csrfToken,
+    );
+    if (!isCurrentAccount(accountId)) return;
+    appleSession.value = mergedAppleSession(result);
+    appleLoginForm.password = "";
+    if (result.status === "verification_required") {
+      if (!result.challengeId) {
+        throw new Error("Apple 登录未返回验证码挑战标识，请重新登录。");
+      }
+      Object.assign(appleAuthChallenge, {
+        challengeId: result.challengeId,
+        flow: result.flow,
+      });
+      appleAuthStep.value = "verification";
+      await nextTick();
+      appleVerificationFormRef.value?.clearValidate();
+      return;
+    }
+    if (result.status === "authenticated") {
+      await finishAppleAuthentication(result, accountId);
+      return;
+    }
+    throw new Error("Apple 登录返回了未知状态，请重试。");
+  } catch (error) {
+    if (!isCurrentAccount(accountId)) return;
+    appleAuthError.value = error;
+  } finally {
+    appleAuthLoading.value = false;
+  }
+}
+
+async function submitAppleVerification() {
+  if (appleAuthLoading.value || !account.value) return;
+  const valid = await appleVerificationFormRef.value
+    ?.validate()
+    .catch(() => false);
+  if (!valid) return;
+  const accountId = account.value.id;
+  beginDetailMutation();
+  appleAuthLoading.value = true;
+  appleAuthError.value = null;
+  try {
+    const verificationPayload = {
+      challenge_id: appleAuthChallenge.challengeId,
+      code: appleVerificationForm.code.trim(),
+    };
+    if (appleAuthChallenge.flow) {
+      verificationPayload.flow = appleAuthChallenge.flow;
+    }
+    const result = await verifyAppleSession(
+      accountId,
+      verificationPayload,
+      auth.state.csrfToken,
+    );
+    if (!isCurrentAccount(accountId)) return;
+    if (result.status !== "authenticated") {
+      throw new Error("验证码已提交，但 Apple 登录尚未完成，请重试。");
+    }
+    await finishAppleAuthentication(result, accountId);
+  } catch (error) {
+    if (!isCurrentAccount(accountId)) return;
+    if (isAppleSessionInvalid(error)) {
+      openAppleLogin({ error, resumeSync: resumeAliasSyncAfterAuth });
+      return;
+    }
+    appleAuthError.value = error;
+  } finally {
+    appleAuthLoading.value = false;
+  }
+}
+
+function syncAliasesFromApple() {
+  if (aliasesSyncLoading.value || oneTimeSecretVisible.value) return;
+  if (!appleSessionAuthenticated.value) {
+    openAppleLogin({ resumeSync: true });
+    return;
+  }
+  performAliasesSync();
+}
+
+function batchDirectLink(item) {
+  const value = item.mailApiDirectLink || item.alias.directLinkPath || "";
+  if (!value.startsWith("/")) return value;
+  try {
+    return buildRecentMailDirectLink(value);
+  } catch {
+    return value;
+  }
+}
+
+async function performAliasesSync() {
+  if (
+    aliasesSyncLoading.value ||
+    oneTimeSecretVisible.value ||
+    !account.value
+  ) {
+    return;
+  }
+  const accountId = account.value.id;
+  beginDetailMutation();
+  aliasesSyncLoading.value = true;
+  try {
+    const result = await syncAccountAliases(accountId, auth.state.csrfToken);
+    if (!isCurrentAccount(accountId)) return;
+    account.value = result.account;
+    aliases.value = result.aliases;
+    appleSession.value = result.appleSession || appleSession.value;
+    aliasSyncSummary.value = result.summary;
+    const created = result.created
+      .filter((item) => item.apiKey)
+      .map((item) => ({
+        address: item.alias.address,
+        apiKey: item.apiKey,
+        mailApiDirectLink: batchDirectLink(item),
+      }));
+    if (created.length) {
+      batchSummary.value = result.summary;
+      batchSecrets.value = created;
+      batchSecretsVisible.value = true;
+      return;
+    }
+    const capacityNotice = result.summary.importedDisabledCount
+      ? `，其中 ${result.summary.importedDisabledCount} 个因本地容量暂未启用`
+      : "";
+    successMessage(
+      `隐私邮箱同步完成，Apple 共 ${result.summary.total} 个地址，没有新增地址${capacityNotice}。`,
+    );
+  } catch (error) {
+    if (!isCurrentAccount(accountId)) return;
+    if (isAppleSessionInvalid(error)) {
+      if (appleSession.value) {
+        appleSession.value = { ...appleSession.value, status: "expired" };
+      }
+      openAppleLogin({ error, resumeSync: true });
+      return;
+    }
+    showRequestError(error, "隐私邮箱同步失败，请稍后重试。");
+  } finally {
+    aliasesSyncLoading.value = false;
+  }
+}
+
+async function disconnectAppleSession() {
+  if (
+    !appleSessionAuthenticated.value ||
+    !appleDisconnectLock.acquire() ||
+    !account.value
+  ) {
+    return;
+  }
+  const accountId = account.value.id;
+  beginDetailMutation();
+  appleDisconnectLoading.value = true;
+  try {
+    await ElMessageBox.confirm(
+      "退出后，下次同步隐私邮箱时需要重新登录 Apple 账户。",
+      "退出 Apple 登录",
+      {
+        type: "warning",
+        confirmButtonText: "退出登录",
+        cancelButtonText: "取消",
+        autofocus: false,
+      },
+    );
+    if (!isCurrentAccount(accountId)) return;
+    await deleteAppleSession(accountId, auth.state.csrfToken);
+    if (!isCurrentAccount(accountId)) return;
+    appleSession.value = null;
+    aliasSyncSummary.value = null;
+    successMessage("Apple 登录已退出。");
+  } catch (error) {
+    if (confirmationCancelled(error)) return;
+    if (!isCurrentAccount(accountId)) return;
+    showRequestError(error, "退出 Apple 登录失败，请稍后重试。");
+  } finally {
+    appleDisconnectLoading.value = false;
+    appleDisconnectLock.release();
+  }
+}
+
+async function copyBatchSecret(value, label) {
+  const copied = await copyText(value);
+  if (copied) {
+    successMessage(`${label} 已复制。`);
+    return;
+  }
+  ElMessage({
+    type: "error",
+    message: `${label} 复制失败，请检查浏览器剪切板权限后重试。`,
+    grouping: true,
+  });
+}
+
+function csvCell(value) {
+  let text = String(value ?? "");
+  if (/^[=+\-@\t\r]/.test(text)) {
+    text = `'${text}`;
+  }
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function downloadBatchSecrets() {
+  if (!batchSecrets.value.length) return;
+  const rows = [
+    ["隐私邮箱", "API Key", "邮件 API 直达链接"],
+    ...batchSecrets.value.map((item) => [
+      item.address,
+      item.apiKey,
+      item.mailApiDirectLink,
+    ]),
+  ];
+  const csv = `\ufeff${rows.map((row) => row.map(csvCell).join(",")).join("\r\n")}`;
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  const accountName = String(account.value?.email || "icloud")
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  link.href = url;
+  link.download = `${accountName || "icloud"}-aliases-${timestamp}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function clearBatchSecrets() {
+  batchSecretsVisible.value = false;
+  batchSecrets.value = [];
+  batchSummary.value = emptySyncSummary();
+}
+
+function closeBatchSecrets() {
+  clearBatchSecrets();
+}
+
+async function confirmBatchSecretsClose(done) {
+  try {
+    await ElMessageBox.confirm(
+      "关闭后完整 API Key 将从页面清除，且不能再次查看。确定已保存吗？",
+      "确认关闭",
+      {
+        type: "warning",
+        confirmButtonText: "已保存，关闭",
+        cancelButtonText: "继续查看",
+        autofocus: false,
+      },
+    );
+    clearBatchSecrets();
+    done();
+  } catch (error) {
+    if (!confirmationCancelled(error)) {
+      ElMessage.error("关闭确认失败，请稍后重试。");
+    }
+  }
+}
+
 async function addAlias() {
-  if (apiKey.value || !createLock.acquire()) return;
+  if (oneTimeSecretVisible.value || !createLock.acquire()) return;
   beginDetailMutation();
   const accountId = account.value.id;
   let sessionInvalid = false;
@@ -585,7 +1226,7 @@ async function addAlias() {
 }
 
 async function rotateKey(alias) {
-  if (apiKey.value || !aliasActionLock.acquire(alias.id)) return;
+  if (oneTimeSecretVisible.value || !aliasActionLock.acquire(alias.id)) return;
   beginDetailMutation();
   const accountId = account.value.id;
   let sessionInvalid = false;
@@ -748,6 +1389,7 @@ function editAccount() {
 function clearSecret() {
   apiKey.value = "";
   apiDirectLinkPath.value = "";
+  clearBatchSecrets();
 }
 
 async function confirmSecretNavigation() {
@@ -769,7 +1411,7 @@ async function confirmSecretNavigation() {
   try {
     await ElMessageBox.confirm(
       "完整 API Key 只显示这一次。离开后将无法再次查看，确定离开吗？",
-      "尚未关闭 API Key 提示",
+      "尚未保存 API Key",
       {
         type: "warning",
         confirmButtonText: "仍要离开",
@@ -802,8 +1444,11 @@ watch(
       detailGate.invalidate();
       loading.value = false;
       clearSecret();
+      cancelAppleAuth();
       account.value = null;
       aliases.value = [];
+      appleSession.value = null;
+      aliasSyncSummary.value = null;
       loadDetail();
     }
   },

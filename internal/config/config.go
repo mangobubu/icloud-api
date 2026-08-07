@@ -13,6 +13,7 @@ type Config struct {
 	DatabasePath              string
 	WebRoot                   string
 	MasterKeyFile             string
+	OAuthToken                string
 	AdminUsername             string
 	AdminPassword             string
 	CookieSecure              bool
@@ -35,6 +36,7 @@ func Load() (Config, error) {
 		Addr:          env("ICLOUD_API_ADDR", "127.0.0.1:8080"),
 		DatabasePath:  env("ICLOUD_API_DB", "data/icloud-api.db"),
 		WebRoot:       strings.TrimSpace(os.Getenv("ICLOUD_API_WEB_ROOT")),
+		OAuthToken:    strings.TrimSpace(os.Getenv("ICLOUD_API_OAUTH_TOKEN")),
 		AdminUsername: env("ICLOUD_API_ADMIN_USER", "admin"),
 		AdminPassword: os.Getenv("ICLOUD_API_ADMIN_PASSWORD"),
 		GinMode:       env("GIN_MODE", "release"),
@@ -90,6 +92,9 @@ func Load() (Config, error) {
 
 	if strings.TrimSpace(cfg.AdminUsername) == "" {
 		return Config{}, fmt.Errorf("ICLOUD_API_ADMIN_USER 不能为空")
+	}
+	if cfg.OAuthToken != "" && (len(cfg.OAuthToken) < 32 || len(cfg.OAuthToken) > 4096 || strings.ContainsAny(cfg.OAuthToken, " \t\r\n")) {
+		return Config{}, fmt.Errorf("ICLOUD_API_OAUTH_TOKEN 必须为 32 到 4096 个不含空白的字符")
 	}
 	if cfg.SyncConcurrency < 1 || cfg.SyncConcurrency > 16 {
 		return Config{}, fmt.Errorf("ICLOUD_API_SYNC_CONCURRENCY 必须在 1 到 16 之间")

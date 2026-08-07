@@ -17,7 +17,9 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"icloud-api/internal/apple"
 	"icloud-api/internal/config"
+	"icloud-api/internal/hmesync"
 	"icloud-api/internal/httpserver"
 	mailfetch "icloud-api/internal/mail"
 	"icloud-api/internal/secure"
@@ -100,6 +102,14 @@ func run() error {
 	defer stop()
 	manager := syncer.New(db, cipher, fetcher, logger, cfg.PollInterval, cfg.SyncConcurrency)
 	manager.SetSyncTimeout(cfg.SyncTimeout)
+	appleClient, err := apple.NewClient(apple.Config{})
+	if err != nil {
+		return fmt.Errorf("初始化 Apple 客户端: %w", err)
+	}
+	hmeService, err := hmesync.New(db, cipher, appleClient, manager)
+	if err != nil {
+		return fmt.Errorf("初始化隐私邮箱同步服务: %w", err)
+	}
 	syncDone := make(chan struct{})
 	go func() {
 		defer close(syncDone)
@@ -109,10 +119,12 @@ func run() error {
 	web, err := httpserver.New(db, cipher, cfg, logger, func(accountID int64) error {
 		return manager.SyncAccountWithTimeout(appContext, accountID)
 	})
+	cfg.OAuthToken = ""
 	if err != nil {
 		return fmt.Errorf("初始化 HTTP 服务: %w", err)
 	}
 	web.SetAccountLocker(manager.WithAccountLock)
+	web.SetHMESyncService(hmeService)
 	router, err := web.Router()
 	if err != nil {
 		return err

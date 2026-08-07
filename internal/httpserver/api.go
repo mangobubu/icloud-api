@@ -14,9 +14,14 @@ import (
 const recentMailWindow = time.Hour
 
 type recentMailResponse struct {
-	Email   string `json:"email"`
-	Content string `json:"content"`
-	Time    string `json:"time"`
+	Data recentMailData `json:"data"`
+}
+
+type recentMailData struct {
+	Address string `json:"address"`
+	Subject string `json:"subject"`
+	Snippet string `json:"snippet"`
+	SentAt  string `json:"sent_at"`
 }
 
 func (s *Server) availableMailboxSnapshot(c *gin.Context) (domain.MailboxBinding, time.Time, bool) {
@@ -94,10 +99,17 @@ func (s *Server) recentMail(c *gin.Context) {
 	if location == nil {
 		location = time.Local
 	}
+	sentAt := message.InternalDate
+	if message.HeaderDate != nil && !message.HeaderDate.IsZero() {
+		sentAt = *message.HeaderDate
+	}
 	c.JSON(http.StatusOK, recentMailResponse{
-		Email:   binding.Alias.Address,
-		Content: content,
-		Time:    message.InternalDate.In(location).Format(time.RFC3339),
+		Data: recentMailData{
+			Address: binding.Alias.Address,
+			Subject: message.Subject,
+			Snippet: content,
+			SentAt:  sentAt.In(location).Format(time.RFC3339),
+		},
 	})
 }
 

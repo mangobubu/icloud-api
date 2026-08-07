@@ -36,6 +36,34 @@ func TestCipherRoundTripAndTamper(t *testing.T) {
 	}
 }
 
+func TestAppleSessionCipherUsesDedicatedContext(t *testing.T) {
+	box, err := NewCipher(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := box.EncryptAppleSession(`{"session_token":"secret"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(encrypted, "as1.") {
+		t.Fatalf("Apple 会话密文前缀错误: %q", encrypted)
+	}
+	got, err := box.DecryptAppleSession(encrypted)
+	if err != nil || got != `{"session_token":"secret"}` {
+		t.Fatalf("Apple 会话解密结果错误: %q, %v", got, err)
+	}
+	if _, err := box.Decrypt(encrypted); err == nil {
+		t.Fatal("Apple 会话密文不应作为 IMAP 凭据解密")
+	}
+	imapCiphertext, err := box.Encrypt("app-specific-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := box.DecryptAppleSession(imapCiphertext); err == nil {
+		t.Fatal("IMAP 凭据密文不应作为 Apple 会话解密")
+	}
+}
+
 func TestAPIKeyUsesHighEntropyAndStableHash(t *testing.T) {
 	raw, hash, prefix, err := NewAPIKey()
 	if err != nil {

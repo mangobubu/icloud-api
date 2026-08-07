@@ -22,6 +22,7 @@ func TestRecentMailDirectLinkReturnsCompactOwnedMessageInConfiguredTimezone(t *t
 	mailboxes := env.createMailboxFixture(t)
 	now := time.Date(2026, time.August, 7, 5, 15, 0, 0, time.UTC)
 	receivedAt := now.Add(-59 * time.Minute)
+	sentAt := receivedAt.Add(-2 * time.Minute)
 	location, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
 		t.Fatalf("load Asia/Shanghai: %v", err)
@@ -32,6 +33,8 @@ func TestRecentMailDirectLinkReturnsCompactOwnedMessageInConfiguredTimezone(t *t
 	env.upsertMessage(t, domain.LatestMessage{
 		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
 		InternalDate: receivedAt,
+		HeaderDate:   &sentAt,
+		Subject:      "Your ChatGPT verification code",
 		TextBody:     "  A compact\r\n\tbody  ",
 		HTMLBody:     "<p>A compact body</p>",
 		SyncedAt:     now,
@@ -53,21 +56,18 @@ func TestRecentMailDirectLinkReturnsCompactOwnedMessageInConfiguredTimezone(t *t
 		t.Fatalf("Content-Type = %q, want application/json", got)
 	}
 
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode compact response: %v", err)
+	data := decodeRecentMailData(t, response)
+	if got := decodeStringField(t, data, "address"); got != mailboxes.aliasA.Address {
+		t.Fatalf("address = %q, want owned alias %q", got, mailboxes.aliasA.Address)
 	}
-	if len(payload) != 3 {
-		t.Fatalf("compact response fields = %v, want exactly email/content/time", payload)
+	if got := decodeStringField(t, data, "subject"); got != "Your ChatGPT verification code" {
+		t.Fatalf("subject = %q, want message subject", got)
 	}
-	if got := decodeStringField(t, payload, "email"); got != mailboxes.aliasA.Address {
-		t.Fatalf("email = %q, want owned alias %q", got, mailboxes.aliasA.Address)
+	if got := decodeStringField(t, data, "snippet"); got != "A compact body" {
+		t.Fatalf("snippet = %q, want plain-text body", got)
 	}
-	if got := decodeStringField(t, payload, "content"); got != "A compact body" {
-		t.Fatalf("content = %q, want plain-text body", got)
-	}
-	if got := decodeStringField(t, payload, "time"); got != receivedAt.In(location).Format(time.RFC3339) {
-		t.Fatalf("time = %q, want %q", got, receivedAt.In(location).Format(time.RFC3339))
+	if got := decodeStringField(t, data, "sent_at"); got != sentAt.In(location).Format(time.RFC3339) {
+		t.Fatalf("sent_at = %q, want %q", got, sentAt.In(location).Format(time.RFC3339))
 	}
 	for _, forbidden := range []string{mailboxes.aliasB.Address, "B private body", "A newest subject", "<p>A compact body</p>"} {
 		if strings.Contains(response.Body.String(), forbidden) {
@@ -81,6 +81,7 @@ func TestRecentMailDirectLinkExtractsPlainTextFromHTMLBody(t *testing.T) {
 	mailboxes := env.createMailboxFixture(t)
 	now := time.Now().UTC().Truncate(time.Second)
 	env.server.now = func() time.Time { return now }
+	env.server.cfg.Timezone = time.UTC
 	setAliasSyncedAt(t, env, mailboxes.aliasA, now)
 	env.upsertMessage(t, domain.LatestMessage{
 		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
@@ -102,21 +103,21 @@ func TestRecentMailDirectLinkExtractsPlainTextFromHTMLBody(t *testing.T) {
 	if response.Code != http.StatusOK {
 		t.Fatalf("recent mail status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
 	}
-	var payload map[string]json.RawMessage
-	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("decode compact response: %v", err)
-	}
+	data := decodeRecentMailData(t, response)
 	wanted := "您的临时 ChatGPT 登录代码 739638 请勿与他人分享 & 使用。"
-	content := decodeStringField(t, payload, "content")
-	if content != wanted {
-		t.Fatalf("content = %q, want extracted plain text %q", content, wanted)
+	snippet := decodeStringField(t, data, "snippet")
+	if snippet != wanted {
+		t.Fatalf("snippet = %q, want extracted plain text %q", snippet, wanted)
 	}
-	if strings.ContainsAny(content, "\r\n") {
-		t.Fatalf("content contains line breaks: %q", content)
+	if got := decodeStringField(t, data, "sent_at"); got != now.Add(-time.Minute).Format(time.RFC3339) {
+		t.Fatalf("sent_at fallback = %q, want IMAP receive time %q", got, now.Add(-time.Minute).Format(time.RFC3339))
+	}
+	if strings.ContainsAny(snippet, "\r\n") {
+		t.Fatalf("snippet contains line breaks: %q", snippet)
 	}
 	for _, forbidden := range []string{"<html", "<style", "color: red", "window.secret", "Ignored email title"} {
-		if strings.Contains(content, forbidden) {
-			t.Fatalf("plain-text content contains HTML metadata %q: %q", forbidden, content)
+		if strings.Contains(snippet, forbidden) {
+			t.Fatalf("plain-text snippet contains HTML metadata %q: %q", forbidden, snippet)
 		}
 	}
 }
@@ -390,6 +391,29 @@ func directMailRequest(t *testing.T, env *httpTestEnv, query url.Values) *httpte
 		target += "?" + encoded
 	}
 	return env.request(t, http.MethodGet, target, nil, nil)
+}
+
+func decodeRecentMailData(t *testing.T, response *httptest.ResponseRecorder) map[string]json.RawMessage {
+	t.Helper()
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode recent mail response: %v", err)
+	}
+	if len(envelope) != 1 {
+		t.Fatalf("recent mail response fields = %v, want exactly data", envelope)
+	}
+	rawData, ok := envelope["data"]
+	if !ok {
+		t.Fatalf("recent mail response omitted data: %v", envelope)
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(rawData, &data); err != nil {
+		t.Fatalf("decode recent mail data: %v", err)
+	}
+	if len(data) != 4 {
+		t.Fatalf("recent mail data fields = %v, want exactly address/subject/snippet/sent_at", data)
+	}
+	return data
 }
 
 func setAliasSyncedAt(t *testing.T, env *httpTestEnv, alias domain.Alias, syncedAt time.Time) {

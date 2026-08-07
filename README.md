@@ -12,7 +12,7 @@ iCloud 主号（一个 IMAP 连接）
 ```
 
 - 一个主号可以绑定多个隐私邮箱；隐私邮箱收到的邮件应已由 Apple 转发到这个主号的 `INBOX`。
-- API 请求不接收邮箱地址参数。服务从 Bearer Header 或紧凑接口的 `api_key` 查询参数取得 Key，做哈希匹配后读取与该 Key 绑定的唯一隐私邮箱，因此 Key A 无权指定或读取邮箱 B。
+- 收件 API 请求不接收邮箱地址参数。服务从 Bearer Header 或紧凑接口的 `api_key` 查询参数取得 Key，做哈希匹配后读取与该 Key 绑定的唯一隐私邮箱，因此 Key A 无权指定或读取邮箱 B。外部登记接口使用独立的 OAuth Bearer 令牌，并接收待登记隐私邮箱和所属主号邮箱。
 - 每个隐私邮箱只保存一条最新邮件快照。同步到更新邮件时，旧快照会被替换；本项目不是邮件归档系统。
 - 新建或轮换 Key 时，完整 Key 只在后台显示一次。数据库只保存 Key 哈希和用于辨认的前缀。
 - 禁用主号或隐私邮箱后，对应 Key 立即失效；轮换 Key 后旧 Key 立即失效。
@@ -36,15 +36,21 @@ iCloud IMAP 不应使用 Apple 账户登录密码。先确认 Apple 账户已启
 3. 为本服务生成一个新的 App 专用密码，并妥善记录。
 4. 以后停止使用本服务或怀疑凭据泄露时，在同一页面撤销该密码。
 
-App 专用密码只用于后台的 IMAP 密码字段。IMAP 连接固定使用 `imap.mail.me.com:993` 和 TLS，IMAP 用户名通常是完整的 iCloud 主号邮箱地址。
+App 专用密码只用于后台的 IMAP 密码字段。邮件正文、文件夹和已读/收件状态始终通过 `imap.mail.me.com:993` 和 TLS 获取，IMAP 用户名通常是完整的 iCloud 主号邮箱地址。Apple 账户密码不会代替 App 专用密码访问邮件。
 
-### 2. 确认隐私邮箱归属
+### 2. 同步已有隐私邮箱目录
 
-本服务不会通过 Apple 接口创建“隐藏邮件地址”。请先在 Apple/iCloud 中创建并启用隐私邮箱，确认其邮件转发到准备登记的主号，然后在本服务后台逐个登记这些地址。一个隐私邮箱只能登记一次，也只能归属于一个主号。
+App 专用密码只开放 IMAP 邮件访问，不能读取 Apple 账户中已有的完整“隐藏邮件地址”目录。要自动导入该目录，请在主号详情页点击“同步隐私邮箱”，首次连接时填写 Apple ID、Apple 账户密码，并按提示输入 6 位双重认证验证码。Apple 账户密码和验证码只用于建立受信任的 Apple Web 会话，不写入数据库；服务仅使用主密钥加密保存会话材料。会话过期后需要重新登录。
+
+目录同步读取 Apple `premiummailsettings` 服务的 `/v2/hme/list` 完整列表，不会扫描收件箱，也不会只导入曾经收到过邮件的地址。服务会保留列表中的启用和停用地址，并只导入 `forwardToEmail` 与当前主号邮箱匹配的条目；不匹配的条目会被过滤。超过本地启用容量的地址仍会导入，但初始标记为 `disabled`。每个新导入地址都会生成只显示一次的独立邮件 API Key，已有地址保持原 Key、本地启停状态和邮件快照。
+
+### 3. 确认隐私邮箱归属
+
+本服务不会通过 Apple 接口创建“隐藏邮件地址”。请先在 Apple/iCloud 中创建并启用隐私邮箱，确认其邮件转发到准备登记的主号，然后在本服务后台或通过外部登记接口逐个登记这些地址。一个隐私邮箱只能登记一次，也只能归属于一个主号。
 
 ## 使用 Docker Compose 启动
 
-Compose 只启动一个 `icloud-api` 容器。根 Dockerfile 会先用 Node 构建 Vue 管理端，再编译 Go 服务，并把两者一起放入最终镜像；运行时只有一个 Go 进程、一个端口，由 Go 同时提供 Vue 静态资源、JSON API、SQLite 和 IMAP 同步。容器使用非 root 用户和只读根文件系统，SQLite 数据继续保存在原来的 `icloud_api_data` 持久化卷中。凭据主密钥必须通过环境变量单独提供，并与数据卷分离。项目不依赖 Nginx、Redis 或 PostgreSQL。
+Compose 只启动一个 `icloud-api` 容器。根 Dockerfile 会先用 Node 构建 Vue 管理端，再编译 Go 服务，并把两者一起放入最终镜像；运行时只有一个 Go 进程、一个端口，由 Go 同时提供 Vue 静态资源、JSON API、SQLite 和 IMAP 同步。容器使用非 root 用户和只读根文件系统，SQLite 数据继续保存在原来的 `icloud_api_data` 持久化卷中。凭据主密钥和外部接口 OAuth 令牌必须通过环境变量单独提供，并与数据卷分离。项目不依赖 Nginx、Redis 或 PostgreSQL。
 
 在项目目录创建本机专用的 `.env`：
 
@@ -52,6 +58,7 @@ Compose 只启动一个 `icloud-api` 容器。根 Dockerfile 会先用 Node 构�
 ICLOUD_API_ADMIN_USER=admin
 ICLOUD_API_ADMIN_PASSWORD=请替换为至少12位的高强度密码
 ICLOUD_API_MASTER_KEY=请粘贴32字节Base64主密钥
+ICLOUD_API_OAUTH_TOKEN=请替换为32至4096个无空白字符的随机令牌
 ICLOUD_API_PORT=8080
 ICLOUD_API_COOKIE_SECURE=false
 # 单个主号一整轮同步的总时限，至少为单次 IMAP 操作超时的两倍
@@ -61,9 +68,9 @@ TZ=Asia/Shanghai
 
 从旧版本升级时，如果现有 `.env` 曾把 `ICLOUD_API_SYNC_TIMEOUT` 设为 `10s`，请在重新构建或重启容器前先改为 `2m`。新版本会拒绝启动同步总时限不足单次 IMAP 操作时限两倍的配置，避免服务启动后所有同步都稳定超时。
 
-可用 `go run ./cmd/icloud-api keygen` 或 `openssl rand -base64 32` 生成主密钥并填入 `.env`。Compose 将 `ICLOUD_API_MASTER_KEY` 作为必填项，应用直接从环境变量读取它，不会把主密钥生成或写入 `/app/data`。重启、迁移和恢复时必须注入原来的同一把密钥。
+可用 `go run ./cmd/icloud-api keygen` 或 `openssl rand -base64 32` 生成主密钥并填入 `.env`。OAuth 令牌应独立生成，例如执行 `openssl rand -base64 32`，并将输出填入 `ICLOUD_API_OAUTH_TOKEN`；令牌必须包含 32 至 4096 个字符且不得包含空白，不要与管理员密码、主密钥或邮件 API Key 复用。Compose 将 `ICLOUD_API_MASTER_KEY`、`ICLOUD_API_ADMIN_PASSWORD` 和 `ICLOUD_API_OAUTH_TOKEN` 作为必填项。应用不会把这些值生成或写入 `/app/data`；重启、迁移和恢复时必须继续注入原来的主密钥。
 
-`.env` 包含登录凭据和主密钥，不要提交到版本库，也不要放入镜像。生产环境优先通过部署平台的 Secret 机制注入主密钥。若经由 HTTPS 反向代理对外提供后台，请把 `ICLOUD_API_COOKIE_SECURE` 设为 `true`。
+`.env` 包含登录凭据、OAuth 令牌和主密钥，不要提交到版本库，也不要放入镜像。生产环境优先通过部署平台的 Secret 机制注入这些值。若经由 HTTPS 反向代理对外提供后台，请把 `ICLOUD_API_COOKIE_SECURE` 设为 `true`。
 
 构建并启动：
 
@@ -115,6 +122,7 @@ docker compose logs -f icloud-api
 export ICLOUD_API_ADMIN_USER=admin
 export ICLOUD_API_ADMIN_PASSWORD='请替换为至少12位的高强度密码'
 export ICLOUD_API_MASTER_KEY='请粘贴32字节Base64主密钥'
+export ICLOUD_API_OAUTH_TOKEN='请替换为32至4096个无空白字符的随机令牌'
 export ICLOUD_API_ADDR=127.0.0.1:8080
 go run ./cmd/icloud-api
 ```
@@ -159,6 +167,7 @@ Go 时长使用 `10s`、`1m`、`8h` 这类格式；正文大小使用字节数�
 | `ICLOUD_API_MASTER_KEY` | 空 | 32 字节 Base64 或十六进制主密钥；Compose 部署必填，设置后优先于文件 |
 | `ICLOUD_API_ADMIN_USER` | `admin` | 首次初始化或显式 `admin reset` 时使用的管理员用户名 |
 | `ICLOUD_API_ADMIN_PASSWORD` | 空 | 首次初始化或显式 `admin reset` 时使用的管理员密码，长度为 12 到 72 字节；Compose 部署必填 |
+| `ICLOUD_API_OAUTH_TOKEN` | 空 | 外部登记接口使用的 OAuth Bearer 令牌，长度为 32 至 4096 个字符且不得包含空白；Compose 部署必填，不得与其他凭据复用 |
 | `ICLOUD_API_COOKIE_SECURE` | `false` | 是否只允许浏览器通过 HTTPS 发送后台会话 Cookie |
 | `ICLOUD_API_SESSION_TTL` | `8h` | 后台登录会话有效期 |
 | `ICLOUD_API_POLL_INTERVAL` | `1m` | IMAP 轮询间隔，最短 `10s` |
@@ -171,7 +180,7 @@ Go 时长使用 `10s`、`1m`、`8h` 这类格式；正文大小使用字节数�
 | `ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS` | `false` | 是否在缺少投递头时允许用 `To`/`Cc` 归属邮件；详见安全事项 |
 | `ICLOUD_API_TRUSTED_PROXIES` | 空（Compose 默认使用私有网段） | 逗号分隔的受信反向代理 IP/CIDR；Compose 端口仅发布到宿主回环地址，默认信任 Docker bridge 可能使用的 RFC 1918 地址，已知实际网关或 CIDR 时应收紧 |
 | `GIN_MODE` | `release` | Gin 运行模式 |
-| `TZ` | 系统时区 | `/api/v1/mail/recent` 的时间时区；须为 Go 可加载的 IANA、`UTC` 或 `Local` 时区名称，否则服务拒绝启动；紧凑接口按该时区返回带偏移的 RFC 3339，`/api/v1/mail/latest` 仍返回 RFC 3339/UTC；管理端 SPA 的时间显示取浏览器本地时区 |
+| `TZ` | 系统时区 | `/api/v1/mail/recent` 的 `data.sent_at` 时区；须为 Go 可加载的 IANA、`UTC` 或 `Local` 时区名称，否则服务拒绝启动；紧凑接口按该时区返回带偏移的 RFC 3339，`/api/v1/mail/latest` 仍返回 RFC 3339/UTC；管理端 SPA 的时间显示取浏览器本地时区 |
 
 主密钥也可以用内置命令生成：
 
@@ -179,22 +188,66 @@ Go 时长使用 `10s`、`1m`、`8h` 这类格式；正文大小使用字节数�
 go run ./cmd/icloud-api keygen
 ```
 
-数据库中的 IMAP App 专用密码使用主密钥进行 AES-GCM 加密；管理端可复制的邮件 API 直达链接凭据也由主密钥签名。主密钥一旦丢失，现有 IMAP 密文将失去解密条件，已经复制的派生直达链接也会失效。Compose 数据卷不保存主密钥，必须从 Secret 管理系统或受保护的 `.env` 单独备份，并与对应数据库组成同一份恢复集。
+数据库中的 IMAP App 专用密码和受信任 Apple Web 会话使用彼此隔离的主密钥上下文进行 AES-GCM 加密；管理端可复制的邮件 API 直达链接凭据也由主密钥签名。Apple 账户密码和 6 位验证码不落库。主密钥一旦丢失，现有 IMAP 密文和 Apple 会话将失去解密条件，已经复制的派生直达链接也会失效。Compose 数据卷不保存主密钥，必须从 Secret 管理系统或受保护的 `.env` 单独备份，并与对应数据库组成同一份恢复集。
 
 ## 后台操作
 
 1. 打开 `/admin/login`，使用首次启动时配置的管理员账户登录。
 2. 添加主号，填写名称、iCloud 主号邮箱、IMAP 用户名和 App 专用密码。
-3. 进入主号详情页，添加所有归属于该主号的隐私邮箱地址。每次创建都会生成一个独立 API Key，请立即保存。
-4. 使用“立即同步”检查 IMAP 连接和收件状态；后台也会按轮询间隔自动同步所有已启用主号。
-5. 在主号详情或全部隐私邮箱页面查看归属、状态和最近收件时间，并从操作列复制邮件 API 直达链接。需要时可以停用、删除或轮换 Key。
-6. 在操作记录页面检查登录、配置变更、同步和 Key 轮换记录。
+3. 进入主号详情页点击“同步隐私邮箱”。首次连接使用 Apple 账户密码和 6 位双重认证建立受信任会话，随后从 Apple 账户的完整目录批量导入该主号的隐私邮箱；也可以继续手动逐个登记。
+4. 立即保存本次新导入地址的一次性 API Key；离开结果页后服务端无法恢复原始 Key。
+5. 使用“同步邮件”检查 IMAP 连接和收件状态；后台也会按轮询间隔自动同步所有已启用主号。
+6. 在主号详情或全部隐私邮箱页面查看归属、状态和最近收件时间，并从操作列复制邮件 API 直达链接。需要时可以停用、删除或轮换 Key。
+7. 在操作记录页面检查登录、配置变更、目录同步、邮件同步和 Key 轮换记录。
 
 主号列表、主号详情和隐私邮箱列表会在页面可见时每 5 秒静默读取最新同步状态与时间；切换到其他标签页时暂停，返回页面或窗口重新获得焦点时立即刷新。旧版回退管理页使用相同的刷新规则。
 
 轮换 Key 会直接吊销旧 Key。Vue 管理端只会在创建或轮换 Key 的结果中显示一次完整 API Key；离开结果页后无法从数据库重建，因为数据库不保存原始 Key。未保存原始 Key 时需要再次轮换。
 
 邮件 API 直达链接不需要保存原始 Key：服务端会为管理端生成一个仅用于紧凑链接接口的派生凭据，并在主号详情和全部隐私邮箱列表的操作列提供复制按钮。派生凭据不写入数据库，也不能用于 Bearer 接口；它与当前 API Key 状态绑定，轮换 Key 会同时吊销此前复制的直达链接。
+
+## 外部登记接口
+
+外部系统可通过 `POST /api/v1/aliases` 把一个**已在 Apple/iCloud 中创建并启用**的隐私邮箱登记到现有主号。本接口只登记地址，不会调用 Apple 创建隐私邮箱。请求头必须携带部署时配置的独立 OAuth 令牌：
+
+```http
+POST /api/v1/aliases
+Authorization: Bearer <ICLOUD_API_OAUTH_TOKEN>
+Content-Type: application/x-www-form-urlencoded
+
+add_hide_my_eamil=alias%40icloud.com&icloud=primary%40icloud.com
+```
+
+字段名 `add_hide_my_eamil` 为外部兼容契约中的既有拼写，必须按此拼写发送；其值是待登记的隐私邮箱。`icloud` 是该隐私邮箱所属、且已在管理端登记的 iCloud 主号邮箱。隐私邮箱不能与任何已登记主号邮箱或所选主号的 IMAP 用户名相同。推荐把两个字段放在 `application/x-www-form-urlencoded` 正文中：
+
+```bash
+curl --fail-with-body \
+  -X POST \
+  -H "Authorization: Bearer ${ICLOUD_API_OAUTH_TOKEN}" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode 'add_hide_my_eamil=alias@icloud.com' \
+  --data-urlencode 'icloud=primary@icloud.com' \
+  https://mail.example.com/api/v1/aliases
+```
+
+为兼容已有调用方，也可把参数放在 URL 查询串中，例如 `POST /api/v1/aliases?add_hide_my_eamil=alias%40icloud.com&icloud=primary%40icloud.com`。查询串会暴露邮箱到代理日志、监控和浏览器历史，因此只建议作为兼容方式使用。每个字段在查询串与正文合计必须恰好出现一次；不要同时在两处传同一字段，也不要发送未知字段。只要请求带有正文，`Content-Type` 就必须是 `application/x-www-form-urlencoded`。
+
+成功时返回 `201 Created`。`api_key` 是新隐私邮箱仅显示一次的原始邮件 API Key；`mail_api_direct_link` 是同源相对路径，查询参数使用服务端派生的直达凭据，而不是把原始 `api_key` 直接拼入 URL：
+
+```json
+{
+  "data": {
+    "alias": "alias@icloud.com",
+    "icloud": "primary@icloud.com",
+    "api_key": "icm_REPLACE_WITH_GENERATED_ALIAS_KEY",
+    "mail_api_direct_link": "/api/v1/mail/recent?api_key=icm_REPLACE_WITH_DERIVED_TOKEN"
+  }
+}
+```
+
+新登记的地址初始同步状态为 `pending`，直达链接会在下一轮同步确认该地址状态后按收件 API 规则返回邮件；同步确认前会返回 `503 SYNC_UNAVAILABLE`。
+
+所有响应均包含 `Cache-Control: no-store`。接口可能返回 `400`（字段缺失、重复、未知、邮箱格式错误或地址与主号身份冲突）、`401`（OAuth Bearer 令牌缺失或无效）、`404`（主号不存在）、`409`（隐私邮箱已登记或主号已达地址上限）、`413`（URL 编码参数合计超过 4 KiB）、`415`（正文媒体类型错误）、`429`（请求过于频繁）、`500`（邮件 API Key 或直达凭据生成异常）或 `503`（数据库暂不可用）。响应中的 `api_key` 和直达链接都属于敏感凭据，应立即保存并只通过 HTTPS 传输。
 
 ## 收件 API
 
@@ -212,17 +265,20 @@ GET /api/v1/mail/recent?api_key=icm_<后台复制的43位RawBase64URL凭据>
 https://mail.example.com/api/v1/mail/recent?api_key=icm_REPLACE_WITH_ALIAS_KEY
 ```
 
-成功响应是没有额外信封层的紧凑 JSON 对象：
+成功响应是带 `data` 信封层的 JSON 对象：
 
 ```json
 {
-  "email": "example@icloud.com",
-  "content": "您的验证码是 123456",
-  "time": "2026-08-07T10:30:00+08:00"
+  "data": {
+    "address": "user@icloud.com",
+    "subject": "Your ChatGPT verification code",
+    "snippet": "Your code is 123456",
+    "sent_at": "2026-08-07T12:30:00+08:00"
+  }
 }
 ```
 
-`email` 是 Key 绑定的隐私邮箱；`content` 返回单行纯文本，优先使用邮件声明的纯文本正文，纯文本为空时从 HTML 正文中提取可读文字，并过滤结构标签、样式、脚本及常见的内联隐藏内容。两种来源中的换行、制表符和连续空白都会压缩成一个普通空格。内容可能因服务端邮件或正文大小上限而截断；`time` 是 IMAP 服务器记录的收件时间，按 `.env` 中 `TZ` 对应的时区格式化为 RFC 3339。上例使用 `TZ=Asia/Shanghai`，因此偏移为 `+08:00`。时区只改变显示形式，不改变“最近一小时”的绝对时间窗口。
+`address` 是 Key 绑定的隐私邮箱，`subject` 是邮件主题；`snippet` 返回单行纯文本，优先使用邮件声明的纯文本正文，纯文本为空时从 HTML 正文中提取可读文字，并过滤结构标签、样式、脚本及常见的内联隐藏内容。两种来源中的换行、制表符和连续空白都会压缩成一个普通空格。内容可能因服务端邮件或正文大小上限而截断；`sent_at` 优先使用邮件 `Date` 头，缺失或无效时回退到 IMAP 服务器记录的收件时间，并按 `.env` 中 `TZ` 对应的时区格式化为 RFC 3339。上例使用 `TZ=Asia/Shanghai`，因此偏移为 `+08:00`。时区只改变显示形式，不改变按 IMAP 收件时间计算的“最近一小时”绝对时间窗口。
 
 查询参数会进入浏览器历史，并可能被反向代理或外围监控记录、通过 Referer 泄露。本应用内置 HTTP 日志只记录 URL 路径，不记录查询字符串，但不能代替外围系统的脱敏配置。完整链接必须和 API Key 一样按密钥保护。能设置请求头的客户端应优先使用下面的 Bearer 接口；确实使用紧凑链接时，只能通过 HTTPS 传输，并应在代理层关闭或脱敏查询字符串日志，不要把链接发到工单、聊天、分析平台或第三方页面。怀疑链接泄露后立即在后台轮换 Key。
 
@@ -307,10 +363,11 @@ curl -fsS https://mail.example.com/healthz
 
 ## 轮询与“仅最新一条”语义
 
-- API 读取 SQLite 快照，不会在每次 API 调用时连接 iCloud；因此延迟通常为一个 `ICLOUD_API_POLL_INTERVAL`，外加 IMAP 网络耗时。
-- 每轮同步按主号建立一个只读 IMAP 连接，并处理这个主号下的所有已启用隐私邮箱。
+- 收件 API 读取 SQLite 快照，不会在每次 API 调用时连接 iCloud；因此延迟通常为一个 `ICLOUD_API_POLL_INTERVAL`，外加 IMAP 网络耗时。
+- 邮件正文、文件夹和已读/收件状态始终由 `imap.mail.me.com:993` 的只读 IMAP 连接获取；Apple Web 会话只用于读取隐私邮箱完整目录，不参与邮件收取。
+- 每轮邮件同步按主号建立一个只读 IMAP 连接，并处理这个主号下的所有已启用隐私邮箱。
 - 同步可用性按隐私邮箱独立判断：同一主号下一个地址状态未确认时，该地址返回 `503`；其他已确认地址仍可正常返回 `200` 或 `404`。
-- 服务从 iCloud 转发邮件中的候选投递收件头精确解析邮箱地址，不做字符串包含匹配；这些普通邮件头的可信程度取决于下文所述的 iCloud 转发行为。单个主号默认最多处理 256 个已启用隐私邮箱。
+- 服务从 iCloud 转发邮件中的候选投递收件头精确解析邮箱地址，不做字符串包含匹配；这些普通邮件头的可信程度取决于下文所述的 iCloud 转发行为。单个主号最多启用并处理 1000 个隐私邮箱；完整目录中超出此容量的新地址仍会导入，但标记为 `disabled`。
 - Apple 的 Hide My Email 转发邮件会额外带有 `X-ICLOUD-HME` 路由头（例如 `p=<隐私号>; f=<主号>; r=to`）。同步会单独解析并校验该头：`p` 必须出现在对应的 `To`/`Cc`，`f` 必须等于当前主号，且存在的 `Original-Recipient` 也必须与 `f` 一致；只有校验通过后才会按 `p` 归属隐私邮箱。`Original-Recipient` 指向主号是 Apple 的正常物理投递结果，不会覆盖 `p`。
 - 如果 iCloud 拒绝复合投递收件头搜索，同步会改用一次有界的最近消息序号扫描，并在本地解析投递收件头；完整获取扫描窗口后，窗口内确认命中的邮件仍可同步。若窗口未覆盖全邮箱且没有命中，或窗口响应本身不完整，则保持 `503`/`Unknown`，不会把不确定结果当成空邮箱清除旧快照。
 - SQLite 对每个隐私邮箱只保留一行最新邮件。新 UID 会替换旧 UID，旧邮件不会通过 API 查询；接口不会为了凑足一小时窗口而回退到次新邮件。
@@ -318,7 +375,7 @@ curl -fsS https://mail.example.com/healthz
 - `error` 表示最近同步没有确认该地址的最新状态。旧快照可能仍保存在内部，但 API 会返回 `503`，不会把它作为可用邮件返回。
 - `ok` 表示最近同步已明确找到最新邮件，或权威确认当前为空。在三个轮询周期的有效期内，完整 Bearer 接口有快照就返回 `200`、没有快照时返回 `404`；紧凑接口仅在最新快照的 IMAP 收件时间处于 `[当前时间-1小时, 当前时间]` 时返回 `200`，没有快照或快照不在该窗口时返回 `404`。最后同步时间晚于当前时间或结果超过有效期时，两个接口都返回 `503`。
 - 当前版本的成功响应中 `stale` 始终为 `false`。降级状态统一返回 `503`，不会返回带 `stale=true` 的旧快照。
-- 使用完整接口的客户端可保存 `message.id` 并定时重试；ID 未变化时不要重复处理。紧凑接口不返回 ID，调用方需要自行按 `email`、`time` 和内容去重。建议轮询频率低于服务端每分钟 120 次的 Key 限流。
+- 使用完整接口的客户端可保存 `message.id` 并定时重试；ID 未变化时不要重复处理。紧凑接口不返回 ID，调用方需要自行按 `address`、`sent_at` 和 `snippet` 去重。建议轮询频率低于服务端每分钟 120 次的 Key 限流。
 
 ## 备份与恢复
 
@@ -352,8 +409,8 @@ curl -fsS "http://${APP_ADDR}/healthz"
 ## 安全事项
 
 - 生产环境应放在 HTTPS 反向代理之后，并设置 `ICLOUD_API_COOKIE_SECURE=true`。限制后台来源 IP，不要直接把无 TLS 的管理端口暴露到公网。
-- `.env`、App 专用密码、完整 API Key、SQLite 数据和主密钥都属于敏感信息。限制文件/卷权限，不要写入代码、工单或普通访问日志。`/api/v1/mail/recent` 为支持直接访问而有意把 Key 放入 URL；应优先使用不在 URL 暴露 Key 的 `/api/v1/mail/latest`，使用紧凑链接时必须把整个 URL 视为密钥并对代理日志中的查询字符串做删除或脱敏。
-- 完整接口返回的 `html` 是未经清理的外部邮件内容，前端展示时必须做 HTML 清理或放入严格隔离的沙箱，禁止直接插入管理页面 DOM。紧凑接口回退到 HTML 正文时，`content` 只保留提取出的文本，不返回 HTML 的结构标签、样式或脚本。
+- `.env`、OAuth 令牌、App 专用密码、受信任 Apple Web 会话、完整 API Key、SQLite 数据和主密钥都属于敏感信息。限制文件/卷权限，不要写入代码、工单或普通访问日志。Apple 账户密码和双重认证验证码仅在连接流程中使用，不落库；会话过期后重新登录，不要尝试保存或复用验证码。外部登记接口必须通过 HTTPS 调用，怀疑 OAuth 令牌泄露后应立即轮换并重启服务。`/api/v1/mail/recent` 为支持直接访问而有意把 Key 放入 URL；应优先使用不在 URL 暴露 Key 的 `/api/v1/mail/latest`，使用紧凑链接时必须把整个 URL 视为密钥并对代理日志中的查询字符串做删除或脱敏。
+- 完整接口返回的 `html` 是未经清理的外部邮件内容，前端展示时必须做 HTML 清理或放入严格隔离的沙箱，禁止直接插入管理页面 DOM。紧凑接口回退到 HTML 正文时，`snippet` 只保留提取出的文本，不返回 HTML 的结构标签、样式或脚本。
 - 默认优先使用 `X-ICLOUD-HME` 以及 `Delivered-To`、`X-Original-To`、`Envelope-To` 等投递头判断邮件归属。这些都是普通邮件头，本身没有密码学可信性；HME 路由头也必须经过上面的主号、可见收件人和物理投递收件人交叉校验。归属隔离仍依赖 iCloud 在实际 Hide My Email 转发链路中注入可识别的隐私邮箱投递标记，并清洗或隔离发件人预置的同名头。
 - 上线前必须用真实 Hide My Email 原始邮件完成验收：既测试正常投递，也测试发件人预置同名 `Delivered-To`、`X-Original-To`、`Envelope-To` 等头的投递，确认 iCloud 最终保存的原始邮件仍能让服务唯一识别真实隐私邮箱。不同候选投递头指向不同地址时，服务会 fail-closed，将该地址视为未确认并返回 `503`，不会返回旧快照；如果 Apple 没有注入可识别标记且保留了单个伪造同名头，仍存在邮件误归属的残余风险。
 - `ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS` 默认为 `false`。有效的 `X-ICLOUD-HME` 路由不受这个开关影响；开关只会在缺少已配置投递标记时使用可由发件人影响的 `To`/`Cc`，会进一步降低隐私邮箱隔离强度。对已经被候选搜索发现、但 HME 头缺失、重复或校验失败的邮件，服务会保持 `Unknown`/`503`，不会回退到 `To` 误归属。只有在真实样本验收并明确接受该风险后才应启用。

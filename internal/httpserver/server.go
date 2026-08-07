@@ -24,19 +24,29 @@ import (
 var webAssets embed.FS
 
 type Server struct {
-	store       *store.Store
-	cipher      *secure.Cipher
-	cfg         config.Config
-	logger      *slog.Logger
-	now         func() time.Time
-	sync        func(int64) error
-	lockAccount func(context.Context, int64, func() error) error
-	adminSPA    *adminSPA
+	store                *store.Store
+	cipher               *secure.Cipher
+	cfg                  config.Config
+	logger               *slog.Logger
+	now                  func() time.Time
+	sync                 func(int64) error
+	hmeSync              HMESyncService
+	lockAccount          func(context.Context, int64, func() error) error
+	adminSPA             *adminSPA
+	oauthTokenHash       []byte
+	oauthTokenConfigured bool
 
 	loginLimiter        *windowLimiter
 	loginRequestLimiter *windowLimiter
 	apiLimiter          *windowLimiter
 	apiIPLimiter        *windowLimiter
+	externalAPILimiter  *windowLimiter
+}
+
+// SetHMESyncService configures Apple Hide My Email authentication and
+// directory synchronization. It must be called before Router starts serving.
+func (s *Server) SetHMESyncService(service HMESyncService) {
+	s.hmeSync = service
 }
 
 type adminSPA struct {
@@ -87,6 +97,12 @@ type PageData struct {
 }
 
 func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog.Logger, syncFn func(int64) error) (*Server, error) {
+	if st == nil {
+		return nil, fmt.Errorf("数据存储未配置")
+	}
+	if cipher == nil {
+		return nil, fmt.Errorf("凭据加密器未配置")
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -94,18 +110,24 @@ func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog
 	if err != nil {
 		return nil, err
 	}
+	oauthTokenConfigured := cfg.OAuthToken != ""
+	oauthTokenHash := secure.HashToken(cfg.OAuthToken)
+	cfg.OAuthToken = ""
 	return &Server{
-		store:               st,
-		cipher:              cipher,
-		cfg:                 cfg,
-		logger:              logger,
-		now:                 time.Now,
-		sync:                syncFn,
-		adminSPA:            spa,
-		loginLimiter:        newWindowLimiter(8, 10*time.Minute),
-		loginRequestLimiter: newWindowLimiter(60, time.Minute),
-		apiLimiter:          newWindowLimiter(120, time.Minute),
-		apiIPLimiter:        newWindowLimiter(300, time.Minute),
+		store:                st,
+		cipher:               cipher,
+		cfg:                  cfg,
+		logger:               logger,
+		now:                  time.Now,
+		sync:                 syncFn,
+		adminSPA:             spa,
+		oauthTokenHash:       oauthTokenHash,
+		oauthTokenConfigured: oauthTokenConfigured,
+		loginLimiter:         newWindowLimiter(8, 10*time.Minute),
+		loginRequestLimiter:  newWindowLimiter(60, time.Minute),
+		apiLimiter:           newWindowLimiter(120, time.Minute),
+		apiIPLimiter:         newWindowLimiter(300, time.Minute),
+		externalAPILimiter:   newWindowLimiter(300, time.Minute),
 	}, nil
 }
 
@@ -165,6 +187,9 @@ func (s *Server) Router() (*gin.Engine, error) {
 	recentAuth := s.apiKeyQueryAuth()
 	api.GET("/mail/recent", recentAuth, s.recentMail)
 	api.GET("/mail/recent/", recentAuth, s.recentMail)
+	externalAuth := s.oauthTokenAuth()
+	api.POST("/aliases", externalAuth, s.createExternalAlias)
+	api.POST("/aliases/", externalAuth, s.createExternalAlias)
 
 	adminAPI := router.Group("/admin/api/v1")
 	s.registerAdminAPIRoutes(adminAPI)

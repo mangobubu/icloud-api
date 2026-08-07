@@ -207,6 +207,25 @@ func TestListMetadataAndCascade(t *testing.T) {
 	}
 }
 
+func TestGetAccountByEmailNormalizesInput(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestStore(t)
+	want := createAccount(t, ctx, db, "Primary", "primary@icloud.com")
+
+	got, err := db.GetAccountByEmail(ctx, "  PrImArY@IcLoUd.CoM  ")
+	if err != nil {
+		t.Fatalf("get account by normalized email: %v", err)
+	}
+	if got.ID != want.ID || got.Email != want.Email {
+		t.Fatalf("account by email = %#v, want ID %d and email %q", got, want.ID, want.Email)
+	}
+
+	if _, err := db.GetAccountByEmail(ctx, "missing@icloud.com"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("missing account error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestSetAliasEnabledClearsSnapshotWhenReenabled(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

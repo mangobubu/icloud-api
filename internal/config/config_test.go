@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ var configEnvironment = []string{
 	"ICLOUD_API_DB",
 	"ICLOUD_API_WEB_ROOT",
 	"ICLOUD_API_MASTER_KEY_FILE",
+	"ICLOUD_API_OAUTH_TOKEN",
 	"ICLOUD_API_ADMIN_USER",
 	"ICLOUD_API_ADMIN_PASSWORD",
 	"ICLOUD_API_COOKIE_SECURE",
@@ -26,6 +28,31 @@ var configEnvironment = []string{
 	"ICLOUD_API_TRUSTED_PROXIES",
 	"GIN_MODE",
 	"TZ",
+}
+
+func TestOAuthTokenConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_OAUTH_TOKEN", "  0123456789abcdef0123456789abcdef  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OAuthToken != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("OAuth 令牌 = %q, want 已去除首尾空白的配置值", cfg.OAuthToken)
+	}
+}
+
+func TestOAuthTokenLengthValidation(t *testing.T) {
+	for _, value := range []string{"too-short", strings.Repeat("x", 4097), strings.Repeat("x", 31) + " " + strings.Repeat("y", 31)} {
+		t.Run(fmt.Sprintf("length_%d", len(value)), func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_OAUTH_TOKEN", value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_OAUTH_TOKEN") {
+				t.Fatalf("ICLOUD_API_OAUTH_TOKEN 长度错误 = %v", err)
+			}
+		})
+	}
 }
 
 func TestWebRootOverride(t *testing.T) {

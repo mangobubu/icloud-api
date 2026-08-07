@@ -88,6 +88,31 @@ export function normalizeAlias(raw = {}) {
   };
 }
 
+export function normalizeAppleSession(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+  return {
+    status:
+      firstDefined(raw, "status", "Status", "auth_state", "authState", "AuthState") ||
+      (firstDefined(raw, "authenticated", "Authenticated")
+        ? "authenticated"
+        : ""),
+    appleId:
+      firstDefined(raw, "apple_id", "appleId", "AppleID") || "",
+    region: firstDefined(raw, "region", "Region") || "global",
+    authenticatedAt:
+      firstDefined(
+        raw,
+        "authenticated_at",
+        "authenticatedAt",
+        "AuthenticatedAt",
+      ) || null,
+    expiresAt:
+      firstDefined(raw, "expires_at", "expiresAt", "ExpiresAt") || null,
+  };
+}
+
 export function normalizeAuditLog(raw = {}) {
   return {
     id: firstDefined(raw, "id", "ID"),
@@ -161,6 +186,9 @@ function normalizeAccountDetail(data = {}) {
   return {
     account: normalizeAccount(accountRaw),
     aliases: listFrom(data, "aliases").map(normalizeAlias),
+    appleSession: normalizeAppleSession(
+      firstDefined(data, "apple_session", "appleSession", "AppleSession"),
+    ),
   };
 }
 
@@ -195,6 +223,154 @@ export async function syncAccount(id, csrfToken) {
     csrfToken,
   });
   return normalizeAccountDetail(data);
+}
+
+function appleSessionResult(data = {}) {
+  const appleSession = normalizeAppleSession(
+    firstDefined(data, "apple_session", "appleSession", "AppleSession"),
+  );
+  return {
+    status:
+      firstDefined(data, "status", "Status") || appleSession?.status || "",
+    appleSession,
+    flow: firstDefined(data, "flow", "Flow") || "",
+    challengeId:
+      firstDefined(data, "challenge_id", "challengeId", "ChallengeID") || "",
+  };
+}
+
+export async function loginAppleSession(accountId, payload, csrfToken) {
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/apple-auth`,
+    {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    },
+  );
+  return appleSessionResult(data);
+}
+
+export async function verifyAppleSession(accountId, payload, csrfToken) {
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/apple-auth/verify`,
+    {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    },
+  );
+  return appleSessionResult(data);
+}
+
+export function deleteAppleSession(accountId, csrfToken) {
+  return apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/apple-auth`,
+    {
+      method: "DELETE",
+      csrfToken,
+    },
+  );
+}
+
+function normalizeSyncSummary(raw = {}) {
+  return {
+    total:
+      Number(firstDefined(raw, "total", "Total", "discovered", "Discovered")) ||
+      0,
+    createdCount:
+      Number(
+        firstDefined(
+          raw,
+          "created_count",
+          "createdCount",
+          "CreatedCount",
+          "created",
+          "Created",
+        ),
+      ) ||
+      0,
+    existingCount:
+      Number(
+        firstDefined(
+          raw,
+          "existing_count",
+          "existingCount",
+          "ExistingCount",
+          "existing",
+          "Existing",
+        ),
+      ) || 0,
+    inactiveCount:
+      Number(
+        firstDefined(
+          raw,
+          "inactive_count",
+          "inactiveCount",
+          "InactiveCount",
+          "inactive",
+          "Inactive",
+        ),
+      ) || 0,
+    importedDisabledCount:
+      Number(
+        firstDefined(
+          raw,
+          "imported_disabled_count",
+          "importedDisabledCount",
+          "ImportedDisabledCount",
+          "imported_disabled",
+          "ImportedDisabled",
+          "filtered_out_count",
+          "filteredOutCount",
+          "FilteredOutCount",
+        ),
+      ) || 0,
+    conflictCount:
+      Number(
+        firstDefined(
+          raw,
+          "conflict_count",
+          "conflictCount",
+          "ConflictCount",
+          "conflicts",
+          "Conflicts",
+        ),
+      ) || 0,
+  };
+}
+
+function normalizeCreatedAlias(raw = {}) {
+  const aliasRaw = firstDefined(raw, "alias", "Alias") || {};
+  return {
+    alias: normalizeAlias(
+      typeof aliasRaw === "string" ? { address: aliasRaw } : aliasRaw,
+    ),
+    apiKey: firstDefined(raw, "api_key", "apiKey", "APIKey") || "",
+    mailApiDirectLink:
+      firstDefined(
+        raw,
+        "mail_api_direct_link",
+        "mailApiDirectLink",
+        "MailAPIDirectLink",
+      ) || "",
+  };
+}
+
+export async function syncAccountAliases(accountId, csrfToken) {
+  const data =
+    (await apiRequest(
+      `/accounts/${encodeURIComponent(accountId)}/aliases/sync`,
+      {
+        method: "POST",
+        csrfToken,
+      },
+    )) || {};
+  return {
+    ...normalizeAccountDetail(data),
+    summary: normalizeSyncSummary(data.summary),
+    created: listFrom(data, "created").map(normalizeCreatedAlias),
+  };
 }
 
 function aliasMutationResult(data = {}) {

@@ -632,6 +632,137 @@ code {
   margin-bottom: 1px;
 }
 
+.apple-session-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 42px;
+  gap: 14px;
+  padding: 8px 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.apple-session-strip__identity,
+.apple-session-strip__summary,
+.dialog-actions,
+.batch-secret-copy {
+  display: flex;
+  align-items: center;
+}
+
+.apple-session-strip__identity {
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.apple-session-strip__summary {
+  min-width: 0;
+  justify-content: flex-end;
+  text-align: right;
+}
+
+.dialog-form {
+  display: grid;
+  gap: 2px;
+  padding-top: 4px;
+}
+
+.dialog-form .el-form-item:last-child {
+  margin-bottom: 0;
+}
+
+.dialog-form__lead {
+  margin-bottom: 14px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.apple-auth-dialog .request-alert {
+  margin-bottom: 18px;
+}
+
+.dialog-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.dialog-actions--spread {
+  justify-content: space-between;
+}
+
+.batch-secrets-dialog .el-dialog__body {
+  display: grid;
+  gap: 16px;
+  max-height: calc(100vh - 180px);
+  max-height: calc(100dvh - 180px);
+  overflow: auto;
+}
+
+.sync-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+
+.sync-summary-grid > div {
+  min-width: 0;
+  padding: 10px 12px;
+  text-align: center;
+  background: var(--surface);
+}
+
+.sync-summary-grid dt {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.sync-summary-grid dd {
+  margin-top: 3px;
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.batch-secret-table {
+  overflow: auto;
+}
+
+.batch-secret-value {
+  overflow-wrap: anywhere;
+}
+
+.batch-secret-copy {
+  min-width: 0;
+  gap: 8px;
+}
+
+.batch-secret-copy code {
+  display: block;
+  min-width: 0;
+  flex: 1;
+  padding: 7px 8px;
+  overflow: auto hidden;
+  color: #26323c;
+  white-space: nowrap;
+  background: #f4f6f7;
+  border: 1px solid #e1e5e8;
+  border-radius: 4px;
+}
+
+.batch-secret-copy .el-button {
+  flex: 0 0 auto;
+}
+
 .danger-zone {
   display: flex;
   align-items: center;
@@ -1100,6 +1231,29 @@ code {
 
   .section-header__actions > .el-button:not(.is-circle) {
     flex: 1;
+  }
+
+  .apple-session-strip {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .apple-session-strip__summary {
+    justify-content: flex-start;
+    text-align: left;
+  }
+
+  .sync-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dialog-actions--spread {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .dialog-actions--spread > .el-button {
+    width: 100%;
   }
 
   .form-panel {
