@@ -46,6 +46,7 @@ var (
 type imapSession interface {
 	Login(username, password string) error
 	Select(name string, readOnly bool) (*imap.MailboxStatus, error)
+	Fetch(seqset *imap.SeqSet, items []imap.FetchItem, ch chan *imap.Message) error
 	UidSearch(criteria *imap.SearchCriteria) ([]uint32, error)
 	UidFetch(seqset *imap.SeqSet, items []imap.FetchItem, ch chan *imap.Message) error
 	Logout() error
@@ -152,7 +153,9 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 	if mailbox == nil {
 		return nil, errors.New("select INBOX read-only: empty mailbox status")
 	}
-	if mailbox.UidValidity == 0 {
+	uidValidity := mailbox.UidValidity
+	messagesCount := mailbox.Messages
+	if uidValidity == 0 {
 		return nil, errors.New("select INBOX read-only: UIDVALIDITY is zero")
 	}
 	if len(aliasAddresses) == 0 {
@@ -169,7 +172,7 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 		for _, aliasID := range aliasIDs {
 			result[aliasID] = domain.LatestMessage{
 				AliasID:       aliasID,
-				UIDValidity:   mailbox.UidValidity,
+				UIDValidity:   uidValidity,
 				SyncedAt:      syncedAt,
 				SnapshotState: domain.SnapshotUnknown,
 			}
@@ -179,6 +182,7 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 	uidLists := make([][]uint32, 0, len(searchAddresses))
 	aliasCandidateUIDs := make(map[int64][]uint32, len(result))
 	aliasCandidatesTruncated := make(map[int64]bool, len(result))
+	var recipientSearchErr error
 	for _, aliasAddress := range searchAddresses {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -188,7 +192,8 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr
 			}
-			return nil, fmt.Errorf("search alias recipients: %w", searchErr)
+			recipientSearchErr = searchErr
+			break
 		}
 		newest, candidatesTruncated := newestUIDs(uids, settings.maxCandidatesPerAlias)
 		uidLists = append(uidLists, newest)
@@ -201,6 +206,41 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 				empty := result[aliasID]
 				empty.SnapshotState = domain.SnapshotEmpty
 				result[aliasID] = empty
+			}
+		}
+	}
+	if recipientSearchErr != nil {
+		fallbackUIDs, fallbackIncomplete, fallbackErr := fallbackRecipientCandidateUIDs(
+			ctx,
+			session,
+			messagesCount,
+			settings.maxCandidates,
+		)
+		if fallbackErr != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, fmt.Errorf(
+				"search alias recipients: %w; scan recent UID candidates: %w",
+				recipientSearchErr,
+				fallbackErr,
+			)
+		}
+
+		uidLists = make([][]uint32, 0, len(searchAddresses))
+		aliasCandidateUIDs = make(map[int64][]uint32, len(result))
+		aliasCandidatesTruncated = make(map[int64]bool, len(result))
+		for _, aliasAddress := range searchAddresses {
+			uidLists = append(uidLists, fallbackUIDs)
+			for _, aliasID := range aliasAddresses[aliasAddress] {
+				aliasCandidateUIDs[aliasID] = fallbackUIDs
+				aliasCandidatesTruncated[aliasID] = fallbackIncomplete
+				snapshot := result[aliasID]
+				snapshot.SnapshotState = domain.SnapshotUnknown
+				if len(fallbackUIDs) == 0 && !fallbackIncomplete {
+					snapshot.SnapshotState = domain.SnapshotEmpty
+				}
+				result[aliasID] = snapshot
 			}
 		}
 	}
@@ -272,7 +312,7 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 		for _, aliasID := range uidToAliases[uid] {
 			result[aliasID] = domain.LatestMessage{
 				AliasID:       aliasID,
-				UIDValidity:   mailbox.UidValidity,
+				UIDValidity:   uidValidity,
 				UID:           uid,
 				MessageID:     parsed.messageID,
 				InternalDate:  fetched.internalDate,
@@ -450,6 +490,97 @@ func recipientSearchCriteria(address string, allowWeak bool) *imap.SearchCriteri
 		leaves = next
 	}
 	return leaves[0]
+}
+
+// fallbackRecipientCandidateUIDs avoids complex HEADER/OR searches that some
+// iCloud IMAP backends reject. It scans a bounded recent sequence range and
+// requests UIDs, leaving the existing local header classifier responsible for
+// mailbox ownership. Sequence numbers are used for the range because UIDs can
+// be sparse after messages are expunged.
+func fallbackRecipientCandidateUIDs(
+	ctx context.Context,
+	session imapSession,
+	messagesCount uint32,
+	limit int,
+) ([]uint32, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
+	if limit <= 0 {
+		return nil, true, errors.New("candidate limit must be positive")
+	}
+	if messagesCount == 0 {
+		return nil, false, nil
+	}
+
+	window := uint64(limit)
+	if window > uint64(messagesCount) {
+		window = uint64(messagesCount)
+	}
+	first := messagesCount - uint32(window) + 1
+	last := messagesCount
+	truncated := window < uint64(messagesCount)
+
+	set := new(imap.SeqSet)
+	set.AddRange(first, last)
+	messages := make(chan *imap.Message)
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Fetch(set, []imap.FetchItem{imap.FetchUid}, messages)
+	}()
+
+	type sequenceUID struct {
+		sequence uint32
+		uid      uint32
+	}
+	capacity := int(window)
+	seenUIDs := make(map[uint32]struct{}, capacity)
+	seenSequences := make(map[uint32]struct{}, capacity)
+	discovered := make([]sequenceUID, 0, capacity)
+	malformed := false
+	for message := range messages {
+		if message == nil || message.SeqNum < first || message.SeqNum > last || message.Uid == 0 {
+			malformed = true
+			continue
+		}
+		if _, duplicateSequence := seenSequences[message.SeqNum]; duplicateSequence {
+			malformed = true
+			continue
+		}
+		if _, duplicate := seenUIDs[message.Uid]; duplicate {
+			malformed = true
+			continue
+		}
+		seenSequences[message.SeqNum] = struct{}{}
+		seenUIDs[message.Uid] = struct{}{}
+		discovered = append(discovered, sequenceUID{sequence: message.SeqNum, uid: message.Uid})
+	}
+	if err := <-done; err != nil {
+		return nil, true, fmt.Errorf("fetch sequence range %d:%d: %w", first, last, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
+
+	if uint64(len(discovered)) != window {
+		malformed = true
+	}
+	sort.Slice(discovered, func(i, j int) bool { return discovered[i].sequence < discovered[j].sequence })
+	for index := 1; index < len(discovered); index++ {
+		if discovered[index].uid <= discovered[index-1].uid {
+			malformed = true
+			break
+		}
+	}
+	if malformed {
+		return nil, true, nil
+	}
+
+	uids := make([]uint32, len(discovered))
+	for index, candidate := range discovered {
+		uids[len(discovered)-1-index] = candidate.uid
+	}
+	return uids, truncated, nil
 }
 
 type uidMinHeap []uint32
