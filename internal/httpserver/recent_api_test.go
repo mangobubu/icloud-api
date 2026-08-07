@@ -76,7 +76,7 @@ func TestRecentMailDirectLinkReturnsCompactOwnedMessageInConfiguredTimezone(t *t
 	}
 }
 
-func TestRecentMailDirectLinkFallsBackToHTMLBody(t *testing.T) {
+func TestRecentMailDirectLinkExtractsPlainTextFromHTMLBody(t *testing.T) {
 	env := newHTTPTestEnv(t)
 	mailboxes := env.createMailboxFixture(t)
 	now := time.Now().UTC().Truncate(time.Second)
@@ -86,8 +86,16 @@ func TestRecentMailDirectLinkFallsBackToHTMLBody(t *testing.T) {
 		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
 		InternalDate: now.Add(-time.Minute),
 		TextBody:     "  \n",
-		HTMLBody:     "<p>HTML-only message</p>",
-		SyncedAt:     now,
+		HTMLBody: `<!doctype html><html><head>
+			<title>Ignored email title</title>
+			<style>.code { color: red }</style>
+			</head><body>
+			<div>您的临时 <strong>ChatGPT</strong> 登录代码</div>
+			<p class="code">739638</p>
+			<script>window.secret = "ignored"</script>
+			<p>请勿与他人分享 &amp; 使用。</p>
+			</body></html>`,
+		SyncedAt: now,
 	})
 
 	response := directMailRequest(t, env, url.Values{"api_key": {mailboxes.keyA}})
@@ -98,8 +106,15 @@ func TestRecentMailDirectLinkFallsBackToHTMLBody(t *testing.T) {
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode compact response: %v", err)
 	}
-	if got := decodeStringField(t, payload, "content"); got != "<p>HTML-only message</p>" {
-		t.Fatalf("content = %q, want HTML fallback", got)
+	wanted := "您的临时 ChatGPT 登录代码\n739638\n请勿与他人分享 & 使用。"
+	content := decodeStringField(t, payload, "content")
+	if content != wanted {
+		t.Fatalf("content = %q, want extracted plain text %q", content, wanted)
+	}
+	for _, forbidden := range []string{"<html", "<style", "color: red", "window.secret", "Ignored email title"} {
+		if strings.Contains(content, forbidden) {
+			t.Fatalf("plain-text content contains HTML metadata %q: %q", forbidden, content)
+		}
 	}
 }
 

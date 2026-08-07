@@ -176,6 +176,8 @@ paths:
 
         成功响应是仅包含 `email`、`content`、`time` 的顶层 JSON 对象。`time` 是 IMAP 收件时间，
         按服务端 `TZ` 对应时区输出 RFC 3339；例如 `TZ=Asia/Shanghai` 时包含 `+08:00` 偏移。
+        `content` 优先原样使用邮件声明的纯文本正文；纯文本为空时从 HTML 正文中提取
+        可读文字，并过滤结构标签、样式、脚本及常见的内联隐藏内容。
         只有收件时间处于 `[当前时间-1小时, 当前时间]` 区间的快照才会返回；时区转换只影响显示，
         不改变最近一小时的绝对时间窗口。
 
@@ -373,7 +375,7 @@ components:
           description: api_key 绑定的隐私邮箱地址。
         content:
           type: string
-          description: 解析后的纯文本正文；纯文本为空时回退到 HTML 正文。内容可能因服务端邮件或正文大小上限而截断。
+          description: 优先原样使用邮件声明的纯文本正文；纯文本为空时从 HTML 正文中提取可读文字，并过滤结构标签、样式、脚本及常见的内联隐藏内容。内容可能因服务端邮件或正文大小上限而截断。
         time:
           type: string
           format: date-time
