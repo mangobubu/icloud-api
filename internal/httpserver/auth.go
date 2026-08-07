@@ -33,7 +33,12 @@ func (s *Server) login(c *gin.Context) {
 		s.renderLoginError(c, "", "用户名或密码错误。", http.StatusUnauthorized)
 		return
 	}
-	if !s.validLoginCSRF(c) {
+	if reason := loginCSRFFailureReason(c.Request, c.PostForm("csrf_token")); reason != "" {
+		s.logger.Warn("后台登录请求校验失败",
+			"reason", reason,
+			"cookie_count", requestCookieCount(c.Request, loginCSRFCookie),
+			"request_id", requestID(c),
+		)
 		s.renderLoginError(c, username, "请求校验失败，请刷新页面后重试。", http.StatusForbidden)
 		return
 	}
@@ -156,10 +161,40 @@ func (s *Server) ensureLoginCSRF(c *gin.Context) string {
 	return token
 }
 
-func (s *Server) validLoginCSRF(c *gin.Context) bool {
-	cookie, err := c.Cookie(loginCSRFCookie)
-	provided := c.PostForm("csrf_token")
-	return err == nil && sameOrigin(c.Request) && len(cookie) == len(provided) && subtle.ConstantTimeCompare([]byte(cookie), []byte(provided)) == 1
+const (
+	loginCSRFCookieMissing      = "cookie_missing"
+	loginCSRFFormTokenMissing   = "form_token_missing"
+	loginCSRFTokenMismatch      = "token_mismatch"
+	loginCSRFFetchSiteCrossSite = "fetch_site_cross_site"
+	loginCSRFOriginInvalid      = "origin_invalid"
+	loginCSRFOriginHostMismatch = "origin_host_mismatch"
+)
+
+func loginCSRFFailureReason(r *http.Request, provided string) string {
+	cookie, err := r.Cookie(loginCSRFCookie)
+	if err != nil || cookie.Value == "" {
+		return loginCSRFCookieMissing
+	}
+	if reason := originFailureReason(r); reason != "" {
+		return reason
+	}
+	if provided == "" {
+		return loginCSRFFormTokenMissing
+	}
+	if len(cookie.Value) != len(provided) || subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(provided)) != 1 {
+		return loginCSRFTokenMismatch
+	}
+	return ""
+}
+
+func requestCookieCount(r *http.Request, name string) int {
+	count := 0
+	for _, cookie := range r.Cookies() {
+		if cookie.Name == name {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *Server) renderLoginError(c *gin.Context, username, message string, status int) {

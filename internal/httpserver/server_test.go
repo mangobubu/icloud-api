@@ -91,6 +91,147 @@ func TestAdminLoginRequiresCSRFAndCorrectPassword(t *testing.T) {
 	})
 }
 
+func TestLoginCSRFFailureReason(t *testing.T) {
+	const token = "matching-login-csrf-token"
+	tests := []struct {
+		name      string
+		provided  string
+		cookie    string
+		host      string
+		origin    string
+		fetchSite string
+		want      string
+	}{
+		{name: "missing cookie", provided: token, want: "cookie_missing"},
+		{name: "missing form token", cookie: token, want: "form_token_missing"},
+		{name: "token mismatch", provided: "Matching-login-csrf-token", cookie: token, want: "token_mismatch"},
+		{name: "cross-site fetch", provided: token, cookie: token, fetchSite: "cross-site", want: "fetch_site_cross_site"},
+		{name: "invalid origin", provided: token, cookie: token, origin: "null", want: "origin_invalid"},
+		{name: "origin with path", provided: token, cookie: token, origin: "https://example.com/path", want: "origin_invalid"},
+		{name: "origin with user info", provided: token, cookie: token, origin: "https://user@example.com", want: "origin_invalid"},
+		{name: "origin with query", provided: token, cookie: token, origin: "https://example.com?query", want: "origin_invalid"},
+		{name: "non-http origin", provided: token, cookie: token, origin: "ftp://example.com", want: "origin_invalid"},
+		{name: "origin host mismatch", provided: token, cookie: token, host: "internal:8080", origin: "https://admin.example.com", want: "origin_host_mismatch"},
+		{name: "same origin", provided: token, cookie: token, host: "admin.example.com", origin: "https://admin.example.com"},
+		{name: "missing origin", provided: token, cookie: token},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			host := test.host
+			if host == "" {
+				host = "example.com"
+			}
+			request := httptest.NewRequest(http.MethodPost, "http://"+host+"/admin/login", nil)
+			if test.cookie != "" {
+				request.AddCookie(&http.Cookie{Name: loginCSRFCookie, Value: test.cookie})
+			}
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			if test.fetchSite != "" {
+				request.Header.Set("Sec-Fetch-Site", test.fetchSite)
+			}
+			if got := loginCSRFFailureReason(request, test.provided); got != test.want {
+				t.Fatalf("loginCSRFFailureReason() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestLoginCSRFFailureLogExcludesSecrets(t *testing.T) {
+	const (
+		username = "diagnostic-admin-secret"
+		password = "diagnostic-password-secret"
+	)
+	tests := []struct {
+		name        string
+		cookie      string
+		formToken   string
+		host        string
+		origin      string
+		wantReason  string
+		wantCookies float64
+	}{
+		{
+			name:       "missing cookie",
+			formToken:  "missing-cookie-form-token-secret",
+			wantReason: loginCSRFCookieMissing,
+		},
+		{
+			name:        "token mismatch",
+			cookie:      "mismatch-cookie-token-secret",
+			formToken:   "mismatch-form-token-secret--",
+			wantReason:  loginCSRFTokenMismatch,
+			wantCookies: 1,
+		},
+		{
+			name:        "origin host mismatch",
+			cookie:      "origin-cookie-token-secret",
+			formToken:   "origin-cookie-token-secret",
+			host:        "internal-host-secret:8080",
+			origin:      "https://public-origin-secret.example",
+			wantReason:  loginCSRFOriginHostMismatch,
+			wantCookies: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newHTTPTestEnv(t)
+			var logs bytes.Buffer
+			env.server.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+			host := test.host
+			if host == "" {
+				host = "login-host-secret.example"
+			}
+			form := url.Values{
+				"csrf_token": {test.formToken},
+				"username":   {username},
+				"password":   {password},
+			}
+			request := httptest.NewRequest(http.MethodPost, "http://"+host+"/admin/login", strings.NewReader(form.Encode()))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			if test.cookie != "" {
+				request.AddCookie(&http.Cookie{Name: loginCSRFCookie, Value: test.cookie})
+			}
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+			response := httptest.NewRecorder()
+			env.router.ServeHTTP(response, request)
+			if response.Code != http.StatusForbidden {
+				t.Fatalf("login CSRF failure status = %d, want %d", response.Code, http.StatusForbidden)
+			}
+
+			var entry map[string]any
+			if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
+				t.Fatalf("parse login CSRF log: %v; output=%s", err, logs.String())
+			}
+			if got := entry["reason"]; got != test.wantReason {
+				t.Fatalf("login CSRF log reason = %#v, want %q", got, test.wantReason)
+			}
+			if got := entry["cookie_count"]; got != test.wantCookies {
+				t.Fatalf("login CSRF log cookie_count = %#v, want %.0f", got, test.wantCookies)
+			}
+			if got, want := entry["request_id"], response.Header().Get("X-Request-ID"); got != want {
+				t.Fatalf("login CSRF log request_id = %#v, want %q", got, want)
+			}
+
+			output := logs.String()
+			for _, secret := range []string{username, password, test.formToken, test.cookie, host, test.origin} {
+				if secret != "" && strings.Contains(output, secret) {
+					t.Fatalf("login CSRF log exposed secret %q: %s", secret, output)
+				}
+			}
+			if strings.Contains(response.Body.String(), test.wantReason) {
+				t.Fatal("login CSRF response exposed internal failure reason")
+			}
+		})
+	}
+}
+
 func TestSuccessfulLoginDeletesExpiredSessions(t *testing.T) {
 	env := newHTTPTestEnv(t)
 	const (
@@ -467,6 +608,7 @@ func TestAdminPagesDoNotEchoIMAPPassword(t *testing.T) {
 type httpTestEnv struct {
 	store  *store.Store
 	cipher *secure.Cipher
+	server *Server
 	router http.Handler
 }
 
@@ -502,7 +644,7 @@ func newHTTPTestEnv(t *testing.T) *httpTestEnv {
 	if err != nil {
 		t.Fatalf("create HTTP router: %v", err)
 	}
-	return &httpTestEnv{store: db, cipher: cipher, router: router}
+	return &httpTestEnv{store: db, cipher: cipher, server: server, router: router}
 }
 
 func (e *httpTestEnv) request(

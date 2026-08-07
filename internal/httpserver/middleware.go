@@ -177,15 +177,28 @@ func (s *Server) csrfGuard() gin.HandlerFunc {
 }
 
 func sameOrigin(r *http.Request) bool {
-	if fetchSite := strings.ToLower(r.Header.Get("Sec-Fetch-Site")); fetchSite == "cross-site" {
-		return false
+	return originFailureReason(r) == ""
+}
+
+func originFailureReason(r *http.Request) string {
+	if fetchSite := strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")); strings.EqualFold(fetchSite, "cross-site") {
+		return loginCSRFFetchSiteCrossSite
 	}
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
-		return true
+		return ""
 	}
 	parsed, err := url.Parse(origin)
-	return err == nil && strings.EqualFold(parsed.Host, r.Host)
+	if err != nil || parsed.Host == "" ||
+		(!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) ||
+		parsed.User != nil || parsed.Opaque != "" || parsed.Path != "" ||
+		parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return loginCSRFOriginInvalid
+	}
+	if !strings.EqualFold(parsed.Host, r.Host) {
+		return loginCSRFOriginHostMismatch
+	}
+	return ""
 }
 
 func validAPIKey(token string) bool {
