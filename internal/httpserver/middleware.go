@@ -214,6 +214,28 @@ func validAPIKey(token string) bool {
 }
 
 func (s *Server) apiKeyAuth() gin.HandlerFunc {
+	return s.apiKeyAuthWithToken(func(c *gin.Context) (string, bool) {
+		authorization := c.GetHeader("Authorization")
+		scheme, token, ok := strings.Cut(authorization, " ")
+		return token, ok && strings.EqualFold(scheme, "Bearer")
+	})
+}
+
+func (s *Server) apiKeyQueryAuth() gin.HandlerFunc {
+	return s.apiKeyAuthWithToken(func(c *gin.Context) (string, bool) {
+		values, err := url.ParseQuery(c.Request.URL.RawQuery)
+		if err != nil {
+			return "", false
+		}
+		apiKeys, ok := values["api_key"]
+		if !ok || len(apiKeys) != 1 {
+			return "", false
+		}
+		return apiKeys[0], true
+	})
+}
+
+func (s *Server) apiKeyAuthWithToken(tokenFromRequest func(*gin.Context) (string, bool)) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		if !s.apiIPLimiter.Allow(c.ClientIP()) {
@@ -221,9 +243,8 @@ func (s *Server) apiKeyAuth() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		authorization := c.GetHeader("Authorization")
-		scheme, token, ok := strings.Cut(authorization, " ")
-		if !ok || !strings.EqualFold(scheme, "Bearer") || !validAPIKey(token) {
+		token, ok := tokenFromRequest(c)
+		if !ok || !validAPIKey(token) {
 			s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 			c.Abort()
 			return

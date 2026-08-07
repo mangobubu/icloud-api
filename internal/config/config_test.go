@@ -25,6 +25,7 @@ var configEnvironment = []string{
 	"ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS",
 	"ICLOUD_API_TRUSTED_PROXIES",
 	"GIN_MODE",
+	"TZ",
 }
 
 func TestWebRootOverride(t *testing.T) {
@@ -79,5 +80,41 @@ func TestSyncTimeoutValidation(t *testing.T) {
 				t.Fatalf("ICLOUD_API_SYNC_TIMEOUT=%q 错误 = %v", value, err)
 			}
 		})
+	}
+}
+
+func TestTimezoneDefault(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Timezone != time.Local {
+		t.Fatalf("默认时区 = %v, want time.Local", cfg.Timezone)
+	}
+}
+
+func TestTimezoneOverride(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("TZ", "  Asia/Shanghai  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Timezone == nil || cfg.Timezone.String() != "Asia/Shanghai" {
+		t.Fatalf("时区 = %v, want Asia/Shanghai", cfg.Timezone)
+	}
+	_, offset := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC).In(cfg.Timezone).Zone()
+	if offset != 8*60*60 {
+		t.Fatalf("Asia/Shanghai UTC 偏移 = %d, want %d", offset, 8*60*60)
+	}
+}
+
+func TestTimezoneValidation(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("TZ", "not/a-real-timezone")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "TZ") {
+		t.Fatalf("无效 TZ 错误 = %v, want 包含 TZ", err)
 	}
 }

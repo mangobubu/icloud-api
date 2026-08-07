@@ -27,6 +27,7 @@ type Config struct {
 	AllowWeakRecipientHeaders bool
 	TrustedProxies            []string
 	GinMode                   string
+	Timezone                  *time.Location
 }
 
 func Load() (Config, error) {
@@ -37,6 +38,14 @@ func Load() (Config, error) {
 		AdminUsername: env("ICLOUD_API_ADMIN_USER", "admin"),
 		AdminPassword: os.Getenv("ICLOUD_API_ADMIN_PASSWORD"),
 		GinMode:       env("GIN_MODE", "release"),
+		Timezone:      time.Local,
+	}
+	if value := strings.TrimSpace(os.Getenv("TZ")); value != "" {
+		location, err := time.LoadLocation(value)
+		if err != nil {
+			return Config{}, fmt.Errorf("TZ 不是有效时区: %w", err)
+		}
+		cfg.Timezone = location
 	}
 	cfg.MasterKeyFile = env("ICLOUD_API_MASTER_KEY_FILE", cfg.DatabasePath+".key")
 	if value := strings.TrimSpace(os.Getenv("ICLOUD_API_TRUSTED_PROXIES")); value != "" {

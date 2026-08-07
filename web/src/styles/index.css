@@ -676,6 +676,26 @@ code {
   line-height: 1.45;
 }
 
+.one-time-secret__values,
+.one-time-secret__item {
+  display: grid;
+  min-width: 0;
+}
+
+.one-time-secret__values {
+  gap: 12px;
+}
+
+.one-time-secret__item {
+  gap: 5px;
+}
+
+.one-time-secret__label {
+  color: #315f4b;
+  font-size: 12px;
+  font-weight: 650;
+}
+
 .one-time-secret__value {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -692,6 +712,17 @@ code {
   background: #ffffff;
   border: 1px solid #bfd5ca;
   border-radius: 4px;
+}
+
+.one-time-secret__value--link code {
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: break-all;
+}
+
+.one-time-secret__value .el-button {
+  min-width: 104px;
 }
 
 .secret-region__close {

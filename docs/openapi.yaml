@@ -1,11 +1,14 @@
 openapi: 3.1.0
 info:
   title: iCloud 隐私邮箱收件 API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     每个隐私邮箱使用独立的 API Key。服务端根据该 Key 绑定到唯一隐私邮箱，
-    只返回该隐私邮箱通过所属 iCloud 主号 IMAP 同步到的最新一封邮件。
+    只返回该隐私邮箱通过所属 iCloud 主号 IMAP 同步到的最新邮件快照。
     邮件可用性按隐私邮箱自身的同步状态和同步时间独立判断，而不是直接使用主号的整体同步状态。
+    `/api/v1/mail/latest` 使用 Bearer Header 并返回已保存快照的完整 UTC 数据；
+    `/api/v1/mail/recent` 使用 URL 查询参数，只在 IMAP 收件时间位于最近一小时时
+    返回按服务端 `TZ` 格式化的紧凑数据。
 servers:
   - url: http://127.0.0.1:8080
     description: 默认本地服务地址，可由 ICLOUD_API_ADDR 调整
@@ -31,13 +34,16 @@ paths:
         - `error`：最近一次同步未能确认该隐私邮箱的最新状态；
         - `ok`：最近一次同步已确认有最新邮件，或已权威确认邮箱为空。
 
-        只有状态为 `ok`、`last_synced_at` 存在且距今不超过三倍轮询周期时，
-        才继续按最新邮件快照是否存在返回 200 或 404；其他情况返回 503。
+        只有状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过三倍轮询周期时，
+        才继续判断最新邮件快照。快照存在时返回 200，不额外限制邮件年龄；快照不存在时返回 404；
+        其他同步状态返回 503。
+
+        成功响应保留完整邮件结构，所有时间字段统一使用 RFC 3339/UTC，不受服务端 `TZ` 影响。
       security:
         - aliasApiKey: []
       responses:
         "200":
-          description: 当前隐私邮箱最近一次同步成功且仍新鲜，已返回其保存的最新一封邮件
+          description: 当前隐私邮箱同步结果仍新鲜，且存在已保存的最新邮件快照
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -89,7 +95,7 @@ paths:
                   message: API Key 无效
                   request_id: 6oe7j0x3x3pJv9Dv
         "404":
-          description: 当前隐私邮箱最近一次同步成功且仍新鲜，并已确认当前没有邮件快照
+          description: 当前隐私邮箱同步结果仍新鲜，但没有邮件快照
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -122,7 +128,130 @@ paths:
                   request_id: 6oe7j0x3x3pJv9Dv
         "503":
           description: |
-            当前隐私邮箱状态不是 ok、从未完成同步或最后同步时间已超过三倍轮询周期时返回 SYNC_UNAVAILABLE；
+            当前隐私邮箱状态不是 ok、从未完成同步、最后同步时间晚于当前时间，
+            或最后同步时间已超过三倍轮询周期时返回 SYNC_UNAVAILABLE；
+            查询 Key 或最新邮件快照时数据库暂不可用则返回 DATABASE_UNAVAILABLE。
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                syncUnavailable:
+                  summary: 隐私邮箱同步状态不可用
+                  value:
+                    error:
+                      code: SYNC_UNAVAILABLE
+                      message: 邮箱同步暂不可用
+                      request_id: 6oe7j0x3x3pJv9Dv
+                databaseUnavailable:
+                  summary: 数据库查询暂不可用
+                  value:
+                    error:
+                      code: DATABASE_UNAVAILABLE
+                      message: 数据库暂不可用
+                      request_id: 6oe7j0x3x3pJv9Dv
+
+  /api/v1/mail/recent:
+    get:
+      tags:
+        - Mail
+      operationId: getRecentMail
+      summary: 通过可直接访问的链接获取最近一小时内的最新邮件
+      description: |
+        使用必填且只能出现一次的查询参数 `api_key` 鉴权；Bearer Header 不能替代该查询参数。
+        Key 只解析到它绑定的唯一隐私邮箱；接口不接受邮箱地址参数，也不会返回同一主号下其他隐私邮箱的邮件。
+
+        只有该隐私邮箱状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过三倍轮询周期，
+        并且当前最新邮件快照的 IMAP INTERNALDATE 位于最近一小时内时才返回 200。
+        接口只检查当前最新快照，不会回退到次新邮件。没有快照或最新邮件的 IMAP INTERNALDATE
+        缺失、为未来时间或不在最近一小时时返回 404，
+        同步状态不可用时返回 503。
+
+        成功响应是仅包含 `email`、`content`、`time` 的顶层 JSON 对象。`time` 是 IMAP 收件时间，
+        按服务端 `TZ` 对应时区输出 RFC 3339；例如 `TZ=Asia/Shanghai` 时包含 `+08:00` 偏移。
+        只有收件时间处于 `[当前时间-1小时, 当前时间]` 区间的快照才会返回；时区转换只影响显示，
+        不改变最近一小时的绝对时间窗口。
+
+        注意：查询参数中的 Key 会出现在浏览器历史中，并可能被反向代理或外围监控记录、
+        通过 Referer 泄露。本应用内置 HTTP 日志只记录 URL 路径，不记录查询字符串，但不能
+        代替外围系统的脱敏配置。完整 URL 必须按密钥保护，只能通过 HTTPS 使用，并应在代理层
+        删除或脱敏查询字符串日志。能设置请求头的客户端应优先使用 `/api/v1/mail/latest`；
+        怀疑链接泄露后应立即轮换 Key。
+      security:
+        - aliasApiKeyQuery: []
+      responses:
+        "200":
+          description: 当前隐私邮箱同步结果仍新鲜，且当前最新邮件的 IMAP 收件时间位于最近一小时内
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecentMailResponse"
+              example:
+                email: orders@example.icloud.com
+                content: 您的验证码是 123456
+                time: "2026-08-07T20:30:45+08:00"
+        "401":
+          description: api_key 查询参数缺失、格式错误、Key 无效，或绑定的隐私邮箱/主号已停用
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: INVALID_API_KEY
+                  message: API Key 无效
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "404":
+          description: 当前隐私邮箱同步结果仍新鲜，但没有邮件快照，或当前最新邮件的 IMAP 收件时间不在 [当前时间-1小时, 当前时间] 区间内
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: MAIL_NOT_FOUND
+                  message: 最近一小时内没有邮件
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "429":
+          description: 此隐私邮箱 API Key 在当前限流窗口内请求过多
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: RATE_LIMITED
+                  message: 请求过于频繁
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "503":
+          description: |
+            当前隐私邮箱状态不是 ok、从未完成同步、最后同步时间晚于当前时间，
+            或最后同步时间已超过三倍轮询周期时返回 SYNC_UNAVAILABLE；
             查询 Key 或最新邮件快照时数据库暂不可用则返回 DATABASE_UNAVAILABLE。
           headers:
             X-Request-ID:
@@ -199,6 +328,18 @@ components:
         受限字符集保证末尾填充位为零。服务端还会执行严格 Base64URL 解码和长度检查。
         `icm_REPLACE_WITH_ALIAS_KEY` 仅为说明性占位值，其格式故意无效，直接发送会返回 401。
 
+    aliasApiKeyQuery:
+      type: apiKey
+      in: query
+      name: api_key
+      x-token-pattern: "^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
+      description: |
+        `/api/v1/mail/recent` 使用的查询参数 Key，格式和 `aliasApiKey` 完全相同。
+        查询参数会进入浏览器历史，并可能被代理或外围监控记录、通过 Referer 泄露。
+        本应用内置 HTTP 日志不记录查询字符串，但外围日志仍须删除或脱敏查询参数。
+        完整 URL 必须按密钥保护，并且只能通过 HTTPS 使用。
+        能设置 Authorization Header 的客户端应优先使用 `aliasApiKey`；泄露后应立即轮换 Key。
+
   headers:
     RequestID:
       description: 服务端生成的请求追踪标识；错误响应体中的 request_id 与此值一致。
@@ -213,6 +354,28 @@ components:
       example: no-store
 
   schemas:
+    RecentMailResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - content
+        - time
+      properties:
+        email:
+          type: string
+          format: email
+          description: api_key 绑定的隐私邮箱地址。
+        content:
+          type: string
+          description: 解析后的纯文本正文；纯文本为空时回退到 HTML 正文。内容可能因服务端邮件或正文大小上限而截断。
+        time:
+          type: string
+          format: date-time
+          description: IMAP INTERNALDATE，按服务端 TZ 对应时区格式化为 RFC 3339，并包含该时区的 UTC 偏移；只在 [当前时间-1小时, 当前时间] 区间内返回。
+          examples:
+            - "2026-08-07T20:30:45+08:00"
+
     LatestMailResponse:
       type: object
       additionalProperties: false
@@ -246,7 +409,8 @@ components:
           const: false
           description: |
             成功响应中恒为 false。若当前隐私邮箱状态不是 ok、last_synced_at 为空，
-            或最后同步距今超过三倍轮询周期，接口返回 503，而不会返回带 stale=true 的旧快照。
+            最后同步时间晚于当前时间，或最后同步距今超过三倍轮询周期，接口返回 503，
+            而不会返回带 stale=true 的旧快照。
 
     MailMessage:
       type: object

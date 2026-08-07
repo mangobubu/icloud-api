@@ -28,6 +28,7 @@ type Server struct {
 	cipher      *secure.Cipher
 	cfg         config.Config
 	logger      *slog.Logger
+	now         func() time.Time
 	sync        func(int64) error
 	lockAccount func(context.Context, int64, func() error) error
 	adminSPA    *adminSPA
@@ -55,6 +56,15 @@ func (s *Server) withAccountLock(ctx context.Context, accountID int64, operation
 		return operation()
 	}
 	return s.lockAccount(ctx, accountID, operation)
+}
+
+func (s *Server) recovery() gin.HandlerFunc {
+	// Gin's default recovery dumps the request line, which would expose a
+	// query-string API key. Keep diagnostics at path/request-ID granularity.
+	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, _ any) {
+		s.logger.Error("HTTP 请求异常", "path", c.Request.URL.Path, "request_id", requestID(c))
+		c.AbortWithStatus(http.StatusInternalServerError)
+	})
 }
 
 type PageData struct {
@@ -89,6 +99,7 @@ func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog
 		cipher:              cipher,
 		cfg:                 cfg,
 		logger:              logger,
+		now:                 time.Now,
 		sync:                syncFn,
 		adminSPA:            spa,
 		loginLimiter:        newWindowLimiter(8, 10*time.Minute),
@@ -136,7 +147,7 @@ func (s *Server) Router() (*gin.Engine, error) {
 	if err := router.SetTrustedProxies(s.cfg.TrustedProxies); err != nil {
 		return nil, fmt.Errorf("配置受信代理: %w", err)
 	}
-	router.Use(s.requestContext(), s.securityHeaders(), gin.Recovery())
+	router.Use(s.requestContext(), s.securityHeaders(), s.recovery())
 
 	router.GET("/healthz", s.health)
 	rootRedirect := func(c *gin.Context) {
@@ -150,8 +161,10 @@ func (s *Server) Router() (*gin.Engine, error) {
 	router.HEAD("/", rootRedirect)
 
 	api := router.Group("/api/v1")
-	api.Use(s.apiKeyAuth())
-	api.GET("/mail/latest", s.latestMail)
+	api.GET("/mail/latest", s.apiKeyAuth(), s.latestMail)
+	recentAuth := s.apiKeyQueryAuth()
+	api.GET("/mail/recent", recentAuth, s.recentMail)
+	api.GET("/mail/recent/", recentAuth, s.recentMail)
 
 	adminAPI := router.Group("/admin/api/v1")
 	s.registerAdminAPIRoutes(adminAPI)
