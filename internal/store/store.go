@@ -11,12 +11,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 )
 
 var (
 	// ErrNotFound is returned when a requested row does not exist.
 	ErrNotFound               = sql.ErrNoRows
+	ErrInvalidPostgresURL     = errors.New("PostgreSQL URL must use postgres:// or postgresql://")
 	ErrAliasLimit             = errors.New("enabled alias limit reached")
 	ErrAliasOwnershipConflict = errors.New("alias address belongs to another account")
 	ErrAccountIdentityLocked  = errors.New("account identity is locked by aliases")
@@ -24,19 +26,58 @@ var (
 	memoryID                  atomic.Uint64
 )
 
-// Store owns the application's SQLite persistence layer.
+type dialect uint8
+
+const (
+	dialectSQLite dialect = iota
+	dialectPostgres
+)
+
+// Store owns the application's persistence layer.
 type Store struct {
-	db  *sql.DB
-	now func() time.Time
+	db      *sql.DB
+	dialect dialect
+	now     func() time.Time
 }
 
-// Open opens a SQLite database, configures it, and applies all migrations.
-func Open(path string) (*Store, error) {
-	return OpenContext(context.Background(), path)
+// Open opens a PostgreSQL connection URL or a legacy SQLite database and
+// applies all migrations.
+func Open(dataSource string) (*Store, error) {
+	return OpenContext(context.Background(), dataSource)
 }
 
 // OpenContext is Open with a caller-provided context for setup and migration.
-func OpenContext(ctx context.Context, path string) (*Store, error) {
+func OpenContext(ctx context.Context, dataSource string) (*Store, error) {
+	dataSource = strings.TrimSpace(dataSource)
+	if hasPostgresScheme(dataSource) {
+		postgresURL, err := normalizePostgresURL(dataSource)
+		if err != nil {
+			return nil, err
+		}
+		return openPostgres(ctx, postgresURL)
+	}
+	return openSQLite(ctx, dataSource)
+}
+
+func openPostgres(ctx context.Context, dataSource string) (*Store, error) {
+	db, err := sql.Open("pgx", dataSource)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres: %w", err)
+	}
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(4)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	s := newStore(db, dialectPostgres)
+	if err := s.Migrate(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func openSQLite(ctx context.Context, path string) (*Store, error) {
 	dsn, err := sqliteDSN(path)
 	if err != nil {
 		return nil, err
@@ -50,7 +91,7 @@ func OpenContext(ctx context.Context, path string) (*Store, error) {
 	db.SetMaxIdleConns(8)
 	db.SetConnMaxLifetime(0)
 
-	s := New(db)
+	s := newStore(db, dialectSQLite)
 	if err := s.configure(ctx); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -66,7 +107,15 @@ func OpenContext(ctx context.Context, path string) (*Store, error) {
 // The caller remains responsible for ensuring every pooled connection enables
 // SQLite foreign keys (Open does this through its DSN).
 func New(db *sql.DB) *Store {
-	return &Store{db: db, now: func() time.Time { return time.Now().UTC() }}
+	return newStore(db, dialectSQLite)
+}
+
+func newStore(db *sql.DB, databaseDialect dialect) *Store {
+	return &Store{
+		db:      db,
+		dialect: databaseDialect,
+		now:     func() time.Time { return time.Now().UTC() },
+	}
 }
 
 // DB exposes the underlying handle for health checks and transaction-aware
@@ -81,6 +130,9 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) configure(ctx context.Context) error {
+	if s.dialect != dialectSQLite {
+		return nil
+	}
 	for _, statement := range []string{
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA busy_timeout = 5000",
@@ -91,6 +143,269 @@ func (s *Store) configure(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// ValidatePostgresURL verifies that dataSource uses the URL form supported by
+// OpenContext. It does not connect to the database.
+func ValidatePostgresURL(dataSource string) error {
+	_, err := normalizePostgresURL(dataSource)
+	return err
+}
+
+func hasPostgresScheme(dataSource string) bool {
+	dataSource = strings.TrimSpace(dataSource)
+	separator := strings.IndexByte(dataSource, ':')
+	if separator <= 0 {
+		return false
+	}
+	scheme := dataSource[:separator]
+	return strings.EqualFold(scheme, "postgres") || strings.EqualFold(scheme, "postgresql")
+}
+
+func normalizePostgresURL(dataSource string) (string, error) {
+	dataSource = strings.TrimSpace(dataSource)
+	separator := strings.IndexByte(dataSource, ':')
+	if separator <= 0 {
+		return "", ErrInvalidPostgresURL
+	}
+
+	scheme := strings.ToLower(dataSource[:separator])
+	if scheme != "postgres" && scheme != "postgresql" {
+		return "", ErrInvalidPostgresURL
+	}
+	if len(dataSource) < separator+3 || dataSource[separator+1:separator+3] != "//" {
+		return "", ErrInvalidPostgresURL
+	}
+
+	parsed, err := url.Parse(dataSource)
+	if err != nil || parsed.Opaque != "" || !strings.EqualFold(parsed.Scheme, scheme) {
+		return "", ErrInvalidPostgresURL
+	}
+	return scheme + dataSource[separator:], nil
+}
+
+func (s *Store) execContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return s.db.ExecContext(ctx, s.rebind(query), args...)
+}
+
+func (s *Store) queryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return s.db.QueryContext(ctx, s.rebind(query), args...)
+}
+
+func (s *Store) queryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	return s.db.QueryRowContext(ctx, s.rebind(query), args...)
+}
+
+func (s *Store) txExecContext(ctx context.Context, tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	return tx.ExecContext(ctx, s.rebind(query), args...)
+}
+
+func (s *Store) txQueryContext(ctx context.Context, tx *sql.Tx, query string, args ...any) (*sql.Rows, error) {
+	return tx.QueryContext(ctx, s.rebind(query), args...)
+}
+
+func (s *Store) txQueryRowContext(ctx context.Context, tx *sql.Tx, query string, args ...any) *sql.Row {
+	return tx.QueryRowContext(ctx, s.rebind(query), args...)
+}
+
+// lockAccountForUpdate serializes account-scoped writes across application
+// processes for the lifetime of the transaction.
+func (s *Store) lockAccountForUpdate(ctx context.Context, tx *sql.Tx, accountID int64) error {
+	_, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
+	return err
+}
+
+func (s *Store) lockAccountVersionForUpdate(ctx context.Context, tx *sql.Tx, accountID int64) (int64, error) {
+	if s.dialect == dialectPostgres {
+		var version int64
+		err := s.txQueryRowContext(ctx, tx,
+			`SELECT updated_at FROM accounts WHERE id = ? FOR UPDATE`, accountID,
+		).Scan(&version)
+		if err == sql.ErrNoRows {
+			return 0, ErrNotFound
+		}
+		return version, err
+	}
+
+	// SQLite has no row-level SELECT FOR UPDATE. Taking its write lock before
+	// reading the capacity or cursor gives the equivalent transaction ordering.
+	result, err := s.txExecContext(ctx, tx,
+		`UPDATE accounts SET updated_at = updated_at WHERE id = ?`, accountID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	if err := requireAffected(result, "account"); err != nil {
+		return 0, err
+	}
+	var version int64
+	if err := s.txQueryRowContext(ctx, tx,
+		`SELECT updated_at FROM accounts WHERE id = ?`, accountID,
+	).Scan(&version); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, ErrNotFound
+		}
+		return 0, err
+	}
+	return version, nil
+}
+
+func (s *Store) nextAccountVersion(current int64) (int64, error) {
+	candidate := timestamp(s.now())
+	if candidate > current {
+		return candidate, nil
+	}
+	if current == int64(^uint64(0)>>1) {
+		return 0, errors.New("account version is exhausted")
+	}
+	return current + 1, nil
+}
+
+func (s *Store) bumpAccountVersionTx(ctx context.Context, tx *sql.Tx, accountID, current int64) (int64, error) {
+	next, err := s.nextAccountVersion(current)
+	if err != nil {
+		return 0, err
+	}
+	result, err := s.txExecContext(ctx, tx, `
+		UPDATE accounts SET updated_at = ?
+		WHERE id = ? AND updated_at = ?`, next, accountID, current)
+	if err != nil {
+		return 0, err
+	}
+	if err := requireAffected(result, "account"); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+func (s *Store) rebind(query string) string {
+	if s.dialect != dialectPostgres || !strings.Contains(query, "?") {
+		return query
+	}
+	return rebindPostgres(query)
+}
+
+// rebindPostgres replaces placeholders while leaving quoted text, identifiers,
+// dollar-quoted bodies, and comments untouched.
+func rebindPostgres(query string) string {
+	var result strings.Builder
+	result.Grow(len(query) + 8)
+	placeholder := 1
+
+	for index := 0; index < len(query); {
+		switch query[index] {
+		case '\'':
+			start := index
+			index++
+			for index < len(query) {
+				if query[index] == '\\' && index+1 < len(query) {
+					index += 2
+					continue
+				}
+				if query[index] == '\'' {
+					index++
+					if index < len(query) && query[index] == '\'' {
+						index++
+						continue
+					}
+					break
+				}
+				index++
+			}
+			result.WriteString(query[start:index])
+		case '"':
+			start := index
+			index++
+			for index < len(query) {
+				if query[index] == '"' {
+					index++
+					if index < len(query) && query[index] == '"' {
+						index++
+						continue
+					}
+					break
+				}
+				index++
+			}
+			result.WriteString(query[start:index])
+		case '-':
+			if index+1 < len(query) && query[index+1] == '-' {
+				end := strings.IndexByte(query[index+2:], '\n')
+				if end < 0 {
+					result.WriteString(query[index:])
+					return result.String()
+				}
+				end += index + 3
+				result.WriteString(query[index:end])
+				index = end
+				continue
+			}
+			result.WriteByte(query[index])
+			index++
+		case '/':
+			if index+1 < len(query) && query[index+1] == '*' {
+				end := strings.Index(query[index+2:], "*/")
+				if end < 0 {
+					result.WriteString(query[index:])
+					return result.String()
+				}
+				end += index + 4
+				result.WriteString(query[index:end])
+				index = end
+				continue
+			}
+			result.WriteByte(query[index])
+			index++
+		case '$':
+			delimiterEnd := postgresDollarDelimiterEnd(query, index)
+			if delimiterEnd < 0 {
+				result.WriteByte(query[index])
+				index++
+				continue
+			}
+			delimiter := query[index:delimiterEnd]
+			closingOffset := strings.Index(query[delimiterEnd:], delimiter)
+			if closingOffset < 0 {
+				result.WriteString(query[index:])
+				return result.String()
+			}
+			end := delimiterEnd + closingOffset + len(delimiter)
+			result.WriteString(query[index:end])
+			index = end
+		case '?':
+			fmt.Fprintf(&result, "$%d", placeholder)
+			placeholder++
+			index++
+		default:
+			result.WriteByte(query[index])
+			index++
+		}
+	}
+	return result.String()
+}
+
+func postgresDollarDelimiterEnd(query string, start int) int {
+	if start+1 >= len(query) {
+		return -1
+	}
+	if query[start+1] == '$' {
+		return start + 2
+	}
+	first := query[start+1]
+	if first != '_' && (first < 'A' || first > 'Z') && (first < 'a' || first > 'z') {
+		return -1
+	}
+	for index := start + 2; index < len(query); index++ {
+		character := query[index]
+		if character == '$' {
+			return index + 1
+		}
+		if character != '_' && (character < 'A' || character > 'Z') &&
+			(character < 'a' || character > 'z') && (character < '0' || character > '9') {
+			return -1
+		}
+	}
+	return -1
 }
 
 func sqliteDSN(path string) (string, error) {

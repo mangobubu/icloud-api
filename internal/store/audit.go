@@ -33,30 +33,33 @@ func (s *Store) CreateAuditLog(ctx context.Context, log domain.AuditLog) (domain
 	if log.CreatedAt.IsZero() {
 		log.CreatedAt = s.now()
 	}
-	result, err := s.db.ExecContext(ctx, `
+	var id int64
+	err := s.queryRowContext(ctx, `
 		INSERT INTO audit_logs(
 			admin_id, username, action, resource_type, resource_id,
 			result, ip, request_id, detail, created_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		RETURNING id`,
 		log.AdminID, log.Username, log.Action, log.ResourceType, log.ResourceID,
 		log.Result, log.IP, log.RequestID, log.Detail, timestamp(log.CreatedAt),
-	)
+	).Scan(&id)
 	if err != nil {
 		return domain.AuditLog{}, fmt.Errorf("create audit log: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return domain.AuditLog{}, fmt.Errorf("read new audit log id: %w", err)
 	}
 	log.ID = id
 	return log, nil
 }
 
 func truncate(value string, limit int) string {
-	if len(value) <= limit {
-		return value
+	if limit <= 0 {
+		return ""
 	}
-	return value[:limit]
+	value = sanitizePostgresText(value)
+	runes := []rune(value)
+	if len(runes) > limit {
+		runes = runes[:limit]
+	}
+	return string(runes)
 }
 
 func (s *Store) AppendAuditLog(ctx context.Context, log domain.AuditLog) error {
@@ -69,6 +72,9 @@ func (s *Store) ListAuditLogs(ctx context.Context, limit, offset int) ([]domain.
 }
 
 func (s *Store) ListAuditLogsFiltered(ctx context.Context, filter AuditLogFilter) ([]domain.AuditLog, error) {
+	filter.Action = sanitizePostgresText(filter.Action)
+	filter.ResourceType = sanitizePostgresText(filter.ResourceType)
+	filter.Result = sanitizePostgresText(filter.Result)
 	if filter.Limit <= 0 {
 		filter.Limit = 100
 	}
@@ -117,7 +123,7 @@ func (s *Store) ListAuditLogsFiltered(ctx context.Context, filter AuditLogFilter
 	query.WriteString(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
 	args = append(args, filter.Limit, filter.Offset)
 
-	rows, err := s.db.QueryContext(ctx, query.String(), args...)
+	rows, err := s.queryContext(ctx, query.String(), args...)
 	if err != nil {
 		return nil, fmt.Errorf("list audit logs: %w", err)
 	}

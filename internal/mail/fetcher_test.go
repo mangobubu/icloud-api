@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -15,63 +17,104 @@ import (
 	"icloud-api/internal/domain"
 )
 
+type fetchCall struct {
+	seqSet string
+	items  []imap.FetchItem
+}
+
 type fakeIMAPSession struct {
-	searchResults   [][]uint32
-	searchErrors    []error
-	searchIndex     int
-	searchCriteria  []*imap.SearchCriteria
-	uidOnlyResults  []uint32
-	uidOnlySeqNums  []uint32
-	headerByUID     map[uint32][]byte
-	bodyByUID       map[uint32][]byte
-	internalDates   map[uint32]time.Time
-	fetchItems      [][]imap.FetchItem
-	fetchSeqSets    []string
-	fetchErrors     []error
-	username        string
-	password        string
-	selected        string
-	readOnly        bool
-	messages        uint32
-	uidNext         uint32
-	loggedOut       bool
-	terminated      bool
-	zeroUIDValidity bool
+	mu sync.Mutex
+
+	uidValidity uint32
+	uidNext     uint32
+	messages    uint32
+	mailboxUIDs []uint32
+
+	headerByUID        map[uint32][]byte
+	bodyByUID          map[uint32][]byte
+	internalDates      map[uint32]time.Time
+	fetchErrors        []error
+	duplicateUID       uint32
+	expungeBeforeFetch map[int][]uint32
+
+	username       string
+	password       string
+	selected       string
+	readOnly       bool
+	loginCalls     int
+	selectCalls    int
+	searchCalls    int
+	searchUIDSets  []string
+	fetchCalls     []fetchCall
+	activeCommands int
+	maxActive      int
+	terminated     bool
 }
 
 func (f *fakeIMAPSession) Login(username, password string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.username = username
 	f.password = password
+	f.loginCalls++
 	return nil
 }
 
 func (f *fakeIMAPSession) Select(name string, readOnly bool) (*imap.MailboxStatus, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.selected = name
 	f.readOnly = readOnly
-	uidValidity := uint32(4242)
-	if f.zeroUIDValidity {
-		uidValidity = 0
+	f.selectCalls++
+	messages := f.messages
+	if messages == 0 {
+		messages = uint32(len(f.mailboxUIDListLocked()))
 	}
 	return &imap.MailboxStatus{
-		Name: name, UidValidity: uidValidity, UidNext: f.uidNext, Messages: f.messages,
+		Name:        name,
+		UidValidity: f.uidValidity,
+		UidNext:     f.uidNext,
+		Messages:    messages,
 	}, nil
 }
 
 func (f *fakeIMAPSession) UidSearch(criteria *imap.SearchCriteria) ([]uint32, error) {
-	f.searchCriteria = append(f.searchCriteria, criteria)
-	call := f.searchIndex
-	f.searchIndex++
-	if call < len(f.searchErrors) && f.searchErrors[call] != nil {
-		return nil, f.searchErrors[call]
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.searchCalls++
+	if criteria == nil || criteria.Uid == nil {
+		return nil, errors.New("expected account-level UID range search")
 	}
-	if call >= len(f.searchResults) {
-		return nil, fmt.Errorf("unexpected search %d", call)
+	f.searchUIDSets = append(f.searchUIDSets, criteria.Uid.String())
+	uids := make([]uint32, 0)
+	for _, uid := range f.mailboxUIDListLocked() {
+		if criteria.Uid.Contains(uid) {
+			uids = append(uids, uid)
+		}
 	}
-	return f.searchResults[call], nil
+	return uids, nil
 }
 
 func (f *fakeIMAPSession) Fetch(seqset *imap.SeqSet, items []imap.FetchItem, ch chan *imap.Message) error {
-	return f.fetch(seqset, items, ch)
+	commandErr := f.beginFetch(seqset, items)
+	defer func() {
+		close(ch)
+		f.endFetch()
+	}()
+	if commandErr != nil {
+		return commandErr
+	}
+	if len(items) != 1 || items[0] != imap.FetchUid {
+		return errors.New("unexpected sequence fetch items")
+	}
+	for index, uid := range f.mailboxUIDList() {
+		sequence := uint32(index + 1)
+		if !seqset.Contains(sequence) {
+			continue
+		}
+		ch <- &imap.Message{SeqNum: sequence, Uid: uid}
+	}
+	return nil
 }
 
 func (f *fakeIMAPSession) UidFetch(seqset *imap.SeqSet, items []imap.FetchItem, ch chan *imap.Message) error {
@@ -79,27 +122,24 @@ func (f *fakeIMAPSession) UidFetch(seqset *imap.SeqSet, items []imap.FetchItem, 
 }
 
 func (f *fakeIMAPSession) fetch(seqset *imap.SeqSet, items []imap.FetchItem, ch chan *imap.Message) error {
-	defer close(ch)
-	call := len(f.fetchItems)
-	f.fetchItems = append(f.fetchItems, append([]imap.FetchItem(nil), items...))
-	f.fetchSeqSets = append(f.fetchSeqSets, seqset.String())
-	if call < len(f.fetchErrors) && f.fetchErrors[call] != nil {
-		return f.fetchErrors[call]
+	commandErr := f.beginFetch(seqset, items)
+
+	defer func() {
+		close(ch)
+		f.endFetch()
+	}()
+	if commandErr != nil {
+		return commandErr
 	}
 	if len(items) == 1 && items[0] == imap.FetchUid {
-		first := uint32(1)
-		if seqset != nil && len(seqset.Set) > 0 && seqset.Set[0].Start != 0 {
-			first = seqset.Set[0].Start
-		}
-		for index, uid := range f.uidOnlyResults {
-			seqNum := first + uint32(index)
-			if index < len(f.uidOnlySeqNums) {
-				seqNum = f.uidOnlySeqNums[index]
+		for _, uid := range f.mailboxUIDList() {
+			if seqset.Contains(uid) {
+				ch <- &imap.Message{Uid: uid}
 			}
-			ch <- &imap.Message{SeqNum: seqNum, Uid: uid}
 		}
 		return nil
 	}
+
 	headerFetch := false
 	var requested *imap.BodySectionName
 	for _, item := range items {
@@ -118,673 +158,1091 @@ func (f *fakeIMAPSession) fetch(seqset *imap.SeqSet, items []imap.FetchItem, ch 
 	if headerFetch {
 		source = f.headerByUID
 	}
-	for uid, raw := range source {
-		if seqset == nil || !seqset.Contains(uid) {
-			continue
+	uids := make([]uint32, 0, len(source))
+	for uid := range source {
+		if seqset.Contains(uid) {
+			uids = append(uids, uid)
 		}
-		responseSection := *requested
-		responseSection.Peek = false
-		if len(responseSection.Partial) == 2 {
-			responseSection.Partial = []int{responseSection.Partial[0]}
-		}
-		ch <- &imap.Message{
-			Uid:          uid,
-			Size:         uint32(len(raw)),
-			InternalDate: f.internalDates[uid],
-			Body: map[*imap.BodySectionName]imap.Literal{
-				&responseSection: bytes.NewBuffer(raw),
-			},
+	}
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+	for _, uid := range uids {
+		f.sendMessage(ch, requested, uid, source[uid])
+		if headerFetch && uid == f.duplicateUID {
+			f.sendMessage(ch, requested, uid, source[uid])
 		}
 	}
 	return nil
 }
 
+func (f *fakeIMAPSession) beginFetch(seqset *imap.SeqSet, items []imap.FetchItem) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	callIndex := len(f.fetchCalls)
+	if uids := f.expungeBeforeFetch[callIndex]; len(uids) > 0 {
+		f.expungeUIDsLocked(uids)
+	}
+	f.fetchCalls = append(f.fetchCalls, fetchCall{
+		seqSet: seqset.String(),
+		items:  append([]imap.FetchItem(nil), items...),
+	})
+	f.activeCommands++
+	if f.activeCommands > f.maxActive {
+		f.maxActive = f.activeCommands
+	}
+	var commandErr error
+	if callIndex < len(f.fetchErrors) {
+		commandErr = f.fetchErrors[callIndex]
+	}
+	return commandErr
+}
+
+func (f *fakeIMAPSession) expungeUIDsLocked(uids []uint32) {
+	expunged := make(map[uint32]struct{}, len(uids))
+	for _, uid := range uids {
+		expunged[uid] = struct{}{}
+	}
+	mailboxUIDs := f.mailboxUIDListLocked()
+	kept := mailboxUIDs[:0]
+	for _, uid := range mailboxUIDs {
+		if _, remove := expunged[uid]; !remove {
+			kept = append(kept, uid)
+		}
+	}
+	f.mailboxUIDs = make([]uint32, len(kept))
+	copy(f.mailboxUIDs, kept)
+	for uid := range expunged {
+		delete(f.headerByUID, uid)
+		delete(f.bodyByUID, uid)
+		delete(f.internalDates, uid)
+	}
+}
+
+func (f *fakeIMAPSession) endFetch() {
+	f.mu.Lock()
+	f.activeCommands--
+	f.mu.Unlock()
+}
+
+func (f *fakeIMAPSession) mailboxUIDListLocked() []uint32 {
+	if f.mailboxUIDs != nil {
+		return append([]uint32(nil), f.mailboxUIDs...)
+	}
+	uids := make([]uint32, 0, len(f.headerByUID))
+	for uid := range f.headerByUID {
+		uids = append(uids, uid)
+	}
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+	return uids
+}
+
+func (f *fakeIMAPSession) mailboxUIDList() []uint32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.mailboxUIDListLocked()
+}
+
+func (f *fakeIMAPSession) sendMessage(ch chan *imap.Message, requested *imap.BodySectionName, uid uint32, raw []byte) {
+	responseSection := *requested
+	responseSection.Peek = false
+	if len(responseSection.Partial) == 2 {
+		responseSection.Partial = []int{responseSection.Partial[0]}
+	}
+	ch <- &imap.Message{
+		Uid:          uid,
+		Size:         uint32(len(raw)),
+		InternalDate: f.internalDates[uid],
+		Body: map[*imap.BodySectionName]imap.Literal{
+			&responseSection: bytes.NewBuffer(raw),
+		},
+	}
+}
+
 func (f *fakeIMAPSession) Logout() error {
-	f.loggedOut = true
 	return nil
 }
 
 func (f *fakeIMAPSession) Terminate() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.terminated = true
 	return nil
 }
 
-type blockingLogoutSession struct {
-	*fakeIMAPSession
-	logoutStarted    chan struct{}
-	logoutRelease    chan struct{}
-	terminatedSignal chan struct{}
-	terminateOnce    sync.Once
+func (f *fakeIMAPSession) calls() []fetchCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result := make([]fetchCall, len(f.fetchCalls))
+	copy(result, f.fetchCalls)
+	return result
 }
 
-func (s *blockingLogoutSession) Logout() error {
-	s.loggedOut = true
-	close(s.logoutStarted)
-	select {
-	case <-s.logoutRelease:
-	case <-s.terminatedSignal:
-	}
-	return nil
+func (f *fakeIMAPSession) counters() (login, selectCount, search, maxActive int, terminated bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.loginCalls, f.selectCalls, f.searchCalls, f.maxActive, f.terminated
 }
 
-func (s *blockingLogoutSession) Terminate() error {
-	s.terminated = true
-	s.terminateOnce.Do(func() { close(s.terminatedSignal) })
-	return nil
+func (f *fakeIMAPSession) searches() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.searchUIDSets...)
 }
 
-func TestFetcherFetchLatest(t *testing.T) {
-	fixedNow := time.Date(2026, 8, 6, 12, 0, 0, 0, time.FixedZone("CST", 8*60*60))
-	firstDate := fixedNow.Add(-2 * time.Hour)
-	secondDate := fixedNow.Add(-time.Hour)
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{9, 10, 11}, {20}},
-		headerByUID: map[uint32][]byte{
-			9:  []byte("To: alias@example.com\r\n\r\n"),
-			10: []byte("X-Original-To: Alias@Example.com\r\n\r\n"),
-			11: []byte("X-Original-To: notalias@example.com\r\n\r\n"),
-			20: []byte("Delivered-To: second@example.com\r\n\r\n"),
-		},
-		bodyByUID: map[uint32][]byte{
-			10: []byte("Message-ID: <ten@example.com>\r\nSubject: Ten\r\nTo: alias@example.com\r\n\r\nbody ten"),
-			20: []byte("Message-ID: <twenty@example.com>\r\nSubject: Twenty\r\nTo: second@example.com\r\n\r\nbody twenty"),
-		},
-		internalDates: map[uint32]time.Time{10: firstDate, 20: secondDate},
-	}
-
-	fetcher := NewFetcher()
-	fetcher.MaxCandidatesPerAlias = 3
-	fetcher.now = func() time.Time { return fixedNow }
-	var dialAddress, dialServerName string
-	fetcher.dial = func(_ context.Context, address, serverName string, _ time.Duration) (imapSession, error) {
-		dialAddress = address
-		dialServerName = serverName
-		return session, nil
-	}
-
-	account := domain.Account{
+func testAccount() domain.Account {
+	return domain.Account{
 		ID:           7,
 		Email:        "owner@icloud.com",
 		IMAPUsername: "imap-user",
 		Enabled:      true,
 	}
-	aliases := []domain.Alias{
-		{ID: 1, AccountID: 7, Address: "alias@example.com", Enabled: true},
-		{ID: 2, AccountID: 7, Address: "second@example.com", Enabled: true},
-		{ID: 3, AccountID: 7, Address: "disabled@example.com", Enabled: false},
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), account, "app-password", aliases)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dialAddress != "imap.mail.me.com:993" || dialServerName != "imap.mail.me.com" {
-		t.Fatalf("dial = %q server name %q", dialAddress, dialServerName)
-	}
-	if session.username != "imap-user" || session.password != "app-password" {
-		t.Fatalf("login = %q / %q", session.username, session.password)
-	}
-	if session.selected != "INBOX" || !session.readOnly {
-		t.Fatalf("select = %q read-only=%v", session.selected, session.readOnly)
-	}
-	if session.loggedOut || !session.terminated {
-		t.Fatalf("cleanup = logout=%v terminate=%v", session.loggedOut, session.terminated)
-	}
-	if len(got) != 2 {
-		t.Fatalf("messages = %#v", got)
-	}
-	if got[1].UID != 10 || got[1].Subject != "Ten" || got[1].TextBody != "body ten" {
-		t.Fatalf("alias 1 message = %#v", got[1])
-	}
-	if got[1].SnapshotState != domain.SnapshotFound || got[2].SnapshotState != domain.SnapshotFound {
-		t.Fatalf("snapshot states = %q / %q", got[1].SnapshotState, got[2].SnapshotState)
-	}
-	if got[2].UID != 20 || got[2].Subject != "Twenty" || got[2].TextBody != "body twenty" {
-		t.Fatalf("alias 2 message = %#v", got[2])
-	}
-	for aliasID, message := range got {
-		if message.AliasID != aliasID || message.UIDValidity != 4242 || !message.SyncedAt.Equal(fixedNow.UTC()) {
-			t.Fatalf("alias %d identity = %#v", aliasID, message)
-		}
-	}
-	if len(session.fetchItems) != 2 {
-		t.Fatalf("fetch calls = %d, want 2", len(session.fetchItems))
-	}
-	for call, items := range session.fetchItems {
-		foundPeek := false
-		for _, item := range items {
-			if strings.HasPrefix(string(item), "BODY.PEEK[") {
-				foundPeek = true
-			}
-		}
-		if !foundPeek {
-			t.Fatalf("fetch call %d did not use BODY.PEEK: %#v", call, items)
-		}
-	}
-	for _, criteria := range session.searchCriteria {
-		headerNames := make(map[string]struct{})
-		collectSearchHeaderNames(criteria, headerNames)
-		for _, weak := range weakRecipientHeaderFields {
-			if containsSearchHeaderNameFold(headerNames, weak) {
-				t.Fatalf("default search included weak header %q", weak)
-			}
-		}
-		for _, strong := range strongRecipientHeaderFields {
-			if !containsSearchHeaderNameFold(headerNames, strong) {
-				t.Fatalf("default search omitted strong header %q", strong)
-			}
-		}
-		if !containsSearchHeaderNameFold(headerNames, icloudHMEHeaderField) {
-			t.Fatalf("default search omitted Apple HME header %q", icloudHMEHeaderField)
-		}
-	}
 }
 
-func TestFetcherFetchLatestRecognizesAppleHMERoute(t *testing.T) {
-	fixedNow := time.Date(2026, 8, 7, 8, 5, 0, 0, time.UTC)
-	const aliasAddress = "hidden.alias@icloud.com"
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{42}},
-		headerByUID: map[uint32][]byte{
-			42: []byte("Original-Recipient: rfc822; primary@icloud.com\r\n" +
-				"To: Hide My Email <" + aliasAddress + ">\r\n" +
-				"X-ICLOUD-HME: p=" + aliasAddress + "; d=; f=primary@icloud.com; r=to; s=sender@example.com\r\n\r\n"),
-		},
-		bodyByUID: map[uint32][]byte{
-			42: []byte("Message-ID: <hme@example.com>\r\nSubject: HME\r\nTo: Hide My Email <" + aliasAddress + ">\r\n\r\nbody"),
-		},
-		internalDates: map[uint32]time.Time{42: fixedNow.Add(-time.Minute)},
-	}
+func testAlias(id int64, address string) domain.Alias {
+	return domain.Alias{ID: id, AccountID: 7, Address: address, Enabled: true}
+}
+
+func testFetcher(session imapSession, now time.Time) *Fetcher {
 	fetcher := NewFetcher()
-	fetcher.now = func() time.Time { return fixedNow }
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+	fetcher.now = func() time.Time { return now }
+	fetcher.dial = func(_ context.Context, address, serverName string, _ time.Duration) (imapSession, error) {
+		if address != "imap.mail.me.com:993" || serverName != "imap.mail.me.com" {
+			return nil, fmt.Errorf("unexpected endpoint %q / %q", address, serverName)
+		}
 		return session, nil
 	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "primary@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{{ID: 7, AccountID: 1, Address: aliasAddress, Enabled: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	message := got[7]
-	if message.SnapshotState != domain.SnapshotFound || message.UID != 42 || message.Subject != "HME" {
-		t.Fatalf("HME snapshot = %#v, want UID 42 Found", message)
-	}
-	headerNames := make(map[string]struct{})
-	collectSearchHeaderNames(session.searchCriteria[0], headerNames)
-	if !containsSearchHeaderNameFold(headerNames, icloudHMEHeaderField) {
-		t.Fatalf("HME search omitted %q", icloudHMEHeaderField)
-	}
-	if len(session.fetchItems) != 2 {
-		t.Fatalf("HME FETCH calls = %d, want headers and body", len(session.fetchItems))
-	}
-	if !strings.Contains(string(session.fetchItems[0][1]), icloudHMEHeaderField) ||
-		!strings.Contains(string(session.fetchItems[0][1]), "To") {
-		t.Fatalf("HME header FETCH fields = %#v, want HME and To", session.fetchItems[0])
-	}
+	return fetcher
 }
 
-func TestFetcherFallbackRecognizesAppleHMERoute(t *testing.T) {
-	const aliasAddress = "hidden.alias@icloud.com"
-	session := &fakeIMAPSession{
-		searchResults:  [][]uint32{{}},
-		searchErrors:   []error{errors.New("Unexpected exception")},
-		messages:       1,
-		uidOnlyResults: []uint32{42},
-		headerByUID: map[uint32][]byte{
-			42: []byte("Original-Recipient: rfc822; primary@icloud.com\r\n" +
-				"To: Hide My Email <" + aliasAddress + ">\r\n" +
-				"X-ICLOUD-HME: p=" + aliasAddress + "; d=; f=primary@icloud.com; r=to\r\n\r\n"),
-		},
-		bodyByUID: map[uint32][]byte{42: []byte("Subject: fallback HME\r\n\r\nbody")},
-	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidates = 1
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "primary@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{{ID: 7, AccountID: 1, Address: aliasAddress, Enabled: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if message := got[7]; message.SnapshotState != domain.SnapshotFound || message.UID != 42 {
-		t.Fatalf("fallback HME snapshot = %#v, want UID 42 Found", message)
-	}
+func aliasHeader(address string) []byte {
+	return []byte("X-Original-To: " + address + "\r\n\r\n")
 }
 
-func TestFetcherMalformedAppleHMERouteStaysUnknown(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{42}},
-		headerByUID: map[uint32][]byte{
-			42: []byte("Original-Recipient: rfc822; primary@icloud.com\r\n" +
-				"To: Hide My Email <hidden.alias@icloud.com>\r\n" +
-				"X-ICLOUD-HME: f=primary@icloud.com; r=to\r\n\r\n"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "primary@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{{ID: 7, AccountID: 1, Address: "hidden.alias@icloud.com", Enabled: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if message := got[7]; message.SnapshotState != domain.SnapshotUnknown || message.UID != 0 {
-		t.Fatalf("malformed HME snapshot = %#v, want Unknown", message)
-	}
+func ordinaryHeader() []byte {
+	return []byte("From: sender@example.com\r\nTo: owner@icloud.com\r\n\r\n")
 }
 
-func collectSearchHeaderNames(criteria *imap.SearchCriteria, names map[string]struct{}) {
-	for name := range criteria.Header {
-		names[name] = struct{}{}
-	}
-	for _, pair := range criteria.Or {
-		collectSearchHeaderNames(pair[0], names)
-		collectSearchHeaderNames(pair[1], names)
-	}
+func rawMessage(uid uint32) []byte {
+	return []byte(fmt.Sprintf(
+		"Message-ID: <%d@example.com>\r\nSubject: message %d\r\n\r\nbody %d",
+		uid,
+		uid,
+		uid,
+	))
 }
 
-func containsSearchHeaderNameFold(names map[string]struct{}, wanted string) bool {
-	for name := range names {
-		if strings.EqualFold(name, wanted) {
+func isHeaderFetch(call fetchCall) bool {
+	for _, item := range call.items {
+		if strings.Contains(string(item), "HEADER.FIELDS") {
 			return true
 		}
 	}
 	return false
 }
 
-func TestFetcherFallsBackToRecentUIDScanWhenRecipientSearchFails(t *testing.T) {
+func isUIDOnlyFetch(call fetchCall) bool {
+	return len(call.items) == 1 && call.items[0] == imap.FetchUid
+}
+
+func TestFetchIncrementalScans165AliasesWithOneAccountUIDSearch(t *testing.T) {
+	const aliasCount = 165
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 	session := &fakeIMAPSession{
-		searchResults:  [][]uint32{nil},
-		searchErrors:   []error{errors.New("Unexpected exception")},
-		messages:       20,
-		uidNext:        13,
-		uidOnlyResults: []uint32{10, 11, 12, 13},
-		headerByUID: map[uint32][]byte{
-			10: []byte("X-Original-To: alias@example.com\r\n\r\n"),
-			11: []byte("Delivered-To: alias@example.com\r\n\r\n"),
-			12: []byte("X-Original-To: other@example.com\r\n\r\n"),
-			13: []byte("X-Original-To: other@example.com\r\n\r\n"),
-		},
-		bodyByUID: map[uint32][]byte{
-			11: []byte("Subject: fallback winner\r\n\r\nbody"),
-		},
-		internalDates: map[uint32]time.Time{
-			11: time.Date(2026, 8, 7, 7, 0, 0, 0, time.UTC),
-		},
+		uidValidity:   9001,
+		uidNext:       aliasCount + 1,
+		headerByUID:   make(map[uint32][]byte, aliasCount),
+		bodyByUID:     make(map[uint32][]byte, aliasCount),
+		internalDates: make(map[uint32]time.Time, aliasCount),
 	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidates = 4
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
+	aliases := make([]domain.Alias, 0, aliasCount)
+	for index := 1; index <= aliasCount; index++ {
+		uid := uint32(index)
+		address := fmt.Sprintf("alias-%03d@icloud.com", index)
+		aliases = append(aliases, testAlias(int64(index), address))
+		session.headerByUID[uid] = aliasHeader(address)
+		session.bodyByUID[uid] = rawMessage(uid)
+		session.internalDates[uid] = now.Add(-time.Duration(aliasCount-index) * time.Minute)
 	}
 
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
+	result, err := testFetcher(session, now).FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"app-password",
+		aliases,
+		&domain.IMAPSyncState{AccountID: 7, UIDValidity: 9001, LastUID: 0},
+		nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message := got[5]; message.SnapshotState != domain.SnapshotFound || message.UID != 11 || message.Subject != "fallback winner" {
-		t.Fatalf("fallback snapshot = %#v, want UID 11 Found", message)
+	if result.Reset || result.HasMore || result.State.AccountID != 7 || result.State.UIDValidity != 9001 ||
+		result.State.LastUID != aliasCount || !result.State.UpdatedAt.Equal(now) {
+		t.Fatalf("state = %#v", result)
 	}
-	if len(session.searchCriteria) != 1 || len(session.searchCriteria[0].Or) == 0 {
-		t.Fatalf("SEARCH calls = %#v, want one combined recipient search", session.searchCriteria)
+	if len(result.Messages) != aliasCount {
+		t.Fatalf("messages = %d, want %d", len(result.Messages), aliasCount)
 	}
-	if len(session.fetchItems) != 3 || len(session.fetchItems[0]) != 1 || session.fetchItems[0][0] != imap.FetchUid {
-		t.Fatalf("fallback FETCH calls = %#v, want UID discovery, headers, body", session.fetchItems)
-	}
-	if got := session.fetchSeqSets[0]; got != "17:20" {
-		t.Fatalf("fallback sequence range = %q, want 17:20", got)
-	}
-}
-
-func TestFetcherFallbackStopsAfterNewestHeaderBatchFindsWinner(t *testing.T) {
-	const candidateCount = candidateHeaderFetchBatch + 1
-	uidResults := make([]uint32, 0, candidateCount)
-	headers := make(map[uint32][]byte, candidateCount)
-	for uid := uint32(1); uid <= candidateCount; uid++ {
-		uidResults = append(uidResults, uid)
-		headers[uid] = []byte("X-Original-To: other@example.com\r\n\r\n")
-	}
-	headers[candidateCount] = []byte("X-Original-To: alias@example.com\r\n\r\n")
-	session := &fakeIMAPSession{
-		searchResults:  [][]uint32{nil},
-		searchErrors:   []error{errors.New("Unexpected exception")},
-		messages:       candidateCount,
-		uidOnlyResults: uidResults,
-		headerByUID:    headers,
-		bodyByUID: map[uint32][]byte{
-			candidateCount: []byte("Subject: newest batch winner\r\n\r\nbody"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidates = candidateCount
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if message := got[5]; message.SnapshotState != domain.SnapshotFound || message.UID != candidateCount {
-		t.Fatalf("fallback snapshot = %#v, want newest batch winner", message)
-	}
-	if len(session.fetchItems) != 3 {
-		t.Fatalf("fallback FETCH calls = %d, want UID discovery, one header batch, and body", len(session.fetchItems))
-	}
-}
-
-func TestFetcherFallbackStopsAfterUnresolvedNewestCandidate(t *testing.T) {
-	const candidateCount = candidateHeaderFetchBatch + 1
-	uidResults := make([]uint32, 0, candidateCount)
-	headers := make(map[uint32][]byte, candidateCount-1)
-	for uid := uint32(1); uid <= candidateCount; uid++ {
-		uidResults = append(uidResults, uid)
-		if uid != candidateCount {
-			headers[uid] = []byte("X-Original-To: alias@example.com\r\n\r\n")
+	for _, alias := range aliases {
+		message := result.Messages[alias.ID]
+		if message.SnapshotState != domain.SnapshotFound || message.UID != uint32(alias.ID) {
+			t.Fatalf("alias %d message = %#v", alias.ID, message)
 		}
 	}
-	session := &fakeIMAPSession{
-		searchResults:  [][]uint32{nil},
-		searchErrors:   []error{errors.New("Unexpected exception")},
-		messages:       candidateCount,
-		uidOnlyResults: uidResults,
-		headerByUID:    headers,
-	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidates = candidateCount
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
 
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
+	login, selectCount, search, maxActive, terminated := session.counters()
+	if login != 1 || selectCount != 1 || search != 1 || maxActive != 1 || !terminated {
+		t.Fatalf(
+			"commands login=%d select=%d search=%d max-active=%d terminated=%v",
+			login,
+			selectCount,
+			search,
+			maxActive,
+			terminated,
+		)
 	}
-	if message := got[5]; message.SnapshotState != domain.SnapshotUnknown || message.UID != 0 {
-		t.Fatalf("fallback snapshot = %#v, want Unknown", message)
+	if searches := session.searches(); !reflect.DeepEqual(searches, []string{"1:165"}) {
+		t.Fatalf("account-level UID searches = %v", searches)
 	}
-	if len(session.fetchItems) != 2 {
-		t.Fatalf("fallback FETCH calls = %d, want UID discovery and one header batch", len(session.fetchItems))
+	headerCalls := 0
+	for _, call := range session.calls() {
+		if isHeaderFetch(call) {
+			headerCalls++
+		}
+	}
+	wantHeaderCalls := (aliasCount + candidateHeaderFetchBatch - 1) / candidateHeaderFetchBatch
+	if headerCalls != wantHeaderCalls {
+		t.Fatalf("shared header FETCH calls = %d, want %d", headerCalls, wantHeaderCalls)
 	}
 }
 
-func TestFetcherFallbackContinuesUntilEveryAliasIsTerminal(t *testing.T) {
-	const candidateCount = candidateHeaderFetchBatch + 1
-	uidResults := make([]uint32, 0, candidateCount)
-	headers := make(map[uint32][]byte, candidateCount)
-	for uid := uint32(1); uid <= candidateCount; uid++ {
-		uidResults = append(uidResults, uid)
-		headers[uid] = []byte("X-Original-To: other@example.com\r\n\r\n")
-	}
-	headers[candidateCount] = []byte("X-Original-To: a@example.com\r\n\r\n")
-	headers[1] = []byte("X-Original-To: b@example.com\r\n\r\n")
-	session := &fakeIMAPSession{
-		searchResults:  [][]uint32{nil},
-		searchErrors:   []error{errors.New("Unexpected exception")},
-		messages:       candidateCount,
-		uidOnlyResults: uidResults,
-		headerByUID:    headers,
-		bodyByUID: map[uint32][]byte{
-			candidateCount: []byte("Subject: alias a\r\n\r\nbody a"),
-			1:              []byte("Subject: alias b\r\n\r\nbody b"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidates = candidateCount
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
+func TestFetchIncrementalNoNewUIDDoesNotFetch(t *testing.T) {
+	now := time.Date(2026, 8, 7, 13, 0, 0, 0, time.UTC)
+	session := &fakeIMAPSession{uidValidity: 77, uidNext: 21}
+	previous := domain.IMAPSyncState{
+		AccountID: 7, UIDValidity: 77, LastUID: 20, UpdatedAt: now.Add(-time.Hour),
 	}
 
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "a@example.com", Enabled: true},
-		{ID: 6, AccountID: 1, Address: "b@example.com", Enabled: true},
-	})
+	result, err := testFetcher(session, now).FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")},
+		&previous,
+		nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message := got[5]; message.SnapshotState != domain.SnapshotFound || message.UID != candidateCount {
-		t.Fatalf("alias A snapshot = %#v, want first-batch winner", message)
+	if result.Reset || len(result.Messages) != 0 || len(session.calls()) != 0 {
+		t.Fatalf("no-new result = %#v, FETCH calls = %#v", result, session.calls())
 	}
-	if message := got[6]; message.SnapshotState != domain.SnapshotFound || message.UID != 1 {
-		t.Fatalf("alias B snapshot = %#v, want second-batch winner", message)
+	if result.State.LastUID != 20 || !result.State.UpdatedAt.Equal(now) {
+		t.Fatalf("state = %#v", result.State)
 	}
-	if len(session.fetchItems) != 4 {
-		t.Fatalf("fallback FETCH calls = %d, want discovery, two header batches, and body", len(session.fetchItems))
-	}
-	if session.fetchSeqSets[1] != "2:65" || session.fetchSeqSets[2] != "1" {
-		t.Fatalf("header batch UID sets = %q / %q, want newest batch then remaining UID", session.fetchSeqSets[1], session.fetchSeqSets[2])
+	_, _, search, _, _ := session.counters()
+	if search != 0 {
+		t.Fatalf("UID SEARCH calls = %d", search)
 	}
 }
 
-func TestFetcherFallbackUIDScanRemainsUnknownWhenWindowIsIncomplete(t *testing.T) {
+func TestFetchIncrementalValidatesExistingSnapshotsBeforeScanAndPublish(t *testing.T) {
+	now := time.Date(2026, 8, 7, 13, 30, 0, 0, time.UTC)
 	session := &fakeIMAPSession{
-		searchResults:  [][]uint32{nil},
-		searchErrors:   []error{errors.New("Unexpected exception")},
-		messages:       10,
-		uidNext:        100,
-		uidOnlyResults: []uint32{98, 99},
+		uidValidity: 77,
+		uidNext:     31,
+		mailboxUIDs: []uint32{20, 30},
+	}
+	aliases := []domain.Alias{
+		testAlias(1, "one@icloud.com"),
+		testAlias(2, "two@icloud.com"),
+	}
+	positions := map[int64]domain.MailboxSnapshotPosition{
+		1: {AliasID: 1, UIDValidity: 77, UID: 20},
+		2: {AliasID: 2, UIDValidity: 77, UID: 30},
+	}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 30}
+
+	result, err := testFetcher(session, now).FetchIncremental(
+		context.Background(), testAccount(), "password", aliases, &previous, positions,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Reset || result.HasMore || len(result.Messages) != 0 || result.State.LastUID != 30 {
+		t.Fatalf("stable snapshot result = %#v", result)
+	}
+	calls := session.calls()
+	if len(calls) != 2 || calls[0].seqSet != "20,30" || !isUIDOnlyFetch(calls[0]) ||
+		calls[1].seqSet != "20,30" || !isUIDOnlyFetch(calls[1]) {
+		t.Fatalf("shared snapshot validation calls = %#v", calls)
+	}
+}
+
+func TestFetchIncrementalReconcilesExpungedLatestSnapshot(t *testing.T) {
+	now := time.Date(2026, 8, 7, 13, 45, 0, 0, time.UTC)
+	aliases := []domain.Alias{testAlias(1, "one@icloud.com")}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 30}
+	positions := map[int64]domain.MailboxSnapshotPosition{
+		1: {AliasID: 1, UIDValidity: 77, UID: 30},
+	}
+
+	t.Run("falls back to next newest message in shared window", func(t *testing.T) {
+		session := &fakeIMAPSession{
+			uidValidity: 77,
+			uidNext:     31,
+			mailboxUIDs: []uint32{10, 20},
+			headerByUID: map[uint32][]byte{10: ordinaryHeader(), 20: aliasHeader("one@icloud.com")},
+			bodyByUID:   map[uint32][]byte{20: rawMessage(20)},
+		}
+		result, err := testFetcher(session, now).FetchIncremental(
+			context.Background(), testAccount(), "password", aliases, &previous, positions,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		message := result.Messages[1]
+		if message.SnapshotState != domain.SnapshotFound || message.UID != 20 || result.State.LastUID != 30 {
+			t.Fatalf("expunged snapshot fallback = %#v", result)
+		}
+		if _, _, searches, maxActive, _ := session.counters(); searches != 0 || maxActive != 1 {
+			t.Fatalf("expunge reconciliation searches=%d max-active=%d", searches, maxActive)
+		}
+		calls := session.calls()
+		if len(calls) != 5 || calls[0].seqSet != "30" || !isUIDOnlyFetch(calls[0]) ||
+			calls[1].seqSet != "1:2" || !isUIDOnlyFetch(calls[1]) ||
+			calls[2].seqSet != "10,20" || !isHeaderFetch(calls[2]) || calls[3].seqSet != "20" ||
+			calls[4].seqSet != "20" || !isUIDOnlyFetch(calls[4]) {
+			t.Fatalf("shared expunge reconciliation calls = %#v", calls)
+		}
+	})
+
+	t.Run("deletes snapshot when shared window has no fallback", func(t *testing.T) {
+		session := &fakeIMAPSession{
+			uidValidity: 77,
+			uidNext:     31,
+			mailboxUIDs: []uint32{10},
+			headerByUID: map[uint32][]byte{10: ordinaryHeader()},
+		}
+		result, err := testFetcher(session, now).FetchIncremental(
+			context.Background(), testAccount(), "password", aliases, &previous, positions,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		message := result.Messages[1]
+		if message.SnapshotState != domain.SnapshotEmpty || message.AliasID != 1 || result.State.LastUID != 30 {
+			t.Fatalf("expunged snapshot deletion = %#v", result)
+		}
+		if searches := session.searches(); len(searches) != 0 {
+			t.Fatalf("expunge deletion performed UID SEARCH: %v", searches)
+		}
+	})
+}
+
+func TestFetchIncrementalResetValidatesPreservedSameGenerationSnapshots(t *testing.T) {
+	now := time.Date(2026, 8, 7, 13, 50, 0, 0, time.UTC)
+	session := &fakeIMAPSession{
+		uidValidity: 77,
+		uidNext:     31,
+		mailboxUIDs: []uint32{5, 20, 30},
 		headerByUID: map[uint32][]byte{
-			98: []byte("X-Original-To: other@example.com\r\n\r\n"),
-			99: []byte("Delivered-To: other@example.com\r\n\r\n"),
+			5:  aliasHeader("one@icloud.com"),
+			20: aliasHeader("two@icloud.com"),
+			30: ordinaryHeader(),
 		},
+		bodyByUID: map[uint32][]byte{20: rawMessage(20)},
 	}
-	fetcher := NewFetcher()
+	aliases := []domain.Alias{
+		testAlias(1, "one@icloud.com"),
+		testAlias(2, "two@icloud.com"),
+	}
+	positions := map[int64]domain.MailboxSnapshotPosition{
+		1: {AliasID: 1, UIDValidity: 77, UID: 5},
+		2: {AliasID: 2, UIDValidity: 77, UID: 25},
+	}
+	fetcher := testFetcher(session, now)
 	fetcher.MaxCandidates = 2
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
 
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
+	result, err := fetcher.FetchIncremental(
+		context.Background(), testAccount(), "password", aliases, nil, positions,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if message := got[5]; message.SnapshotState != domain.SnapshotUnknown || message.UID != 0 {
-		t.Fatalf("incomplete fallback snapshot = %#v, want Unknown", message)
+	if !result.Reset || result.State.LastUID != 30 {
+		t.Fatalf("reset result = %#v", result)
+	}
+	if _, exists := result.Messages[1]; exists {
+		t.Fatalf("validated snapshot outside reset window was replaced: %#v", result.Messages[1])
+	}
+	if message := result.Messages[2]; message.SnapshotState != domain.SnapshotFound || message.UID != 20 {
+		t.Fatalf("expunged reset snapshot fallback = %#v", message)
+	}
+	calls := session.calls()
+	if len(calls) != 5 || calls[0].seqSet != "2:3" || !isUIDOnlyFetch(calls[0]) ||
+		calls[1].seqSet != "5,25" || !isUIDOnlyFetch(calls[1]) ||
+		calls[2].seqSet != "20,30" || !isHeaderFetch(calls[2]) || calls[3].seqSet != "20" ||
+		calls[4].seqSet != "5,20" || !isUIDOnlyFetch(calls[4]) {
+		t.Fatalf("bounded reset validation calls = %#v", calls)
 	}
 }
 
-func TestFetcherFallbackUIDScanCanConfirmEmptyMailboxBinding(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults:  [][]uint32{nil},
-		searchErrors:   []error{errors.New("Unexpected exception")},
-		messages:       2,
-		uidNext:        100,
-		uidOnlyResults: []uint32{98, 99},
-		headerByUID: map[uint32][]byte{
-			98: []byte("X-Original-To: other@example.com\r\n\r\n"),
-			99: []byte("Delivered-To: other@example.com\r\n\r\n"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidates = 2
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if message := got[5]; message.SnapshotState != domain.SnapshotEmpty {
-		t.Fatalf("complete fallback snapshot = %#v, want Empty", message)
-	}
-}
-
-func TestFetcherFallbackUsesSequenceWindowForSparseUIDs(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults:  [][]uint32{nil},
-		searchErrors:   []error{errors.New("Unexpected exception")},
-		messages:       3,
-		uidNext:        900000,
-		uidOnlyResults: []uint32{3, 11, 700000},
-		headerByUID: map[uint32][]byte{
-			700000: []byte("X-Original-To: other@example.com\r\n\r\n"),
-			11:     []byte("X-Original-To: alias@example.com\r\n\r\n"),
-			3:      []byte("X-Original-To: other@example.com\r\n\r\n"),
-		},
-		bodyByUID: map[uint32][]byte{
-			11: []byte("Subject: sparse UID winner\r\n\r\nbody"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidates = 3
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if message := got[5]; message.SnapshotState != domain.SnapshotFound || message.UID != 11 {
-		t.Fatalf("sparse UID fallback = %#v, want UID 11 Found", message)
-	}
-	if got := session.fetchSeqSets[0]; got != "1:3" {
-		t.Fatalf("fallback sequence range = %q, want 1:3", got)
-	}
-}
-
-func TestFetcherFallbackRejectsMalformedUIDDiscovery(t *testing.T) {
+func TestFetchIncrementalFinalValidationRejectsExpungeDuringScan(t *testing.T) {
+	incrementalPrevious := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 10}
+	fallbackPrevious := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 30}
 	tests := []struct {
-		name    string
-		uids    []uint32
-		seqNums []uint32
+		name          string
+		session       *fakeIMAPSession
+		aliases       []domain.Alias
+		previous      *domain.IMAPSyncState
+		positions     map[int64]domain.MailboxSnapshotPosition
+		maxCandidates int
+		wantCalls     int
+		wantFinalUIDs string
+		wantSearches  int
 	}{
-		{name: "duplicate UID", uids: []uint32{10, 10}},
-		{name: "zero UID", uids: []uint32{0, 11}},
-		{name: "out of range sequence", uids: []uint32{10, 11}, seqNums: []uint32{1, 99}},
-		{name: "missing newer sequence", uids: []uint32{10}},
+		{
+			name: "new winner expunged after body fetch",
+			session: &fakeIMAPSession{
+				uidValidity:        77,
+				uidNext:            12,
+				mailboxUIDs:        []uint32{11},
+				headerByUID:        map[uint32][]byte{11: aliasHeader("one@icloud.com")},
+				bodyByUID:          map[uint32][]byte{11: rawMessage(11)},
+				expungeBeforeFetch: map[int][]uint32{2: {11}},
+			},
+			aliases:       []domain.Alias{testAlias(1, "one@icloud.com")},
+			previous:      &incrementalPrevious,
+			wantCalls:     3,
+			wantFinalUIDs: "11",
+			wantSearches:  1,
+		},
+		{
+			name: "same generation reset snapshot expunged after replacement body fetch",
+			session: &fakeIMAPSession{
+				uidValidity: 77,
+				uidNext:     31,
+				mailboxUIDs: []uint32{5, 20, 30},
+				headerByUID: map[uint32][]byte{
+					5:  aliasHeader("one@icloud.com"),
+					20: aliasHeader("two@icloud.com"),
+					30: ordinaryHeader(),
+				},
+				bodyByUID:          map[uint32][]byte{20: rawMessage(20)},
+				expungeBeforeFetch: map[int][]uint32{4: {5}},
+			},
+			aliases: []domain.Alias{
+				testAlias(1, "one@icloud.com"),
+				testAlias(2, "two@icloud.com"),
+			},
+			positions: map[int64]domain.MailboxSnapshotPosition{
+				1: {AliasID: 1, UIDValidity: 77, UID: 5},
+				2: {AliasID: 2, UIDValidity: 77, UID: 25},
+			},
+			maxCandidates: 2,
+			wantCalls:     5,
+			wantFinalUIDs: "5,20",
+		},
+		{
+			name: "incremental fallback expunged after body fetch",
+			session: &fakeIMAPSession{
+				uidValidity:        77,
+				uidNext:            31,
+				mailboxUIDs:        []uint32{10, 20},
+				headerByUID:        map[uint32][]byte{10: ordinaryHeader(), 20: aliasHeader("one@icloud.com")},
+				bodyByUID:          map[uint32][]byte{20: rawMessage(20)},
+				expungeBeforeFetch: map[int][]uint32{4: {20}},
+			},
+			aliases:  []domain.Alias{testAlias(1, "one@icloud.com")},
+			previous: &fallbackPrevious,
+			positions: map[int64]domain.MailboxSnapshotPosition{
+				1: {AliasID: 1, UIDValidity: 77, UID: 30},
+			},
+			wantCalls:     5,
+			wantFinalUIDs: "20",
+		},
 	}
+
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			session := &fakeIMAPSession{
-				searchResults:  [][]uint32{nil},
-				searchErrors:   []error{errors.New("Unexpected exception")},
-				messages:       2,
-				uidNext:        100,
-				uidOnlyResults: test.uids,
-				uidOnlySeqNums: test.seqNums,
-				headerByUID:    map[uint32][]byte{10: []byte("X-Original-To: alias@example.com\r\n\r\n"), 11: []byte("X-Original-To: alias@example.com\r\n\r\n")},
+			fetcher := testFetcher(test.session, time.Now())
+			if test.maxCandidates > 0 {
+				fetcher.MaxCandidates = test.maxCandidates
 			}
-			fetcher := NewFetcher()
-			fetcher.MaxCandidates = 2
-			fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-				return session, nil
+			result, err := fetcher.FetchIncremental(
+				context.Background(), testAccount(), "password", test.aliases, test.previous, test.positions,
+			)
+			if err == nil || !strings.Contains(err.Error(), "expunged before publish") {
+				t.Fatalf("result = %#v, error = %v, want final EXPUNGE error", result, err)
 			}
-
-			got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-				ID: 1, Email: "owner@icloud.com", Enabled: true,
-			}, "password", []domain.Alias{
-				{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-			})
-			if err != nil {
-				t.Fatal(err)
+			wantState := domain.IMAPSyncState{}
+			if test.previous != nil {
+				wantState = *test.previous
 			}
-			if got[5].SnapshotState != domain.SnapshotUnknown {
-				t.Fatalf("malformed fallback snapshot = %#v, want Unknown", got[5])
+			if !reflect.DeepEqual(result.State, wantState) || len(result.Messages) != 0 {
+				t.Fatalf("failed validation returned publishable result: %#v, want state %#v", result, wantState)
 			}
-			if len(session.fetchItems) != 1 {
-				t.Fatalf("malformed fallback FETCH calls = %d, want discovery only", len(session.fetchItems))
+			calls := test.session.calls()
+			if len(calls) != test.wantCalls {
+				t.Fatalf("FETCH calls = %#v, want %d", calls, test.wantCalls)
+			}
+			finalCall := calls[len(calls)-1]
+			if finalCall.seqSet != test.wantFinalUIDs || !isUIDOnlyFetch(finalCall) {
+				t.Fatalf("final shared validation = %#v, want UID FETCH %s", finalCall, test.wantFinalUIDs)
+			}
+			login, selectCount, searches, maxActive, terminated := test.session.counters()
+			if login != 1 || selectCount != 1 || searches != test.wantSearches || maxActive != 1 || !terminated {
+				t.Fatalf(
+					"commands login=%d select=%d search=%d max-active=%d terminated=%v",
+					login, selectCount, searches, maxActive, terminated,
+				)
 			}
 		})
 	}
 }
 
-func TestFetcherFallbackConfirmsEmptyZeroMessageMailbox(t *testing.T) {
+func TestFetchIncrementalReadsOnlyNewUIDsAndLatestWinnerBody(t *testing.T) {
+	now := time.Date(2026, 8, 7, 14, 0, 0, 0, time.UTC)
 	session := &fakeIMAPSession{
-		searchResults: [][]uint32{nil},
-		searchErrors:  []error{errors.New("Unexpected exception")},
-		messages:      0,
-		uidNext:       1,
+		uidValidity: 77,
+		uidNext:     14,
+		headerByUID: map[uint32][]byte{
+			11: ordinaryHeader(),
+			12: aliasHeader("one@icloud.com"),
+			13: aliasHeader("one@icloud.com"),
+		},
+		bodyByUID: map[uint32][]byte{
+			12: rawMessage(12),
+			13: rawMessage(13),
+		},
 	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 10}
 
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
+	result, err := testFetcher(session, now).FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{
+			testAlias(1, "one@icloud.com"),
+			testAlias(2, "two@icloud.com"),
+		},
+		&previous,
+		nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[5].SnapshotState != domain.SnapshotEmpty || len(session.fetchItems) != 0 {
-		t.Fatalf("zero-message fallback = %#v, FETCH calls=%d; want Empty without FETCH", got[5], len(session.fetchItems))
+	if result.Reset || result.State.LastUID != 13 || len(result.Messages) != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	message := result.Messages[1]
+	if message.SnapshotState != domain.SnapshotFound || message.UID != 13 || message.Subject != "message 13" {
+		t.Fatalf("winner = %#v", message)
+	}
+	if _, exists := result.Messages[2]; exists {
+		t.Fatalf("incremental miss unexpectedly replaced alias 2: %#v", result.Messages[2])
+	}
+	calls := session.calls()
+	if len(calls) != 3 || calls[0].seqSet != "11:13" || !isHeaderFetch(calls[0]) ||
+		calls[1].seqSet != "13" || isHeaderFetch(calls[1]) ||
+		calls[2].seqSet != "13" || !isUIDOnlyFetch(calls[2]) {
+		t.Fatalf("FETCH calls = %#v", calls)
+	}
+	if searches := session.searches(); !reflect.DeepEqual(searches, []string{"11:13"}) {
+		t.Fatalf("account-level UID searches = %v", searches)
 	}
 }
 
-func TestFetcherReturnsFallbackUIDScanError(t *testing.T) {
-	searchErr := errors.New("Unexpected exception")
-	fallbackErr := errors.New("sequence range failed")
+func TestFetchIncrementalOrdinaryAccountMailDoesNotBlockAlias(t *testing.T) {
 	session := &fakeIMAPSession{
-		searchResults: [][]uint32{nil},
-		searchErrors:  []error{searchErr},
-		messages:      1,
-		uidNext:       2,
-		fetchErrors:   []error{fallbackErr},
+		uidValidity: 77,
+		uidNext:     13,
+		headerByUID: map[uint32][]byte{
+			11: ordinaryHeader(),
+			12: aliasHeader("one@icloud.com"),
+		},
+		bodyByUID: map[uint32][]byte{12: rawMessage(12)},
 	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 10}
 
-	_, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID: 1, Email: "owner@icloud.com", Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err == nil || !strings.Contains(err.Error(), "Unexpected exception") || !strings.Contains(err.Error(), "sequence range failed") || !errors.Is(err, searchErr) || !errors.Is(err, fallbackErr) {
-		t.Fatalf("fallback error = %v, want combined SEARCH and UID scan errors", err)
+	result, err := testFetcher(session, time.Now()).FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")},
+		&previous,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Messages[1].UID != 12 || result.State.LastUID != 12 {
+		t.Fatalf("result = %#v", result)
 	}
 }
 
-func TestFetcherRejectsAliasFromAnotherAccount(t *testing.T) {
-	fetcher := NewFetcher()
-	_, err := fetcher.FetchLatest(context.Background(), domain.Account{ID: 1, Enabled: true}, "password", []domain.Alias{
-		{ID: 2, AccountID: 99, Address: "alias@example.com", Enabled: true},
-	})
-	if !errors.Is(err, ErrAliasAccountMismatch) {
-		t.Fatalf("error = %v, want ErrAliasAccountMismatch", err)
+func TestFetchIncrementalInitialMissIsEmptyButIncrementalMissIsOmitted(t *testing.T) {
+	aliases := []domain.Alias{testAlias(1, "one@icloud.com")}
+
+	initialSession := &fakeIMAPSession{
+		uidValidity: 77,
+		uidNext:     3,
+		headerByUID: map[uint32][]byte{1: ordinaryHeader(), 2: ordinaryHeader()},
+	}
+	initial, err := testFetcher(initialSession, time.Now()).FetchIncremental(
+		context.Background(), testAccount(), "password", aliases, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !initial.Reset || initial.Messages[1].SnapshotState != domain.SnapshotEmpty {
+		t.Fatalf("initial result = %#v", initial)
+	}
+
+	incrementalSession := &fakeIMAPSession{
+		uidValidity: 77,
+		uidNext:     3,
+		headerByUID: map[uint32][]byte{1: ordinaryHeader(), 2: ordinaryHeader()},
+	}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 0}
+	incremental, err := testFetcher(incrementalSession, time.Now()).FetchIncremental(
+		context.Background(), testAccount(), "password", aliases, &previous, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incremental.Reset || len(incremental.Messages) != 0 || incremental.State.LastUID != 2 {
+		t.Fatalf("incremental result = %#v", incremental)
 	}
 }
 
-func TestFetcherHonorsCanceledContext(t *testing.T) {
+func TestFetchIncrementalUIDValidityChangeReturnsResetSnapshot(t *testing.T) {
+	session := &fakeIMAPSession{
+		uidValidity: 88,
+		uidNext:     4,
+		headerByUID: map[uint32][]byte{
+			1: aliasHeader("one@icloud.com"),
+			2: ordinaryHeader(),
+			3: aliasHeader("two@icloud.com"),
+		},
+		bodyByUID: map[uint32][]byte{1: rawMessage(1), 3: rawMessage(3)},
+	}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 999}
+
+	result, err := testFetcher(session, time.Now()).FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{
+			testAlias(1, "one@icloud.com"),
+			testAlias(2, "two@icloud.com"),
+			testAlias(3, "three@icloud.com"),
+		},
+		&previous,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Reset || result.State.UIDValidity != 88 || result.State.LastUID != 3 {
+		t.Fatalf("reset result = %#v", result)
+	}
+	if result.Messages[1].UID != 1 || result.Messages[2].UID != 3 ||
+		result.Messages[3].SnapshotState != domain.SnapshotEmpty {
+		t.Fatalf("reset messages = %#v", result.Messages)
+	}
+}
+
+func TestFetchIncrementalProcessesLargeSparseBacklogInOldestBatches(t *testing.T) {
+	newSession := func() *fakeIMAPSession {
+		return &fakeIMAPSession{
+			uidValidity: 77,
+			uidNext:     9001,
+			mailboxUIDs: []uint32{1, 5, 100, 1000, 2000, 5000, 9000},
+			headerByUID: map[uint32][]byte{
+				1:    ordinaryHeader(),
+				5:    ordinaryHeader(),
+				100:  aliasHeader("one@icloud.com"),
+				1000: ordinaryHeader(),
+				2000: ordinaryHeader(),
+				5000: aliasHeader("one@icloud.com"),
+				9000: ordinaryHeader(),
+			},
+			bodyByUID: map[uint32][]byte{100: rawMessage(100), 5000: rawMessage(5000)},
+		}
+	}
+	now := time.Now()
+	session := newSession()
+	fetcher := testFetcher(session, now)
+	fetcher.MaxCandidates = 3
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 10}
+
+	result, err := fetcher.FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")},
+		&previous,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State.LastUID != 2000 || !result.HasMore || result.Messages[1].UID != 100 {
+		t.Fatalf("result = %#v", result)
+	}
+	calls := session.calls()
+	if len(calls) < 4 || calls[len(calls)-3].seqSet != "100,1000,2000" ||
+		!isHeaderFetch(calls[len(calls)-3]) || calls[len(calls)-2].seqSet != "100" ||
+		calls[len(calls)-1].seqSet != "100" || !isUIDOnlyFetch(calls[len(calls)-1]) ||
+		len(session.searches()) != 0 {
+		t.Fatalf("first bounded batch: searches=%v FETCH=%#v", session.searches(), calls)
+	}
+	for _, call := range calls[:len(calls)-3] {
+		if !isUIDOnlyFetch(call) {
+			t.Fatalf("unbounded sparse discovery call = %#v", call)
+		}
+	}
+
+	secondSession := newSession()
+	secondFetcher := testFetcher(secondSession, now.Add(time.Minute))
+	secondFetcher.MaxCandidates = 3
+	second, err := secondFetcher.FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")},
+		&result.State,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.State.LastUID != 9000 || second.HasMore || second.Messages[1].UID != 5000 {
+		t.Fatalf("second result = %#v", second)
+	}
+	secondCalls := secondSession.calls()
+	if len(secondCalls) < 4 || secondCalls[len(secondCalls)-3].seqSet != "5000,9000" ||
+		!isHeaderFetch(secondCalls[len(secondCalls)-3]) || secondCalls[len(secondCalls)-2].seqSet != "5000" ||
+		secondCalls[len(secondCalls)-1].seqSet != "5000" || !isUIDOnlyFetch(secondCalls[len(secondCalls)-1]) ||
+		len(secondSession.searches()) != 0 {
+		t.Fatalf("second bounded batch: searches=%v FETCH=%#v", secondSession.searches(), secondCalls)
+	}
+}
+
+func TestFetchIncrementalBacklogReconcilesExpungedSnapshotBeforeLaterReplacement(t *testing.T) {
+	newSession := func() *fakeIMAPSession {
+		return &fakeIMAPSession{
+			uidValidity: 77,
+			uidNext:     51,
+			mailboxUIDs: []uint32{5, 20, 30, 40, 50},
+			headerByUID: map[uint32][]byte{
+				5:  ordinaryHeader(),
+				20: ordinaryHeader(),
+				30: ordinaryHeader(),
+				40: aliasHeader("one@icloud.com"),
+				50: ordinaryHeader(),
+			},
+			bodyByUID: map[uint32][]byte{40: rawMessage(40)},
+		}
+	}
+	aliases := []domain.Alias{
+		testAlias(1, "one@icloud.com"),
+		testAlias(2, "two@icloud.com"),
+	}
+	positions := map[int64]domain.MailboxSnapshotPosition{
+		1: {AliasID: 1, UIDValidity: 77, UID: 10},
+		2: {AliasID: 2, UIDValidity: 77, UID: 5},
+	}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 10}
+
+	firstSession := newSession()
+	firstFetcher := testFetcher(firstSession, time.Now())
+	firstFetcher.MaxCandidates = 2
+	first, err := firstFetcher.FetchIncremental(
+		context.Background(), testAccount(), "password", aliases, &previous, positions,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.State.LastUID != 30 || !first.HasMore {
+		t.Fatalf("first backlog state = %#v", first)
+	}
+	if message := first.Messages[1]; message.SnapshotState != domain.SnapshotEmpty {
+		t.Fatalf("first missing snapshot reconciliation = %#v", message)
+	}
+	if _, replaced := first.Messages[2]; replaced {
+		t.Fatalf("valid retained snapshot was replaced: %#v", first.Messages[2])
+	}
+	assertUIDOnlyFetchBeforeHeaders(t, firstSession.calls(), "5,10")
+	assertFinalUIDOnlyFetch(t, firstSession.calls(), "5")
+	if searches := firstSession.searches(); len(searches) != 0 {
+		t.Fatalf("first backlog performed UID SEARCH: %v", searches)
+	}
+
+	secondSession := newSession()
+	secondFetcher := testFetcher(secondSession, time.Now().Add(time.Minute))
+	secondFetcher.MaxCandidates = 2
+	remainingPositions := map[int64]domain.MailboxSnapshotPosition{
+		2: {AliasID: 2, UIDValidity: 77, UID: 5},
+	}
+	second, err := secondFetcher.FetchIncremental(
+		context.Background(), testAccount(), "password", aliases, &first.State, remainingPositions,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.State.LastUID != 50 || second.HasMore {
+		t.Fatalf("second backlog state = %#v", second)
+	}
+	if message := second.Messages[1]; message.SnapshotState != domain.SnapshotFound || message.UID != 40 {
+		t.Fatalf("later replacement = %#v", message)
+	}
+	if _, replaced := second.Messages[2]; replaced {
+		t.Fatalf("valid retained snapshot was replaced: %#v", second.Messages[2])
+	}
+	assertUIDOnlyFetchBeforeHeaders(t, secondSession.calls(), "5")
+	assertFinalUIDOnlyFetch(t, secondSession.calls(), "5,40")
+	if searches := secondSession.searches(); len(searches) != 0 {
+		t.Fatalf("second backlog performed UID SEARCH: %v", searches)
+	}
+}
+
+func assertUIDOnlyFetchBeforeHeaders(t *testing.T, calls []fetchCall, seqSet string) {
+	t.Helper()
+	for index, call := range calls {
+		if !isHeaderFetch(call) {
+			continue
+		}
+		if index == 0 {
+			t.Fatalf("header FETCH had no shared UID validation before it: %#v", calls)
+		}
+		if calls[index-1].seqSet != seqSet || !isUIDOnlyFetch(calls[index-1]) {
+			t.Fatalf("shared UID validation before headers = %#v, want UID FETCH %s; all FETCH calls = %#v", calls[index-1], seqSet, calls)
+		}
+		return
+	}
+	t.Fatalf("missing header FETCH after shared UID validation %s: %#v", seqSet, calls)
+}
+
+func assertFinalUIDOnlyFetch(t *testing.T, calls []fetchCall, seqSet string) {
+	t.Helper()
+	if len(calls) == 0 {
+		t.Fatalf("missing final shared UID validation %s", seqSet)
+	}
+	last := calls[len(calls)-1]
+	if last.seqSet != seqSet || !isUIDOnlyFetch(last) {
+		t.Fatalf("final shared UID validation = %#v, want UID FETCH %s; all FETCH calls = %#v", last, seqSet, calls)
+	}
+}
+
+func TestFetchIncrementalResetUsesNewestActualSparseMessages(t *testing.T) {
+	session := &fakeIMAPSession{
+		uidValidity: 77,
+		uidNext:     1001,
+		mailboxUIDs: []uint32{5, 400, 900, 1000},
+		headerByUID: map[uint32][]byte{
+			5:    aliasHeader("two@icloud.com"),
+			400:  aliasHeader("one@icloud.com"),
+			900:  ordinaryHeader(),
+			1000: ordinaryHeader(),
+		},
+		bodyByUID: map[uint32][]byte{400: rawMessage(400)},
+	}
+	fetcher := testFetcher(session, time.Now())
+	fetcher.MaxCandidates = 3
+
+	result, err := fetcher.FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{testAlias(1, "one@icloud.com"), testAlias(2, "two@icloud.com")},
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := session.calls()
+	if !result.Reset || result.HasMore || result.State.LastUID != 1000 || result.Messages[1].UID != 400 {
+		t.Fatalf("sparse reset result = %#v", result)
+	}
+	if _, exists := result.Messages[2]; exists {
+		t.Fatalf("bounded reset replaced alias outside recent window: %#v", result.Messages[2])
+	}
+	if len(calls) != 4 || calls[0].seqSet != "2:4" || calls[1].seqSet != "400,900,1000" ||
+		calls[2].seqSet != "400" || calls[3].seqSet != "400" || !isUIDOnlyFetch(calls[3]) {
+		t.Fatalf("sparse reset calls = %#v", calls)
+	}
+	if searches := session.searches(); len(searches) != 0 {
+		t.Fatalf("reset performed UID SEARCH: %v", searches)
+	}
+}
+
+func TestFetchIncrementalFailureDoesNotAdvanceCursor(t *testing.T) {
+	previous := domain.IMAPSyncState{
+		AccountID:   7,
+		UIDValidity: 77,
+		LastUID:     10,
+		UpdatedAt:   time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC),
+	}
+	tests := []struct {
+		name    string
+		session *fakeIMAPSession
+	}{
+		{
+			name: "winner body missing",
+			session: &fakeIMAPSession{
+				uidValidity: 77,
+				uidNext:     12,
+				headerByUID: map[uint32][]byte{11: aliasHeader("one@icloud.com")},
+				bodyByUID:   map[uint32][]byte{},
+			},
+		},
+		{
+			name: "duplicate candidate response",
+			session: &fakeIMAPSession{
+				uidValidity:  77,
+				uidNext:      12,
+				headerByUID:  map[uint32][]byte{11: aliasHeader("one@icloud.com")},
+				duplicateUID: 11,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := testFetcher(test.session, time.Now()).FetchIncremental(
+				context.Background(),
+				testAccount(),
+				"password",
+				[]domain.Alias{testAlias(1, "one@icloud.com")},
+				&previous,
+				nil,
+			)
+			if err == nil {
+				t.Fatalf("result = %#v, want error", result)
+			}
+			if !reflect.DeepEqual(result.State, previous) {
+				t.Fatalf("state advanced on error: got %#v, want %#v", result.State, previous)
+			}
+		})
+	}
+}
+
+func TestFetchIncrementalSkipsUnrouteableCandidateAndAdvancesCursor(t *testing.T) {
+	now := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	session := &fakeIMAPSession{
+		uidValidity: 77,
+		uidNext:     13,
+		headerByUID: map[uint32][]byte{
+			11: aliasHeader("one@icloud.com"),
+			12: []byte("X-Original-To: one@icloud.com\r\nDelivered-To: other@icloud.com\r\n\r\n"),
+		},
+		bodyByUID: map[uint32][]byte{11: rawMessage(11)},
+	}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 10}
+
+	result, err := testFetcher(session, now).FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")},
+		&previous,
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.State.LastUID != 12 || result.HasMore || result.Messages[1].UID != 11 {
+		t.Fatalf("result = %#v, want cursor 12 and fallback winner UID 11", result)
+	}
+	calls := session.calls()
+	if len(calls) != 3 || calls[0].seqSet != "11:12" || calls[1].seqSet != "11" || calls[2].seqSet != "11" {
+		t.Fatalf("FETCH calls = %#v", calls)
+	}
+}
+
+func TestFetchIncrementalSkipsMalformedAndOversizedCandidateHeaders(t *testing.T) {
+	tests := []struct {
+		name           string
+		header         []byte
+		maxHeaderBytes int
+	}{
+		{name: "malformed", header: []byte("not a header\r\n\r\n")},
+		{name: "oversized", header: aliasHeader("one@icloud.com"), maxHeaderBytes: 8},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := &fakeIMAPSession{
+				uidValidity: 77,
+				uidNext:     12,
+				headerByUID: map[uint32][]byte{11: test.header},
+			}
+			fetcher := testFetcher(session, time.Now())
+			if test.maxHeaderBytes > 0 {
+				fetcher.MaxHeaderBytes = test.maxHeaderBytes
+			}
+			previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 10}
+
+			result, err := fetcher.FetchIncremental(
+				context.Background(),
+				testAccount(),
+				"password",
+				[]domain.Alias{testAlias(1, "one@icloud.com")},
+				&previous,
+				nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.State.LastUID != 11 || len(result.Messages) != 0 {
+				t.Fatalf("result = %#v, want skipped candidate and cursor 11", result)
+			}
+		})
+	}
+}
+
+func TestFetchLatestUsesAuthoritativeInitialSemantics(t *testing.T) {
+	session := &fakeIMAPSession{uidValidity: 77, uidNext: 1}
+	messages, err := testFetcher(session, time.Now()).FetchLatest(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messages[1].SnapshotState != domain.SnapshotEmpty || len(session.calls()) != 0 {
+		t.Fatalf("messages = %#v, calls = %#v", messages, session.calls())
+	}
+}
+
+func TestFetchIncrementalRejectsInvalidMailboxState(t *testing.T) {
+	tests := []struct {
+		name        string
+		uidValidity uint32
+		uidNext     uint32
+		want        string
+	}{
+		{name: "zero UIDVALIDITY", uidValidity: 0, uidNext: 1, want: "UIDVALIDITY is zero"},
+		{name: "zero UIDNEXT", uidValidity: 1, uidNext: 0, want: "UIDNEXT is zero"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := &fakeIMAPSession{uidValidity: test.uidValidity, uidNext: test.uidNext}
+			_, err := testFetcher(session, time.Now()).FetchIncremental(
+				context.Background(), testAccount(), "password", nil, nil, nil,
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestFetchIncrementalHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	fetcher := NewFetcher()
@@ -793,399 +1251,37 @@ func TestFetcherHonorsCanceledContext(t *testing.T) {
 		dialed = true
 		return nil, errors.New("unexpected dial")
 	}
-	_, err := fetcher.FetchLatest(ctx, domain.Account{ID: 1, Enabled: true}, "password", nil)
+	_, err := fetcher.FetchIncremental(ctx, testAccount(), "password", nil, nil, nil)
 	if !errors.Is(err, context.Canceled) || dialed {
 		t.Fatalf("error = %v, dialed = %v", err, dialed)
 	}
 }
 
-func TestFetcherValidatesIMAPWithNoAliases(t *testing.T) {
-	session := &fakeIMAPSession{}
+func TestFetchIncrementalRejectsAliasFromAnotherAccount(t *testing.T) {
 	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "app-password", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 0 {
-		t.Fatalf("messages = %#v", got)
-	}
-	if session.username != "owner@icloud.com" || session.selected != "INBOX" || !session.readOnly {
-		t.Fatalf("IMAP validation = username %q mailbox %q read-only=%v", session.username, session.selected, session.readOnly)
-	}
-	if session.loggedOut || !session.terminated {
-		t.Fatalf("cleanup = logout=%v terminate=%v", session.loggedOut, session.terminated)
-	}
-}
-
-func TestFetcherRejectsZeroUIDValidity(t *testing.T) {
-	session := &fakeIMAPSession{zeroUIDValidity: true}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	_, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "app-password", nil)
-	if err == nil || !strings.Contains(err.Error(), "UIDVALIDITY is zero") {
-		t.Fatalf("error = %v, want zero UIDVALIDITY rejection", err)
-	}
-	if !session.terminated {
-		t.Fatal("session was not terminated after invalid UIDVALIDITY")
-	}
-}
-
-func TestFetcherCancellationCannotBeBlockedByLogout(t *testing.T) {
-	base := &fakeIMAPSession{}
-	session := &blockingLogoutSession{
-		fakeIMAPSession:  base,
-		logoutStarted:    make(chan struct{}),
-		logoutRelease:    make(chan struct{}),
-		terminatedSignal: make(chan struct{}),
-	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		_, err := fetcher.FetchLatest(ctx, domain.Account{
-			ID:      1,
-			Email:   "owner@icloud.com",
-			Enabled: true,
-		}, "app-password", nil)
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		cancel()
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-session.logoutStarted:
-		cancel()
-		select {
-		case err := <-done:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				t.Fatal(err)
-			}
-		case <-time.After(time.Second):
-			close(session.logoutRelease)
-			<-done
-			t.Fatal("cancellation did not release a blocking Logout")
-		}
-	case <-time.After(time.Second):
-		cancel()
-		t.Fatal("fetch did not finish or enter cleanup")
-	}
-	if !session.terminated {
-		t.Fatal("session was not terminated during cleanup")
-	}
-}
-
-func TestFetcherSnapshotStates(t *testing.T) {
-	tests := []struct {
-		name          string
-		searchResults []uint32
-		header        []byte
-		body          []byte
-		want          domain.SnapshotState
-	}{
-		{name: "authoritative empty", searchResults: nil, want: domain.SnapshotEmpty},
-		{
-			name:          "candidate fails recipient validation",
-			searchResults: []uint32{10},
-			header:        []byte("To: alias@example.com\r\n\r\n"),
-			want:          domain.SnapshotUnknown,
-		},
-		{
-			name:          "winner body missing",
-			searchResults: []uint32{10},
-			header:        []byte("X-Original-To: alias@example.com\r\n\r\n"),
-			want:          domain.SnapshotUnknown,
-		},
-		{
-			name:          "winner MIME malformed",
-			searchResults: []uint32{10},
-			header:        []byte("X-Original-To: alias@example.com\r\n\r\n"),
-			body:          []byte("malformed header without colon\r\n\r\nbody"),
-			want:          domain.SnapshotUnknown,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			session := &fakeIMAPSession{
-				searchResults: [][]uint32{test.searchResults},
-				headerByUID:   map[uint32][]byte{},
-				bodyByUID:     map[uint32][]byte{},
-			}
-			if test.header != nil {
-				session.headerByUID[10] = test.header
-			}
-			if test.body != nil {
-				session.bodyByUID[10] = test.body
-			}
-			fetcher := NewFetcher()
-			fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-				return session, nil
-			}
-
-			got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-				ID:      1,
-				Email:   "owner@icloud.com",
-				Enabled: true,
-			}, "password", []domain.Alias{
-				{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			message, exists := got[5]
-			if !exists {
-				t.Fatalf("alias state missing from result: %#v", got)
-			}
-			if message.SnapshotState != test.want || message.UIDValidity != 4242 {
-				t.Fatalf("snapshot = state %q UIDVALIDITY %d, want %q / 4242", message.SnapshotState, message.UIDValidity, test.want)
-			}
-			if test.want != domain.SnapshotFound && message.UID != 0 {
-				t.Fatalf("non-found snapshot UID = %d", message.UID)
-			}
-		})
-	}
-}
-
-func TestHigherUnresolvedCandidateBlocksLowerWinner(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{10, 11}},
-		headerByUID: map[uint32][]byte{
-			10: []byte("X-Original-To: alias@example.com\r\n\r\n"),
-			// UID 11 is deliberately missing from the FETCH response.
-		},
-		bodyByUID: map[uint32][]byte{
-			10: []byte("Subject: older\r\n\r\nbody"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got[5].SnapshotState != domain.SnapshotUnknown || got[5].UID != 0 {
-		t.Fatalf("snapshot = %#v, want Unknown without lower-UID fallback", got[5])
-	}
-	if len(session.fetchItems) != 1 {
-		t.Fatalf("FETCH calls = %d, lower winner body should not be fetched", len(session.fetchItems))
-	}
-}
-
-func TestHigherAmbiguousCandidateBlocksLowerWinner(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{10, 11}},
-		headerByUID: map[uint32][]byte{
-			10: []byte("X-Original-To: alias@example.com\r\n\r\n"),
-			11: []byte("X-Original-To: alias@example.com\r\nX-Original-To: other@example.com\r\n\r\n"),
-		},
-		bodyByUID: map[uint32][]byte{
-			10: []byte("Subject: older\r\n\r\nbody"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got[5].SnapshotState != domain.SnapshotUnknown || got[5].UID != 0 {
-		t.Fatalf("snapshot = %#v, want Unknown without lower-UID fallback", got[5])
-	}
-}
-
-func TestCompleteFalsePositiveCandidatesAreAuthoritativelyEmpty(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{10}},
-		headerByUID: map[uint32][]byte{
-			10: []byte("X-Original-To: other@example.com\r\n\r\n"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got[5].SnapshotState != domain.SnapshotEmpty {
-		t.Fatalf("snapshot = %#v, want authoritative Empty", got[5])
-	}
-}
-
-func TestPerAliasCandidateTruncationStaysUnknown(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{10, 11}},
-		headerByUID: map[uint32][]byte{
-			11: []byte("X-Original-To: other@example.com\r\n\r\n"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidatesPerAlias = 1
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got[5].SnapshotState != domain.SnapshotUnknown {
-		t.Fatalf("snapshot = %#v, want Unknown after per-alias truncation", got[5])
-	}
-}
-
-func TestGlobalCandidateTruncationStaysUnknown(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{10, 11}, {20, 21}},
-		headerByUID: map[uint32][]byte{
-			11: []byte("X-Original-To: other@example.com\r\n\r\n"),
-			21: []byte("X-Original-To: other@example.com\r\n\r\n"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.MaxCandidates = 2
-	fetcher.MaxCandidatesPerAlias = 2
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 1, AccountID: 1, Address: "a@example.com", Enabled: true},
-		{ID: 2, AccountID: 1, Address: "b@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got[1].SnapshotState != domain.SnapshotUnknown || got[2].SnapshotState != domain.SnapshotUnknown {
-		t.Fatalf("snapshots = %#v / %#v, want Unknown after global truncation", got[1], got[2])
-	}
-}
-
-func TestInvalidZeroUIDKeepsFalsePositiveResultUnknown(t *testing.T) {
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{0, 10}},
-		headerByUID: map[uint32][]byte{
-			10: []byte("X-Original-To: other@example.com\r\n\r\n"),
-		},
-	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got[5].SnapshotState != domain.SnapshotUnknown {
-		t.Fatalf("snapshot = %#v, want Unknown after invalid UID 0", got[5])
-	}
-}
-
-func TestFetcherReturnsIMAPFetchCommandError(t *testing.T) {
-	commandErr := errors.New("fetch command failed")
-	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{10}},
-		headerByUID: map[uint32][]byte{
-			10: []byte("X-Original-To: alias@example.com\r\n\r\n"),
-		},
-		bodyByUID: map[uint32][]byte{
-			10: []byte("Subject: latest\r\n\r\nbody"),
-		},
-		fetchErrors: []error{nil, commandErr},
-	}
-	fetcher := NewFetcher()
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-
-	_, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
-	if !errors.Is(err, commandErr) {
-		t.Fatalf("error = %v, want command error", err)
+	_, err := fetcher.FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{{ID: 1, AccountID: 99, Address: "one@icloud.com", Enabled: true}},
+		nil,
+		nil,
+	)
+	if !errors.Is(err, ErrAliasAccountMismatch) {
+		t.Fatalf("error = %v, want ErrAliasAccountMismatch", err)
 	}
 }
 
 func TestFetchMessagesBatchesUIDs(t *testing.T) {
 	session := &fakeIMAPSession{bodyByUID: make(map[uint32][]byte)}
 	uids := make([]uint32, 0, messageFetchBatch+1)
+	aliasesByUID := make(map[uint32][]int64)
 	for uid := uint32(1); uid <= uint32(messageFetchBatch+1); uid++ {
 		uids = append(uids, uid)
-		session.bodyByUID[uid] = []byte(fmt.Sprintf("Subject: message %d\r\n\r\nbody", uid))
-	}
-
-	aliasesByUID := make(map[uint32][]int64, len(uids))
-	for _, uid := range uids {
+		session.bodyByUID[uid] = rawMessage(uid)
 		aliasesByUID[uid] = []int64{int64(uid)}
 	}
+
 	messages, err := fetchMessages(
 		session,
 		uids,
@@ -1197,98 +1293,34 @@ func TestFetchMessagesBatchesUIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != len(uids) || len(session.fetchItems) != 2 {
-		t.Fatalf("messages = %d, FETCH calls = %d", len(messages), len(session.fetchItems))
+	if len(messages) != len(uids) || len(session.calls()) != 2 {
+		t.Fatalf("messages = %d, FETCH calls = %d", len(messages), len(session.calls()))
 	}
 }
 
-func TestTruncatedMessageHeaderStillReturnsFoundSnapshot(t *testing.T) {
-	raw := []byte("Subject: " + strings.Repeat("x", 1024) + "\r\n\r\nbody")
+func TestFetchIncrementalPublishesPlaceholderForMalformedWinnerBody(t *testing.T) {
 	session := &fakeIMAPSession{
-		searchResults: [][]uint32{{10}},
-		headerByUID: map[uint32][]byte{
-			10: []byte("X-Original-To: alias@example.com\r\n\r\n"),
-		},
-		bodyByUID: map[uint32][]byte{10: raw},
+		uidValidity: 77,
+		uidNext:     12,
+		headerByUID: map[uint32][]byte{11: aliasHeader("one@icloud.com")},
+		bodyByUID:   map[uint32][]byte{11: []byte("not a message")},
 	}
-	fetcher := NewFetcher()
-	fetcher.MaxMessageBytes = 64
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
+	previous := domain.IMAPSyncState{AccountID: 7, UIDValidity: 77, LastUID: 10}
 
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", []domain.Alias{
-		{ID: 5, AccountID: 1, Address: "alias@example.com", Enabled: true},
-	})
+	result, err := testFetcher(session, time.Now()).FetchIncremental(
+		context.Background(),
+		testAccount(),
+		"password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")},
+		&previous,
+		nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[5].SnapshotState != domain.SnapshotFound || got[5].UID != 10 || !got[5].BodyTruncated {
-		t.Fatalf("snapshot = %#v, want truncated Found", got[5])
-	}
-}
-
-func TestFetchResultBudgetPreservesAllWinners(t *testing.T) {
-	const aliasCount = 4
-	const dynamicBytesPerAlias = 100
-	session := &fakeIMAPSession{
-		searchResults: make([][]uint32, 0, aliasCount),
-		headerByUID:   make(map[uint32][]byte, aliasCount),
-		bodyByUID:     make(map[uint32][]byte, aliasCount),
-	}
-	aliases := make([]domain.Alias, 0, aliasCount)
-	for i := 1; i <= aliasCount; i++ {
-		uid := uint32(i)
-		address := fmt.Sprintf("alias%d@example.com", i)
-		session.searchResults = append(session.searchResults, []uint32{uid})
-		session.headerByUID[uid] = []byte("X-Original-To: " + address + "\r\n\r\n")
-		session.bodyByUID[uid] = []byte(fmt.Sprintf("Message-ID: <%d@example.com>\r\nSubject: message %d\r\n\r\n", i, i) + strings.Repeat("x", 1024))
-		aliases = append(aliases, domain.Alias{ID: int64(i), AccountID: 1, Address: address, Enabled: true})
-	}
-
-	resultBudget := aliasCount*parsedMessageBaseBytes + aliasCount*dynamicBytesPerAlias
-	fetcher := NewFetcher()
-	fetcher.MaxBodyBytes = 1024
-	fetcher.MaxFetchResultBytes = resultBudget
-	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
-		return session, nil
-	}
-	got, err := fetcher.FetchLatest(context.Background(), domain.Account{
-		ID:      1,
-		Email:   "owner@icloud.com",
-		Enabled: true,
-	}, "password", aliases)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var retained int64
-	for _, alias := range aliases {
-		message := got[alias.ID]
-		if message.SnapshotState != domain.SnapshotFound || !message.BodyTruncated {
-			t.Fatalf("alias %d snapshot = %#v, want truncated Found", alias.ID, message)
-		}
-		retained += parsedMessageResultBytes(parsedMessage{
-			messageID:     message.MessageID,
-			from:          message.From,
-			to:            message.To,
-			cc:            message.CC,
-			subject:       message.Subject,
-			textBody:      message.TextBody,
-			htmlBody:      message.HTMLBody,
-			attachments:   message.Attachments,
-			bodyTruncated: message.BodyTruncated,
-		})
-	}
-	if retained > int64(resultBudget) {
-		t.Fatalf("retained result bytes = %d, budget = %d", retained, resultBudget)
-	}
-	if settings := NewFetcher().settings(); settings.maxFetchResultBytes != 64<<20 {
-		t.Fatalf("default result budget = %d, want 64 MiB", settings.maxFetchResultBytes)
+	message := result.Messages[1]
+	if result.State.LastUID != 11 || message.UID != 11 || !message.BodyTruncated || message.SnapshotState != domain.SnapshotFound {
+		t.Fatalf("result = %#v, want truncated placeholder at UID 11", result)
 	}
 }
 
@@ -1313,33 +1345,34 @@ func TestAccountEndpointRejectsOtherServer(t *testing.T) {
 	}
 }
 
-func TestFairCandidateUIDs(t *testing.T) {
-	got := fairCandidateUIDs([][]uint32{{10, 9, 8}, {20, 19}, {10, 7}}, 5)
-	want := []uint32{20, 19, 10, 9, 7}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("fairCandidateUIDs() = %v, want %v", got, want)
+func TestFetchRecentMailboxUIDsUsesActualSparseMessages(t *testing.T) {
+	session := &fakeIMAPSession{mailboxUIDs: []uint32{5, 400, 900, 1000}}
+	uids, err := fetchRecentMailboxUIDs(context.Background(), session, 4, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []uint32{1000, 900, 400}; !reflect.DeepEqual(uids, want) {
+		t.Fatalf("recent mailbox UIDs = %v, want %v", uids, want)
+	}
+	calls := session.calls()
+	if len(calls) != 1 || calls[0].seqSet != "2:4" || isHeaderFetch(calls[0]) || len(calls[0].items) != 1 || calls[0].items[0] != imap.FetchUid {
+		t.Fatalf("sequence UID discovery calls = %#v", calls)
 	}
 }
 
-func TestNewestUIDsUsesBoundedTopKSemantics(t *testing.T) {
-	tests := []struct {
-		name          string
-		uids          []uint32
-		limit         int
-		want          []uint32
-		wantTruncated bool
-	}{
-		{name: "deduplicates without truncation", uids: []uint32{0, 3, 3, 2}, limit: 3, want: []uint32{3, 2}, wantTruncated: true},
-		{name: "keeps newest values", uids: []uint32{1, 5, 2, 4, 3, 5}, limit: 3, want: []uint32{5, 4, 3}, wantTruncated: true},
-		{name: "zero limit", uids: []uint32{1}, limit: 0, want: nil, wantTruncated: true},
-		{name: "empty", uids: nil, limit: 3, want: nil, wantTruncated: false},
+func TestFetchIncrementalMailboxUIDsRejectsUnstableSequenceView(t *testing.T) {
+	session := &fakeIMAPSession{
+		// SELECT reported eight messages, but an EXPUNGE made the sequence view
+		// shorter before discovery completed.
+		mailboxUIDs: []uint32{1, 5, 100, 1000, 2000, 5000, 9000},
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got, truncated := newestUIDs(test.uids, test.limit)
-			if fmt.Sprint(got) != fmt.Sprint(test.want) || truncated != test.wantTruncated {
-				t.Fatalf("newestUIDs(%v, %d) = %v/%v, want %v/%v", test.uids, test.limit, got, truncated, test.want, test.wantTruncated)
-			}
-		})
+	uids, processedThrough, hasMore, err := fetchIncrementalMailboxUIDs(
+		context.Background(), session, 8, 5000, 9000, 3,
+	)
+	if err == nil || !strings.Contains(err.Error(), "unstable mailbox view") {
+		t.Fatalf("result = %v/%d/%v, error = %v, want unstable mailbox view", uids, processedThrough, hasMore, err)
+	}
+	if processedThrough != 5000 || hasMore || len(uids) != 0 {
+		t.Fatalf("unstable sequence advanced cursor: %v/%d/%v", uids, processedThrough, hasMore)
 	}
 }

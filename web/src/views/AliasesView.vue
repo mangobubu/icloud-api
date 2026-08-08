@@ -6,6 +6,23 @@
       description="查看每个地址的主号归属、Key 状态和最近使用情况。"
     >
       <template #actions>
+        <el-button
+          :icon="Download"
+          :disabled="selectedAliases.length === 0"
+          @click="exportSelectedAliases"
+        >
+          导出勾选<span v-if="selectedAliases.length">
+            （{{ selectedAliases.length }}）
+          </span>
+        </el-button>
+        <el-button
+          type="primary"
+          :icon="Download"
+          :disabled="aliases.length === 0"
+          @click="exportAllAliases"
+        >
+          全部导出
+        </el-button>
         <el-tooltip content="刷新隐私邮箱列表" placement="bottom">
           <el-button
             :icon="Refresh"
@@ -46,7 +63,14 @@
       />
 
       <div class="data-panel desktop-data-table" :aria-busy="loading">
-        <el-table :data="aliases" row-key="id" style="width: 100%">
+        <el-table
+          ref="aliasTable"
+          :data="aliases"
+          row-key="id"
+          style="width: 100%"
+          @selection-change="handleSelectionChange"
+        >
+          <el-table-column type="selection" width="52" reserve-selection />
           <el-table-column label="隐私邮箱" min-width="220">
             <template #default="{ row }">
               <div class="primary-stack">
@@ -118,9 +142,17 @@
       <div class="mobile-record-list" :aria-busy="loading">
         <article v-for="alias in aliases" :key="alias.id" class="mobile-record">
           <header class="mobile-record__header">
-            <div class="primary-stack">
-              <strong>{{ alias.address }}</strong>
-              <small>{{ alias.label || "未填写用途备注" }}</small>
+            <div class="mobile-alias-selection">
+              <el-checkbox
+                class="mobile-alias-selection__checkbox"
+                :model-value="isAliasSelected(alias.id)"
+                :aria-label="`勾选 ${alias.address}`"
+                @change="setAliasSelected(alias, $event)"
+              />
+              <div class="primary-stack">
+                <strong>{{ alias.address }}</strong>
+                <small>{{ alias.label || "未填写用途备注" }}</small>
+              </div>
             </div>
             <SyncStatus :item="alias" details />
           </header>
@@ -167,9 +199,14 @@
 </template>
 
 <script setup>
-import { CopyDocument, Refresh, Setting } from "@element-plus/icons-vue";
+import {
+  CopyDocument,
+  Download,
+  Refresh,
+  Setting,
+} from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
-import { onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
 import { getAliases } from "../api/admin.js";
@@ -178,6 +215,7 @@ import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncStatus from "../components/SyncStatus.vue";
 import { createActionLock } from "../utils/asyncState.js";
+import { buildAliasExportText } from "../utils/aliasExport.js";
 import {
   buildRecentMailDirectLink,
   copyText,
@@ -188,12 +226,19 @@ import { createLiveRefresh } from "../utils/liveRefresh.js";
 
 const router = useRouter();
 const aliases = ref([]);
+const aliasTable = ref(null);
+const selectedAliasIds = ref([]);
 const loading = ref(false);
 const loadError = ref(null);
 const copyLoading = reactive({});
 const copyLock = createActionLock();
 let refreshInFlight = false;
 let viewActive = true;
+
+const selectedAliases = computed(() => {
+  const selectedIds = new Set(selectedAliasIds.value);
+  return aliases.value.filter((alias) => selectedIds.has(alias.id));
+});
 
 function keyPrefix(alias) {
   return alias.apiKeyPrefix ? `${alias.apiKeyPrefix}…` : "-";
@@ -224,6 +269,67 @@ async function loadAliases({ silent = false } = {}) {
 }
 
 const liveRefresh = createLiveRefresh(() => loadAliases({ silent: true }));
+
+function handleSelectionChange(selection) {
+  selectedAliasIds.value = selection.map((alias) => alias.id);
+}
+
+function isAliasSelected(id) {
+  return selectedAliasIds.value.includes(id);
+}
+
+function setAliasSelected(alias, selected) {
+  if (aliasTable.value) {
+    aliasTable.value.toggleRowSelection(alias, selected);
+    return;
+  }
+
+  const selectedIds = new Set(selectedAliasIds.value);
+  if (selected) {
+    selectedIds.add(alias.id);
+  } else {
+    selectedIds.delete(alias.id);
+  }
+  selectedAliasIds.value = [...selectedIds];
+}
+
+function exportAliases(items, scope) {
+  if (!items.length) return;
+
+  let url = "";
+  let link = null;
+  try {
+    const content = buildAliasExportText(items);
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+    url = URL.createObjectURL(blob);
+    link = document.createElement("a");
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    link.href = url;
+    link.download = `icloud-aliases-${scope}-${timestamp}.txt`;
+    document.body.appendChild(link);
+    link.click();
+    successMessage(`已导出 ${items.length} 个邮箱。`);
+  } catch {
+    ElMessage({
+      type: "error",
+      message: "邮箱导出失败，请刷新页面后重试。",
+      grouping: true,
+    });
+  } finally {
+    link?.remove();
+    if (url) {
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+  }
+}
+
+function exportSelectedAliases() {
+  exportAliases(selectedAliases.value, "selected");
+}
+
+function exportAllAliases() {
+  exportAliases(aliases.value, "all");
+}
 
 async function copyAliasDirectLink(alias) {
   if (!alias.directLinkPath || !copyLock.acquire(alias.id)) return;
@@ -283,5 +389,25 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.mobile-alias-selection {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  flex: 1 1 auto;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.mobile-alias-selection .primary-stack {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.mobile-alias-selection__checkbox {
+  flex: 0 0 auto;
+  margin-top: 1px;
 }
 </style>

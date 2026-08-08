@@ -117,15 +117,6 @@ func headerValues(header stdmail.Header, field string) []string {
 	return result
 }
 
-func recipientSearchHeaderFields(allowWeak bool) []string {
-	fields := []string{icloudHMEHeaderField}
-	fields = append(fields, strongRecipientHeaderFields...)
-	if allowWeak {
-		fields = append(fields, weakRecipientHeaderFields...)
-	}
-	return fields
-}
-
 func normalizeAliasAddress(value string) (string, bool) {
 	value = strings.TrimSpace(value)
 	parsed, err := headerAddressParser.Parse(value)

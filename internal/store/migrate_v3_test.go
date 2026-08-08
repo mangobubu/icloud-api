@@ -20,6 +20,10 @@ func TestMigrateV2ToV3(t *testing.T) {
 		t.Fatalf("create current database: %v", err)
 	}
 	account := createAccount(t, ctx, current, "Legacy v2", "legacy-v2@icloud.com")
+	if _, err := current.DB().ExecContext(ctx, `DROP TABLE imap_sync_states`); err != nil {
+		_ = current.Close()
+		t.Fatalf("remove v4 table from fixture: %v", err)
+	}
 	if _, err := current.DB().ExecContext(ctx, `DROP TABLE apple_web_sessions`); err != nil {
 		_ = current.Close()
 		t.Fatalf("remove v3 table from fixture: %v", err)
@@ -46,8 +50,8 @@ func TestMigrateV2ToV3(t *testing.T) {
 	if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("schema version = %d, want 3", version)
+	if version != 4 {
+		t.Fatalf("schema version = %d, want 4", version)
 	}
 	retained, err := migrated.GetAccount(ctx, account.ID)
 	if err != nil {

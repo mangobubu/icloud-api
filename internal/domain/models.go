@@ -136,6 +136,40 @@ type LatestMessage struct {
 	SnapshotState SnapshotState `json:"-"`
 }
 
+// IMAPSyncState is the account-level cursor for one selected mailbox
+// generation. LastUID is the consumed high-water mark. A reset establishes a
+// bounded recent baseline; normal incremental runs never advance it past an
+// existing UID that was not processed. UpdatedAt is when this mailbox position
+// was observed, not when it committed.
+type IMAPSyncState struct {
+	AccountID   int64
+	UIDValidity uint32
+	LastUID     uint32
+	UpdatedAt   time.Time
+}
+
+// MailboxSnapshotPosition identifies the locally published latest message for
+// one alias. Sync uses these positions to validate all current snapshots with
+// one shared IMAP command before reconciling expunged messages.
+type MailboxSnapshotPosition struct {
+	AliasID     int64
+	UIDValidity uint32
+	UID         uint32
+}
+
+// MailboxSyncResult contains only changed alias snapshots during an
+// incremental run. Reset establishes a bounded baseline for an initial,
+// invalidated-cursor, or new-generation scan. A bounded reset only includes
+// aliases it found. SnapshotEmpty means the local snapshot was authoritatively
+// invalidated and no replacement was found in the bounded reconciliation window.
+type MailboxSyncResult struct {
+	Messages map[int64]LatestMessage
+	State    IMAPSyncState
+	Reset    bool
+	// HasMore means later actual UIDs remain beyond State.LastUID.
+	HasMore bool
+}
+
 type MailboxBinding struct {
 	Alias   Alias
 	Account Account

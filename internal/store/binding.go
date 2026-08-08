@@ -18,19 +18,23 @@ func (s *Store) GetMailboxBindingByAPIKeyHash(
 	if len(apiKeyHash) == 0 {
 		return domain.MailboxBinding{}, ErrNotFound
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	txOptions := &sql.TxOptions{ReadOnly: true}
+	if s.dialect == dialectPostgres {
+		txOptions.Isolation = sql.LevelRepeatableRead
+	}
+	tx, err := s.db.BeginTx(ctx, txOptions)
 	if err != nil {
 		return domain.MailboxBinding{}, fmt.Errorf("begin mailbox binding lookup: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	var binding domain.MailboxBinding
-	var aliasEnabled, accountEnabled int
+	var aliasEnabled, accountEnabled bool
 	var aliasLastSynced, aliasLastAccessed sql.NullInt64
 	var aliasCreatedAt, aliasUpdatedAt int64
 	var accountLastSynced sql.NullInt64
 	var accountCreatedAt, accountUpdatedAt int64
-	err = tx.QueryRowContext(ctx, `
+	err = s.txQueryRowContext(ctx, tx, `
 		SELECT
 			al.id, al.account_id, a.email, al.address, al.label, al.api_key_hash,
 			al.api_key_prefix, al.enabled, al.last_sync_status, al.last_sync_error,
@@ -61,17 +65,17 @@ func (s *Store) GetMailboxBindingByAPIKeyHash(
 		return domain.MailboxBinding{}, fmt.Errorf("get mailbox binding: %w", err)
 	}
 
-	binding.Alias.Enabled = aliasEnabled != 0
+	binding.Alias.Enabled = aliasEnabled
 	binding.Alias.LastSyncedAt = timePtr(aliasLastSynced)
 	binding.Alias.LastAccessedAt = timePtr(aliasLastAccessed)
 	binding.Alias.CreatedAt = timeFromTimestamp(aliasCreatedAt)
 	binding.Alias.UpdatedAt = timeFromTimestamp(aliasUpdatedAt)
-	binding.Account.Enabled = accountEnabled != 0
+	binding.Account.Enabled = accountEnabled
 	binding.Account.LastSyncedAt = timePtr(accountLastSynced)
 	binding.Account.CreatedAt = timeFromTimestamp(accountCreatedAt)
 	binding.Account.UpdatedAt = timeFromTimestamp(accountUpdatedAt)
 
-	message, err := scanLatestMessage(tx.QueryRowContext(ctx,
+	message, err := scanLatestMessage(s.txQueryRowContext(ctx, tx,
 		`SELECT `+latestMessageColumns+` FROM latest_messages WHERE alias_id = ?`,
 		binding.Alias.ID,
 	))

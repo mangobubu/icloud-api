@@ -5,6 +5,7 @@ import {
   deleteAppleSession,
   getAccount,
   loginAppleSession,
+  syncAccount,
   syncAccountAliases,
   verifyAppleSession,
 } from "../src/api/admin.js";
@@ -45,6 +46,35 @@ test("account detail includes the normalized Apple session", async () => {
     authenticatedAt: "2026-08-07T08:00:00Z",
     expiresAt: null,
   });
+});
+
+test("pending mail sync accepts HTTP 202 and exposes continuation state", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse(
+      {
+        account: {
+          id: 12,
+          email: "owner@icloud.com",
+          enabled: true,
+          last_sync_status: "pending",
+        },
+        aliases: [],
+        apple_session: null,
+        sync_pending: true,
+      },
+      202,
+    );
+  };
+
+  const detail = await syncAccount(12, "csrf-token");
+
+  assert.equal(request.url, "/admin/api/v1/accounts/12/sync");
+  assert.equal(request.options.method, "POST");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.equal(detail.account.lastSyncStatus, "pending");
+  assert.equal(detail.syncPending, true);
 });
 
 test("Apple session endpoints send credentials and verification only in request bodies", async () => {

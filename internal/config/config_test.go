@@ -9,7 +9,8 @@ import (
 
 var configEnvironment = []string{
 	"ICLOUD_API_ADDR",
-	"ICLOUD_API_DB",
+	"ICLOUD_API_DATABASE_URL",
+	"ICLOUD_API_LEGACY_SQLITE",
 	"ICLOUD_API_WEB_ROOT",
 	"ICLOUD_API_MASTER_KEY_FILE",
 	"ICLOUD_API_OAUTH_TOKEN",
@@ -28,6 +29,102 @@ var configEnvironment = []string{
 	"ICLOUD_API_TRUSTED_PROXIES",
 	"GIN_MODE",
 	"TZ",
+}
+
+func TestDatabaseURLDefault(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "postgres://icloud_api@/icloud_api?host=/var/run/postgresql&sslmode=disable"
+	if cfg.DatabaseURL != want {
+		t.Fatalf("默认数据库 URL = %q, want %q", cfg.DatabaseURL, want)
+	}
+}
+
+func TestLegacySQLitePathConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LegacySQLitePath != "" {
+		t.Fatalf("默认旧 SQLite 路径 = %q, want empty", cfg.LegacySQLitePath)
+	}
+
+	t.Setenv("ICLOUD_API_LEGACY_SQLITE", "  /app/legacy/icloud-api.db  ")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LegacySQLitePath != "/app/legacy/icloud-api.db" {
+		t.Fatalf("旧 SQLite 路径 = %q, want 已去除首尾空白的配置值", cfg.LegacySQLitePath)
+	}
+}
+
+func TestDatabaseURLOverride(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_DATABASE_URL", "  postgres://app@db/app?sslmode=disable  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DatabaseURL != "postgres://app@db/app?sslmode=disable" {
+		t.Fatalf("数据库 URL = %q, want 已去除首尾空白的配置值", cfg.DatabaseURL)
+	}
+}
+
+func TestDatabaseURLValidation(t *testing.T) {
+	for _, value := range []string{
+		"data/icloud-api.db",
+		"file:data/icloud-api.db",
+		"sqlite://data/icloud-api.db",
+		"postgres:data/icloud-api.db",
+		"postgresql:data/icloud-api.db",
+		"postgres:/data/icloud-api.db",
+		"postgresql:/data/icloud-api.db",
+		"POSTGRES:data/icloud-api.db",
+		"postgres://%zz",
+		"://invalid",
+	} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_DATABASE_URL", value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_DATABASE_URL") {
+				t.Fatalf("ICLOUD_API_DATABASE_URL=%q 错误 = %v", value, err)
+			}
+		})
+	}
+}
+
+func TestPostgreSQLSchemeIsAccepted(t *testing.T) {
+	for _, value := range []string{
+		"postgresql://app@db/app?sslmode=disable",
+		"POSTGRES://app@db/app?sslmode=disable",
+		"postgres://app@/app?host=/var/run/postgresql&sslmode=disable",
+	} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_DATABASE_URL", value)
+			if _, err := Load(); err != nil {
+				t.Fatalf("合法 PostgreSQL 数据库 URL %q 不应被拒绝: %v", value, err)
+			}
+		})
+	}
+}
+
+func TestMasterKeyFileDefaultDoesNotDependOnDatabaseURL(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_DATABASE_URL", "postgres://app@db/app?sslmode=disable")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MasterKeyFile != "data/master.key" {
+		t.Fatalf("默认主密钥文件 = %q, want %q", cfg.MasterKeyFile, "data/master.key")
+	}
 }
 
 func TestOAuthTokenConfiguration(t *testing.T) {
@@ -64,6 +161,40 @@ func TestWebRootOverride(t *testing.T) {
 	}
 	if cfg.WebRoot != "/app/web" {
 		t.Fatalf("前端目录 = %q, want %q", cfg.WebRoot, "/app/web")
+	}
+}
+
+func TestPollIntervalBoundaries(t *testing.T) {
+	for _, value := range []string{"10s", "24h"} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_POLL_INTERVAL", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("ICLOUD_API_POLL_INTERVAL=%q 不应被拒绝: %v", value, err)
+			}
+			if 3*cfg.PollInterval > 72*time.Hour {
+				t.Fatalf("三倍轮询周期 = %v, want 不超过 72h", 3*cfg.PollInterval)
+			}
+		})
+	}
+}
+
+func TestPollIntervalValidation(t *testing.T) {
+	for _, value := range []string{
+		"9.999999999s",
+		"24h0.000000001s",
+		"2562047h47m16.854775807s",
+		"not-a-duration",
+	} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_POLL_INTERVAL", value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_POLL_INTERVAL") {
+				t.Fatalf("ICLOUD_API_POLL_INTERVAL=%q 错误 = %v", value, err)
+			}
+		})
 	}
 }
 

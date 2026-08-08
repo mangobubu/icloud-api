@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"icloud-api/internal/domain"
 )
@@ -23,6 +24,7 @@ func (s *Store) UpsertLatestMessage(ctx context.Context, message domain.LatestMe
 	if err := validateLatestMessagePosition(message); err != nil {
 		return false, err
 	}
+	sanitizeLatestMessageText(&message)
 	fromJSON, err := marshalJSONList(message.From)
 	if err != nil {
 		return false, fmt.Errorf("encode message from addresses: %w", err)
@@ -49,7 +51,7 @@ func (s *Store) UpsertLatestMessage(ctx context.Context, message domain.LatestMe
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx, `
+	result, err := s.txExecContext(ctx, tx, `
 		INSERT INTO latest_messages(
 			alias_id, uid_validity, uid, message_id, internal_date, header_date,
 			from_json, to_json, cc_json, subject, text_body, html_body,
@@ -103,6 +105,7 @@ func (s *Store) ReplaceLatestMessage(ctx context.Context, message domain.LatestM
 	if err := validateLatestMessagePosition(message); err != nil {
 		return err
 	}
+	sanitizeLatestMessageText(&message)
 	fromJSON, err := marshalJSONList(message.From)
 	if err != nil {
 		return fmt.Errorf("encode message from addresses: %w", err)
@@ -122,7 +125,7 @@ func (s *Store) ReplaceLatestMessage(ctx context.Context, message domain.LatestM
 	if message.SyncedAt.IsZero() {
 		message.SyncedAt = s.now()
 	}
-	_, err = s.db.ExecContext(ctx, `
+	_, err = s.execContext(ctx, `
 		INSERT INTO latest_messages(
 			alias_id, uid_validity, uid, message_id, internal_date, header_date,
 			from_json, to_json, cc_json, subject, text_body, html_body,
@@ -167,14 +170,26 @@ func validateLatestMessagePosition(message domain.LatestMessage) error {
 	return nil
 }
 
+func sanitizeLatestMessageText(message *domain.LatestMessage) {
+	message.MessageID = sanitizePostgresText(message.MessageID)
+	message.Subject = sanitizePostgresText(message.Subject)
+	message.TextBody = sanitizePostgresText(message.TextBody)
+	message.HTMLBody = sanitizePostgresText(message.HTMLBody)
+}
+
+func sanitizePostgresText(value string) string {
+	value = strings.ToValidUTF8(value, "\uFFFD")
+	return strings.ReplaceAll(value, "\x00", "\uFFFD")
+}
+
 func (s *Store) GetLatestMessage(ctx context.Context, aliasID int64) (domain.LatestMessage, error) {
-	return scanLatestMessage(s.db.QueryRowContext(ctx,
+	return scanLatestMessage(s.queryRowContext(ctx,
 		`SELECT `+latestMessageColumns+` FROM latest_messages WHERE alias_id = ?`, aliasID,
 	))
 }
 
 func (s *Store) DeleteLatestMessage(ctx context.Context, aliasID int64) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM latest_messages WHERE alias_id = ?`, aliasID); err != nil {
+	if _, err := s.execContext(ctx, `DELETE FROM latest_messages WHERE alias_id = ?`, aliasID); err != nil {
 		return fmt.Errorf("delete latest message: %w", err)
 	}
 	return nil
@@ -183,7 +198,7 @@ func (s *Store) DeleteLatestMessage(ctx context.Context, aliasID int64) error {
 // DeleteLatestMessageFromOtherUIDValidity clears a snapshot from an obsolete
 // IMAP mailbox generation while retaining an uncertain current-generation row.
 func (s *Store) DeleteLatestMessageFromOtherUIDValidity(ctx context.Context, aliasID int64, uidValidity uint32) error {
-	if _, err := s.db.ExecContext(ctx, `
+	if _, err := s.execContext(ctx, `
 		DELETE FROM latest_messages WHERE alias_id = ? AND uid_validity != ?`,
 		aliasID, int64(uidValidity),
 	); err != nil {
@@ -198,7 +213,7 @@ func scanLatestMessage(scanner rowScanner) (domain.LatestMessage, error) {
 	var internalDate, syncedAt int64
 	var headerDate sql.NullInt64
 	var fromJSON, toJSON, ccJSON, attachmentsJSON string
-	var truncated int
+	var truncated bool
 	err := scanner.Scan(
 		&message.AliasID, &uidValidity, &uid, &message.MessageID,
 		&internalDate, &headerDate, &fromJSON, &toJSON, &ccJSON,
@@ -215,7 +230,7 @@ func scanLatestMessage(scanner rowScanner) (domain.LatestMessage, error) {
 	message.UID = uint32(uid)
 	message.InternalDate = timeFromTimestamp(internalDate)
 	message.HeaderDate = timePtr(headerDate)
-	message.BodyTruncated = truncated != 0
+	message.BodyTruncated = truncated
 	message.SyncedAt = timeFromTimestamp(syncedAt)
 	if err := unmarshalMessageJSON(&message, fromJSON, toJSON, ccJSON, attachmentsJSON); err != nil {
 		return domain.LatestMessage{}, err

@@ -2,7 +2,6 @@ package mail
 
 import (
 	"bytes"
-	"container/heap"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -21,18 +20,17 @@ import (
 )
 
 const (
-	defaultIMAPHost              = "imap.mail.me.com"
-	defaultIMAPPort              = 993
-	defaultIMAPTimeout           = 25 * time.Second
-	defaultMaxAliases            = domain.MaxEnabledAliasesPerAccount
-	defaultMaxCandidates         = 1024
-	defaultMaxCandidatesPerAlias = 24
-	defaultMaxHeaderBytes        = 128 << 10
-	defaultMaxMessageBytes       = 10 << 20
-	defaultMaxBodyBytes          = 1 << 20
-	defaultMaxFetchResultBytes   = 64 << 20
-	candidateHeaderFetchBatch    = 64
-	messageFetchBatch            = 8
+	defaultIMAPHost            = "imap.mail.me.com"
+	defaultIMAPPort            = 993
+	defaultIMAPTimeout         = 25 * time.Second
+	defaultMaxAliases          = domain.MaxEnabledAliasesPerAccount
+	defaultMaxCandidates       = 1024
+	defaultMaxHeaderBytes      = 128 << 10
+	defaultMaxMessageBytes     = 10 << 20
+	defaultMaxBodyBytes        = 1 << 20
+	defaultMaxFetchResultBytes = 64 << 20
+	candidateHeaderFetchBatch  = 64
+	messageFetchBatch          = 8
 )
 
 var (
@@ -61,7 +59,6 @@ type Fetcher struct {
 	IMAPTimeout               time.Duration
 	MaxAliases                int
 	MaxCandidates             int
-	MaxCandidatesPerAlias     int
 	MaxHeaderBytes            int
 	MaxMessageBytes           int
 	MaxBodyBytes              int
@@ -77,48 +74,70 @@ type Fetcher struct {
 // overwritten directly, for example from the application configuration.
 func NewFetcher() *Fetcher {
 	return &Fetcher{
-		IMAPTimeout:           defaultIMAPTimeout,
-		MaxAliases:            defaultMaxAliases,
-		MaxCandidates:         defaultMaxCandidates,
-		MaxCandidatesPerAlias: defaultMaxCandidatesPerAlias,
-		MaxHeaderBytes:        defaultMaxHeaderBytes,
-		MaxMessageBytes:       defaultMaxMessageBytes,
-		MaxBodyBytes:          defaultMaxBodyBytes,
-		dial:                  dialIMAPTLS,
-		now:                   time.Now,
+		IMAPTimeout:     defaultIMAPTimeout,
+		MaxAliases:      defaultMaxAliases,
+		MaxCandidates:   defaultMaxCandidates,
+		MaxHeaderBytes:  defaultMaxHeaderBytes,
+		MaxMessageBytes: defaultMaxMessageBytes,
+		MaxBodyBytes:    defaultMaxBodyBytes,
+		dial:            dialIMAPTLS,
+		now:             time.Now,
 	}
 }
 
-// FetchLatest returns one snapshot state per enabled alias. Empty is
-// authoritative, Unknown preserves the prior snapshot, and Found includes the
-// latest parsed message.
+// FetchLatest performs an authoritative bounded snapshot without a persisted
+// cursor. It remains as a compatibility wrapper around FetchIncremental.
 func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, password string, aliases []domain.Alias) (map[int64]domain.LatestMessage, error) {
-	settings := f.settings()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if !account.Enabled {
-		return nil, ErrAccountDisabled
-	}
-	if password == "" {
-		return nil, fmt.Errorf("%w: empty password", ErrInvalidIMAPConfig)
-	}
-
-	aliasAddresses, searchAddresses, err := prepareAliases(account, aliases, settings.maxAliases, settings.maxCandidates)
+	result, err := f.FetchIncremental(ctx, account, password, aliases, nil, nil)
 	if err != nil {
 		return nil, err
+	}
+	return result.Messages, nil
+}
+
+// FetchIncremental reads one bounded account-level UID window and classifies
+// its recipients locally. It never performs one IMAP query per alias.
+func (f *Fetcher) FetchIncremental(
+	ctx context.Context,
+	account domain.Account,
+	password string,
+	aliases []domain.Alias,
+	previous *domain.IMAPSyncState,
+	snapshotPositions map[int64]domain.MailboxSnapshotPosition,
+) (domain.MailboxSyncResult, error) {
+	settings := f.settings()
+	failure := domain.MailboxSyncResult{}
+	if previous != nil {
+		failure.State = *previous
+	}
+	if err := ctx.Err(); err != nil {
+		return failure, err
+	}
+	if !account.Enabled {
+		return failure, ErrAccountDisabled
+	}
+	if password == "" {
+		return failure, fmt.Errorf("%w: empty password", ErrInvalidIMAPConfig)
+	}
+
+	aliasAddresses, err := prepareAliases(account, aliases, settings.maxAliases)
+	if err != nil {
+		return failure, err
+	}
+	if err := validateSnapshotPositions(aliases, snapshotPositions); err != nil {
+		return failure, err
 	}
 
 	host, address, username, err := accountEndpoint(account)
 	if err != nil {
-		return nil, err
+		return failure, err
 	}
 	session, err := settings.dial(ctx, address, host, settings.timeout)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return failure, ctxErr
 		}
-		return nil, fmt.Errorf("connect IMAP %s: %w", address, err)
+		return failure, fmt.Errorf("connect IMAP %s: %w", address, err)
 	}
 
 	stopCancellation := make(chan struct{})
@@ -139,147 +158,185 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 
 	if err := session.Login(username, password); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return failure, ctxErr
 		}
-		return nil, fmt.Errorf("login IMAP account: %w", err)
+		return failure, fmt.Errorf("login IMAP account: %w", err)
 	}
 	mailbox, err := session.Select("INBOX", true)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return failure, ctxErr
 		}
-		return nil, fmt.Errorf("select INBOX read-only: %w", err)
+		return failure, fmt.Errorf("select INBOX read-only: %w", err)
 	}
 	if mailbox == nil {
-		return nil, errors.New("select INBOX read-only: empty mailbox status")
+		return failure, errors.New("select INBOX read-only: empty mailbox status")
 	}
 	uidValidity := mailbox.UidValidity
-	messagesCount := mailbox.Messages
 	if uidValidity == 0 {
-		return nil, errors.New("select INBOX read-only: UIDVALIDITY is zero")
+		return failure, errors.New("select INBOX read-only: UIDVALIDITY is zero")
 	}
-	if len(aliasAddresses) == 0 {
-		return map[int64]domain.LatestMessage{}, nil
+	if mailbox.UidNext == 0 {
+		return failure, errors.New("select INBOX read-only: UIDNEXT is zero")
 	}
 
 	syncedAt := settings.now().UTC()
-	resultCapacity := 0
-	for _, aliasIDs := range aliasAddresses {
-		resultCapacity += len(aliasIDs)
-	}
-	result := make(map[int64]domain.LatestMessage, resultCapacity)
-	for _, aliasIDs := range aliasAddresses {
-		for _, aliasID := range aliasIDs {
-			result[aliasID] = domain.LatestMessage{
-				AliasID:       aliasID,
-				UIDValidity:   uidValidity,
-				SyncedAt:      syncedAt,
-				SnapshotState: domain.SnapshotUnknown,
-			}
-		}
-	}
-
-	uidLists := make([][]uint32, 0, len(searchAddresses))
-	aliasCandidateUIDs := make(map[int64][]uint32, len(result))
-	aliasCandidatesTruncated := make(map[int64]bool, len(result))
-	var recipientSearchErr error
-	for _, aliasAddress := range searchAddresses {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		uids, searchErr := session.UidSearch(recipientSearchCriteria(aliasAddress, settings.allowWeakRecipientHeaders))
-		if searchErr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			recipientSearchErr = searchErr
-			break
-		}
-		newest, candidatesTruncated := newestUIDs(uids, settings.maxCandidatesPerAlias)
-		uidLists = append(uidLists, newest)
-		for _, aliasID := range aliasAddresses[aliasAddress] {
-			aliasCandidateUIDs[aliasID] = newest
-			aliasCandidatesTruncated[aliasID] = candidatesTruncated
-		}
-		if len(uids) == 0 {
-			for _, aliasID := range aliasAddresses[aliasAddress] {
-				empty := result[aliasID]
-				empty.SnapshotState = domain.SnapshotEmpty
-				result[aliasID] = empty
-			}
-		}
-	}
-	if recipientSearchErr != nil {
-		fallbackUIDs, fallbackIncomplete, fallbackErr := fallbackRecipientCandidateUIDs(
-			ctx,
-			session,
-			messagesCount,
-			settings.maxCandidates,
-		)
-		if fallbackErr != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			return nil, fmt.Errorf(
-				"search alias recipients: %w; scan recent UID candidates: %w",
-				recipientSearchErr,
-				fallbackErr,
+	upperUID := mailbox.UidNext - 1
+	reset := previous == nil || previous.AccountID != account.ID || previous.UIDValidity != uidValidity
+	if !reset {
+		if previous.LastUID > upperUID {
+			return failure, fmt.Errorf(
+				"stored IMAP cursor UID %d exceeds mailbox upper UID %d",
+				previous.LastUID,
+				upperUID,
 			)
 		}
+	}
 
-		uidLists = make([][]uint32, 0, len(searchAddresses))
-		aliasCandidateUIDs = make(map[int64][]uint32, len(result))
-		aliasCandidatesTruncated = make(map[int64]bool, len(result))
-		for _, aliasAddress := range searchAddresses {
-			uidLists = append(uidLists, fallbackUIDs)
-			for _, aliasID := range aliasAddresses[aliasAddress] {
-				aliasCandidateUIDs[aliasID] = fallbackUIDs
-				aliasCandidatesTruncated[aliasID] = fallbackIncomplete
-				snapshot := result[aliasID]
-				snapshot.SnapshotState = domain.SnapshotUnknown
-				if len(fallbackUIDs) == 0 && !fallbackIncomplete {
-					snapshot.SnapshotState = domain.SnapshotEmpty
+	result := domain.MailboxSyncResult{
+		Messages: make(map[int64]domain.LatestMessage),
+		State: domain.IMAPSyncState{
+			AccountID:   account.ID,
+			UIDValidity: uidValidity,
+			LastUID:     upperUID,
+			UpdatedAt:   syncedAt,
+		},
+		Reset: reset,
+	}
+	if !reset {
+		result.State.LastUID = previous.LastUID
+	}
+	preserveExistingSnapshots := !reset || previous == nil || previous.UIDValidity == uidValidity
+	publish := func() (domain.MailboxSyncResult, error) {
+		if err := validatePublishUIDs(
+			ctx,
+			session,
+			snapshotPositions,
+			result.Messages,
+			uidValidity,
+			preserveExistingSnapshots,
+		); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return failure, ctxErr
+			}
+			return failure, fmt.Errorf("validate mailbox snapshots before publish: %w", err)
+		}
+		return result, nil
+	}
+	aliasIDs := flattenedAliasIDs(aliasAddresses)
+	if len(aliasIDs) == 0 {
+		result.State.LastUID = upperUID
+		return publish()
+	}
+
+	var (
+		candidateUIDs      []uint32
+		authoritativeEmpty map[int64]struct{}
+	)
+	if reset {
+		// A new baseline intentionally keeps only the newest actual messages.
+		// Sequence numbers make the limit message-based even when UIDs are sparse.
+		candidateUIDs, err = fetchRecentMailboxUIDs(ctx, session, mailbox.Messages, settings.maxCandidates)
+		if mailbox.Messages <= uint32(settings.maxCandidates) {
+			authoritativeEmpty = idSet(aliasIDs)
+		}
+		if err == nil && mailbox.Messages > uint32(settings.maxCandidates) {
+			currentPositions := make(map[int64]domain.MailboxSnapshotPosition, len(snapshotPositions))
+			for aliasID, position := range snapshotPositions {
+				if position.UIDValidity == uidValidity {
+					currentPositions[aliasID] = position
 				}
-				result[aliasID] = snapshot
+			}
+			var missing map[int64]struct{}
+			missing, err = findMissingSnapshotAliases(ctx, session, currentPositions, uidValidity)
+			if len(missing) > 0 && authoritativeEmpty == nil {
+				authoritativeEmpty = make(map[int64]struct{}, len(missing))
+			}
+			for aliasID := range missing {
+				authoritativeEmpty[aliasID] = struct{}{}
+			}
+		}
+	} else {
+		if previous.LastUID < upperUID {
+			// Incremental runs process the oldest outstanding actual messages first.
+			// Sequence lookup bounds both the command response and local allocation.
+			candidateUIDs, result.State.LastUID, result.HasMore, err = fetchIncrementalMailboxUIDs(
+				ctx,
+				session,
+				mailbox.Messages,
+				previous.LastUID,
+				upperUID,
+				settings.maxCandidates,
+			)
+		}
+		if err == nil {
+			var missing map[int64]struct{}
+			missing, err = findMissingSnapshotAliases(ctx, session, snapshotPositions, uidValidity)
+			if err == nil && len(missing) > 0 {
+				authoritativeEmpty = missing
+				if !result.HasMore {
+					// Once caught up, one shared recent-window scan supplies a fallback
+					// for every expunged alias snapshot. During a backlog, only the
+					// current cursor-bounded batch may replace a missing snapshot; the
+					// empty result keeps the cursor moving so later batches remain visible.
+					candidateUIDs, err = fetchRecentMailboxUIDs(ctx, session, mailbox.Messages, settings.maxCandidates)
+				}
 			}
 		}
 	}
-
-	candidateUIDs := fairCandidateUIDs(uidLists, settings.maxCandidates)
-	if len(candidateUIDs) == 0 {
-		return result, nil
-	}
-
-	winners, falsePositiveEmpty, err := findAliasWinners(
-		session,
-		candidateUIDs,
-		aliasCandidateUIDs,
-		aliasCandidatesTruncated,
-		aliasAddresses,
-		account.Email,
-		settings.maxHeaderBytes,
-		settings.allowWeakRecipientHeaders,
-	)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return failure, ctxErr
 		}
-		return nil, err
+		return failure, fmt.Errorf("discover candidate message UIDs: %w", err)
 	}
-	for aliasID := range falsePositiveEmpty {
-		empty := result[aliasID]
-		empty.SnapshotState = domain.SnapshotEmpty
-		result[aliasID] = empty
+	for _, uid := range candidateUIDs {
+		if uid == 0 || uid > upperUID {
+			return failure, fmt.Errorf("discover candidate message UIDs: UID %d is outside mailbox upper UID %d", uid, upperUID)
+		}
+	}
+	winners := make(map[int64]uint32)
+	if len(candidateUIDs) > 0 {
+		winners, err = fetchCandidateWinners(
+			ctx,
+			session,
+			candidateUIDs,
+			aliasAddresses,
+			account.Email,
+			settings.maxHeaderBytes,
+			settings.allowWeakRecipientHeaders,
+		)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return failure, ctxErr
+			}
+			return failure, err
+		}
+	}
+	for aliasID := range authoritativeEmpty {
+		if _, found := winners[aliasID]; found {
+			continue
+		}
+		result.Messages[aliasID] = domain.LatestMessage{
+			AliasID:       aliasID,
+			UIDValidity:   uidValidity,
+			SyncedAt:      syncedAt,
+			SnapshotState: domain.SnapshotEmpty,
+		}
 	}
 	if len(winners) == 0 {
-		return result, nil
+		return publish()
 	}
 
 	uidToAliases := make(map[uint32][]int64)
 	for aliasID, uid := range winners {
 		uidToAliases[uid] = append(uidToAliases[uid], aliasID)
 	}
-	resultBaseBytes := int64(len(result) * parsedMessageBaseBytes)
+	resultMessageCount := len(result.Messages)
+	if resultMessageCount < len(winners) {
+		resultMessageCount = len(winners)
+	}
+	resultBaseBytes := int64(resultMessageCount * parsedMessageBaseBytes)
 	resultDynamicBudget := int64(settings.maxFetchResultBytes) - resultBaseBytes
 	if resultDynamicBudget < 0 {
 		resultDynamicBudget = 0
@@ -303,15 +360,20 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 	)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
+			return failure, ctxErr
 		}
-		return nil, err
+		return failure, err
+	}
+	for uid := range uidToAliases {
+		if _, found := messages[uid]; !found {
+			return failure, fmt.Errorf("fetch latest messages: missing or invalid winner UID %d", uid)
+		}
 	}
 
 	for uid, fetched := range messages {
 		parsed := fetched.parsed
 		for _, aliasID := range uidToAliases[uid] {
-			result[aliasID] = domain.LatestMessage{
+			result.Messages[aliasID] = domain.LatestMessage{
 				AliasID:       aliasID,
 				UIDValidity:   uidValidity,
 				UID:           uid,
@@ -331,14 +393,116 @@ func (f *Fetcher) FetchLatest(ctx context.Context, account domain.Account, passw
 			}
 		}
 	}
-	return result, nil
+	return publish()
+}
+
+// fetchCandidateWinners scans candidate headers newest-first in shared batches.
+// A successful UID FETCH may omit expunged UID gaps. Individual malformed or
+// ambiguous messages are skipped because they cannot be routed safely; command
+// failures and protocol invariant violations still fail the whole batch.
+func fetchCandidateWinners(
+	ctx context.Context,
+	session imapSession,
+	candidateUIDs []uint32,
+	aliases map[string][]int64,
+	accountEmail string,
+	maxHeaderBytes int,
+	allowWeak bool,
+) (map[int64]uint32, error) {
+	section := &imap.BodySectionName{
+		Peek: true,
+		BodyPartName: imap.BodyPartName{
+			Specifier: imap.HeaderSpecifier,
+			Fields:    recipientHeaderFieldsForFetch(),
+		},
+		Partial: []int{0, maxHeaderBytes + 1},
+	}
+	winners := make(map[int64]uint32)
+	for start := 0; start < len(candidateUIDs); start += candidateHeaderFetchBatch {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := min(start+candidateHeaderFetchBatch, len(candidateUIDs))
+		uids := candidateUIDs[start:end]
+		requested := make(map[uint32]struct{}, len(uids))
+		for _, uid := range uids {
+			requested[uid] = struct{}{}
+		}
+		batch := make(map[uint32]int64, len(uids))
+		seen := make(map[uint32]struct{}, len(uids))
+		err := uidFetchEach(session, uids, []imap.FetchItem{imap.FetchUid, section.FetchItem()}, func(message *imap.Message) error {
+			if _, ok := requested[message.Uid]; !ok {
+				return fmt.Errorf("unexpected candidate UID %d", message.Uid)
+			}
+			if _, duplicate := seen[message.Uid]; duplicate {
+				return fmt.Errorf("duplicate candidate header UID %d", message.Uid)
+			}
+			seen[message.Uid] = struct{}{}
+			body := message.GetBody(section)
+			if body == nil {
+				return nil
+			}
+			raw, truncated, readErr := readLiteral(body, maxHeaderBytes)
+			if readErr != nil {
+				return fmt.Errorf("read candidate UID %d header: %w", message.Uid, readErr)
+			}
+			if truncated {
+				return nil
+			}
+			parsed, parseErr := stdmail.ReadMessage(bytes.NewReader(raw))
+			if parseErr != nil {
+				return nil
+			}
+			aliasID, determinate := classifyScannedRecipientAlias(parsed.Header, aliases, accountEmail, allowWeak)
+			if !determinate {
+				return nil
+			}
+			batch[message.Uid] = aliasID
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("fetch candidate headers: %w", err)
+		}
+		for _, uid := range uids {
+			aliasID, found := batch[uid]
+			if !found || aliasID == 0 {
+				continue
+			}
+			if _, alreadyFound := winners[aliasID]; !alreadyFound {
+				winners[aliasID] = uid
+			}
+		}
+	}
+	return winners, nil
+}
+
+// classifyScannedRecipientAlias treats mail without any trusted routing
+// signal as ordinary account mail. Once a relevant signal is present, the
+// stricter classifier still fails closed on malformed or conflicting values.
+func classifyScannedRecipientAlias(
+	header stdmail.Header,
+	aliases map[string][]int64,
+	accountEmail string,
+	allowWeak bool,
+) (int64, bool) {
+	aliasID, determinate := classifyRecipientAlias(header, aliases, accountEmail, allowWeak)
+	if determinate {
+		return aliasID, true
+	}
+	candidateFields := append([]string{icloudHMEHeaderField}, strongRecipientHeaderFields...)
+	if allowWeak {
+		candidateFields = append(candidateFields, weakRecipientHeaderFields...)
+	}
+	if !hasAnyHeader(header, candidateFields) {
+		return 0, true
+	}
+	return 0, false
 }
 
 type fetchSettings struct {
 	timeout                   time.Duration
 	maxAliases                int
 	maxCandidates             int
-	maxCandidatesPerAlias     int
 	maxHeaderBytes            int
 	maxMessageBytes           int
 	maxBodyBytes              int
@@ -351,16 +515,15 @@ type fetchSettings struct {
 
 func (f *Fetcher) settings() fetchSettings {
 	settings := fetchSettings{
-		timeout:               defaultIMAPTimeout,
-		maxAliases:            defaultMaxAliases,
-		maxCandidates:         defaultMaxCandidates,
-		maxCandidatesPerAlias: defaultMaxCandidatesPerAlias,
-		maxHeaderBytes:        defaultMaxHeaderBytes,
-		maxMessageBytes:       defaultMaxMessageBytes,
-		maxBodyBytes:          defaultMaxBodyBytes,
-		maxFetchResultBytes:   defaultMaxFetchResultBytes,
-		dial:                  dialIMAPTLS,
-		now:                   time.Now,
+		timeout:             defaultIMAPTimeout,
+		maxAliases:          defaultMaxAliases,
+		maxCandidates:       defaultMaxCandidates,
+		maxHeaderBytes:      defaultMaxHeaderBytes,
+		maxMessageBytes:     defaultMaxMessageBytes,
+		maxBodyBytes:        defaultMaxBodyBytes,
+		maxFetchResultBytes: defaultMaxFetchResultBytes,
+		dial:                dialIMAPTLS,
+		now:                 time.Now,
 	}
 	if f == nil {
 		return settings
@@ -373,9 +536,6 @@ func (f *Fetcher) settings() fetchSettings {
 	}
 	if f.MaxCandidates > 0 {
 		settings.maxCandidates = f.MaxCandidates
-	}
-	if f.MaxCandidatesPerAlias > 0 {
-		settings.maxCandidatesPerAlias = f.MaxCandidatesPerAlias
 	}
 	if f.MaxHeaderBytes > 0 {
 		settings.maxHeaderBytes = f.MaxHeaderBytes
@@ -406,7 +566,7 @@ func (f *Fetcher) settings() fetchSettings {
 	return settings
 }
 
-func prepareAliases(account domain.Account, aliases []domain.Alias, maxAliases, maxCandidates int) (map[string][]int64, []string, error) {
+func prepareAliases(account domain.Account, aliases []domain.Alias, maxAliases int) (map[string][]int64, error) {
 	byAddress := make(map[string][]int64)
 	seenIDs := make(map[int64]struct{})
 	for _, alias := range aliases {
@@ -414,36 +574,195 @@ func prepareAliases(account domain.Account, aliases []domain.Alias, maxAliases, 
 			continue
 		}
 		if alias.AccountID != account.ID {
-			return nil, nil, fmt.Errorf("%w: alias %d", ErrAliasAccountMismatch, alias.ID)
+			return nil, fmt.Errorf("%w: alias %d", ErrAliasAccountMismatch, alias.ID)
 		}
 		if alias.ID <= 0 {
-			return nil, nil, fmt.Errorf("%w: missing ID", ErrInvalidAlias)
+			return nil, fmt.Errorf("%w: missing ID", ErrInvalidAlias)
 		}
 		if _, exists := seenIDs[alias.ID]; exists {
-			return nil, nil, fmt.Errorf("%w: duplicate ID %d", ErrInvalidAlias, alias.ID)
+			return nil, fmt.Errorf("%w: duplicate ID %d", ErrInvalidAlias, alias.ID)
 		}
 		if len(seenIDs) == maxAliases {
-			return nil, nil, ErrTooManyAliases
+			return nil, ErrTooManyAliases
 		}
 		seenIDs[alias.ID] = struct{}{}
 		address, ok := normalizeAliasAddress(alias.Address)
 		if !ok {
-			return nil, nil, fmt.Errorf("%w: alias %d address", ErrInvalidAlias, alias.ID)
-		}
-		if _, exists := byAddress[address]; !exists && len(byAddress) == maxCandidates {
-			return nil, nil, ErrTooManyAliases
+			return nil, fmt.Errorf("%w: alias %d address", ErrInvalidAlias, alias.ID)
 		}
 		byAddress[address] = append(byAddress[address], alias.ID)
 	}
-	if len(seenIDs) > maxAliases || len(byAddress) > maxCandidates {
-		return nil, nil, ErrTooManyAliases
+	if len(seenIDs) > maxAliases {
+		return nil, ErrTooManyAliases
 	}
-	addresses := make([]string, 0, len(byAddress))
-	for address := range byAddress {
-		addresses = append(addresses, address)
+	return byAddress, nil
+}
+
+func validateSnapshotPositions(aliases []domain.Alias, positions map[int64]domain.MailboxSnapshotPosition) error {
+	enabled := make(map[int64]struct{}, len(aliases))
+	for _, alias := range aliases {
+		if alias.Enabled {
+			enabled[alias.ID] = struct{}{}
+		}
 	}
-	sort.Strings(addresses)
-	return byAddress, addresses, nil
+	for aliasID, position := range positions {
+		if _, ok := enabled[aliasID]; !ok {
+			return fmt.Errorf("invalid mailbox snapshot position: alias %d is not enabled", aliasID)
+		}
+		if position.AliasID != aliasID || position.UIDValidity == 0 || position.UID == 0 {
+			return fmt.Errorf("invalid mailbox snapshot position for alias %d", aliasID)
+		}
+	}
+	return nil
+}
+
+func flattenedAliasIDs(aliases map[string][]int64) []int64 {
+	result := make([]int64, 0)
+	for _, ids := range aliases {
+		result = append(result, ids...)
+	}
+	sort.Slice(result, func(left, right int) bool { return result[left] < result[right] })
+	return result
+}
+
+func idSet(ids []int64) map[int64]struct{} {
+	result := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		result[id] = struct{}{}
+	}
+	return result
+}
+
+// findMissingSnapshotAliases validates all same-generation snapshot UIDs in
+// one account-level UID FETCH. Positions from an older generation are already
+// stale and are reconciled without sending them to the current mailbox.
+func findMissingSnapshotAliases(
+	ctx context.Context,
+	session imapSession,
+	positions map[int64]domain.MailboxSnapshotPosition,
+	uidValidity uint32,
+) (map[int64]struct{}, error) {
+	missing := make(map[int64]struct{})
+	uids := make([]uint32, 0, len(positions))
+	requested := make(map[uint32]struct{}, len(positions))
+	for aliasID, position := range positions {
+		if position.UIDValidity != uidValidity {
+			missing[aliasID] = struct{}{}
+			continue
+		}
+		if _, exists := requested[position.UID]; !exists {
+			requested[position.UID] = struct{}{}
+			uids = append(uids, position.UID)
+		}
+	}
+	if len(uids) == 0 {
+		return missing, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	found := make(map[uint32]struct{}, len(uids))
+	err := uidFetchEach(session, uids, []imap.FetchItem{imap.FetchUid}, func(message *imap.Message) error {
+		if _, ok := requested[message.Uid]; !ok {
+			return fmt.Errorf("snapshot validation returned unexpected UID %d", message.Uid)
+		}
+		if _, duplicate := found[message.Uid]; duplicate {
+			return fmt.Errorf("snapshot validation returned duplicate UID %d", message.Uid)
+		}
+		found[message.Uid] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("validate mailbox snapshots: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for aliasID, position := range positions {
+		if position.UIDValidity != uidValidity {
+			continue
+		}
+		if _, exists := found[position.UID]; !exists {
+			missing[aliasID] = struct{}{}
+		}
+	}
+	return missing, nil
+}
+
+// validatePublishUIDs is the final account-level mailbox check before a result
+// can be published. It covers both newly fetched winners and same-generation
+// snapshots that the store will retain because this result does not replace
+// them. A UID omitted by this one shared command was expunged during the scan,
+// so the whole result must be retried without advancing its cursor.
+func validatePublishUIDs(
+	ctx context.Context,
+	session imapSession,
+	positions map[int64]domain.MailboxSnapshotPosition,
+	messages map[int64]domain.LatestMessage,
+	uidValidity uint32,
+	preserveExisting bool,
+) error {
+	requested := make(map[uint32]struct{}, len(positions)+len(messages))
+	if preserveExisting {
+		for aliasID, position := range positions {
+			if position.UIDValidity != uidValidity {
+				continue
+			}
+			if _, replaced := messages[aliasID]; replaced {
+				continue
+			}
+			requested[position.UID] = struct{}{}
+		}
+	}
+	for aliasID, message := range messages {
+		switch message.SnapshotState {
+		case domain.SnapshotFound:
+			if message.AliasID != aliasID || message.UIDValidity != uidValidity || message.UID == 0 {
+				return fmt.Errorf("invalid found snapshot for alias %d", aliasID)
+			}
+			requested[message.UID] = struct{}{}
+		case domain.SnapshotEmpty:
+		case domain.SnapshotUnknown:
+			return fmt.Errorf("indeterminate snapshot for alias %d", aliasID)
+		default:
+			return fmt.Errorf("invalid snapshot state %q for alias %d", message.SnapshotState, aliasID)
+		}
+	}
+	if len(requested) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	uids := make([]uint32, 0, len(requested))
+	for uid := range requested {
+		uids = append(uids, uid)
+	}
+	sort.Slice(uids, func(left, right int) bool { return uids[left] < uids[right] })
+	found := make(map[uint32]struct{}, len(uids))
+	err := uidFetchEach(session, uids, []imap.FetchItem{imap.FetchUid}, func(message *imap.Message) error {
+		if _, ok := requested[message.Uid]; !ok {
+			return fmt.Errorf("final validation returned unexpected UID %d", message.Uid)
+		}
+		if _, duplicate := found[message.Uid]; duplicate {
+			return fmt.Errorf("final validation returned duplicate UID %d", message.Uid)
+		}
+		found[message.Uid] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("final UID FETCH: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, uid := range uids {
+		if _, exists := found[uid]; !exists {
+			return fmt.Errorf("UID %d was expunged before publish", uid)
+		}
+	}
+	return nil
 }
 
 func accountEndpoint(account domain.Account) (host, address, username string, err error) {
@@ -471,47 +790,25 @@ func accountEndpoint(account domain.Account) (host, address, username string, er
 	return defaultIMAPHost, "imap.mail.me.com:993", username, nil
 }
 
-func recipientSearchCriteria(address string, allowWeak bool) *imap.SearchCriteria {
-	headerFields := recipientSearchHeaderFields(allowWeak)
-	leaves := make([]*imap.SearchCriteria, 0, len(headerFields))
-	for _, field := range headerFields {
-		criteria := imap.NewSearchCriteria()
-		criteria.Header.Set(field, address)
-		leaves = append(leaves, criteria)
-	}
-	for len(leaves) > 1 {
-		next := make([]*imap.SearchCriteria, 0, (len(leaves)+1)/2)
-		for i := 0; i < len(leaves); i += 2 {
-			if i+1 == len(leaves) {
-				next = append(next, leaves[i])
-				continue
-			}
-			next = append(next, &imap.SearchCriteria{Or: [][2]*imap.SearchCriteria{{leaves[i], leaves[i+1]}}})
-		}
-		leaves = next
-	}
-	return leaves[0]
-}
-
-// fallbackRecipientCandidateUIDs avoids complex HEADER/OR searches that some
-// iCloud IMAP backends reject. It scans a bounded recent sequence range and
-// requests UIDs, leaving the existing local header classifier responsible for
-// mailbox ownership. Sequence numbers are used for the range because UIDs can
-// be sparse after messages are expunged.
-func fallbackRecipientCandidateUIDs(
+// fetchRecentMailboxUIDs returns the newest actual message UIDs in descending
+// order. Sequence numbers are used for discovery because UIDs can be sparse
+// after messages are expunged; the caller then uses UID FETCH for headers and
+// bodies. A short or malformed response is an error so the caller never
+// advances its cursor past an uncertain mailbox view.
+func fetchRecentMailboxUIDs(
 	ctx context.Context,
 	session imapSession,
 	messagesCount uint32,
 	limit int,
-) ([]uint32, bool, error) {
+) ([]uint32, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, true, err
+		return nil, err
 	}
 	if limit <= 0 {
-		return nil, true, errors.New("candidate limit must be positive")
+		return nil, errors.New("candidate limit must be positive")
 	}
 	if messagesCount == 0 {
-		return nil, false, nil
+		return nil, nil
 	}
 
 	window := uint64(limit)
@@ -520,8 +817,154 @@ func fallbackRecipientCandidateUIDs(
 	}
 	first := messagesCount - uint32(window) + 1
 	last := messagesCount
-	truncated := window < uint64(messagesCount)
+	uids, err := fetchMailboxUIDSequenceRange(ctx, session, first, last)
+	if err != nil {
+		return nil, err
+	}
+	for left, right := 0, len(uids)-1; left < right; left, right = left+1, right-1 {
+		uids[left], uids[right] = uids[right], uids[left]
+	}
+	return uids, nil
+}
 
+// fetchIncrementalMailboxUIDs returns at most limit oldest outstanding actual
+// UIDs in descending order. Small numeric ranges use one bounded UID SEARCH;
+// large ranges locate the first sequence after lastUID with bounded binary
+// probes, then fetch one contiguous sequence batch plus a sentinel. Response
+// size is O(limit), even for very large or sparse UID sets.
+func fetchIncrementalMailboxUIDs(
+	ctx context.Context,
+	session imapSession,
+	messagesCount uint32,
+	lastUID uint32,
+	upperUID uint32,
+	limit int,
+) (uids []uint32, processedThrough uint32, hasMore bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, lastUID, false, err
+	}
+	if limit <= 0 {
+		return nil, lastUID, false, errors.New("candidate limit must be positive")
+	}
+	if lastUID >= upperUID {
+		return nil, upperUID, false, nil
+	}
+	if uint64(upperUID)-uint64(lastUID) <= uint64(limit) {
+		set := new(imap.SeqSet)
+		set.AddRange(lastUID+1, upperUID)
+		criteria := imap.NewSearchCriteria()
+		criteria.Uid = set
+		discovered, searchErr := session.UidSearch(criteria)
+		if searchErr != nil {
+			return nil, lastUID, false, fmt.Errorf("search UID range %d:%d: %w", lastUID+1, upperUID, searchErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, lastUID, false, err
+		}
+		seen := make(map[uint32]struct{}, len(discovered))
+		for _, uid := range discovered {
+			if uid <= lastUID || uid > upperUID {
+				return nil, lastUID, false, fmt.Errorf("search UID range %d:%d returned unexpected UID %d", lastUID+1, upperUID, uid)
+			}
+			if _, duplicate := seen[uid]; duplicate {
+				return nil, lastUID, false, fmt.Errorf("search UID range %d:%d returned duplicate UID %d", lastUID+1, upperUID, uid)
+			}
+			seen[uid] = struct{}{}
+		}
+		sort.Slice(discovered, func(left, right int) bool { return discovered[left] > discovered[right] })
+		return discovered, upperUID, false, nil
+	}
+	if messagesCount == 0 {
+		return nil, upperUID, false, nil
+	}
+
+	firstSequence, err := findFirstSequenceAfterUID(ctx, session, messagesCount, lastUID, upperUID)
+	if err != nil {
+		return nil, lastUID, false, err
+	}
+	if firstSequence > uint64(messagesCount) {
+		return nil, upperUID, false, nil
+	}
+
+	first := uint32(firstSequence)
+	rangeFirst := first
+	if first > 1 {
+		rangeFirst--
+	}
+	rangeLast := firstSequence + uint64(limit)
+	if rangeLast > uint64(messagesCount) {
+		rangeLast = uint64(messagesCount)
+	}
+	discovered, err := fetchMailboxUIDSequenceRange(ctx, session, rangeFirst, uint32(rangeLast))
+	if err != nil {
+		return nil, lastUID, false, err
+	}
+	if first > 1 {
+		if discovered[0] > lastUID {
+			return nil, lastUID, false, fmt.Errorf("mailbox sequence boundary changed before batch fetch")
+		}
+		discovered = discovered[1:]
+	}
+	for _, uid := range discovered {
+		if uid <= lastUID || uid > upperUID {
+			return nil, lastUID, false, fmt.Errorf("incremental sequence batch returned unexpected UID %d", uid)
+		}
+	}
+	hasMore = len(discovered) > limit
+	if hasMore {
+		discovered = discovered[:limit]
+		processedThrough = discovered[len(discovered)-1]
+	} else {
+		processedThrough = upperUID
+	}
+	for left, right := 0, len(discovered)-1; left < right; left, right = left+1, right-1 {
+		discovered[left], discovered[right] = discovered[right], discovered[left]
+	}
+	return discovered, processedThrough, hasMore, nil
+}
+
+func findFirstSequenceAfterUID(
+	ctx context.Context,
+	session imapSession,
+	messagesCount uint32,
+	lastUID uint32,
+	upperUID uint32,
+) (uint64, error) {
+	low, high := uint64(1), uint64(messagesCount)+1
+	for low < high {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		middle := low + (high-low)/2
+		uids, err := fetchMailboxUIDSequenceRange(ctx, session, uint32(middle), uint32(middle))
+		if err != nil {
+			return 0, err
+		}
+		uid := uids[0]
+		if uid > upperUID {
+			return 0, fmt.Errorf("sequence %d returned UID %d beyond selected upper UID %d", middle, uid, upperUID)
+		}
+		if uid <= lastUID {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low, nil
+}
+
+func fetchMailboxUIDSequenceRange(
+	ctx context.Context,
+	session imapSession,
+	first uint32,
+	last uint32,
+) ([]uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if first == 0 || last < first {
+		return nil, fmt.Errorf("invalid mailbox sequence range %d:%d", first, last)
+	}
 	set := new(imap.SeqSet)
 	set.AddRange(first, last)
 	messages := make(chan *imap.Message)
@@ -534,17 +977,17 @@ func fallbackRecipientCandidateUIDs(
 		sequence uint32
 		uid      uint32
 	}
-	capacity := int(window)
-	seenUIDs := make(map[uint32]struct{}, capacity)
-	seenSequences := make(map[uint32]struct{}, capacity)
-	discovered := make([]sequenceUID, 0, capacity)
+	want := uint64(last) - uint64(first) + 1
+	discovered := make([]sequenceUID, 0, int(want))
+	seenSequences := make(map[uint32]struct{}, int(want))
+	seenUIDs := make(map[uint32]struct{}, int(want))
 	malformed := false
 	for message := range messages {
 		if message == nil || message.SeqNum < first || message.SeqNum > last || message.Uid == 0 {
 			malformed = true
 			continue
 		}
-		if _, duplicateSequence := seenSequences[message.SeqNum]; duplicateSequence {
+		if _, duplicate := seenSequences[message.SeqNum]; duplicate {
 			malformed = true
 			continue
 		}
@@ -557,241 +1000,31 @@ func fallbackRecipientCandidateUIDs(
 		discovered = append(discovered, sequenceUID{sequence: message.SeqNum, uid: message.Uid})
 	}
 	if err := <-done; err != nil {
-		return nil, true, fmt.Errorf("fetch sequence range %d:%d: %w", first, last, err)
+		return nil, fmt.Errorf("fetch sequence range %d:%d: %w", first, last, err)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, true, err
+		return nil, err
 	}
-
-	if uint64(len(discovered)) != window {
+	sort.Slice(discovered, func(left, right int) bool {
+		return discovered[left].sequence < discovered[right].sequence
+	})
+	if uint64(len(discovered)) != want {
 		malformed = true
 	}
-	sort.Slice(discovered, func(i, j int) bool { return discovered[i].sequence < discovered[j].sequence })
-	for index := 1; index < len(discovered); index++ {
-		if discovered[index].uid <= discovered[index-1].uid {
+	for index, item := range discovered {
+		if item.sequence != first+uint32(index) || (index > 0 && item.uid <= discovered[index-1].uid) {
 			malformed = true
 			break
 		}
 	}
 	if malformed {
-		return nil, true, nil
+		return nil, fmt.Errorf("fetch sequence range %d:%d returned an unstable mailbox view", first, last)
 	}
-
 	uids := make([]uint32, len(discovered))
-	for index, candidate := range discovered {
-		uids[len(discovered)-1-index] = candidate.uid
+	for index, item := range discovered {
+		uids[index] = item.uid
 	}
-	return uids, truncated, nil
-}
-
-type uidMinHeap []uint32
-
-func (h uidMinHeap) Len() int           { return len(h) }
-func (h uidMinHeap) Less(i, j int) bool { return h[i] < h[j] }
-func (h uidMinHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *uidMinHeap) Push(value any)    { *h = append(*h, value.(uint32)) }
-func (h *uidMinHeap) Pop() any {
-	old := *h
-	last := old[len(old)-1]
-	*h = old[:len(old)-1]
-	return last
-}
-
-func newestUIDs(uids []uint32, limit int) ([]uint32, bool) {
-	if limit <= 0 {
-		if len(uids) > 0 {
-			return nil, true
-		}
-		return nil, false
-	}
-
-	selected := make(uidMinHeap, 0, min(limit, len(uids)))
-	selectedSet := make(map[uint32]struct{}, min(limit, len(uids)))
-	truncated := false
-	for _, uid := range uids {
-		if uid == 0 {
-			truncated = true
-			continue
-		}
-		if _, exists := selectedSet[uid]; exists {
-			continue
-		}
-		if len(selected) < limit {
-			heap.Push(&selected, uid)
-			selectedSet[uid] = struct{}{}
-			continue
-		}
-		truncated = true
-		if uid <= selected[0] {
-			continue
-		}
-		removed := heap.Pop(&selected).(uint32)
-		delete(selectedSet, removed)
-		heap.Push(&selected, uid)
-		selectedSet[uid] = struct{}{}
-	}
-	result := append([]uint32(nil), selected...)
-	sort.Slice(result, func(i, j int) bool { return result[i] > result[j] })
-	return result, truncated
-}
-
-func fairCandidateUIDs(lists [][]uint32, limit int) []uint32 {
-	seen := make(map[uint32]struct{})
-	result := make([]uint32, 0, limit)
-	for depth := 0; len(result) < limit; depth++ {
-		found := false
-		for _, list := range lists {
-			if depth >= len(list) {
-				continue
-			}
-			found = true
-			uid := list[depth]
-			if _, exists := seen[uid]; exists {
-				continue
-			}
-			seen[uid] = struct{}{}
-			result = append(result, uid)
-			if len(result) == limit {
-				break
-			}
-		}
-		if !found {
-			break
-		}
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i] > result[j] })
-	return result
-}
-
-type candidateHeaderResolution struct {
-	aliasID     int64
-	determinate bool
-}
-
-func findAliasWinners(
-	session imapSession,
-	uids []uint32,
-	aliasCandidates map[int64][]uint32,
-	aliasCandidatesTruncated map[int64]bool,
-	aliases map[string][]int64,
-	accountEmail string,
-	maxHeaderBytes int,
-	allowWeak bool,
-) (map[int64]uint32, map[int64]struct{}, error) {
-	requestedUIDs := make(map[uint32]struct{}, len(uids))
-	for _, uid := range uids {
-		requestedUIDs[uid] = struct{}{}
-	}
-	section := &imap.BodySectionName{
-		Peek: true,
-		BodyPartName: imap.BodyPartName{
-			Specifier: imap.HeaderSpecifier,
-			Fields:    recipientHeaderFieldsForFetch(),
-		},
-		Partial: []int{0, maxHeaderBytes + 1},
-	}
-	resolutions := make(map[uint32]candidateHeaderResolution, len(uids))
-	seenResponses := make(map[uint32]struct{}, len(uids))
-	for start := 0; start < len(uids); start += candidateHeaderFetchBatch {
-		end := min(start+candidateHeaderFetchBatch, len(uids))
-		batchUIDs := make(map[uint32]struct{}, end-start)
-		for _, uid := range uids[start:end] {
-			batchUIDs[uid] = struct{}{}
-		}
-		err := uidFetchEach(session, uids[start:end], []imap.FetchItem{imap.FetchUid, section.FetchItem()}, func(message *imap.Message) error {
-			if _, requested := batchUIDs[message.Uid]; !requested {
-				return nil
-			}
-			if _, duplicate := seenResponses[message.Uid]; duplicate {
-				resolutions[message.Uid] = candidateHeaderResolution{}
-				return nil
-			}
-			seenResponses[message.Uid] = struct{}{}
-			body := message.GetBody(section)
-			if body == nil {
-				return nil
-			}
-			raw, truncated, readErr := readLiteral(body, maxHeaderBytes)
-			if readErr != nil || truncated {
-				return nil
-			}
-			parsed, parseErr := stdmail.ReadMessage(bytes.NewReader(raw))
-			if parseErr != nil {
-				return nil
-			}
-			aliasID, determinate := classifyRecipientAlias(parsed.Header, aliases, accountEmail, allowWeak)
-			resolutions[message.Uid] = candidateHeaderResolution{aliasID: aliasID, determinate: determinate}
-			return nil
-		})
-		if err != nil {
-			return nil, nil, fmt.Errorf("fetch candidate headers: %w", err)
-		}
-		for _, uid := range uids[start:end] {
-			if _, resolved := resolutions[uid]; !resolved {
-				// Preserve the fail-closed behavior for a response that omitted
-				// a requested UID or did not include a readable header.
-				resolutions[uid] = candidateHeaderResolution{}
-			}
-		}
-		// Candidate UIDs are ordered newest first. Once every alias has a
-		// terminal resolution, older candidates cannot change the result and
-		// there is no reason to issue more IMAP FETCH commands.
-		terminalAliases := 0
-		for aliasID, candidates := range aliasCandidates {
-			if aliasResolutionTerminal(aliasID, candidates, resolutions) {
-				terminalAliases++
-			}
-		}
-		if terminalAliases == len(aliasCandidates) {
-			break
-		}
-	}
-
-	winners := make(map[int64]uint32)
-	empty := make(map[int64]struct{})
-	for aliasID, candidates := range aliasCandidates {
-		fullyResolved := len(candidates) > 0 && !aliasCandidatesTruncated[aliasID]
-		for _, uid := range candidates {
-			if _, requested := requestedUIDs[uid]; !requested {
-				fullyResolved = false
-				break
-			}
-			resolution, fetched := resolutions[uid]
-			if !fetched || !resolution.determinate {
-				fullyResolved = false
-				break
-			}
-			if resolution.aliasID == aliasID {
-				winners[aliasID] = uid
-				break
-			}
-		}
-		if winners[aliasID] == 0 && fullyResolved {
-			empty[aliasID] = struct{}{}
-		}
-	}
-	return winners, empty, nil
-}
-
-// aliasResolutionTerminal reports whether the currently fetched prefix is
-// enough to make an alias result final. A malformed or missing header is
-// terminally indeterminate because accepting an older candidate would violate
-// the newest-message invariant.
-func aliasResolutionTerminal(
-	aliasID int64,
-	candidates []uint32,
-	resolutions map[uint32]candidateHeaderResolution,
-) bool {
-	for _, uid := range candidates {
-		resolution, fetched := resolutions[uid]
-		if !fetched {
-			return false
-		}
-		if !resolution.determinate || resolution.aliasID == aliasID {
-			return true
-		}
-	}
-	return true
+	return uids, nil
 }
 
 type fetchedMessage struct {
@@ -851,10 +1084,12 @@ func fetchMessages(
 			truncated = truncated || uint64(message.Size) > uint64(maxMessageBytes)
 			parsed, parseErr := parseMIMEMessageWithOptions(raw, limits, truncated)
 			if parseErr != nil {
-				if !truncated {
-					return nil
-				}
+				// Recipient routing was already established from the bounded header
+				// fetch. Preserve the mailbox position with an explicit truncated
+				// placeholder instead of letting one malformed MIME body block the
+				// account cursor forever.
 				parsed = parsedMessage{bodyTruncated: true}
+				truncated = true
 			}
 			batchResult[message.Uid] = fetchedMessage{
 				parsed:       parsed,

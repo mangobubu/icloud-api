@@ -18,26 +18,25 @@ const accountColumns = `
 
 func (s *Store) CreateAccount(ctx context.Context, account domain.Account) (domain.Account, error) {
 	now := s.now()
-	status := strings.TrimSpace(account.LastSyncStatus)
+	status := strings.TrimSpace(sanitizePostgresText(account.LastSyncStatus))
 	if status == "" {
 		status = domain.SyncStatusPending
 	}
-	result, err := s.db.ExecContext(ctx, `
+	var id int64
+	err := s.queryRowContext(ctx, `
 		INSERT INTO accounts(
 			name, email, imap_host, imap_port, imap_username, password_ciphertext,
 			enabled, last_sync_status, last_sync_error, last_synced_at, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		strings.TrimSpace(account.Name), domain.NormalizeEmail(account.Email),
-		strings.TrimSpace(account.IMAPHost), account.IMAPPort, strings.TrimSpace(account.IMAPUsername),
-		account.PasswordCiphertext, account.Enabled, status, account.LastSyncError,
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		RETURNING id`,
+		strings.TrimSpace(sanitizePostgresText(account.Name)), domain.NormalizeEmail(sanitizePostgresText(account.Email)),
+		strings.TrimSpace(sanitizePostgresText(account.IMAPHost)), account.IMAPPort,
+		strings.TrimSpace(sanitizePostgresText(account.IMAPUsername)),
+		account.PasswordCiphertext, account.Enabled, status, sanitizePostgresText(account.LastSyncError),
 		nullableTimestamp(account.LastSyncedAt), timestamp(now), timestamp(now),
-	)
+	).Scan(&id)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("create account: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return domain.Account{}, fmt.Errorf("read new account id: %w", err)
 	}
 	return s.getAccountAfterWrite(id)
 }
@@ -51,19 +50,16 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 		return domain.Account{}, fmt.Errorf("begin account update: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	lockResult, err := tx.ExecContext(ctx, `UPDATE accounts SET updated_at = updated_at WHERE id = ?`, account.ID)
+	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, account.ID)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("lock account for update: %w", err)
 	}
-	if err := requireAffected(lockResult, "account"); err != nil {
-		return domain.Account{}, err
-	}
 
 	var currentPassword string
-	var currentEnabled int
+	var currentEnabled bool
 	var currentEmail, currentUsername string
-	var hasAliases int
-	if err := tx.QueryRowContext(ctx, `
+	var hasAliases bool
+	if err := s.txQueryRowContext(ctx, tx, `
 		SELECT password_ciphertext, enabled, email, imap_username,
 		       EXISTS(SELECT 1 FROM aliases WHERE account_id = accounts.id)
 		FROM accounts WHERE id = ?`, account.ID,
@@ -73,24 +69,29 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 		}
 		return domain.Account{}, fmt.Errorf("read account before update: %w", err)
 	}
-	requestedEmail := domain.NormalizeEmail(account.Email)
-	requestedUsername := strings.TrimSpace(account.IMAPUsername)
-	if hasAliases != 0 && (requestedEmail != domain.NormalizeEmail(currentEmail) || requestedUsername != strings.TrimSpace(currentUsername)) {
+	requestedEmail := domain.NormalizeEmail(sanitizePostgresText(account.Email))
+	requestedUsername := strings.TrimSpace(sanitizePostgresText(account.IMAPUsername))
+	if hasAliases && (requestedEmail != domain.NormalizeEmail(currentEmail) || requestedUsername != strings.TrimSpace(currentUsername)) {
 		return domain.Account{}, ErrAccountIdentityLocked
 	}
 
 	now := s.now()
-	result, err := tx.ExecContext(ctx, `
+	nextAccountVersion, err := s.nextAccountVersion(accountVersion)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("advance account version: %w", err)
+	}
+	result, err := s.txExecContext(ctx, tx, `
 		UPDATE accounts SET
 			name = ?,
 			email = CASE WHEN EXISTS(SELECT 1 FROM aliases WHERE account_id = ?) THEN email ELSE ? END,
 			imap_username = CASE WHEN EXISTS(SELECT 1 FROM aliases WHERE account_id = ?) THEN imap_username ELSE ? END,
 			password_ciphertext = CASE WHEN ? = '' THEN password_ciphertext ELSE ? END,
 			enabled = ?, updated_at = ?
-		WHERE id = ?`,
-		strings.TrimSpace(account.Name), account.ID, requestedEmail,
+		WHERE id = ? AND updated_at = ?`,
+		strings.TrimSpace(sanitizePostgresText(account.Name)), account.ID, requestedEmail,
 		account.ID, requestedUsername,
-		account.PasswordCiphertext, account.PasswordCiphertext, account.Enabled, timestamp(now), account.ID,
+		account.PasswordCiphertext, account.PasswordCiphertext, account.Enabled,
+		nextAccountVersion, account.ID, accountVersion,
 	)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("update account: %w", err)
@@ -100,30 +101,31 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	}
 
 	passwordChanged := account.PasswordCiphertext != "" && account.PasswordCiphertext != currentPassword
-	reenabled := currentEnabled == 0 && account.Enabled
-	identityChanged := hasAliases == 0 && (requestedEmail != domain.NormalizeEmail(currentEmail) ||
+	reenabled := !currentEnabled && account.Enabled
+	identityChanged := !hasAliases && (requestedEmail != domain.NormalizeEmail(currentEmail) ||
 		requestedUsername != strings.TrimSpace(currentUsername))
 	if identityChanged {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM apple_web_sessions WHERE account_id = ?`, account.ID); err != nil {
+		if _, err := s.txExecContext(ctx, tx, `DELETE FROM apple_web_sessions WHERE account_id = ?`, account.ID); err != nil {
 			return domain.Account{}, fmt.Errorf("delete apple web session after account identity change: %w", err)
 		}
 	}
 	if passwordChanged || reenabled || identityChanged {
-		if _, err := tx.ExecContext(ctx, `
-			DELETE FROM latest_messages
-			WHERE alias_id IN (SELECT id FROM aliases WHERE account_id = ?)`, account.ID); err != nil {
-			return domain.Account{}, fmt.Errorf("delete account snapshots: %w", err)
+		// Pending status keeps the API from serving this snapshot. Preserve the
+		// row until the next bounded reset can compare UIDVALIDITY and avoid
+		// discarding a valid same-generation message outside its recent window.
+		if _, err := s.txExecContext(ctx, tx, `DELETE FROM imap_sync_states WHERE account_id = ?`, account.ID); err != nil {
+			return domain.Account{}, fmt.Errorf("delete account IMAP sync state: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := s.txExecContext(ctx, tx, `
 			UPDATE aliases
 			SET last_sync_status = ?, last_sync_error = '', last_synced_at = NULL, updated_at = ?
 			WHERE account_id = ?`, domain.SyncStatusPending, timestamp(now), account.ID); err != nil {
 			return domain.Account{}, fmt.Errorf("reset account alias statuses: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `
+		if _, err := s.txExecContext(ctx, tx, `
 			UPDATE accounts
 			SET last_sync_status = ?, last_sync_error = '', last_synced_at = NULL, updated_at = ?
-			WHERE id = ?`, domain.SyncStatusPending, timestamp(now), account.ID); err != nil {
+			WHERE id = ?`, domain.SyncStatusPending, nextAccountVersion, account.ID); err != nil {
 			return domain.Account{}, fmt.Errorf("reset account sync status: %w", err)
 		}
 	}
@@ -141,15 +143,15 @@ func (s *Store) getAccountAfterWrite(id int64) (domain.Account, error) {
 }
 
 func (s *Store) GetAccount(ctx context.Context, id int64) (domain.Account, error) {
-	return scanAccount(s.db.QueryRowContext(ctx,
+	return scanAccount(s.queryRowContext(ctx,
 		`SELECT `+accountColumns+` FROM accounts a WHERE a.id = ?`, id,
 	))
 }
 
 func (s *Store) GetAccountByEmail(ctx context.Context, email string) (domain.Account, error) {
-	return scanAccount(s.db.QueryRowContext(ctx,
-		`SELECT `+accountColumns+` FROM accounts a WHERE a.email = ? COLLATE NOCASE`,
-		domain.NormalizeEmail(email),
+	return scanAccount(s.queryRowContext(ctx,
+		`SELECT `+accountColumns+` FROM accounts a WHERE a.email = ?`,
+		domain.NormalizeEmail(sanitizePostgresText(email)),
 	))
 }
 
@@ -164,10 +166,10 @@ func (s *Store) ListEnabledAccounts(ctx context.Context) ([]domain.Account, erro
 func (s *Store) listAccounts(ctx context.Context, enabledOnly bool) ([]domain.Account, error) {
 	query := `SELECT ` + accountColumns + ` FROM accounts a`
 	if enabledOnly {
-		query += ` WHERE a.enabled = 1`
+		query += ` WHERE a.enabled = TRUE`
 	}
-	query += ` ORDER BY a.email COLLATE NOCASE, a.id`
-	rows, err := s.db.QueryContext(ctx,
+	query += ` ORDER BY a.email, a.id`
+	rows, err := s.queryContext(ctx,
 		query,
 	)
 	if err != nil {
@@ -190,7 +192,7 @@ func (s *Store) listAccounts(ctx context.Context, enabledOnly bool) ([]domain.Ac
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
+	result, err := s.execContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete account: %w", err)
 	}
@@ -204,16 +206,36 @@ func (s *Store) SetAccountSyncStatus(
 	syncError string,
 	syncedAt *time.Time,
 ) error {
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin account sync status update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, id)
+	if err != nil {
+		return fmt.Errorf("lock account for sync status update: %w", err)
+	}
+	nextAccountVersion, err := s.nextAccountVersion(accountVersion)
+	if err != nil {
+		return fmt.Errorf("advance account version for sync status update: %w", err)
+	}
+	result, err := s.txExecContext(ctx, tx, `
 		UPDATE accounts
 		SET last_sync_status = ?, last_sync_error = ?, last_synced_at = ?, updated_at = ?
-		WHERE id = ?`,
-		status, syncError, nullableTimestamp(syncedAt), timestamp(s.now()), id,
+		WHERE id = ? AND updated_at = ?`,
+		sanitizePostgresText(status), sanitizePostgresText(syncError),
+		nullableTimestamp(syncedAt), nextAccountVersion, id, accountVersion,
 	)
 	if err != nil {
 		return fmt.Errorf("set account sync status: %w", err)
 	}
-	return requireAffected(result, "account")
+	if err := requireAffected(result, "account"); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit account sync status update: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) UpdateAccountSyncStatus(
@@ -228,7 +250,7 @@ func (s *Store) UpdateAccountSyncStatus(
 
 func scanAccount(scanner rowScanner) (domain.Account, error) {
 	var account domain.Account
-	var enabled int
+	var enabled bool
 	var lastSyncedAt sql.NullInt64
 	var createdAt, updatedAt int64
 	err := scanner.Scan(
@@ -243,7 +265,7 @@ func scanAccount(scanner rowScanner) (domain.Account, error) {
 		}
 		return domain.Account{}, fmt.Errorf("scan account: %w", err)
 	}
-	account.Enabled = enabled != 0
+	account.Enabled = enabled
 	account.LastSyncedAt = timePtr(lastSyncedAt)
 	account.CreatedAt = timeFromTimestamp(createdAt)
 	account.UpdatedAt = timeFromTimestamp(updatedAt)

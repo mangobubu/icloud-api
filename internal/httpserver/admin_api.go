@@ -21,6 +21,7 @@ import (
 	"icloud-api/internal/domain"
 	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
+	"icloud-api/internal/syncer"
 )
 
 const (
@@ -124,6 +125,7 @@ type adminAPIAccountDetailDTO struct {
 	Account      adminAPIAccountDTO       `json:"account"`
 	Aliases      []adminAPIAliasDTO       `json:"aliases"`
 	AppleSession *adminAPIAppleSessionDTO `json:"apple_session"`
+	SyncPending  bool                     `json:"sync_pending,omitempty"`
 }
 
 type adminAPIOneTimeKeyDTO struct {
@@ -684,12 +686,13 @@ func (s *Server) adminAPISyncAccount(c *gin.Context) {
 	} else {
 		syncErr = s.sync(id)
 	}
-	if syncErr != nil {
+	pending := errors.Is(syncErr, syncer.ErrSyncPending)
+	if syncErr != nil && !pending {
 		result = "failed"
 	}
 	session := mustSession(c)
 	s.audit(c, &session.AdminID, session.Username, "sync", "account", strconv.FormatInt(id, 10), result, "")
-	if syncErr != nil {
+	if syncErr != nil && !pending {
 		writeAdminAPIError(c, http.StatusBadGateway, "SYNC_FAILED", "同步失败，请检查连接状态")
 		return
 	}
@@ -698,7 +701,12 @@ func (s *Server) adminAPISyncAccount(c *gin.Context) {
 		s.writeAdminAPIStoreReadError(c, err)
 		return
 	}
-	writeAdminAPIData(c, http.StatusOK, detail)
+	detail.SyncPending = pending
+	status := http.StatusOK
+	if pending {
+		status = http.StatusAccepted
+	}
+	writeAdminAPIData(c, status, detail)
 }
 
 func (s *Server) adminAPIAccountDetail(ctx context.Context, id int64) (adminAPIAccountDetailDTO, error) {

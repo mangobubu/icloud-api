@@ -12,4 +12,5 @@
 /.env.*
 !/.env.example
 /.cache/
+/.gocache-review/
 **/.gocache/

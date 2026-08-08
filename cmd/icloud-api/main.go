@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -34,10 +33,12 @@ func main() {
 		err = run()
 	case len(os.Args) == 2 && os.Args[1] == "keygen":
 		err = printKey()
+	case len(os.Args) == 2 && os.Args[1] == "verify-startup":
+		err = runStartupVerification()
 	case len(os.Args) == 3 && os.Args[1] == "admin" && os.Args[2] == "reset":
 		err = runAdminReset()
 	default:
-		err = fmt.Errorf("未知命令；可用命令：keygen、admin reset")
+		err = fmt.Errorf("未知命令；可用命令：keygen、verify-startup、admin reset")
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -52,29 +53,17 @@ func run() error {
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o700); err != nil {
-		return fmt.Errorf("创建数据目录: %w", err)
-	}
-	masterKey, keyCreated, err := secure.LoadOrCreateMasterKey(cfg.MasterKeyFile)
+	db, cipher, keyCreated, err := openInitializedStore(context.Background(), cfg)
 	if err != nil {
-		return fmt.Errorf("加载主密钥: %w", err)
+		return err
 	}
+	defer db.Close()
 	if keyCreated {
 		logger.Warn("已生成本机主密钥文件，请与数据库一起安全备份", "path", cfg.MasterKeyFile)
 	}
-	cipher, err := secure.NewCipher(masterKey)
-	if err != nil {
-		return fmt.Errorf("初始化凭据加密: %w", err)
+	if cfg.LegacySQLitePath != "" {
+		logger.Info("旧 SQLite 数据导入检查完成", "path", cfg.LegacySQLitePath)
 	}
-	for i := range masterKey {
-		masterKey[i] = 0
-	}
-
-	db, err := store.Open(cfg.DatabasePath)
-	if err != nil {
-		return fmt.Errorf("打开数据库: %w", err)
-	}
-	defer db.Close()
 	if err := bootstrapAdmin(context.Background(), db, cfg.AdminUsername, cfg.AdminPassword); err != nil {
 		return err
 	}
@@ -172,21 +161,127 @@ func httpWriteTimeout(syncTimeout time.Duration) time.Duration {
 	return syncTimeout + 10*time.Second
 }
 
+type startupStore interface {
+	InitializeMasterKeyWithLegacySQLite(
+		context.Context,
+		[]byte,
+		string,
+		store.MasterKeyCipherValidator,
+	) error
+}
+
+func initializeCipherWithStore(
+	ctx context.Context,
+	database startupStore,
+	masterKey []byte,
+	legacySQLitePath string,
+) (*secure.Cipher, error) {
+	defer zeroBytes(masterKey)
+	cipher, err := secure.NewCipher(masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("初始化凭据加密: %w", err)
+	}
+	if err := database.InitializeMasterKeyWithLegacySQLite(
+		ctx, masterKey, legacySQLitePath, cipher,
+	); err != nil {
+		return nil, masterKeyVerificationError(err)
+	}
+	return cipher, nil
+}
+
+func masterKeyVerificationError(err error) error {
+	if errors.Is(err, store.ErrMasterKeyMismatch) {
+		return fmt.Errorf("主密钥与 PostgreSQL 数据库不匹配；请恢复与该数据库配套的 keys 卷或原 ICLOUD_API_MASTER_KEY: %w", err)
+	}
+	return fmt.Errorf("校验 PostgreSQL 主密钥指纹: %w", err)
+}
+
+func zeroBytes(value []byte) {
+	for index := range value {
+		value[index] = 0
+	}
+}
+
+func openInitializedStore(
+	ctx context.Context,
+	cfg config.Config,
+) (*store.Store, *secure.Cipher, bool, error) {
+	masterKey, keyCreated, err := secure.LoadOrCreateMasterKey(cfg.MasterKeyFile)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("加载主密钥: %w", err)
+	}
+	defer zeroBytes(masterKey)
+
+	db, err := store.OpenContext(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("打开数据库: %w", err)
+	}
+	cipher, err := initializeCipherWithStore(ctx, db, masterKey, cfg.LegacySQLitePath)
+	if err != nil {
+		_ = db.Close()
+		return nil, nil, false, err
+	}
+	return db, cipher, keyCreated, nil
+}
+
+type adminBootstrapStatus string
+
+const (
+	adminBootstrapCreated  adminBootstrapStatus = "admin-created"
+	adminBootstrapExisting adminBootstrapStatus = "admin-existing"
+	adminBootstrapRequired adminBootstrapStatus = "admin-required"
+)
+
+func runStartupVerification() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("读取配置: %w", err)
+	}
+	db, _, _, err := openInitializedStore(context.Background(), cfg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	status, err := checkAdminBootstrap(
+		context.Background(), db, cfg.AdminUsername, cfg.AdminPassword,
+	)
+	cfg.AdminPassword = ""
+	if err != nil {
+		return err
+	}
+	fmt.Println(status)
+	return nil
+}
+
 func runAdminReset() error {
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("读取配置: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0o700); err != nil {
-		return fmt.Errorf("创建数据目录: %w", err)
+	masterKey, _, err := secure.LoadOrCreateMasterKey(cfg.MasterKeyFile)
+	if err != nil {
+		return fmt.Errorf("加载主密钥: %w", err)
 	}
-	db, err := store.Open(cfg.DatabasePath)
+	defer zeroBytes(masterKey)
+
+	ctx := context.Background()
+	db, err := store.OpenContext(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return fmt.Errorf("打开数据库: %w", err)
 	}
 	defer db.Close()
 
-	username, err := resetAdminCredentials(context.Background(), db, cfg.AdminUsername, cfg.AdminPassword)
+	username, err := initializeAndResetAdmin(
+		ctx,
+		db,
+		masterKey,
+		cfg.LegacySQLitePath,
+		func() (string, error) {
+			return resetAdminCredentials(ctx, db, cfg.AdminUsername, cfg.AdminPassword)
+		},
+	)
+	cfg.AdminPassword = ""
 	if err != nil {
 		return err
 	}
@@ -194,26 +289,61 @@ func runAdminReset() error {
 	return nil
 }
 
+func initializeAndResetAdmin(
+	ctx context.Context,
+	database startupStore,
+	masterKey []byte,
+	legacySQLitePath string,
+	reset func() (string, error),
+) (string, error) {
+	if _, err := initializeCipherWithStore(ctx, database, masterKey, legacySQLitePath); err != nil {
+		return "", err
+	}
+	return reset()
+}
+
 func bootstrapAdmin(ctx context.Context, db *store.Store, username, configuredPassword string) error {
+	_, err := bootstrapAdminWithStatus(ctx, db, username, configuredPassword)
+	return err
+}
+
+func bootstrapAdminWithStatus(
+	ctx context.Context,
+	db *store.Store,
+	username, configuredPassword string,
+) (adminBootstrapStatus, error) {
+	status, err := checkAdminBootstrap(ctx, db, username, configuredPassword)
+	if err != nil || status == adminBootstrapExisting {
+		return status, err
+	}
+	username = strings.TrimSpace(username)
+	hash, err := bcrypt.GenerateFromPassword([]byte(configuredPassword), 12)
+	if err != nil {
+		return "", fmt.Errorf("哈希管理员密码: %w", err)
+	}
+	if _, err := db.CreateAdmin(ctx, username, string(hash)); err != nil {
+		return "", fmt.Errorf("创建初始管理员: %w", err)
+	}
+	return adminBootstrapCreated, nil
+}
+
+func checkAdminBootstrap(
+	ctx context.Context,
+	db *store.Store,
+	username, configuredPassword string,
+) (adminBootstrapStatus, error) {
 	count, err := db.CountAdmins(ctx)
 	if err != nil {
-		return fmt.Errorf("检查管理员: %w", err)
+		return "", fmt.Errorf("检查管理员: %w", err)
 	}
 	if count > 0 {
-		return nil
+		return adminBootstrapExisting, nil
 	}
 	username = strings.TrimSpace(username)
 	if err := validateAdminCredentials(username, configuredPassword); err != nil {
-		return fmt.Errorf("首次启动管理员配置无效: %w", err)
+		return "", fmt.Errorf("首次启动管理员配置无效: %w", err)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(configuredPassword), 12)
-	if err != nil {
-		return fmt.Errorf("哈希管理员密码: %w", err)
-	}
-	if _, err := db.CreateAdmin(ctx, username, string(hash)); err != nil {
-		return fmt.Errorf("创建初始管理员: %w", err)
-	}
-	return nil
+	return adminBootstrapRequired, nil
 }
 
 func resetAdminCredentials(ctx context.Context, db *store.Store, username, configuredPassword string) (string, error) {

@@ -10,38 +10,35 @@ import (
 )
 
 func (s *Store) CreateAdmin(ctx context.Context, username, passwordHash string) (domain.Admin, error) {
-	username = strings.TrimSpace(username)
+	username = strings.TrimSpace(sanitizePostgresText(username))
 	createdAt := s.now()
-	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO admins(username, password_hash, password_version, created_at) VALUES(?, ?, 1, ?)`,
+	var id int64
+	err := s.queryRowContext(ctx,
+		`INSERT INTO admins(username, password_hash, password_version, created_at) VALUES(?, ?, 1, ?) RETURNING id`,
 		username, passwordHash, timestamp(createdAt),
-	)
+	).Scan(&id)
 	if err != nil {
 		return domain.Admin{}, fmt.Errorf("create admin: %w", err)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return domain.Admin{}, fmt.Errorf("read new admin id: %w", err)
 	}
 	return domain.Admin{ID: id, Username: username, PasswordHash: passwordHash, PasswordVersion: 1, CreatedAt: createdAt}, nil
 }
 
 func (s *Store) GetAdminByID(ctx context.Context, id int64) (domain.Admin, error) {
-	return scanAdmin(s.db.QueryRowContext(ctx,
+	return scanAdmin(s.queryRowContext(ctx,
 		`SELECT id, username, password_hash, password_version, created_at FROM admins WHERE id = ?`, id,
 	))
 }
 
 func (s *Store) GetAdminByUsername(ctx context.Context, username string) (domain.Admin, error) {
-	return scanAdmin(s.db.QueryRowContext(ctx,
-		`SELECT id, username, password_hash, password_version, created_at FROM admins WHERE username = ? COLLATE NOCASE`,
-		strings.TrimSpace(username),
+	return scanAdmin(s.queryRowContext(ctx,
+		`SELECT id, username, password_hash, password_version, created_at FROM admins WHERE username = ?`,
+		strings.TrimSpace(sanitizePostgresText(username)),
 	))
 }
 
 func (s *Store) ListAdmins(ctx context.Context) ([]domain.Admin, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, username, password_hash, password_version, created_at FROM admins ORDER BY username COLLATE NOCASE, id`,
+	rows, err := s.queryContext(ctx,
+		`SELECT id, username, password_hash, password_version, created_at FROM admins ORDER BY username, id`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list admins: %w", err)
@@ -64,14 +61,14 @@ func (s *Store) ListAdmins(ctx context.Context) ([]domain.Admin, error) {
 
 func (s *Store) CountAdmins(ctx context.Context) (int, error) {
 	var count int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM admins`).Scan(&count); err != nil {
+	if err := s.queryRowContext(ctx, `SELECT COUNT(*) FROM admins`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("count admins: %w", err)
 	}
 	return count, nil
 }
 
 func (s *Store) UpdateAdminPassword(ctx context.Context, id int64, passwordHash string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE admins SET password_hash = ?, password_version = password_version + 1 WHERE id = ?`, passwordHash, id)
+	result, err := s.execContext(ctx, `UPDATE admins SET password_hash = ?, password_version = password_version + 1 WHERE id = ?`, passwordHash, id)
 	if err != nil {
 		return fmt.Errorf("update admin password: %w", err)
 	}
@@ -84,7 +81,7 @@ func (s *Store) ChangeAdminPasswordAndRevokeSessions(ctx context.Context, id, ex
 		return fmt.Errorf("begin admin password change: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, `
+	result, err := s.txExecContext(ctx, tx, `
 		UPDATE admins
 		SET password_hash = ?, password_version = password_version + 1
 		WHERE id = ? AND password_version = ?`, passwordHash, id, expectedVersion)
@@ -98,7 +95,7 @@ func (s *Store) ChangeAdminPasswordAndRevokeSessions(ctx context.Context, id, ex
 	if changed == 0 {
 		return ErrCredentialsChanged
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM admin_sessions WHERE admin_id = ?`, id); err != nil {
+	if _, err := s.txExecContext(ctx, tx, `DELETE FROM admin_sessions WHERE admin_id = ?`, id); err != nil {
 		return fmt.Errorf("revoke admin sessions: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -116,11 +113,11 @@ func (s *Store) ResetAdminCredentialsAndRevokeSessions(ctx context.Context, id, 
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx, `
+	result, err := s.txExecContext(ctx, tx, `
 		UPDATE admins
 		SET username = ?, password_hash = ?, password_version = password_version + 1
 		WHERE id = ? AND password_version = ?`,
-		strings.TrimSpace(username), passwordHash, id, expectedVersion,
+		strings.TrimSpace(sanitizePostgresText(username)), passwordHash, id, expectedVersion,
 	)
 	if err != nil {
 		return fmt.Errorf("reset admin credentials: %w", err)
@@ -132,7 +129,7 @@ func (s *Store) ResetAdminCredentialsAndRevokeSessions(ctx context.Context, id, 
 	if changed == 0 {
 		return ErrCredentialsChanged
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM admin_sessions WHERE admin_id = ?`, id); err != nil {
+	if _, err := s.txExecContext(ctx, tx, `DELETE FROM admin_sessions WHERE admin_id = ?`, id); err != nil {
 		return fmt.Errorf("revoke admin sessions: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -142,7 +139,7 @@ func (s *Store) ResetAdminCredentialsAndRevokeSessions(ctx context.Context, id, 
 }
 
 func (s *Store) DeleteAdmin(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM admins WHERE id = ?`, id)
+	result, err := s.execContext(ctx, `DELETE FROM admins WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("delete admin: %w", err)
 	}
@@ -158,7 +155,7 @@ func (s *Store) CreateSession(ctx context.Context, tokenHash []byte, session dom
 	if session.PasswordVersion < 1 {
 		return fmt.Errorf("create session: %w", ErrCredentialsChanged)
 	}
-	result, err := s.db.ExecContext(ctx, `
+	result, err := s.execContext(ctx, `
 		INSERT INTO admin_sessions(token_hash, admin_id, password_version, csrf, expires_at, created_at)
 		SELECT ?, a.id, a.password_version, ?, ?, ?
 		FROM admins a
@@ -188,7 +185,7 @@ func (s *Store) CreateAdminSession(ctx context.Context, tokenHash []byte, sessio
 func (s *Store) GetSessionByHash(ctx context.Context, tokenHash []byte) (domain.Session, error) {
 	var session domain.Session
 	var expiresAt int64
-	err := s.db.QueryRowContext(ctx, `
+	err := s.queryRowContext(ctx, `
 		SELECT s.admin_id, a.username, s.password_version, s.csrf, s.expires_at
 		FROM admin_sessions s
 		JOIN admins a ON a.id = s.admin_id AND a.password_version = s.password_version
@@ -210,7 +207,7 @@ func (s *Store) GetAdminSessionByHash(ctx context.Context, tokenHash []byte) (do
 }
 
 func (s *Store) DeleteSession(ctx context.Context, tokenHash []byte) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE token_hash = ?`, tokenHash); err != nil {
+	if _, err := s.execContext(ctx, `DELETE FROM admin_sessions WHERE token_hash = ?`, tokenHash); err != nil {
 		return fmt.Errorf("delete session: %w", err)
 	}
 	return nil
@@ -221,14 +218,14 @@ func (s *Store) DeleteAdminSession(ctx context.Context, tokenHash []byte) error 
 }
 
 func (s *Store) DeleteAdminSessions(ctx context.Context, adminID int64) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE admin_id = ?`, adminID); err != nil {
+	if _, err := s.execContext(ctx, `DELETE FROM admin_sessions WHERE admin_id = ?`, adminID); err != nil {
 		return fmt.Errorf("delete admin sessions: %w", err)
 	}
 	return nil
 }
 
 func (s *Store) DeleteExpiredSessions(ctx context.Context) (int64, error) {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM admin_sessions WHERE expires_at <= ?`, timestamp(s.now()))
+	result, err := s.execContext(ctx, `DELETE FROM admin_sessions WHERE expires_at <= ?`, timestamp(s.now()))
 	if err != nil {
 		return 0, fmt.Errorf("delete expired sessions: %w", err)
 	}

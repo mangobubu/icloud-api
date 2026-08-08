@@ -23,6 +23,7 @@ import (
 	"icloud-api/internal/domain"
 	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
+	"icloud-api/internal/syncer"
 )
 
 type adminAPITestEnv struct {
@@ -153,6 +154,88 @@ func adminAPITestErrorCode(t *testing.T, response *httptest.ResponseRecorder) st
 		t.Fatalf("admin API error omitted request_id: %s", response.Body.String())
 	}
 	return payload.Error.Code
+}
+
+func TestAdminAPISyncAccountReturnsAcceptedForPendingBatch(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "sync-pending-admin", "sync pending password")
+	account := adminAPITestCreateAccount(t, env, "sync-pending@icloud.com")
+	syncCalls := 0
+	env.server.sync = func(accountID int64) error {
+		syncCalls++
+		if accountID != account.ID {
+			t.Fatalf("sync account ID = %d, want %d", accountID, account.ID)
+		}
+		return syncer.ErrSyncPending
+	}
+
+	response := env.request(
+		t,
+		http.MethodPost,
+		fmt.Sprintf("/admin/api/v1/accounts/%d/sync", account.ID),
+		nil,
+		"",
+		[]*http.Cookie{sessionCookie},
+		csrf,
+	)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("pending sync status = %d, want 202; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data adminAPIAccountDetailDTO `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode pending sync response: %v; body=%s", err, response.Body.String())
+	}
+	if syncCalls != 1 || !payload.Data.SyncPending || payload.Data.Account.ID != account.ID {
+		t.Fatalf("pending sync payload/calls = %#v / %d", payload.Data, syncCalls)
+	}
+	logs, err := env.store.ListAuditLogs(context.Background(), 10, 0)
+	if err != nil {
+		t.Fatalf("list pending sync audit: %v", err)
+	}
+	if len(logs) == 0 || logs[0].Action != "sync" || logs[0].Result != "success" {
+		t.Fatalf("pending batch audit = %#v, want successful sync", logs)
+	}
+}
+
+func TestAdminAPISyncAccountReturnsOKWhenCaughtUp(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "sync-complete-admin", "sync complete password")
+	account := adminAPITestCreateAccount(t, env, "sync-complete@icloud.com")
+	syncCalls := 0
+	env.server.sync = func(accountID int64) error {
+		syncCalls++
+		if accountID != account.ID {
+			t.Fatalf("sync account ID = %d, want %d", accountID, account.ID)
+		}
+		return nil
+	}
+
+	response := env.request(
+		t,
+		http.MethodPost,
+		fmt.Sprintf("/admin/api/v1/accounts/%d/sync", account.ID),
+		nil,
+		"",
+		[]*http.Cookie{sessionCookie},
+		csrf,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("completed sync status = %d, want 200; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Account     adminAPIAccountDTO `json:"account"`
+			SyncPending *bool              `json:"sync_pending"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode completed sync response: %v; body=%s", err, response.Body.String())
+	}
+	if syncCalls != 1 || payload.Data.Account.ID != account.ID || payload.Data.SyncPending != nil {
+		t.Fatalf("completed sync payload/calls = %#v / %d", payload.Data, syncCalls)
+	}
 }
 
 func TestAdminAPIAuthFlowUsesJSONWithoutRedirects(t *testing.T) {

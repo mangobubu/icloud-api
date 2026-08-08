@@ -25,13 +25,13 @@ func (s *Store) UpsertAppleWebSession(
 	if strings.TrimSpace(session.Ciphertext) == "" {
 		return domain.AppleWebSession{}, fmt.Errorf("upsert apple web session: ciphertext is empty")
 	}
-	appleID := strings.TrimSpace(session.AppleID)
+	appleID := strings.TrimSpace(sanitizePostgresText(session.AppleID))
 	if appleID == "" {
 		return domain.AppleWebSession{}, fmt.Errorf("upsert apple web session: apple id is empty")
 	}
 
 	now := s.now()
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execContext(ctx, `
 		INSERT INTO apple_web_sessions(
 			account_id, session_ciphertext, apple_id, region, authenticated,
 			last_validated_at, created_at, updated_at
@@ -43,7 +43,8 @@ func (s *Store) UpsertAppleWebSession(
 			authenticated = excluded.authenticated,
 			last_validated_at = excluded.last_validated_at,
 			updated_at = excluded.updated_at`,
-		session.AccountID, session.Ciphertext, appleID, strings.TrimSpace(session.Region),
+		session.AccountID, session.Ciphertext, appleID,
+		strings.TrimSpace(sanitizePostgresText(session.Region)),
 		session.Authenticated, nullableTimestamp(session.LastValidatedAt), timestamp(now), timestamp(now),
 	)
 	if err != nil {
@@ -53,13 +54,13 @@ func (s *Store) UpsertAppleWebSession(
 }
 
 func (s *Store) GetAppleWebSession(ctx context.Context, accountID int64) (domain.AppleWebSession, error) {
-	return scanAppleWebSession(s.db.QueryRowContext(ctx, `
+	return scanAppleWebSession(s.queryRowContext(ctx, `
 		SELECT `+appleWebSessionColumns+`
 		FROM apple_web_sessions WHERE account_id = ?`, accountID))
 }
 
 func (s *Store) DeleteAppleWebSession(ctx context.Context, accountID int64) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM apple_web_sessions WHERE account_id = ?`, accountID)
+	result, err := s.execContext(ctx, `DELETE FROM apple_web_sessions WHERE account_id = ?`, accountID)
 	if err != nil {
 		return fmt.Errorf("delete apple web session: %w", err)
 	}
@@ -68,7 +69,7 @@ func (s *Store) DeleteAppleWebSession(ctx context.Context, accountID int64) erro
 
 func scanAppleWebSession(scanner rowScanner) (domain.AppleWebSession, error) {
 	var session domain.AppleWebSession
-	var authenticated int
+	var authenticated bool
 	var lastValidatedAt sql.NullInt64
 	var createdAt, updatedAt int64
 	if err := scanner.Scan(
@@ -80,7 +81,7 @@ func scanAppleWebSession(scanner rowScanner) (domain.AppleWebSession, error) {
 		}
 		return domain.AppleWebSession{}, fmt.Errorf("scan apple web session: %w", err)
 	}
-	session.Authenticated = authenticated != 0
+	session.Authenticated = authenticated
 	session.LastValidatedAt = timePtr(lastValidatedAt)
 	session.CreatedAt = timeFromTimestamp(createdAt)
 	session.UpdatedAt = timeFromTimestamp(updatedAt)

@@ -13,6 +13,7 @@ import (
 	"icloud-api/internal/domain"
 	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
+	"icloud-api/internal/syncer"
 )
 
 func (s *Server) accountsPage(c *gin.Context) {
@@ -147,7 +148,15 @@ func (s *Server) syncAccount(c *gin.Context) {
 	}
 	result := "success"
 	noticeCode := "sync_ok"
-	if s.sync == nil || s.sync(id) != nil {
+	var syncErr error
+	if s.sync == nil {
+		syncErr = errors.New("sync service is unavailable")
+	} else {
+		syncErr = s.sync(id)
+	}
+	if errors.Is(syncErr, syncer.ErrSyncPending) {
+		noticeCode = "sync_pending"
+	} else if syncErr != nil {
 		result, noticeCode = "failed", "sync_error"
 	}
 	session := mustSession(c)

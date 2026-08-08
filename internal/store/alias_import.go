@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"net/mail"
+	"sort"
 	"strings"
 
 	"icloud-api/internal/domain"
@@ -30,12 +31,9 @@ func (s *Store) ImportAliases(
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	lockResult, err := tx.ExecContext(ctx, `UPDATE accounts SET updated_at = updated_at WHERE id = ?`, accountID)
+	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
 	if err != nil {
 		return domain.AliasImportResult{}, fmt.Errorf("lock account for alias import: %w", err)
-	}
-	if err := requireAffected(lockResult, "account"); err != nil {
-		return domain.AliasImportResult{}, err
 	}
 
 	result := domain.AliasImportResult{
@@ -45,7 +43,7 @@ func (s *Store) ImportAliases(
 	}
 	pending := make([]domain.AliasImportCandidate, 0, len(normalized))
 	for _, candidate := range normalized {
-		existing, findErr := getAliasByAddressTx(ctx, tx, candidate.Address)
+		existing, findErr := s.getAliasByAddressTx(ctx, tx, candidate.Address)
 		switch {
 		case findErr == nil && existing.AccountID == accountID:
 			result.Existing = append(result.Existing, existing)
@@ -68,42 +66,101 @@ func (s *Store) ImportAliases(
 	}
 
 	var enabledCount int
-	if err := tx.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM aliases WHERE account_id = ? AND enabled = 1`, accountID,
+	if err := s.txQueryRowContext(ctx, tx, `
+		SELECT COUNT(*) FROM aliases WHERE account_id = ? AND enabled = TRUE`, accountID,
 	).Scan(&enabledCount); err != nil {
 		return domain.AliasImportResult{}, fmt.Errorf("count enabled aliases before import: %w", err)
 	}
 
-	now := s.now()
+	type insertion struct {
+		candidate domain.AliasImportCandidate
+		enabled   bool
+	}
+	insertions := make([]insertion, 0, len(pending))
 	for _, candidate := range pending {
 		enabled := candidate.Active && enabledCount < domain.MaxEnabledAliasesPerAccount
 		if enabled {
 			enabledCount++
-		} else if candidate.Active {
-			result.ImportedDisabledCount++
 		}
-		insertResult, err := tx.ExecContext(ctx, `
+		insertions = append(insertions, insertion{candidate: candidate, enabled: enabled})
+	}
+	// PostgreSQL takes speculative unique-index locks as rows are inserted.
+	// Every batch uses the same address order so overlapping cross-account
+	// imports cannot acquire those locks in opposite order and deadlock.
+	sort.Slice(insertions, func(left, right int) bool {
+		return insertions[left].candidate.Address < insertions[right].candidate.Address
+	})
+
+	now := s.now()
+	createdEnabled := false
+	createdByAddress := make(map[string]domain.Alias, len(insertions))
+	for _, item := range insertions {
+		candidate := item.candidate
+		enabled := item.enabled
+		var id int64
+		err := s.txQueryRowContext(ctx, tx, `
 			INSERT INTO aliases(
 				account_id, address, label, api_key_hash, api_key_prefix, enabled,
 				last_sync_status, last_sync_error, last_synced_at,
 				last_accessed_at, created_at, updated_at
-			) VALUES(?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, ?, ?)`,
+			) VALUES(?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, ?, ?)
+			ON CONFLICT(address) DO NOTHING
+			RETURNING id`,
 			accountID, candidate.Address, candidate.Label, candidate.APIKeyHash,
 			candidate.APIKeyPrefix, enabled, domain.SyncStatusPending,
 			timestamp(now), timestamp(now),
-		)
+		).Scan(&id)
+		if err == sql.ErrNoRows {
+			existing, findErr := s.getAliasByAddressTx(ctx, tx, candidate.Address)
+			if findErr != nil {
+				return domain.AliasImportResult{}, fmt.Errorf(
+					"read concurrent owner of alias %q: %w", candidate.Address, findErr,
+				)
+			}
+			if existing.AccountID == accountID {
+				result.Existing = append(result.Existing, existing)
+				continue
+			}
+			result.Created = result.Created[:0]
+			result.ImportedDisabledCount = 0
+			result.Conflicts = append(result.Conflicts, domain.AliasImportConflict{
+				Address:              candidate.Address,
+				ExistingAliasID:      existing.ID,
+				ExistingAccountID:    existing.AccountID,
+				ExistingAccountEmail: existing.AccountEmail,
+			})
+			return result, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
+		}
 		if err != nil {
 			return domain.AliasImportResult{}, fmt.Errorf("import alias %q: %w", candidate.Address, err)
 		}
-		id, err := insertResult.LastInsertId()
-		if err != nil {
-			return domain.AliasImportResult{}, fmt.Errorf("read imported alias id for %q: %w", candidate.Address, err)
-		}
-		created, err := getAliasByIDTx(ctx, tx, id)
+		created, err := s.getAliasByIDTx(ctx, tx, id)
 		if err != nil {
 			return domain.AliasImportResult{}, fmt.Errorf("read imported alias %q: %w", candidate.Address, err)
 		}
-		result.Created = append(result.Created, created)
+		createdByAddress[candidate.Address] = created
+		if enabled {
+			createdEnabled = true
+		} else if candidate.Active {
+			result.ImportedDisabledCount++
+		}
+	}
+	// Keep the public result in candidate order even though the writes use the
+	// deterministic address order above.
+	for _, candidate := range pending {
+		if created, ok := createdByAddress[candidate.Address]; ok {
+			result.Created = append(result.Created, created)
+		}
+	}
+	if createdEnabled {
+		if _, err := s.txExecContext(ctx, tx,
+			`DELETE FROM imap_sync_states WHERE account_id = ?`, accountID,
+		); err != nil {
+			return domain.AliasImportResult{}, fmt.Errorf("reset IMAP cursor after alias import: %w", err)
+		}
+		if _, err := s.bumpAccountVersionTx(ctx, tx, accountID, accountVersion); err != nil {
+			return domain.AliasImportResult{}, fmt.Errorf("advance account version after alias import: %w", err)
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -131,7 +188,7 @@ func normalizeAliasImportCandidates(candidates []domain.AliasImportCandidate) ([
 		if candidate.APIKeyPrefix == "" {
 			return nil, fmt.Errorf("import aliases: candidate %q has empty api key prefix", candidate.Address)
 		}
-		candidate.Label = strings.TrimSpace(candidate.Label)
+		candidate.Label = strings.TrimSpace(sanitizePostgresText(candidate.Label))
 		candidate.APIKeyHash = append([]byte(nil), candidate.APIKeyHash...)
 		seen[candidate.Address] = struct{}{}
 		normalized = append(normalized, candidate)
@@ -139,14 +196,14 @@ func normalizeAliasImportCandidates(candidates []domain.AliasImportCandidate) ([
 	return normalized, nil
 }
 
-func getAliasByAddressTx(ctx context.Context, tx *sql.Tx, address string) (domain.Alias, error) {
-	return scanAlias(tx.QueryRowContext(ctx,
-		`SELECT `+aliasColumns+aliasJoins+` WHERE al.address = ? COLLATE NOCASE`, address,
+func (s *Store) getAliasByAddressTx(ctx context.Context, tx *sql.Tx, address string) (domain.Alias, error) {
+	return scanAlias(s.txQueryRowContext(ctx, tx,
+		`SELECT `+aliasColumns+aliasJoins+` WHERE al.address = ?`, address,
 	))
 }
 
-func getAliasByIDTx(ctx context.Context, tx *sql.Tx, id int64) (domain.Alias, error) {
-	return scanAlias(tx.QueryRowContext(ctx,
+func (s *Store) getAliasByIDTx(ctx context.Context, tx *sql.Tx, id int64) (domain.Alias, error) {
+	return scanAlias(s.txQueryRowContext(ctx, tx,
 		`SELECT `+aliasColumns+aliasJoins+` WHERE al.id = ?`, id,
 	))
 }

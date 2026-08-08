@@ -106,25 +106,82 @@ func LoadOrCreateMasterKey(path string) ([]byte, bool, error) {
 		key, err := decodeKey(value)
 		return key, false, err
 	}
-	if data, err := os.ReadFile(path); err == nil {
-		key, decodeErr := decodeKey(strings.TrimSpace(string(data)))
-		return key, false, decodeErr
-	} else if !os.IsNotExist(err) {
-		return nil, false, fmt.Errorf("读取主密钥文件: %w", err)
+	if key, err := readMasterKey(path); err == nil {
+		return key, false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
 	}
 
 	key := make([]byte, 32)
 	if _, err := rand.Read(key); err != nil {
 		return nil, false, fmt.Errorf("生成主密钥: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, false, fmt.Errorf("创建主密钥目录: %w", err)
+	created, err := publishMasterKey(path, key)
+	if err != nil {
+		return nil, false, err
 	}
-	encoded := base64.StdEncoding.EncodeToString(key) + "\n"
-	if err := os.WriteFile(path, []byte(encoded), 0o600); err != nil {
-		return nil, false, fmt.Errorf("写入主密钥文件: %w", err)
+	if !created {
+		persisted, err := readMasterKey(path)
+		if err != nil {
+			return nil, false, err
+		}
+		return persisted, false, nil
 	}
 	return key, true, nil
+}
+
+func readMasterKey(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("读取主密钥文件: %w", err)
+	}
+	key, err := decodeKey(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil, fmt.Errorf("解析主密钥文件: %w", err)
+	}
+	return key, nil
+}
+
+func publishMasterKey(path string, key []byte) (bool, error) {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return false, fmt.Errorf("创建主密钥目录: %w", err)
+	}
+	if directory != "." {
+		if err := os.Chmod(directory, 0o700); err != nil {
+			return false, fmt.Errorf("设置主密钥目录权限: %w", err)
+		}
+	}
+
+	temporary, err := os.CreateTemp(directory, ".master-key-*.tmp")
+	if err != nil {
+		return false, fmt.Errorf("创建主密钥临时文件: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		temporary.Close()
+		return false, fmt.Errorf("设置主密钥文件权限: %w", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(key) + "\n"
+	if _, err := temporary.WriteString(encoded); err != nil {
+		temporary.Close()
+		return false, fmt.Errorf("写入主密钥临时文件: %w", err)
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return false, fmt.Errorf("同步主密钥临时文件: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return false, fmt.Errorf("关闭主密钥临时文件: %w", err)
+	}
+	if err := os.Link(temporaryPath, path); err != nil {
+		if info, statErr := os.Lstat(path); statErr == nil && info.Mode().IsRegular() {
+			return false, nil
+		}
+		return false, fmt.Errorf("发布主密钥文件: %w", err)
+	}
+	return true, nil
 }
 
 func decodeKey(value string) ([]byte, error) {

@@ -74,6 +74,45 @@ func TestImportAliasesCreatesActiveAndInactiveAliases(t *testing.T) {
 	}
 }
 
+func TestImportAliasesInvalidatesCursorOnlyWhenItCreatesEnabledAlias(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Import cursor", "import-cursor@icloud.com")
+	at := time.Date(2026, 8, 8, 3, 30, 0, 0, time.UTC)
+	seedCursor := func(lastUID uint32) {
+		t.Helper()
+		if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, nil, domain.MailboxSyncResult{
+			Messages: map[int64]domain.LatestMessage{},
+			State: domain.IMAPSyncState{
+				AccountID: account.ID, UIDValidity: 33, LastUID: lastUID,
+			},
+			Reset: true,
+		}, at); err != nil {
+			t.Fatalf("seed account IMAP cursor: %v", err)
+		}
+	}
+
+	seedCursor(40)
+	if _, err := db.ImportAliases(ctx, account.ID, []domain.AliasImportCandidate{
+		importCandidate("disabled-cursor@icloud.com", "disabled-cursor", false),
+	}); err != nil {
+		t.Fatalf("import disabled alias: %v", err)
+	}
+	if state, err := db.GetIMAPSyncState(ctx, account.ID); err != nil || state.LastUID != 40 {
+		t.Fatalf("cursor after disabled import = %#v, err=%v", state, err)
+	}
+
+	if _, err := db.ImportAliases(ctx, account.ID, []domain.AliasImportCandidate{
+		importCandidate("enabled-cursor@icloud.com", "enabled-cursor", true),
+	}); err != nil {
+		t.Fatalf("import enabled alias: %v", err)
+	}
+	if _, err := db.GetIMAPSyncState(ctx, account.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("IMAP cursor after enabled import error = %v, want ErrNotFound", err)
+	}
+}
+
 func TestImportAliasesPreservesExistingAndRollsBackOnOtherAccountConflict(t *testing.T) {
 	t.Parallel()
 
@@ -226,6 +265,223 @@ func TestImportAliasesAPIKeyConflictRollsBackEntireBatch(t *testing.T) {
 	stillOwned, lookupErr := db.GetAlias(ctx, keyOwner.ID)
 	if lookupErr != nil || !reflect.DeepEqual(stillOwned, keyOwner) {
 		t.Fatalf("existing API key owner changed: alias=%#v err=%v", stillOwned, lookupErr)
+	}
+}
+
+func TestImportAliasesConcurrentAddressConflictReturnsOwnershipConflict(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	firstAccount := createAccount(t, ctx, db, "First", "first-concurrent-import@icloud.com")
+	secondAccount := createAccount(t, ctx, db, "Second", "second-concurrent-import@icloud.com")
+
+	type outcome struct {
+		accountID int64
+		result    domain.AliasImportResult
+		err       error
+	}
+	start := make(chan struct{})
+	outcomes := make(chan outcome, 2)
+	for index, accountID := range []int64{firstAccount.ID, secondAccount.ID} {
+		index, accountID := index, accountID
+		go func() {
+			<-start
+			result, err := db.ImportAliases(ctx, accountID, []domain.AliasImportCandidate{
+				importCandidate("concurrent-owner@icloud.com", fmt.Sprintf("concurrent-owner-%d", index), true),
+			})
+			outcomes <- outcome{accountID: accountID, result: result, err: err}
+		}()
+	}
+	close(start)
+	first, second := <-outcomes, <-outcomes
+
+	var winner, loser outcome
+	switch {
+	case first.err == nil && errors.Is(second.err, store.ErrAliasOwnershipConflict):
+		winner, loser = first, second
+	case second.err == nil && errors.Is(first.err, store.ErrAliasOwnershipConflict):
+		winner, loser = second, first
+	default:
+		t.Fatalf("concurrent import results = (%v, %v), want one success and one ownership conflict", first.err, second.err)
+	}
+	if len(winner.result.Created) != 1 {
+		t.Fatalf("winning import result = %#v, want one created alias", winner.result)
+	}
+	if len(loser.result.Created) != 0 || len(loser.result.Conflicts) != 1 {
+		t.Fatalf("losing import result = %#v, want one conflict and no created aliases", loser.result)
+	}
+	conflict := loser.result.Conflicts[0]
+	created := winner.result.Created[0]
+	if conflict.Address != created.Address || conflict.ExistingAliasID != created.ID ||
+		conflict.ExistingAccountID != winner.accountID {
+		t.Fatalf("concurrent ownership conflict = %#v, winner = %#v", conflict, created)
+	}
+	if loser.accountID == winner.accountID {
+		t.Fatalf("concurrent import winner and loser share account %d", winner.accountID)
+	}
+	var count int
+	if err := db.DB().QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM aliases WHERE address = ?`, "concurrent-owner@icloud.com",
+	).Scan(&count); err != nil {
+		t.Fatalf("count concurrently imported address: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("concurrently imported address count = %d, want 1", count)
+	}
+}
+
+func TestImportAliasesOrdersUniqueWritesWithoutChangingInputSemantics(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Ordered import", "ordered-import@icloud.com")
+	insertEnabledAliasFixtures(t, ctx, db, account.ID, domain.MaxEnabledAliasesPerAccount-1)
+	for _, fixture := range []struct {
+		name      string
+		statement string
+	}{
+		{name: "state table", statement: `CREATE TABLE alias_insert_order_state(last_address TEXT NOT NULL)`},
+		{name: "initial state", statement: `INSERT INTO alias_insert_order_state(last_address) VALUES('')`},
+		{name: "log table", statement: `CREATE TABLE alias_insert_order_log(
+			position INTEGER PRIMARY KEY AUTOINCREMENT,
+			address TEXT NOT NULL
+		)`},
+		{name: "order trigger", statement: `
+			CREATE TRIGGER require_sorted_alias_inserts
+			BEFORE INSERT ON aliases
+			BEGIN
+				SELECT CASE WHEN NEW.address < (
+					SELECT last_address FROM alias_insert_order_state
+				) THEN RAISE(ABORT, 'alias inserts are not address ordered') END;
+				INSERT INTO alias_insert_order_log(address) VALUES(NEW.address);
+				UPDATE alias_insert_order_state SET last_address = NEW.address;
+			END`},
+	} {
+		if _, err := db.DB().ExecContext(ctx, fixture.statement); err != nil {
+			t.Fatalf("create alias insert %s: %v", fixture.name, err)
+		}
+	}
+
+	result, err := db.ImportAliases(ctx, account.ID, []domain.AliasImportCandidate{
+		importCandidate("z-input-first@icloud.com", "z-input-first", true),
+		importCandidate("a-input-second@icloud.com", "a-input-second", true),
+	})
+	if err != nil {
+		t.Fatalf("import aliases in reverse address order: %v", err)
+	}
+	if len(result.Created) != 2 {
+		t.Fatalf("created aliases = %#v, want two", result.Created)
+	}
+	if result.Created[0].Address != "z-input-first@icloud.com" || !result.Created[0].Enabled ||
+		result.Created[1].Address != "a-input-second@icloud.com" || result.Created[1].Enabled {
+		t.Fatalf("created aliases changed input order or capacity assignment: %#v", result.Created)
+	}
+	if result.ImportedDisabledCount != 1 {
+		t.Fatalf("capacity-disabled count = %d, want 1", result.ImportedDisabledCount)
+	}
+	var writeOrder string
+	if err := db.DB().QueryRowContext(ctx, `
+		SELECT group_concat(address, ',')
+		FROM (SELECT address FROM alias_insert_order_log ORDER BY position)`,
+	).Scan(&writeOrder); err != nil {
+		t.Fatalf("read alias insert order: %v", err)
+	}
+	if writeOrder != "a-input-second@icloud.com,z-input-first@icloud.com" {
+		t.Fatalf("alias insert order = %q", writeOrder)
+	}
+}
+
+func TestImportAliasesConcurrentOppositeAddressOrderReturnsOwnershipConflict(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db := openTestStore(t)
+	firstAccount := createAccount(t, ctx, db, "Opposite first", "opposite-first@icloud.com")
+	secondAccount := createAccount(t, ctx, db, "Opposite second", "opposite-second@icloud.com")
+
+	type outcome struct {
+		accountID int64
+		wanted    []string
+		result    domain.AliasImportResult
+		err       error
+	}
+	inputs := []struct {
+		accountID  int64
+		candidates []domain.AliasImportCandidate
+		wanted     []string
+	}{
+		{
+			accountID: firstAccount.ID,
+			candidates: []domain.AliasImportCandidate{
+				importCandidate("opposite-z@icloud.com", "opposite-first-z", true),
+				importCandidate("opposite-a@icloud.com", "opposite-first-a", true),
+			},
+			wanted: []string{"opposite-z@icloud.com", "opposite-a@icloud.com"},
+		},
+		{
+			accountID: secondAccount.ID,
+			candidates: []domain.AliasImportCandidate{
+				importCandidate("opposite-a@icloud.com", "opposite-second-a", true),
+				importCandidate("opposite-z@icloud.com", "opposite-second-z", true),
+			},
+			wanted: []string{"opposite-a@icloud.com", "opposite-z@icloud.com"},
+		},
+	}
+	start := make(chan struct{})
+	outcomes := make(chan outcome, len(inputs))
+	for _, input := range inputs {
+		input := input
+		go func() {
+			<-start
+			result, err := db.ImportAliases(ctx, input.accountID, input.candidates)
+			outcomes <- outcome{accountID: input.accountID, wanted: input.wanted, result: result, err: err}
+		}()
+	}
+	close(start)
+	readOutcome := func() outcome {
+		t.Helper()
+		select {
+		case result := <-outcomes:
+			return result
+		case <-ctx.Done():
+			t.Fatalf("opposite-order imports did not finish: %v", ctx.Err())
+			return outcome{}
+		}
+	}
+	first, second := readOutcome(), readOutcome()
+
+	var winner, loser outcome
+	switch {
+	case first.err == nil && errors.Is(second.err, store.ErrAliasOwnershipConflict):
+		winner, loser = first, second
+	case second.err == nil && errors.Is(first.err, store.ErrAliasOwnershipConflict):
+		winner, loser = second, first
+	default:
+		t.Fatalf("opposite-order import errors = (%v, %v), want one success and one ownership conflict", first.err, second.err)
+	}
+	if len(winner.result.Created) != len(winner.wanted) {
+		t.Fatalf("winning created aliases = %#v", winner.result.Created)
+	}
+	for index, address := range winner.wanted {
+		if winner.result.Created[index].Address != address {
+			t.Fatalf("winning result order at %d = %q, want %q", index, winner.result.Created[index].Address, address)
+		}
+	}
+	if len(loser.result.Created) != 0 || len(loser.result.Conflicts) == 0 {
+		t.Fatalf("losing import result = %#v, want conflicts and no created aliases", loser.result)
+	}
+	for _, conflict := range loser.result.Conflicts {
+		if conflict.ExistingAccountID != winner.accountID {
+			t.Fatalf("ownership conflict = %#v, winning account = %d", conflict, winner.accountID)
+		}
+	}
+	for _, address := range []string{"opposite-a@icloud.com", "opposite-z@icloud.com"} {
+		alias, err := db.GetAliasByAddress(ctx, address)
+		if err != nil {
+			t.Fatalf("get imported alias %q: %v", address, err)
+		}
+		if alias.AccountID != winner.accountID {
+			t.Fatalf("alias %q owner = %d, want %d", address, alias.AccountID, winner.accountID)
+		}
 	}
 }
 

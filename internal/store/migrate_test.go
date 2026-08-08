@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,8 +105,8 @@ func TestMigrateV1ToV3(t *testing.T) {
 	if err := db.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatalf("read migrated schema version: %v", err)
 	}
-	if schemaVersion != 3 {
-		t.Fatalf("schema version = %d, want 3", schemaVersion)
+	if schemaVersion != 4 {
+		t.Fatalf("schema version = %d, want 4", schemaVersion)
 	}
 
 	var adminPasswordVersion, sessionPasswordVersion int64
@@ -159,6 +160,55 @@ func TestMigrateV1ToV3(t *testing.T) {
 		VALUES(1, 100, 0, ?, ?)`, now.UnixNano(), now.UnixNano()); err == nil {
 		t.Fatal("migrated latest_messages constraint accepted UID 0")
 	}
+}
+
+func TestSQLiteV4ConvergenceAddsAliasQueryIndexes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "v4-index-convergence.db")
+	current, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatalf("create current database: %v", err)
+	}
+	for _, index := range []string{
+		"aliases_account_address_idx",
+		"aliases_enabled_account_address_idx",
+	} {
+		if _, err := current.DB().ExecContext(ctx, `DROP INDEX `+index); err != nil {
+			_ = current.Close()
+			t.Fatalf("drop %s from v4 fixture: %v", index, err)
+		}
+	}
+	if err := current.Close(); err != nil {
+		t.Fatalf("close v4 fixture: %v", err)
+	}
+
+	converged, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatalf("reopen and converge v4 database: %v", err)
+	}
+	t.Cleanup(func() { _ = converged.Close() })
+
+	wanted := map[string]string{
+		"aliases_account_address_idx":         "create index aliases_account_address_idx on aliases(account_id, address, id)",
+		"aliases_enabled_account_address_idx": "create index aliases_enabled_account_address_idx on aliases(account_id, enabled, address, id)",
+	}
+	for name, definition := range wanted {
+		var got string
+		if err := converged.DB().QueryRowContext(ctx,
+			`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`, name,
+		).Scan(&got); err != nil {
+			t.Fatalf("read converged %s definition: %v", name, err)
+		}
+		if normalizeTestSQL(got) != definition {
+			t.Fatalf("%s definition = %q, want %q", name, normalizeTestSQL(got), definition)
+		}
+	}
+}
+
+func normalizeTestSQL(statement string) string {
+	return strings.Join(strings.Fields(strings.ToLower(statement)), " ")
 }
 
 var legacyV1Schema = []string{

@@ -189,6 +189,9 @@ function normalizeAccountDetail(data = {}) {
     appleSession: normalizeAppleSession(
       firstDefined(data, "apple_session", "appleSession", "AppleSession"),
     ),
+    syncPending: Boolean(
+      firstDefined(data, "sync_pending", "syncPending", "SyncPending"),
+    ),
   };
 }
 

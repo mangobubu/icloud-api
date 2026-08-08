@@ -329,6 +329,7 @@ func notice(code string) (string, string) {
 		"account_updated":  {"主号配置已更新。", "success"},
 		"account_deleted":  {"主号及其关联数据已删除。", "success"},
 		"sync_ok":          {"同步完成。", "success"},
+		"sync_pending":     {"已提交一批，仍在追平。", "warning"},
 		"sync_error":       {"同步失败，请检查连接状态。", "error"},
 		"alias_updated":    {"隐私邮箱状态已更新。", "success"},
 		"alias_deleted":    {"隐私邮箱已删除。", "success"},

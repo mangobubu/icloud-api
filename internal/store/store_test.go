@@ -5,12 +5,68 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"icloud-api/internal/domain"
 	"icloud-api/internal/store"
 )
+
+func TestValidatePostgresURL(t *testing.T) {
+	for _, dataSource := range []string{
+		"postgres://app@db/app?sslmode=disable",
+		"postgresql://app@db/app?sslmode=disable",
+		"POSTGRES://app@db/app?sslmode=disable",
+		"postgres://app@/app?host=/var/run/postgresql&sslmode=disable",
+	} {
+		t.Run(dataSource, func(t *testing.T) {
+			if err := store.ValidatePostgresURL(dataSource); err != nil {
+				t.Fatalf("ValidatePostgresURL(%q) = %v", dataSource, err)
+			}
+		})
+	}
+}
+
+func TestOpenContextRejectsMalformedPostgresURLBeforeSQLiteFallback(t *testing.T) {
+	for _, dataSource := range []string{
+		"postgres:data.db",
+		"postgresql:data.db",
+		"postgres:/data.db",
+		"postgresql:/data.db",
+		"POSTGRES:data.db",
+		"postgres://%zz",
+	} {
+		t.Run(dataSource, func(t *testing.T) {
+			db, err := store.OpenContext(context.Background(), dataSource)
+			if db != nil {
+				_ = db.Close()
+				t.Fatalf("OpenContext(%q) unexpectedly returned a database", dataSource)
+			}
+			if !errors.Is(err, store.ErrInvalidPostgresURL) {
+				t.Fatalf("OpenContext(%q) error = %v, want ErrInvalidPostgresURL", dataSource, err)
+			}
+		})
+	}
+}
+
+func TestOpenContextKeepsExplicitSQLiteSources(t *testing.T) {
+	for name, dataSource := range map[string]string{
+		"memory":    ":memory:",
+		"file path": filepath.Join(t.TempDir(), "legacy.db"),
+		"file URI":  "file:explicit-sqlite-source?mode=memory&cache=shared",
+	} {
+		t.Run(name, func(t *testing.T) {
+			db, err := store.OpenContext(context.Background(), dataSource)
+			if err != nil {
+				t.Fatalf("OpenContext(%q): %v", dataSource, err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("close SQLite source %q: %v", dataSource, err)
+			}
+		})
+	}
+}
 
 func TestMailboxBindingIsIsolatedByAPIKeyHash(t *testing.T) {
 	t.Parallel()
@@ -169,6 +225,68 @@ func TestLatestMessageRejectsZeroIMAPIdentifiers(t *testing.T) {
 	}
 }
 
+func TestLatestMessageSanitizesPostgresUnsafeTextOnEveryWritePath(t *testing.T) {
+	unsafeText := "before\x00middle" + string([]byte{0xff}) + "after"
+	want := "before\uFFFDmiddle\uFFFDafter"
+
+	tests := []struct {
+		name  string
+		write func(context.Context, *store.Store, domain.Account, domain.Alias, domain.LatestMessage) error
+	}{
+		{
+			name: "upsert",
+			write: func(ctx context.Context, db *store.Store, _ domain.Account, _ domain.Alias, message domain.LatestMessage) error {
+				_, err := db.UpsertLatestMessage(ctx, message)
+				return err
+			},
+		},
+		{
+			name: "replace",
+			write: func(ctx context.Context, db *store.Store, _ domain.Account, _ domain.Alias, message domain.LatestMessage) error {
+				return db.ReplaceLatestMessage(ctx, message)
+			},
+		},
+		{
+			name: "mailbox_sync",
+			write: func(ctx context.Context, db *store.Store, account domain.Account, alias domain.Alias, message domain.LatestMessage) error {
+				message.SnapshotState = domain.SnapshotFound
+				return applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
+					Messages: map[int64]domain.LatestMessage{alias.ID: message},
+					State: domain.IMAPSyncState{
+						AccountID: account.ID, UIDValidity: message.UIDValidity, LastUID: message.UID,
+					},
+					Reset: true,
+				}, message.SyncedAt)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestStore(t)
+			account := createAccount(t, ctx, db, "Text", tt.name+"-text@icloud.com")
+			alias := createAlias(t, ctx, db, account.ID, tt.name+"-alias@icloud.com", []byte(tt.name+"-text-hash"))
+			at := time.Date(2026, 8, 8, 1, 0, 0, 0, time.UTC)
+			message := domain.LatestMessage{
+				AliasID: alias.ID, UIDValidity: 1, UID: 1, InternalDate: at, SyncedAt: at,
+				MessageID: unsafeText, Subject: unsafeText, TextBody: unsafeText, HTMLBody: unsafeText,
+			}
+			if err := tt.write(ctx, db, account, alias, message); err != nil {
+				t.Fatalf("write unsafe message text: %v", err)
+			}
+			got, err := db.GetLatestMessage(ctx, alias.ID)
+			if err != nil {
+				t.Fatalf("get sanitized message: %v", err)
+			}
+			if got.MessageID != want || got.Subject != want || got.TextBody != want || got.HTMLBody != want {
+				t.Fatalf("sanitized text = message-id %q subject %q text %q html %q; want %q",
+					got.MessageID, got.Subject, got.TextBody, got.HTMLBody, want)
+			}
+		})
+	}
+}
+
 func TestListMetadataAndCascade(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -240,6 +358,17 @@ func TestSetAliasEnabledClearsSnapshotWhenReenabled(t *testing.T) {
 	if err := db.UpdateAliasSyncStatus(ctx, alias.ID, domain.SyncStatusError, "old failure", &syncedAt); err != nil {
 		t.Fatalf("set alias sync state: %v", err)
 	}
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{
+			alias.ID: {AliasID: alias.ID, SnapshotState: domain.SnapshotEmpty},
+		},
+		State: domain.IMAPSyncState{
+			AccountID: account.ID, UIDValidity: 10, LastUID: 20,
+		},
+		Reset: true,
+	}, syncedAt); err != nil {
+		t.Fatalf("seed account IMAP cursor: %v", err)
+	}
 
 	if err := db.SetAliasEnabled(ctx, alias.ID, false); err != nil {
 		t.Fatalf("disable alias: %v", err)
@@ -249,9 +378,112 @@ func TestSetAliasEnabledClearsSnapshotWhenReenabled(t *testing.T) {
 	}
 
 	assertAliasSnapshotReset(t, ctx, db, alias.ID, true)
+	if _, err := db.GetIMAPSyncState(ctx, account.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("IMAP cursor after re-enable error = %v, want ErrNotFound", err)
+	}
 }
 
-func TestUpdateAccountResetsAliasSnapshotsAfterSourceChange(t *testing.T) {
+func TestCreateEnabledAliasInvalidatesExistingAccountCursor(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Primary", "create-cursor@icloud.com")
+	at := time.Date(2026, 8, 8, 3, 0, 0, 0, time.UTC)
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, nil, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{},
+		State: domain.IMAPSyncState{
+			AccountID: account.ID, UIDValidity: 22, LastUID: 30,
+		},
+		Reset: true,
+	}, at); err != nil {
+		t.Fatalf("seed account IMAP cursor: %v", err)
+	}
+
+	if _, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID: account.ID, Address: "disabled-cursor@icloud.com",
+		APIKeyHash: []byte("disabled-cursor-hash"), APIKeyPrefix: "disabled", Enabled: false,
+	}); err != nil {
+		t.Fatalf("create disabled alias: %v", err)
+	}
+	if state, err := db.GetIMAPSyncState(ctx, account.ID); err != nil || state.LastUID != 30 {
+		t.Fatalf("cursor after disabled alias creation = %#v, err=%v", state, err)
+	}
+
+	createAlias(t, ctx, db, account.ID, "new-cursor@icloud.com", []byte("new-cursor-hash"))
+	if _, err := db.GetIMAPSyncState(ctx, account.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("IMAP cursor after enabled alias creation error = %v, want ErrNotFound", err)
+	}
+}
+
+func TestResetAliasSnapshotInvalidatesAccountCursor(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Reset alias", "reset-alias-cursor@icloud.com")
+	alias := createAlias(t, ctx, db, account.ID, "reset-one@icloud.com", []byte("reset-one-hash"))
+	at := time.Date(2026, 8, 8, 4, 0, 0, 0, time.UTC)
+	message := domain.LatestMessage{
+		AliasID: alias.ID, UIDValidity: 44, UID: 5, InternalDate: at,
+		Subject: "reset me", SnapshotState: domain.SnapshotFound,
+	}
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{alias.ID: message},
+		State: domain.IMAPSyncState{
+			AccountID: account.ID, UIDValidity: 44, LastUID: 5, UpdatedAt: at,
+		},
+		Reset: true,
+	}, at); err != nil {
+		t.Fatalf("seed alias snapshot and cursor: %v", err)
+	}
+
+	if err := db.ResetAliasSnapshot(ctx, alias.ID); err != nil {
+		t.Fatalf("reset alias snapshot: %v", err)
+	}
+	if _, err := db.GetIMAPSyncState(ctx, account.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("IMAP cursor after alias reset error = %v, want ErrNotFound", err)
+	}
+	assertAliasSnapshotReset(t, ctx, db, alias.ID, true)
+}
+
+func TestAliasEnableUpdatesResetOnlyOnDisabledToEnabledTransition(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Primary", "alias-transition@icloud.com")
+	alias := createAlias(t, ctx, db, account.ID, "alias-transition-relay@icloud.com", []byte("alias-transition-hash"))
+	at := time.Date(2026, 8, 8, 2, 0, 0, 0, time.UTC)
+	mustUpsert(t, ctx, db, domain.LatestMessage{
+		AliasID: alias.ID, UIDValidity: 10, UID: 20, Subject: "keep while enabled",
+		InternalDate: at, SyncedAt: at,
+	})
+	if err := db.SetAliasEnabled(ctx, alias.ID, true); err != nil {
+		t.Fatalf("set already-enabled alias enabled: %v", err)
+	}
+	alias.Label = "updated while enabled"
+	if _, err := db.UpdateAlias(ctx, alias); err != nil {
+		t.Fatalf("update already-enabled alias: %v", err)
+	}
+	assertLatestSubject(t, ctx, db, alias.ID, "keep while enabled", 10, 20)
+
+	alias.Enabled = false
+	if _, err := db.UpdateAlias(ctx, alias); err != nil {
+		t.Fatalf("disable alias through update: %v", err)
+	}
+	if err := db.UpdateAliasSyncStatus(ctx, alias.ID, domain.SyncStatusError, "old failure", &at); err != nil {
+		t.Fatalf("set disabled alias status: %v", err)
+	}
+	alias.Enabled = true
+	alias.Label = "re-enabled through update"
+	updated, err := db.UpdateAlias(ctx, alias)
+	if err != nil {
+		t.Fatalf("re-enable alias through update: %v", err)
+	}
+	if updated.Label != alias.Label {
+		t.Fatalf("re-enabled alias label = %q, want %q", updated.Label, alias.Label)
+	}
+	assertAliasSnapshotReset(t, ctx, db, alias.ID, true)
+}
+
+func TestUpdateAccountInvalidatesCursorButPreservesSnapshotsAfterSourceChange(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -313,11 +545,40 @@ func TestUpdateAccountResetsAliasSnapshotsAfterSourceChange(t *testing.T) {
 			if err := db.SetAliasEnabled(ctx, aliasTwo.ID, false); err != nil {
 				t.Fatalf("disable second alias: %v", err)
 			}
+			baseline := domain.LatestMessage{
+				AliasID: aliasOne.ID, UIDValidity: 20, UID: 1, Subject: "snapshot",
+				InternalDate: syncedAt, SyncedAt: syncedAt, SnapshotState: domain.SnapshotFound,
+			}
+			if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{aliasOne}, domain.MailboxSyncResult{
+				Messages: map[int64]domain.LatestMessage{aliasOne.ID: baseline},
+				State: domain.IMAPSyncState{
+					AccountID: account.ID, UIDValidity: 20, LastUID: 3, UpdatedAt: syncedAt,
+				},
+				Reset: true,
+			}, syncedAt); err != nil {
+				t.Fatalf("seed account IMAP cursor: %v", err)
+			}
 
 			tt.update(t, ctx, db, account)
 
-			assertAliasSnapshotReset(t, ctx, db, aliasOne.ID, true)
-			assertAliasSnapshotReset(t, ctx, db, aliasTwo.ID, false)
+			for _, expected := range []struct {
+				alias   domain.Alias
+				enabled bool
+				uid     uint32
+			}{{aliasOne, true, 1}, {aliasTwo, false, 2}} {
+				stored, err := db.GetAlias(ctx, expected.alias.ID)
+				if err != nil {
+					t.Fatalf("get invalidated alias %d: %v", expected.alias.ID, err)
+				}
+				if stored.Enabled != expected.enabled || stored.LastSyncStatus != domain.SyncStatusPending ||
+					stored.LastSyncError != "" || stored.LastSyncedAt != nil {
+					t.Fatalf("invalidated alias state = %#v", stored)
+				}
+				assertLatestSubject(t, ctx, db, expected.alias.ID, "snapshot", 20, expected.uid)
+			}
+			if _, err := db.GetIMAPSyncState(ctx, account.ID); !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("cursor after source change error = %v, want ErrNotFound", err)
+			}
 			updatedAccount, err := db.GetAccount(ctx, account.ID)
 			if err != nil {
 				t.Fatalf("get reset account: %v", err)
@@ -448,6 +709,81 @@ func TestEnabledAliasLimitIsEnforcedOnCreateAndReenable(t *testing.T) {
 	if stored.Enabled {
 		t.Fatal("rejected alias was enabled")
 	}
+}
+
+func TestEnabledAliasLimitSerializesConcurrentWriters(t *testing.T) {
+	t.Run("create", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestStore(t)
+		account := createAccount(t, ctx, db, "Concurrent create", "concurrent-create@icloud.com")
+		insertEnabledAliasFixtures(t, ctx, db, account.ID, domain.MaxEnabledAliasesPerAccount-1)
+
+		start := make(chan struct{})
+		errorsByAddress := make(chan error, 2)
+		for index := 0; index < 2; index++ {
+			index := index
+			go func() {
+				<-start
+				_, err := db.CreateAlias(ctx, domain.Alias{
+					AccountID:    account.ID,
+					Address:      fmt.Sprintf("concurrent-create-%d@icloud.com", index),
+					APIKeyHash:   []byte(fmt.Sprintf("concurrent-create-hash-%d", index)),
+					APIKeyPrefix: "concurrent",
+					Enabled:      true,
+				})
+				errorsByAddress <- err
+			}()
+		}
+		close(start)
+		assertOneAliasLimitError(t, <-errorsByAddress, <-errorsByAddress)
+		assertAliasCounts(t, ctx, db, account.ID, domain.MaxEnabledAliasesPerAccount, domain.MaxEnabledAliasesPerAccount)
+	})
+
+	t.Run("update and set enabled", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestStore(t)
+		account := createAccount(t, ctx, db, "Concurrent enable", "concurrent-enable@icloud.com")
+		insertEnabledAliasFixtures(t, ctx, db, account.ID, domain.MaxEnabledAliasesPerAccount-1)
+		updateAlias, err := db.CreateAlias(ctx, domain.Alias{
+			AccountID: account.ID, Address: "concurrent-update@icloud.com",
+			APIKeyHash: []byte("concurrent-update-hash"), APIKeyPrefix: "update", Enabled: false,
+		})
+		if err != nil {
+			t.Fatalf("create update candidate: %v", err)
+		}
+		setAlias, err := db.CreateAlias(ctx, domain.Alias{
+			AccountID: account.ID, Address: "concurrent-set@icloud.com",
+			APIKeyHash: []byte("concurrent-set-hash"), APIKeyPrefix: "set", Enabled: false,
+		})
+		if err != nil {
+			t.Fatalf("create set candidate: %v", err)
+		}
+
+		start := make(chan struct{})
+		errorsByOperation := make(chan error, 2)
+		go func() {
+			<-start
+			updateAlias.Enabled = true
+			_, err := db.UpdateAlias(ctx, updateAlias)
+			errorsByOperation <- err
+		}()
+		go func() {
+			<-start
+			errorsByOperation <- db.SetAliasEnabled(ctx, setAlias.ID, true)
+		}()
+		close(start)
+		assertOneAliasLimitError(t, <-errorsByOperation, <-errorsByOperation)
+		assertAliasCounts(t, ctx, db, account.ID, domain.MaxEnabledAliasesPerAccount+1, domain.MaxEnabledAliasesPerAccount)
+	})
+}
+
+func assertOneAliasLimitError(t *testing.T, first, second error) {
+	t.Helper()
+	if first == nil && errors.Is(second, store.ErrAliasLimit) ||
+		second == nil && errors.Is(first, store.ErrAliasLimit) {
+		return
+	}
+	t.Fatalf("concurrent alias results = (%v, %v), want one success and one ErrAliasLimit", first, second)
 }
 
 func TestPasswordVersionRejectsLateSessionAndConcurrentPasswordChange(t *testing.T) {

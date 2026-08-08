@@ -1,0 +1,677 @@
+#!/bin/sh
+set -eu
+umask 077
+
+die() {
+	printf '%s\n' "PostgreSQL 启动失败：$*" >&2
+	exit 1
+}
+
+random_hex() {
+	byte_count="$1"
+	value="$(od -An -N "$byte_count" -tx1 /dev/urandom | tr -d ' \n')"
+	[ "${#value}" -eq "$((byte_count * 2))" ] || die "生成数据库凭据失败"
+	printf '%s' "$value"
+}
+
+load_credentials() {
+	file="$1"
+	[ -f "$file" ] || die "凭据文件不存在"
+	[ "$(wc -l < "$file" | tr -d ' ')" = "4" ] || die "凭据文件格式错误"
+	LOADED_USER="$(sed -n '1p' "$file")"
+	LOADED_DATABASE="$(sed -n '2p' "$file")"
+	LOADED_PASSWORD="$(sed -n '3p' "$file")"
+	LOADED_INSTALLATION_ID="$(sed -n '4p' "$file")"
+	case "$LOADED_USER" in
+		[a-z][a-z0-9_]*) ;;
+		*) die "数据库用户名格式错误" ;;
+	esac
+	case "$LOADED_USER" in
+		*[!a-z0-9_]*) die "数据库用户名格式错误" ;;
+	esac
+	case "$LOADED_DATABASE" in
+		[a-z][a-z0-9_]*) ;;
+		*) die "数据库名格式错误" ;;
+	esac
+	case "$LOADED_DATABASE" in
+		*[!a-z0-9_]*) die "数据库名格式错误" ;;
+	esac
+	[ "${#LOADED_PASSWORD}" -eq 64 ] || die "数据库密码格式错误"
+	case "$LOADED_PASSWORD" in
+		*[!0-9a-f]*) die "数据库密码格式错误" ;;
+	esac
+	[ "${#LOADED_INSTALLATION_ID}" -eq 32 ] || die "安装标识格式错误"
+	case "$LOADED_INSTALLATION_ID" in
+		*[!0-9a-f]*) die "安装标识格式错误" ;;
+	esac
+}
+
+validate_bound_marker() {
+	marker="$1"
+	expected_value="$2"
+	marker_description="$3"
+	[ -f "$marker" ] && [ ! -L "$marker" ] || die "$marker_description 不存在或不是普通文件"
+	[ "$(stat -c '%h' "$marker")" = "1" ] || die "$marker_description 不能是硬链接"
+	[ "$(wc -l < "$marker" | tr -d ' ')" = "1" ] || die "$marker_description 格式错误"
+	[ "$(wc -c < "$marker" | tr -d ' ')" -eq "$(( ${#expected_value} + 1 ))" ] || \
+		die "$marker_description 格式错误"
+	[ "$(sed -n '1p' "$marker")" = "$expected_value" ] || die "$marker_description 与当前安装不匹配"
+}
+
+write_shared_credentials() {
+	user="$1"
+	database="$2"
+	password="$3"
+	installation_id="$4"
+	mkdir -p "$config_directory"
+	chown 0:0 "$config_directory"
+	chmod 755 "$config_directory"
+	temporary="$(mktemp "${credentials_file}.tmp.XXXXXX")"
+	umask 077
+	printf '%s\n%s\n%s\n%s\n' "$user" "$database" "$password" "$installation_id" > "$temporary"
+	chown 0:10001 "$temporary"
+	chmod 640 "$temporary"
+	mv -f "$temporary" "$credentials_file"
+}
+
+write_key_marker() {
+	marker="$1"
+	installation_id="$2"
+	mkdir -p "$app_state_directory"
+	chown 10001:10001 "$app_state_directory"
+	chmod 700 "$app_state_directory"
+	temporary="$(mktemp "${marker}.tmp.XXXXXX")"
+	umask 077
+	printf '%s\n' "$installation_id" > "$temporary"
+	chown 10001:10001 "$temporary"
+	chmod 600 "$temporary"
+	mv -f "$temporary" "$marker"
+}
+
+write_cluster_marker() {
+	marker="$1"
+	installation_id="$2"
+	directory="${marker%/*}"
+	mkdir -p "$directory"
+	chown 70:70 "$directory"
+	chmod 700 "$directory"
+	temporary="$(mktemp "${marker}.tmp.XXXXXX")"
+	umask 077
+	printf '%s\n' "$installation_id" > "$temporary"
+	chown 70:70 "$temporary"
+	chmod 600 "$temporary"
+	mv -f "$temporary" "$marker"
+}
+
+config_directory="${ICLOUD_API_DATABASE_CONFIG_DIR:-/run/icloud-api-database}"
+credentials_file="${config_directory}/credentials"
+config_cluster_state_directory="${config_directory}/cluster-state"
+config_cluster_bootstrap_marker="${config_cluster_state_directory}/allow-cluster-bootstrap"
+config_cluster_initialized_marker="${config_cluster_state_directory}/cluster-initialized"
+config_pgdata_bootstrap_binding="${config_cluster_state_directory}/pgdata-bootstrap-binding"
+installation_state_directory="${ICLOUD_API_INSTALLATION_STATE_DIR:-/run/icloud-api-installation}"
+app_state_directory="${installation_state_directory}/app-state"
+bootstrap_marker="${app_state_directory}/allow-key-bootstrap"
+initialized_marker="${app_state_directory}/key-initialized"
+cluster_state_directory="${installation_state_directory}/cluster-state"
+cluster_bootstrap_marker="${cluster_state_directory}/allow-cluster-bootstrap"
+cluster_initialized_marker="${cluster_state_directory}/cluster-initialized"
+cluster_pgdata_bootstrap_binding="${cluster_state_directory}/pgdata-bootstrap-binding"
+postgres_data="${PGDATA:-/var/lib/postgresql/data}"
+state_file="${postgres_data}/.icloud-api-database-credentials"
+
+acquire_backup_restore_lock() {
+	mkdir -p "$installation_state_directory" || die "创建安装状态目录失败"
+	chmod 755 "$installation_state_directory" || die "设置安装状态目录权限失败"
+	exec 8>"${installation_state_directory}/restore.lock"
+	flock -n 8 || die "另一个 PostgreSQL 备份或恢复任务正在运行"
+}
+
+case "${1:-}" in
+	maintenance-lock)
+		shift
+		[ "$#" -eq 1 ] || die "maintenance-lock 需要一个 32 位十六进制就绪令牌"
+		maintenance_token="$1"
+		[ "${#maintenance_token}" -eq 32 ] || die "maintenance-lock 就绪令牌格式错误"
+		case "$maintenance_token" in
+			*[!0-9a-f]*) die "maintenance-lock 就绪令牌格式错误" ;;
+		esac
+		[ -d "$installation_state_directory" ] && [ ! -L "$installation_state_directory" ] || \
+			die "安装状态卷不存在或不是普通目录"
+		mkdir -p "$app_state_directory" || die "创建应用状态目录失败"
+		[ -d "$app_state_directory" ] && [ ! -L "$app_state_directory" ] || \
+			die "应用状态目录不是普通目录"
+		chown 10001:10001 "$app_state_directory" || die "设置应用状态目录所有者失败"
+		chmod 700 "$app_state_directory" || die "设置应用状态目录权限失败"
+		maintenance_lock_file="${app_state_directory}/maintenance.lock"
+		maintenance_window_lock_file="${app_state_directory}/maintenance-window.lock"
+		maintenance_ready_file="${app_state_directory}/maintenance-window.ready"
+		for lock_file in "$maintenance_lock_file" "$maintenance_window_lock_file"; do
+			if [ -e "$lock_file" ] || [ -L "$lock_file" ]; then
+				[ -f "$lock_file" ] && [ ! -L "$lock_file" ] || die "维护锁不是普通文件"
+				[ "$(stat -c '%h' "$lock_file")" = "1" ] || die "维护锁不能是硬链接"
+			else
+				: > "$lock_file" || die "创建维护锁失败"
+			fi
+			chown 10001:10001 "$lock_file" || die "设置维护锁所有者失败"
+			chmod 600 "$lock_file" || die "设置维护锁权限失败"
+		done
+		exec 8>"$maintenance_lock_file" || die "打开共享维护锁失败"
+		flock -n 8 || die "另一个管理员重置、备份或恢复任务正在运行"
+		exec 7>"$maintenance_window_lock_file" || die "打开维护窗口上下文锁失败"
+		flock -n 7 || die "另一个备份或恢复窗口正在运行"
+		maintenance_ready_temporary=""
+		cleanup_maintenance_lock() {
+			status="$?"
+			trap - EXIT HUP INT TERM
+			if [ -n "$maintenance_ready_temporary" ]; then
+				rm -f "$maintenance_ready_temporary" || status=1
+			fi
+			if [ -f "$maintenance_ready_file" ] && [ ! -L "$maintenance_ready_file" ] && \
+				[ "$(sed -n '1p' "$maintenance_ready_file")" = "$maintenance_token" ]; then
+				rm -f "$maintenance_ready_file" || status=1
+			fi
+			exit "$status"
+		}
+		trap cleanup_maintenance_lock EXIT
+		trap 'exit 0' HUP INT TERM
+		if [ -e "$maintenance_ready_file" ] || [ -L "$maintenance_ready_file" ]; then
+			[ -f "$maintenance_ready_file" ] && [ ! -L "$maintenance_ready_file" ] || \
+				die "维护窗口就绪标记不是普通文件"
+		fi
+		maintenance_ready_temporary="$(mktemp "${maintenance_ready_file}.tmp.XXXXXX")" || \
+			die "创建维护窗口就绪标记失败"
+		printf '%s\n' "$maintenance_token" > "$maintenance_ready_temporary" || \
+			die "写入维护窗口就绪标记失败"
+		chown 10001:10001 "$maintenance_ready_temporary" || die "设置维护窗口就绪标记所有者失败"
+		chmod 600 "$maintenance_ready_temporary" || die "设置维护窗口就绪标记权限失败"
+		mv -f "$maintenance_ready_temporary" "$maintenance_ready_file" || \
+			die "发布维护窗口就绪标记失败"
+		maintenance_ready_temporary=""
+		while :; do
+			sleep 1
+		done
+		;;
+	healthcheck)
+		load_credentials "$credentials_file"
+		[ -f "$cluster_initialized_marker" ] || exit 1
+		[ "$(sed -n '1p' "$cluster_initialized_marker")" = "$LOADED_INSTALLATION_ID" ] || exit 1
+		[ -f "${postgres_data}/postmaster.pid" ] || exit 1
+		[ "$(sed -n '1p' "${postgres_data}/postmaster.pid" | tr -d ' ')" = "1" ] || exit 1
+		PGPASSWORD="$LOADED_PASSWORD"
+		export PGPASSWORD
+		exec psql -h /var/run/postgresql -U "$LOADED_USER" -d "$LOADED_DATABASE" -Atqc "SELECT 1"
+		;;
+	backup)
+		shift
+		acquire_backup_restore_lock
+		load_credentials "$credentials_file"
+		PGPASSWORD="$LOADED_PASSWORD"
+		export PGPASSWORD
+		[ "$#" -eq 0 ] || die "backup 不接受改变 pg_dump 范围或格式的额外参数"
+		exec pg_dump -h /var/run/postgresql -U "$LOADED_USER" -d "$LOADED_DATABASE" \
+			--format=custom --no-owner --no-acl
+		;;
+	restore)
+		shift
+		acquire_backup_restore_lock
+		load_credentials "$credentials_file"
+		PGPASSWORD="$LOADED_PASSWORD"
+		export PGPASSWORD
+		[ "$#" -le 1 ] || die "restore 只接受一个 custom archive 路径，或从 stdin 读取归档"
+		restore_archive=""
+		restore_toc=""
+		restore_sql=""
+		restore_batch=""
+		cleanup_restore_files() {
+			for restore_temporary in \
+				"$restore_archive" "$restore_toc" "$restore_sql" "$restore_batch"; do
+				[ -z "$restore_temporary" ] || rm -f "$restore_temporary"
+			done
+		}
+		trap cleanup_restore_files EXIT
+		trap 'exit 1' HUP INT TERM
+		restore_archive="$(mktemp "${TMPDIR:-/tmp}/icloud-api-restore.XXXXXX")" || \
+			die "创建恢复归档临时文件失败"
+		restore_toc="$(mktemp "${TMPDIR:-/tmp}/icloud-api-restore-toc.XXXXXX")" || \
+			die "创建恢复目录临时文件失败"
+		restore_sql="$(mktemp "${TMPDIR:-/tmp}/icloud-api-restore-sql.XXXXXX")" || \
+			die "创建恢复 SQL 临时文件失败"
+		restore_batch="$(mktemp "${TMPDIR:-/tmp}/icloud-api-restore-batch.XXXXXX")" || \
+			die "创建恢复事务临时文件失败"
+
+		if [ "$#" -eq 0 ] || [ "$1" = "-" ]; then
+			cat > "$restore_archive" || die "读取 stdin 中的恢复归档失败"
+		else
+			cat < "$1" > "$restore_archive" || die "读取恢复归档失败：$1"
+		fi
+		[ -s "$restore_archive" ] || die "恢复归档为空"
+		restore_magic="$(od -An -N 5 -tx1 "$restore_archive" | tr -d ' \n')"
+		[ "$restore_magic" = "5047444d50" ] || die "恢复输入不是 pg_dump custom archive"
+		if ! pg_restore --list "$restore_archive" > "$restore_toc"; then
+			die "恢复输入不是有效的 pg_dump custom archive"
+		fi
+		if ! awk '
+			/^[[:space:]]*;/ || /^[[:space:]]*$/ { next }
+			{ found = 1 }
+			END { exit(found ? 0 : 1) }
+		' "$restore_toc"; then
+			die "恢复归档不包含任何数据库对象"
+		fi
+		for required_table in \
+			schema_migrations app_metadata admins admin_sessions accounts aliases \
+			latest_messages audit_logs apple_web_sessions imap_sync_states data_migrations; do
+			if ! awk -v required_table="$required_table" '
+				$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
+					$6 == required_table { found_table = 1 }
+				$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "DATA" && \
+					$6 == "public" && $7 == required_table { found_data = 1 }
+				END { exit(found_table && found_data ? 0 : 1) }
+			' "$restore_toc"; then
+				die "恢复归档缺少项目必需表或数据段：public.$required_table"
+			fi
+		done
+		for required_sequence in admins_id_seq accounts_id_seq aliases_id_seq audit_logs_id_seq; do
+			if ! awk -v required_sequence="$required_sequence" '
+				$1 ~ /^[0-9]+;$/ && $4 == "SEQUENCE" && $5 == "public" && \
+					$6 == required_sequence { found_sequence = 1 }
+				$1 ~ /^[0-9]+;$/ && $4 == "SEQUENCE" && $5 == "SET" && \
+					$6 == "public" && $7 == required_sequence { found_set = 1 }
+				END { exit(found_sequence && found_set ? 0 : 1) }
+			' "$restore_toc"; then
+				die "恢复归档缺少项目必需序列或状态：public.$required_sequence"
+			fi
+		done
+		for required_constraint in \
+			schema_migrations:schema_migrations_pkey \
+			app_metadata:app_metadata_pkey \
+			admins:admins_pkey admins:admins_username_key \
+			admin_sessions:admin_sessions_pkey \
+			accounts:accounts_pkey accounts:accounts_email_key \
+			aliases:aliases_pkey aliases:aliases_address_key aliases:aliases_api_key_hash_key \
+			latest_messages:latest_messages_pkey audit_logs:audit_logs_pkey \
+			apple_web_sessions:apple_web_sessions_pkey \
+			imap_sync_states:imap_sync_states_pkey data_migrations:data_migrations_pkey; do
+			required_constraint_table="${required_constraint%%:*}"
+			required_constraint_name="${required_constraint#*:}"
+			if ! awk \
+				-v required_table="$required_constraint_table" \
+				-v required_constraint="$required_constraint_name" '
+				$1 ~ /^[0-9]+;$/ && $4 == "CONSTRAINT" && $5 == "public" && \
+					$6 == required_table && $7 == required_constraint { found = 1 }
+				END { exit(found ? 0 : 1) }
+			' "$restore_toc"; then
+				die "恢复归档缺少项目必需主键或唯一约束：public.$required_constraint_name"
+			fi
+		done
+		for required_foreign_key in \
+			admin_sessions:admin_sessions_admin_id_fkey \
+			aliases:aliases_account_id_fkey \
+			latest_messages:latest_messages_alias_id_fkey \
+			audit_logs:audit_logs_admin_id_fkey \
+			apple_web_sessions:apple_web_sessions_account_id_fkey \
+			imap_sync_states:imap_sync_states_account_id_fkey; do
+			required_foreign_key_table="${required_foreign_key%%:*}"
+			required_foreign_key_name="${required_foreign_key#*:}"
+			if ! awk \
+				-v required_table="$required_foreign_key_table" \
+				-v required_constraint="$required_foreign_key_name" '
+				$1 ~ /^[0-9]+;$/ && $4 == "FK" && $5 == "CONSTRAINT" && \
+					$6 == "public" && $7 == required_table && \
+					$8 == required_constraint { found = 1 }
+				END { exit(found ? 0 : 1) }
+			' "$restore_toc"; then
+				die "恢复归档缺少项目必需外键：public.$required_foreign_key_name"
+			fi
+		done
+		for required_index in \
+			admin_sessions_expires_at_idx admin_sessions_admin_id_idx \
+			accounts_enabled_email_idx aliases_account_id_idx \
+			aliases_account_address_idx aliases_enabled_account_address_idx \
+			audit_logs_created_at_idx audit_logs_admin_id_idx; do
+			if ! awk -v required_index="$required_index" '
+				$1 ~ /^[0-9]+;$/ && $4 == "INDEX" && $5 == "public" && \
+					$6 == required_index { found = 1 }
+				END { exit(found ? 0 : 1) }
+			' "$restore_toc"; then
+				die "恢复归档缺少项目关键索引：public.$required_index"
+			fi
+		done
+		if ! pg_restore \
+			--clean --if-exists --no-owner --no-acl --exit-on-error \
+			--file="$restore_sql" "$restore_archive"; then
+			die "展开 PostgreSQL 恢复归档失败"
+		fi
+		[ -s "$restore_sql" ] || die "恢复归档没有生成 SQL"
+		{
+			printf '%s\n' \
+				'DROP SCHEMA IF EXISTS public CASCADE;' \
+				'CREATE SCHEMA public AUTHORIZATION CURRENT_USER;' \
+				'REVOKE CREATE ON SCHEMA public FROM PUBLIC;'
+			cat "$restore_sql"
+			cat <<'SQL'
+DO $icloud_api_restore_validation$
+DECLARE
+	missing_object TEXT;
+BEGIN
+	SELECT required.table_name || '.' || required.constraint_name
+	INTO missing_object
+	FROM (VALUES
+		('schema_migrations', 'schema_migrations_pkey', 'p'),
+		('app_metadata', 'app_metadata_pkey', 'p'),
+		('admins', 'admins_pkey', 'p'),
+		('admins', 'admins_username_key', 'u'),
+		('admin_sessions', 'admin_sessions_pkey', 'p'),
+		('accounts', 'accounts_pkey', 'p'),
+		('accounts', 'accounts_email_key', 'u'),
+		('aliases', 'aliases_pkey', 'p'),
+		('aliases', 'aliases_address_key', 'u'),
+		('aliases', 'aliases_api_key_hash_key', 'u'),
+		('latest_messages', 'latest_messages_pkey', 'p'),
+		('audit_logs', 'audit_logs_pkey', 'p'),
+		('apple_web_sessions', 'apple_web_sessions_pkey', 'p'),
+		('imap_sync_states', 'imap_sync_states_pkey', 'p'),
+		('data_migrations', 'data_migrations_pkey', 'p'),
+		('admin_sessions', 'admin_sessions_admin_id_fkey', 'f'),
+		('aliases', 'aliases_account_id_fkey', 'f'),
+		('latest_messages', 'latest_messages_alias_id_fkey', 'f'),
+		('audit_logs', 'audit_logs_admin_id_fkey', 'f'),
+		('apple_web_sessions', 'apple_web_sessions_account_id_fkey', 'f'),
+		('imap_sync_states', 'imap_sync_states_account_id_fkey', 'f')
+	) AS required(table_name, constraint_name, constraint_type)
+	WHERE NOT EXISTS (
+		SELECT 1
+		FROM pg_catalog.pg_constraint AS constraint_state
+		JOIN pg_catalog.pg_class AS table_state
+			ON table_state.oid = constraint_state.conrelid
+		JOIN pg_catalog.pg_namespace AS schema_state
+			ON schema_state.oid = table_state.relnamespace
+		WHERE schema_state.nspname = 'public'
+			AND table_state.relname = required.table_name
+			AND constraint_state.conname = required.constraint_name
+			AND constraint_state.contype::TEXT = required.constraint_type
+			AND constraint_state.convalidated
+	)
+	LIMIT 1;
+	IF missing_object IS NOT NULL THEN
+		RAISE EXCEPTION 'restored schema is missing required constraint %', missing_object;
+	END IF;
+
+	SELECT required.table_name || '.' || required.index_name
+	INTO missing_object
+	FROM (VALUES
+		('admin_sessions', 'admin_sessions_expires_at_idx'),
+		('admin_sessions', 'admin_sessions_admin_id_idx'),
+		('accounts', 'accounts_enabled_email_idx'),
+		('aliases', 'aliases_account_id_idx'),
+		('aliases', 'aliases_account_address_idx'),
+		('aliases', 'aliases_enabled_account_address_idx'),
+		('audit_logs', 'audit_logs_created_at_idx'),
+		('audit_logs', 'audit_logs_admin_id_idx')
+	) AS required(table_name, index_name)
+	WHERE NOT EXISTS (
+		SELECT 1
+		FROM pg_catalog.pg_class AS index_state
+		JOIN pg_catalog.pg_namespace AS schema_state
+			ON schema_state.oid = index_state.relnamespace
+		JOIN pg_catalog.pg_index AS index_metadata
+			ON index_metadata.indexrelid = index_state.oid
+		JOIN pg_catalog.pg_class AS table_state
+			ON table_state.oid = index_metadata.indrelid
+		WHERE schema_state.nspname = 'public'
+			AND table_state.relname = required.table_name
+			AND index_state.relname = required.index_name
+			AND index_state.relkind IN ('i', 'I')
+			AND index_metadata.indisvalid
+			AND index_metadata.indisready
+	)
+	LIMIT 1;
+	IF missing_object IS NOT NULL THEN
+		RAISE EXCEPTION 'restored schema is missing required index %', missing_object;
+	END IF;
+END
+$icloud_api_restore_validation$;
+SQL
+			printf '%s\n' 'REVOKE CREATE ON SCHEMA public FROM PUBLIC;'
+		} > "$restore_batch" || die "组装 PostgreSQL 恢复事务失败"
+
+		if psql -h /var/run/postgresql -U "$LOADED_USER" -d "$LOADED_DATABASE" \
+			--no-psqlrc --set=ON_ERROR_STOP=1 --single-transaction \
+			--file="$restore_batch"; then
+			exit 0
+		else
+			exit "$?"
+		fi
+		;;
+	psql)
+		shift
+		load_credentials "$credentials_file"
+		PGPASSWORD="$LOADED_PASSWORD"
+		export PGPASSWORD
+		exec psql -h /var/run/postgresql -U "$LOADED_USER" -d "$LOADED_DATABASE" "$@"
+		;;
+esac
+
+mkdir -p "$installation_state_directory" || die "创建安装状态目录失败"
+chmod 755 "$installation_state_directory" || die "设置安装状态目录权限失败"
+exec 9>"${installation_state_directory}/postgres-lifecycle.lock"
+flock -n 9 || die "另一个 PostgreSQL 容器正在使用当前数据卷"
+
+if [ "${1:-}" = "prepare-restore" ]; then
+	[ "$postgres_data" = "/var/lib/postgresql/data" ] || die "prepare-restore 仅允许清理 Compose 固定的 PGDATA 路径"
+	[ -d "$postgres_data" ] && [ ! -L "$postgres_data" ] || die "PGDATA 不是预期的普通目录"
+	[ "$(readlink -f "$postgres_data")" = "/var/lib/postgresql/data" ] || die "PGDATA 解析后的路径不符合预期"
+	postgres_data_has_entries=false
+	if find "$postgres_data" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+		postgres_data_has_entries=true
+	fi
+	if [ "$postgres_data_has_entries" = true ]; then
+		for completed_marker in \
+			"$state_file" \
+			"$cluster_initialized_marker" \
+			"$config_cluster_initialized_marker" \
+			"$initialized_marker"; do
+			if [ -e "$completed_marker" ] || [ -L "$completed_marker" ]; then
+				die "持久化状态表明数据库已完成初始化或状态异常；拒绝清理 postgres_data"
+			fi
+		done
+		[ -f "$credentials_file" ] && [ ! -L "$credentials_file" ] || \
+			die "缺少可验证的首次初始化凭据状态；拒绝清理 postgres_data"
+		[ "$(stat -c '%h' "$credentials_file")" = "1" ] || \
+			die "首次初始化凭据状态不能是硬链接"
+		load_credentials "$credentials_file"
+		validate_bound_marker "$config_cluster_bootstrap_marker" "$LOADED_INSTALLATION_ID" \
+			"数据库配置首次初始化标记"
+		validate_bound_marker "$cluster_bootstrap_marker" "$LOADED_INSTALLATION_ID" \
+			"安装状态首次初始化标记"
+		validate_bound_marker "$bootstrap_marker" "$LOADED_INSTALLATION_ID" \
+			"主密钥首次初始化标记"
+		pgdata_root_identity="$(stat -Lc '%d:%i' "$postgres_data")" || \
+			die "读取 PGDATA 根目录标识失败"
+		pgdata_binding="${LOADED_INSTALLATION_ID}:${pgdata_root_identity}"
+		validate_bound_marker "$config_pgdata_bootstrap_binding" "$pgdata_binding" \
+			"数据库配置 PGDATA 绑定标记"
+		validate_bound_marker "$cluster_pgdata_bootstrap_binding" "$pgdata_binding" \
+			"安装状态 PGDATA 绑定标记"
+		find "$postgres_data" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} \;
+		if find "$postgres_data" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+			die "清理未完成的 PostgreSQL 初始化目录失败"
+		fi
+		printf '%s\n' "PostgreSQL 未完成的首次初始化数据已清理。" >&2
+	fi
+	rm -f "$state_file"
+	rm -f "$credentials_file"
+	rm -f "$config_cluster_bootstrap_marker" "$config_cluster_initialized_marker"
+	rm -f "$config_pgdata_bootstrap_binding"
+	rm -f "$bootstrap_marker" "$initialized_marker"
+	rm -f "$cluster_bootstrap_marker" "$cluster_initialized_marker"
+	rm -f "$cluster_pgdata_bootstrap_binding"
+	sync || die "持久化 PostgreSQL 恢复状态清理失败"
+	printf '%s\n' "PostgreSQL 恢复状态已重置；现在可启动 postgres 并导入逻辑备份。" >&2
+	exit 0
+fi
+
+config_exists=false
+state_exists=false
+postgres_initialized=false
+postgres_data_has_entries=false
+[ -f "$credentials_file" ] && config_exists=true
+[ -f "$state_file" ] && state_exists=true
+[ -s "${postgres_data}/PG_VERSION" ] && postgres_initialized=true
+if [ -d "$postgres_data" ] && find "$postgres_data" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+	postgres_data_has_entries=true
+fi
+
+if [ "$state_exists" = true ] && [ "$postgres_initialized" = false ]; then
+	die "数据库状态文件存在但 PGDATA 未初始化；请成对恢复 postgres_data 与 postgres_config 卷"
+fi
+if [ "$state_exists" = false ] && [ "$postgres_data_has_entries" = true ]; then
+	if { [ -e "$cluster_bootstrap_marker" ] || [ -e "$config_cluster_bootstrap_marker" ]; } && \
+		[ ! -e "$cluster_initialized_marker" ] && [ ! -e "$config_cluster_initialized_marker" ]; then
+		die "检测到未完成的首次 PostgreSQL 初始化；请停止服务后执行 prepare-restore，再重新启动"
+	fi
+	die "PGDATA 包含数据但缺少已完成初始化的凭据状态；请恢复匹配的 postgres_data 卷"
+fi
+
+if [ "$config_exists" = true ]; then
+	load_credentials "$credentials_file"
+	config_user="$LOADED_USER"
+	config_database="$LOADED_DATABASE"
+	config_password="$LOADED_PASSWORD"
+	config_installation_id="$LOADED_INSTALLATION_ID"
+fi
+
+if [ "$state_exists" = true ]; then
+	load_credentials "$state_file"
+	state_user="$LOADED_USER"
+	state_database="$LOADED_DATABASE"
+	state_password="$LOADED_PASSWORD"
+	state_installation_id="$LOADED_INSTALLATION_ID"
+fi
+
+if [ "$config_exists" = true ] && [ "$state_exists" = true ]; then
+	[ "$config_user" = "$state_user" ] && \
+		[ "$config_database" = "$state_database" ] && \
+		[ "$config_password" = "$state_password" ] && \
+		[ "$config_installation_id" = "$state_installation_id" ] || \
+		die "postgres_data 与 postgres_config 凭据不一致；请成对恢复两个卷"
+	database_user="$config_user"
+	database_name="$config_database"
+	database_password="$config_password"
+	installation_id="$config_installation_id"
+elif [ "$state_exists" = true ]; then
+	database_user="$state_user"
+	database_name="$state_database"
+	database_password="$state_password"
+	installation_id="$state_installation_id"
+	write_shared_credentials "$database_user" "$database_name" "$database_password" "$installation_id"
+elif [ "$config_exists" = true ]; then
+	[ "$postgres_initialized" = false ] || die "已初始化的 PGDATA 缺少凭据状态；请恢复匹配的 postgres_config 卷"
+	if [ ! -e "$config_cluster_bootstrap_marker" ] && [ ! -e "$cluster_bootstrap_marker" ]; then
+		die "postgres_config 已存在但数据库与安装状态均为空；请恢复原卷，或先执行 prepare-restore 再导入逻辑备份"
+	fi
+	database_user="$config_user"
+	database_name="$config_database"
+	database_password="$config_password"
+	installation_id="$config_installation_id"
+else
+	[ "$postgres_initialized" = false ] || die "已初始化的 PGDATA 缺少持久化凭据；请恢复 postgres_config 卷"
+	database_user="icloud_$(random_hex 8)"
+	database_name="icloud_$(random_hex 8)"
+	database_password="$(random_hex 32)"
+	installation_id="$(random_hex 16)"
+	write_shared_credentials "$database_user" "$database_name" "$database_password" "$installation_id"
+	write_cluster_marker "$config_cluster_bootstrap_marker" "$installation_id"
+fi
+
+for marker in "$bootstrap_marker" "$initialized_marker"; do
+	if [ -e "$marker" ]; then
+		[ "$(wc -l < "$marker" | tr -d ' ')" = "1" ] || die "主密钥状态文件格式错误"
+		[ "$(sed -n '1p' "$marker")" = "$installation_id" ] || die "主密钥状态与当前数据库不匹配"
+	fi
+done
+
+for marker in "$cluster_bootstrap_marker" "$cluster_initialized_marker"; do
+	if [ -e "$marker" ]; then
+		[ "$(wc -l < "$marker" | tr -d ' ')" = "1" ] || die "数据库集群状态文件格式错误"
+		[ "$(sed -n '1p' "$marker")" = "$installation_id" ] || die "数据库集群状态与凭据不匹配"
+	fi
+done
+
+for marker in "$config_cluster_bootstrap_marker" "$config_cluster_initialized_marker"; do
+	if [ -e "$marker" ]; then
+		[ "$(wc -l < "$marker" | tr -d ' ')" = "1" ] || die "数据库配置阶段文件格式错误"
+		[ "$(sed -n '1p' "$marker")" = "$installation_id" ] || die "数据库配置阶段与凭据不匹配"
+	fi
+done
+
+if [ -e "$cluster_initialized_marker" ] && [ "$postgres_initialized" = false ]; then
+	die "installation_state 表明数据库已初始化，但 postgres_data 为空；请恢复原 postgres_data 卷"
+fi
+if [ -e "$initialized_marker" ] && [ "$postgres_initialized" = false ]; then
+	die "应用主密钥已绑定到原数据库，但 postgres_data 为空；请恢复原 postgres_data 卷"
+fi
+if [ -e "$config_cluster_initialized_marker" ] && [ "$postgres_initialized" = false ]; then
+	die "postgres_config 表明数据库曾完成初始化，但 postgres_data 为空；请恢复原卷，或执行 prepare-restore 后导入逻辑备份"
+fi
+
+if [ "$state_exists" = true ]; then
+	write_cluster_marker "$config_cluster_initialized_marker" "$installation_id"
+	rm -f "$config_cluster_bootstrap_marker"
+elif [ ! -e "$config_cluster_bootstrap_marker" ]; then
+	write_cluster_marker "$config_cluster_bootstrap_marker" "$installation_id"
+fi
+
+if [ -e "$cluster_bootstrap_marker" ] && [ "$postgres_initialized" = true ] && [ "$state_exists" = true ]; then
+	write_cluster_marker "$cluster_initialized_marker" "$installation_id"
+	rm -f "$cluster_bootstrap_marker"
+fi
+if [ ! -e "$cluster_bootstrap_marker" ] && [ ! -e "$cluster_initialized_marker" ]; then
+	if [ "$state_exists" = true ] || [ "$postgres_initialized" = true ]; then
+		write_cluster_marker "$cluster_initialized_marker" "$installation_id"
+	else
+		write_cluster_marker "$cluster_bootstrap_marker" "$installation_id"
+	fi
+fi
+
+if [ ! -e "$bootstrap_marker" ] && [ ! -e "$initialized_marker" ]; then
+	# PostgreSQL lifecycle state cannot prove that the application has parsed
+	# and verified its master key. Only the application preflight promotes this
+	# marker to key-initialized after fingerprint verification succeeds.
+	write_key_marker "$bootstrap_marker" "$installation_id"
+fi
+
+if [ "$postgres_initialized" = false ] && [ "$state_exists" = false ]; then
+	mkdir -p "$postgres_data" || die "创建 PGDATA 目录失败"
+	[ -d "$postgres_data" ] && [ ! -L "$postgres_data" ] || die "PGDATA 不是普通目录"
+	pgdata_root_identity="$(stat -Lc '%d:%i' "$postgres_data")" || die "读取 PGDATA 根目录标识失败"
+	pgdata_binding="${installation_id}:${pgdata_root_identity}"
+	for binding_marker in "$config_pgdata_bootstrap_binding" "$cluster_pgdata_bootstrap_binding"; do
+		if [ -e "$binding_marker" ] || [ -L "$binding_marker" ]; then
+			validate_bound_marker "$binding_marker" "$pgdata_binding" "PGDATA 首次初始化绑定标记"
+		else
+			write_cluster_marker "$binding_marker" "$pgdata_binding"
+		fi
+	done
+fi
+
+# Credentials and every pre-init marker must reach their backing volumes before
+# initdb can leave a partially populated PGDATA directory.
+sync || die "持久化 PostgreSQL 首次初始化状态失败"
+
+POSTGRES_DB="$database_name"
+POSTGRES_APP_USER="$database_user"
+POSTGRES_APP_PASSWORD="$database_password"
+ICLOUD_API_INSTALLATION_ID="$installation_id"
+if [ "$postgres_initialized" = false ]; then
+	POSTGRES_USER="bootstrap_$(random_hex 8)"
+	POSTGRES_PASSWORD="$(random_hex 32)"
+else
+	# The official entrypoint ignores initialization variables for an existing
+	# cluster. Keep them valid without retaining bootstrap credentials.
+	POSTGRES_USER="$database_user"
+	POSTGRES_PASSWORD="$database_password"
+fi
+export POSTGRES_USER POSTGRES_DB POSTGRES_PASSWORD POSTGRES_APP_USER POSTGRES_APP_PASSWORD ICLOUD_API_INSTALLATION_ID
+
+exec "${POSTGRES_OFFICIAL_ENTRYPOINT:-/usr/local/bin/docker-entrypoint.sh}" "$@"

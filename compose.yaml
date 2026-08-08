@@ -1,6 +1,5 @@
 services:
   icloud-api:
-    # SQLite storage and the in-process sync coordinator require one writer instance.
     container_name: icloud-api
     build:
       context: .
@@ -12,19 +11,26 @@ services:
         ALPINE_MIRROR: ${ALPINE_MIRROR:-mirrors.aliyun.com}
     image: icloud-api:local
     restart: unless-stopped
+    stop_grace_period: 30s
     deploy:
       replicas: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "127.0.0.1:${ICLOUD_API_PORT:-8080}:8080"
     environment:
       GIN_MODE: release
       ICLOUD_API_ADDR: 0.0.0.0:8080
-      ICLOUD_API_DB: /app/data/icloud-api.db
+      ICLOUD_API_DATABASE_CONFIG_DIR: /run/icloud-api-database
+      ICLOUD_API_INSTALLATION_STATE_DIR: /run/icloud-api-installation
+      ICLOUD_API_LEGACY_SQLITE: /app/legacy/icloud-api.db
       ICLOUD_API_WEB_ROOT: /app/web
-      ICLOUD_API_MASTER_KEY: ${ICLOUD_API_MASTER_KEY:?ICLOUD_API_MASTER_KEY is required}
+      ICLOUD_API_MASTER_KEY: ${ICLOUD_API_MASTER_KEY:-}
+      ICLOUD_API_MASTER_KEY_FILE: /app/keys/master.key
       ICLOUD_API_ADMIN_USER: ${ICLOUD_API_ADMIN_USER:-admin}
-      ICLOUD_API_ADMIN_PASSWORD: ${ICLOUD_API_ADMIN_PASSWORD:?ICLOUD_API_ADMIN_PASSWORD is required}
-      ICLOUD_API_OAUTH_TOKEN: ${ICLOUD_API_OAUTH_TOKEN:?ICLOUD_API_OAUTH_TOKEN is required}
+      ICLOUD_API_ADMIN_PASSWORD: ${ICLOUD_API_ADMIN_PASSWORD:-}
+      ICLOUD_API_OAUTH_TOKEN: ${ICLOUD_API_OAUTH_TOKEN:-}
       ICLOUD_API_COOKIE_SECURE: ${ICLOUD_API_COOKIE_SECURE:-false}
       ICLOUD_API_SESSION_TTL: ${ICLOUD_API_SESSION_TTL:-8h}
       ICLOUD_API_POLL_INTERVAL: ${ICLOUD_API_POLL_INTERVAL:-1m}
@@ -42,8 +48,11 @@ services:
       ICLOUD_API_TRUSTED_PROXIES: ${ICLOUD_API_TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
-      # Contains the SQLite database and its WAL/SHM sidecars.
-      - icloud_api_data:/app/data
+      - postgres_socket:/var/run/postgresql:ro
+      - postgres_config:/run/icloud-api-database:ro
+      - installation_state:/run/icloud-api-installation
+      - icloud_api_data:/app/legacy:ro
+      - icloud_api_keys:/app/keys
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -57,5 +66,49 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: postgres-runtime
+      args:
+        DOCKER_HUB_MIRROR: ${DOCKER_HUB_MIRROR:-docker.m.daocloud.io}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-mirrors.aliyun.com}
+    image: icloud-api-postgres:local
+    restart: unless-stopped
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+    network_mode: "none"
+    environment:
+      ICLOUD_API_DATABASE_CONFIG_DIR: /run/icloud-api-database
+      ICLOUD_API_INSTALLATION_STATE_DIR: /run/icloud-api-installation
+      POSTGRES_HOST_AUTH_METHOD: reject
+      POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=reject
+      TZ: ${TZ:-Asia/Shanghai}
+    command:
+      - postgres
+      - -c
+      - listen_addresses=
+      - -c
+      - unix_socket_directories=/var/run/postgresql
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_socket:/var/run/postgresql
+      - postgres_config:/run/icloud-api-database
+      - installation_state:/run/icloud-api-installation
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/icloud-api-postgres-entrypoint", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
 volumes:
+  postgres_data:
+  postgres_socket:
+  postgres_config:
+  installation_state:
   icloud_api_data:
+  icloud_api_keys:

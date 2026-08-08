@@ -23,6 +23,8 @@ tags:
     description: 供外部系统登记已存在的隐私邮箱
   - name: Mail
     description: 隐私邮箱收件接口
+  - name: Admin Accounts
+    description: 管理端主号与 IMAP 邮件同步
   - name: Admin Apple
     description: 管理端 Apple 受信任会话与完整隐私邮箱目录同步
   - name: Health
@@ -394,6 +396,106 @@ paths:
                       code: DATABASE_UNAVAILABLE
                       message: 数据库暂不可用
                       request_id: 6oe7j0x3x3pJv9Dv
+
+  /admin/api/v1/accounts/{id}/sync:
+    post:
+      tags:
+        - Admin Accounts
+      operationId: syncAdminAccount
+      summary: 立即同步主号邮件
+      description: |
+        使用该主号的一条 IMAP 连接执行一个有界增量批次，并把邮件快照写入 PostgreSQL。
+        隐私邮箱不会分别连接 iCloud。若执行后已经追平，返回 200，响应中省略
+        `sync_pending`；若本批已成功提交但仍有积压，返回 202，并明确返回
+        `sync_pending: true`。后续轮询或再次调用本接口会继续处理剩余批次。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      responses:
+        "200":
+          description: 本轮同步成功，主号邮件已经追平；sync_pending 字段省略
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAccountDetailResponse"
+        "202":
+          description: 当前有界批次已成功提交，但仍有邮件积压等待后续批次
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAccountDetailResponse"
+              example:
+                data:
+                  account:
+                    id: 12
+                    name: 主账号
+                    email: owner@icloud.com
+                    imap_host: imap.mail.me.com
+                    imap_port: 993
+                    imap_username: owner@icloud.com
+                    enabled: true
+                    last_sync_status: pending
+                    last_sync_error: ""
+                    last_synced_at: "2026-08-08T12:30:00Z"
+                    created_at: "2026-08-07T12:00:00Z"
+                    updated_at: "2026-08-08T12:30:00Z"
+                    alias_count: 1
+                  aliases:
+                    - id: 44
+                      account_id: 12
+                      account_email: owner@icloud.com
+                      address: receipts@icloud.com
+                      label: 收据
+                      api_key_prefix: icm_ABCD
+                      direct_link_path: /api/v1/mail/recent?api_key=icm_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA
+                      enabled: true
+                      last_sync_status: pending
+                      last_sync_error: ""
+                      last_synced_at: "2026-08-08T12:30:00Z"
+                      last_accessed_at: null
+                      latest_received_at: "2026-08-08T12:29:00Z"
+                      created_at: "2026-08-07T12:05:00Z"
+                      updated_at: "2026-08-08T12:30:00Z"
+                  apple_session: null
+                  sync_pending: true
+        "400":
+          description: id 不是正整数
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+              example:
+                error:
+                  code: VALIDATION_FAILED
+                  message: id 参数无效
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAccountNotFound"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+        "502":
+          $ref: "#/components/responses/AdminSyncBadGateway"
 
   /admin/api/v1/accounts/{id}/apple-auth:
     parameters:
@@ -996,6 +1098,23 @@ components:
               message: 请求处理失败，请稍后重试
               request_id: 6oe7j0x3x3pJv9Dv
 
+    AdminSyncBadGateway:
+      description: 主号 IMAP 同步失败，当前批次未成功完成
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          example:
+            error:
+              code: SYNC_FAILED
+              message: 同步失败，请检查连接状态
+              request_id: 6oe7j0x3x3pJv9Dv
+
     AdminAppleBadGateway:
       description: Apple 上游服务返回异常响应
       headers:
@@ -1335,6 +1454,15 @@ components:
           format: date-time
           description: 已知的会话或验证码挑战到期时间；上游未提供时为 null。
 
+    AdminAccountDetailResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAccountDetail"
+
     AdminAccountDetail:
       type: object
       additionalProperties: false
@@ -1356,6 +1484,11 @@ components:
           oneOf:
             - $ref: "#/components/schemas/AdminAppleSession"
             - type: "null"
+        sync_pending:
+          type: boolean
+          description: |
+            仅在手动邮件同步返回 202 时出现且恒为 true，表示当前有界批次已提交，
+            但主号仍有邮件积压等待后续批次；同步已追平时该字段省略。
 
     AdminAccount:
       type: object
@@ -1617,6 +1750,7 @@ components:
             - APPLE_ACCOUNT_MISMATCH
             - ACCOUNT_CHANGED
             - ALIAS_OWNERSHIP_CONFLICT
+            - SYNC_FAILED
             - INTERNAL_ERROR
           description: |
             Apple 会话错误使用 APPLE_ 前缀，与后台登录会话的 AUTH_REQUIRED/SESSION_EXPIRED 分离。

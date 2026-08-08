@@ -3,9 +3,32 @@ package secure
 import (
 	"bytes"
 	"encoding/base64"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestLoadOrCreateMasterKeyPersistsGeneratedKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys", "master.key")
+	t.Setenv("ICLOUD_API_MASTER_KEY", "")
+
+	got, created, err := LoadOrCreateMasterKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created {
+		t.Fatal("首次加载应生成并持久化主密钥")
+	}
+
+	t.Setenv("ICLOUD_API_MASTER_KEY", " \t ")
+	reloaded, created, err := LoadOrCreateMasterKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || !bytes.Equal(reloaded, got) {
+		t.Fatal("仅空白环境变量未回退到持久化主密钥")
+	}
+}
 
 func TestCipherRoundTripAndTamper(t *testing.T) {
 	key := bytes.Repeat([]byte{7}, 32)

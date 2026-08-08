@@ -26,38 +26,53 @@ func (s *Store) CreateAlias(ctx context.Context, alias domain.Alias) (domain.Ali
 		return domain.Alias{}, fmt.Errorf("create alias: api key hash is empty")
 	}
 	now := s.now()
-	status := strings.TrimSpace(alias.LastSyncStatus)
+	status := strings.TrimSpace(sanitizePostgresText(alias.LastSyncStatus))
 	if status == "" {
 		status = domain.SyncStatusPending
 	}
-	result, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("begin alias creation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, alias.AccountID)
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("lock account for alias creation: %w", err)
+	}
+	if alias.Enabled {
+		if err := s.requireEnabledAliasCapacity(ctx, tx, alias.AccountID); err != nil {
+			return domain.Alias{}, fmt.Errorf("create alias: %w", err)
+		}
+	}
+	var id int64
+	err = s.txQueryRowContext(ctx, tx, `
 		INSERT INTO aliases(
 			account_id, address, label, api_key_hash, api_key_prefix, enabled,
 			last_sync_status, last_sync_error, last_synced_at,
 			last_accessed_at, created_at, updated_at
-		) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-		WHERE ? = 0 OR (
-			SELECT COUNT(*) FROM aliases WHERE account_id = ? AND enabled = 1
-		) < ?`,
-		alias.AccountID, domain.NormalizeEmail(alias.Address), strings.TrimSpace(alias.Label),
-		alias.APIKeyHash, strings.TrimSpace(alias.APIKeyPrefix), alias.Enabled,
-		status, strings.TrimSpace(alias.LastSyncError), nullableTimestamp(alias.LastSyncedAt),
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		RETURNING id`,
+		alias.AccountID, domain.NormalizeEmail(sanitizePostgresText(alias.Address)),
+		strings.TrimSpace(sanitizePostgresText(alias.Label)),
+		alias.APIKeyHash, strings.TrimSpace(sanitizePostgresText(alias.APIKeyPrefix)), alias.Enabled,
+		status, strings.TrimSpace(sanitizePostgresText(alias.LastSyncError)), nullableTimestamp(alias.LastSyncedAt),
 		nullableTimestamp(alias.LastAccessedAt), timestamp(now), timestamp(now),
-		alias.Enabled, alias.AccountID, domain.MaxEnabledAliasesPerAccount,
-	)
+	).Scan(&id)
 	if err != nil {
 		return domain.Alias{}, fmt.Errorf("create alias: %w", err)
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return domain.Alias{}, fmt.Errorf("read create alias result: %w", err)
+	if alias.Enabled {
+		if _, err := s.txExecContext(ctx, tx,
+			`DELETE FROM imap_sync_states WHERE account_id = ?`, alias.AccountID,
+		); err != nil {
+			return domain.Alias{}, fmt.Errorf("reset IMAP cursor after alias creation: %w", err)
+		}
+		if _, err := s.bumpAccountVersionTx(ctx, tx, alias.AccountID, accountVersion); err != nil {
+			return domain.Alias{}, fmt.Errorf("advance account version after alias creation: %w", err)
+		}
 	}
-	if affected == 0 {
-		return domain.Alias{}, fmt.Errorf("create alias: %w", ErrAliasLimit)
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return domain.Alias{}, fmt.Errorf("read new alias id: %w", err)
+	if err := tx.Commit(); err != nil {
+		return domain.Alias{}, fmt.Errorf("commit alias creation: %w", err)
 	}
 	return s.getAliasAfterWrite(id)
 }
@@ -65,49 +80,63 @@ func (s *Store) CreateAlias(ctx context.Context, alias domain.Alias) (domain.Ali
 // UpdateAlias updates mutable administrator metadata. Address and account
 // ownership are immutable; moving an alias requires deleting and recreating it.
 func (s *Store) UpdateAlias(ctx context.Context, alias domain.Alias) (domain.Alias, error) {
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE aliases
-		SET label = ?, enabled = ?, updated_at = ?
-		WHERE id = ?`,
-		strings.TrimSpace(alias.Label), alias.Enabled, timestamp(s.now()), alias.ID,
-	)
-	if err != nil {
+	label := strings.TrimSpace(alias.Label)
+	if err := s.updateAliasState(ctx, alias.ID, &label, alias.Enabled); err != nil {
 		return domain.Alias{}, fmt.Errorf("update alias: %w", err)
-	}
-	if err := requireAffected(result, "alias"); err != nil {
-		return domain.Alias{}, err
 	}
 	return s.getAliasAfterWrite(alias.ID)
 }
 
 func (s *Store) GetAlias(ctx context.Context, id int64) (domain.Alias, error) {
-	return scanAlias(s.db.QueryRowContext(ctx,
+	return scanAlias(s.queryRowContext(ctx,
 		`SELECT `+aliasColumns+aliasJoins+` WHERE al.id = ?`, id,
 	))
 }
 
 func (s *Store) GetAliasByAddress(ctx context.Context, address string) (domain.Alias, error) {
-	return scanAlias(s.db.QueryRowContext(ctx,
-		`SELECT `+aliasColumns+aliasJoins+` WHERE al.address = ? COLLATE NOCASE`,
-		domain.NormalizeEmail(address),
+	return scanAlias(s.queryRowContext(ctx,
+		`SELECT `+aliasColumns+aliasJoins+` WHERE al.address = ?`,
+		domain.NormalizeEmail(sanitizePostgresText(address)),
 	))
 }
 
 // ListAliases lists all aliases when accountIDs is empty, or aliases for the
 // single supplied account ID.
 func (s *Store) ListAliases(ctx context.Context, accountIDs ...int64) ([]domain.Alias, error) {
+	return s.listAliases(ctx, false, accountIDs...)
+}
+
+func (s *Store) ListAliasesByAccount(ctx context.Context, accountID int64) ([]domain.Alias, error) {
+	return s.ListAliases(ctx, accountID)
+}
+
+// ListEnabledAliasesByAccount returns the active aliases used by mailbox sync.
+// Keeping this query separate preserves the administrator-facing list while
+// allowing PostgreSQL to use the enabled-alias partial index.
+func (s *Store) ListEnabledAliasesByAccount(ctx context.Context, accountID int64) ([]domain.Alias, error) {
+	return s.listAliases(ctx, true, accountID)
+}
+
+func (s *Store) listAliases(ctx context.Context, enabledOnly bool, accountIDs ...int64) ([]domain.Alias, error) {
 	if len(accountIDs) > 1 {
 		return nil, fmt.Errorf("list aliases: expected at most one account id")
 	}
 	query := `SELECT ` + aliasColumns + aliasJoins
 	var args []any
+	var predicates []string
 	if len(accountIDs) == 1 {
-		query += ` WHERE al.account_id = ?`
+		predicates = append(predicates, `al.account_id = ?`)
 		args = append(args, accountIDs[0])
 	}
-	query += ` ORDER BY al.address COLLATE NOCASE, al.id`
+	if enabledOnly {
+		predicates = append(predicates, `al.enabled = TRUE`)
+	}
+	if len(predicates) > 0 {
+		query += ` WHERE ` + strings.Join(predicates, ` AND `)
+	}
+	query += ` ORDER BY al.address, al.id`
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list aliases: %w", err)
 	}
@@ -127,16 +156,53 @@ func (s *Store) ListAliases(ctx context.Context, accountIDs ...int64) ([]domain.
 	return aliases, nil
 }
 
-func (s *Store) ListAliasesByAccount(ctx context.Context, accountID int64) ([]domain.Alias, error) {
-	return s.ListAliases(ctx, accountID)
-}
-
 func (s *Store) DeleteAlias(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `DELETE FROM aliases WHERE id = ?`, id)
+	var accountID int64
+	if err := s.queryRowContext(ctx,
+		`SELECT account_id FROM aliases WHERE id = ?`, id,
+	).Scan(&accountID); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("read alias account before delete: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin alias deletion: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
+	if err != nil {
+		return fmt.Errorf("lock alias account before delete: %w", err)
+	}
+	var enabled bool
+	if err := s.txQueryRowContext(ctx, tx,
+		`SELECT enabled FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
+	).Scan(&enabled); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("read alias state before delete: %w", err)
+	}
+	result, err := s.txExecContext(ctx, tx,
+		`DELETE FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
+	)
 	if err != nil {
 		return fmt.Errorf("delete alias: %w", err)
 	}
-	return requireAffected(result, "alias")
+	if err := requireAffected(result, "alias"); err != nil {
+		return err
+	}
+	if enabled {
+		if _, err := s.bumpAccountVersionTx(ctx, tx, accountID, accountVersion); err != nil {
+			return fmt.Errorf("advance account version after alias delete: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit alias deletion: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) RotateAliasAPIKey(
@@ -148,11 +214,11 @@ func (s *Store) RotateAliasAPIKey(
 	if len(apiKeyHash) == 0 {
 		return domain.Alias{}, fmt.Errorf("rotate alias api key: hash is empty")
 	}
-	result, err := s.db.ExecContext(ctx, `
+	result, err := s.execContext(ctx, `
 		UPDATE aliases
 		SET api_key_hash = ?, api_key_prefix = ?, updated_at = ?
 		WHERE id = ?`,
-		apiKeyHash, strings.TrimSpace(apiKeyPrefix), timestamp(s.now()), id,
+		apiKeyHash, strings.TrimSpace(sanitizePostgresText(apiKeyPrefix)), timestamp(s.now()), id,
 	)
 	if err != nil {
 		return domain.Alias{}, fmt.Errorf("rotate alias api key: %w", err)
@@ -170,7 +236,7 @@ func (s *Store) getAliasAfterWrite(id int64) (domain.Alias, error) {
 }
 
 func (s *Store) TouchAliasAccess(ctx context.Context, id int64, accessedAt time.Time) error {
-	result, err := s.db.ExecContext(ctx, `
+	result, err := s.execContext(ctx, `
 		UPDATE aliases SET last_accessed_at = ?, updated_at = ? WHERE id = ?`,
 		timestamp(accessedAt), timestamp(s.now()), id,
 	)
@@ -185,11 +251,12 @@ func (s *Store) TouchAliasLastAccessed(ctx context.Context, id int64, accessedAt
 }
 
 func (s *Store) UpdateAliasSyncStatus(ctx context.Context, id int64, status, syncError string, syncedAt *time.Time) error {
-	result, err := s.db.ExecContext(ctx, `
+	result, err := s.execContext(ctx, `
 		UPDATE aliases
 		SET last_sync_status = ?, last_sync_error = ?, last_synced_at = ?, updated_at = ?
 		WHERE id = ?`,
-		status, syncError, nullableTimestamp(syncedAt), timestamp(s.now()), id,
+		sanitizePostgresText(status), sanitizePostgresText(syncError),
+		nullableTimestamp(syncedAt), timestamp(s.now()), id,
 	)
 	if err != nil {
 		return fmt.Errorf("update alias sync status: %w", err)
@@ -198,15 +265,34 @@ func (s *Store) UpdateAliasSyncStatus(ctx context.Context, id int64, status, syn
 }
 
 func (s *Store) ResetAliasSnapshot(ctx context.Context, id int64) error {
+	var accountID int64
+	if err := s.queryRowContext(ctx,
+		`SELECT account_id FROM aliases WHERE id = ?`, id,
+	).Scan(&accountID); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("read alias account before reset: %w", err)
+	}
+
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("begin alias reset: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `DELETE FROM latest_messages WHERE alias_id = ?`, id); err != nil {
+	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
+	if err != nil {
+		return fmt.Errorf("lock alias account before reset: %w", err)
+	}
+	if _, err := s.txExecContext(ctx, tx,
+		`DELETE FROM imap_sync_states WHERE account_id = ?`, accountID,
+	); err != nil {
+		return fmt.Errorf("reset IMAP cursor for alias snapshot: %w", err)
+	}
+	if _, err := s.txExecContext(ctx, tx, `DELETE FROM latest_messages WHERE alias_id = ?`, id); err != nil {
 		return fmt.Errorf("delete alias snapshot: %w", err)
 	}
-	result, err := tx.ExecContext(ctx, `
+	result, err := s.txExecContext(ctx, tx, `
 		UPDATE aliases
 		SET last_sync_status = ?, last_sync_error = '', last_synced_at = NULL, updated_at = ?
 		WHERE id = ?`, domain.SyncStatusPending, timestamp(s.now()), id)
@@ -216,6 +302,9 @@ func (s *Store) ResetAliasSnapshot(ctx context.Context, id int64) error {
 	if err := requireAffected(result, "alias"); err != nil {
 		return err
 	}
+	if _, err := s.bumpAccountVersionTx(ctx, tx, accountID, accountVersion); err != nil {
+		return fmt.Errorf("advance account version after alias reset: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit alias reset: %w", err)
 	}
@@ -223,49 +312,108 @@ func (s *Store) ResetAliasSnapshot(ctx context.Context, id int64) error {
 }
 
 func (s *Store) SetAliasEnabled(ctx context.Context, id int64, enabled bool) error {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
-	if err != nil {
-		return fmt.Errorf("begin alias state update: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	result, err := tx.ExecContext(ctx, `
-		UPDATE aliases SET enabled = ?, updated_at = ?
-		WHERE id = ? AND (? = 0 OR (
-			SELECT COUNT(*) FROM aliases
-			WHERE account_id = (SELECT account_id FROM aliases WHERE id = ?)
-			  AND enabled = 1 AND id <> ?
-		) < ?)`, enabled, timestamp(s.now()), id, enabled,
-		id, id, domain.MaxEnabledAliasesPerAccount)
-	if err != nil {
+	if err := s.updateAliasState(ctx, id, nil, enabled); err != nil {
 		return fmt.Errorf("update alias state: %w", err)
 	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read alias state update result: %w", err)
-	}
-	if affected == 0 {
-		var exists int
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM aliases WHERE id = ?)`, id).Scan(&exists); err != nil {
-			return fmt.Errorf("check alias state update target: %w", err)
-		}
-		if exists == 0 {
+	return nil
+}
+
+func (s *Store) updateAliasState(ctx context.Context, id int64, label *string, enabled bool) error {
+	var accountID int64
+	if err := s.queryRowContext(ctx,
+		`SELECT account_id FROM aliases WHERE id = ?`, id,
+	).Scan(&accountID); err != nil {
+		if err == sql.ErrNoRows {
 			return ErrNotFound
 		}
-		return fmt.Errorf("update alias state: %w", ErrAliasLimit)
+		return fmt.Errorf("read alias account: %w", err)
 	}
-	if enabled {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM latest_messages WHERE alias_id = ?`, id); err != nil {
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
+	if err != nil {
+		return fmt.Errorf("lock alias account: %w", err)
+	}
+
+	var currentEnabled bool
+	if err := s.txQueryRowContext(ctx, tx,
+		`SELECT enabled FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
+	).Scan(&currentEnabled); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("read alias state: %w", err)
+	}
+	reenabled := enabled && !currentEnabled
+	if reenabled {
+		if err := s.requireEnabledAliasCapacity(ctx, tx, accountID); err != nil {
+			return err
+		}
+	}
+	if enabled != currentEnabled {
+		if _, err := s.bumpAccountVersionTx(ctx, tx, accountID, accountVersion); err != nil {
+			return fmt.Errorf("advance account version after alias state change: %w", err)
+		}
+	}
+
+	updates := make([]string, 0, 6)
+	args := make([]any, 0, 8)
+	if label != nil {
+		*label = strings.TrimSpace(sanitizePostgresText(*label))
+		updates = append(updates, "label = ?")
+		args = append(args, *label)
+	}
+	updates = append(updates, "enabled = ?")
+	args = append(args, enabled)
+	if reenabled {
+		updates = append(updates,
+			"last_sync_status = ?",
+			"last_sync_error = ''",
+			"last_synced_at = NULL",
+		)
+		args = append(args, domain.SyncStatusPending)
+	}
+	updates = append(updates, "updated_at = ?")
+	args = append(args, timestamp(s.now()), id)
+	result, err := s.txExecContext(ctx, tx,
+		`UPDATE aliases SET `+strings.Join(updates, ", ")+` WHERE id = ?`, args...,
+	)
+	if err != nil {
+		return fmt.Errorf("write alias: %w", err)
+	}
+	if err := requireAffected(result, "alias"); err != nil {
+		return err
+	}
+
+	if reenabled {
+		if _, err := s.txExecContext(ctx, tx, `DELETE FROM latest_messages WHERE alias_id = ?`, id); err != nil {
 			return fmt.Errorf("delete re-enabled alias snapshot: %w", err)
 		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE aliases
-			SET last_sync_status = ?, last_sync_error = '', last_synced_at = NULL
-			WHERE id = ?`, domain.SyncStatusPending, id); err != nil {
-			return fmt.Errorf("reset re-enabled alias status: %w", err)
+		if _, err := s.txExecContext(ctx, tx,
+			`DELETE FROM imap_sync_states WHERE account_id = ?`, accountID,
+		); err != nil {
+			return fmt.Errorf("reset IMAP cursor after alias re-enable: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit alias state update: %w", err)
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) requireEnabledAliasCapacity(ctx context.Context, tx *sql.Tx, accountID int64) error {
+	var count int
+	if err := s.txQueryRowContext(ctx, tx, `
+		SELECT COUNT(*) FROM aliases WHERE account_id = ? AND enabled = TRUE`, accountID,
+	).Scan(&count); err != nil {
+		return fmt.Errorf("count enabled aliases: %w", err)
+	}
+	if count >= domain.MaxEnabledAliasesPerAccount {
+		return ErrAliasLimit
 	}
 	return nil
 }
@@ -276,21 +424,33 @@ func (s *Store) ResetAccountAliasSnapshots(ctx context.Context, accountID int64)
 		return fmt.Errorf("begin account snapshot reset: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `
+	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
+	if err != nil {
+		return fmt.Errorf("lock account before snapshot reset: %w", err)
+	}
+	if _, err := s.txExecContext(ctx, tx, `DELETE FROM imap_sync_states WHERE account_id = ?`, accountID); err != nil {
+		return fmt.Errorf("delete account IMAP sync state: %w", err)
+	}
+	if _, err := s.txExecContext(ctx, tx, `
 		DELETE FROM latest_messages
 		WHERE alias_id IN (SELECT id FROM aliases WHERE account_id = ?)`, accountID); err != nil {
 		return fmt.Errorf("delete account snapshots: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `
+	if _, err := s.txExecContext(ctx, tx, `
 		UPDATE aliases
 		SET last_sync_status = ?, last_sync_error = '', last_synced_at = NULL, updated_at = ?
 		WHERE account_id = ?`, domain.SyncStatusPending, timestamp(s.now()), accountID); err != nil {
 		return fmt.Errorf("reset account alias statuses: %w", err)
 	}
-	result, err := tx.ExecContext(ctx, `
+	nextAccountVersion, err := s.nextAccountVersion(accountVersion)
+	if err != nil {
+		return fmt.Errorf("advance account version for snapshot reset: %w", err)
+	}
+	result, err := s.txExecContext(ctx, tx, `
 		UPDATE accounts
 		SET last_sync_status = ?, last_sync_error = '', last_synced_at = NULL, updated_at = ?
-		WHERE id = ?`, domain.SyncStatusPending, timestamp(s.now()), accountID)
+		WHERE id = ? AND updated_at = ?`,
+		domain.SyncStatusPending, nextAccountVersion, accountID, accountVersion)
 	if err != nil {
 		return fmt.Errorf("reset account sync status: %w", err)
 	}
@@ -305,7 +465,7 @@ func (s *Store) ResetAccountAliasSnapshots(ctx context.Context, accountID int64)
 
 func scanAlias(scanner rowScanner) (domain.Alias, error) {
 	var alias domain.Alias
-	var enabled int
+	var enabled bool
 	var lastSyncedAt, lastAccessedAt, latestReceivedAt sql.NullInt64
 	var createdAt, updatedAt int64
 	err := scanner.Scan(
@@ -320,7 +480,7 @@ func scanAlias(scanner rowScanner) (domain.Alias, error) {
 		}
 		return domain.Alias{}, fmt.Errorf("scan alias: %w", err)
 	}
-	alias.Enabled = enabled != 0
+	alias.Enabled = enabled
 	alias.LastSyncedAt = timePtr(lastSyncedAt)
 	alias.LastAccessedAt = timePtr(lastAccessedAt)
 	alias.CreatedAt = timeFromTimestamp(createdAt)

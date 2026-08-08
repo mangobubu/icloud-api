@@ -135,6 +135,8 @@
         class="batch-secrets-dialog"
         title="保存新隐私邮箱的 API Key"
         width="min(960px, calc(100vw - 28px))"
+        align-center
+        append-to-body
         :close-on-click-modal="false"
         :close-on-press-escape="false"
         :before-close="confirmBatchSecretsClose"
@@ -166,7 +168,12 @@
         </dl>
 
         <div class="data-panel batch-secret-table">
-          <el-table :data="batchSecrets" row-key="address" style="width: 100%">
+          <el-table
+            :data="batchSecrets"
+            :height="420"
+            row-key="address"
+            style="width: 100%"
+          >
             <el-table-column label="隐私邮箱" min-width="220">
               <template #default="{ row }">
                 <strong class="batch-secret-value">{{ row.address }}</strong>
@@ -830,7 +837,11 @@ async function syncNow() {
     if (!isCurrentAccount(accountId)) return;
     account.value = detail.account;
     aliases.value = detail.aliases;
-    successMessage("同步已完成。");
+    if (detail.syncPending) {
+      ElMessage({ type: "warning", message: "已提交一批，仍在追平。" });
+    } else {
+      successMessage("同步已完成。");
+    }
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;
     showRequestError(error, "同步失败，请检查连接状态。");

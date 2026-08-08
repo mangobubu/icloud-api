@@ -676,8 +676,8 @@ func TestUpdatingIMAPPasswordSetsEveryAliasPending(t *testing.T) {
 		if alias.LastSyncStatus != domain.SyncStatusPending || alias.LastSyncError != "" || alias.LastSyncedAt != nil {
 			t.Errorf("alias %q state after password update = %#v, want pending", alias.Address, alias)
 		}
-		if _, err := env.store.GetLatestMessage(context.Background(), alias.ID); !errors.Is(err, store.ErrNotFound) {
-			t.Errorf("alias %q retained old snapshot after password update: %v", alias.Address, err)
+		if _, err := env.store.GetLatestMessage(context.Background(), alias.ID); err != nil {
+			t.Errorf("alias %q lost its pending same-generation snapshot after password update: %v", alias.Address, err)
 		}
 	}
 	account, err := env.store.GetAccount(context.Background(), mailboxes.accountA.ID)
@@ -698,7 +698,7 @@ func TestUpdatingIMAPPasswordSetsEveryAliasPending(t *testing.T) {
 		apiResponse := env.apiRequest(t, "/api/v1/mail/latest", key)
 		assertAPIError(t, apiResponse, http.StatusServiceUnavailable, "SYNC_UNAVAILABLE")
 		if strings.Contains(apiResponse.Body.String(), "snapshot") {
-			t.Fatal("API exposed a cleared snapshot after IMAP password update")
+			t.Fatal("API exposed a retained internal snapshot while IMAP resync was pending")
 		}
 	}
 }
