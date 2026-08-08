@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -118,6 +119,58 @@ func TestInitializeCipherStopsOnStoredMismatchBeforeImportAndClearsKey(t *testin
 	}
 	if !bytes.Equal(key, make([]byte, len(key))) {
 		t.Fatal("master key was not cleared after mismatch")
+	}
+}
+
+func TestInitializeCipherLabelsLegacySQLiteInitializationError(t *testing.T) {
+	t.Parallel()
+	key := bytes.Repeat([]byte{0x55}, 32)
+	sourceErr := errors.New("read legacy SQLite database: unable to open database file (14)")
+	database := &fakeStartupStore{
+		expectedKey: append([]byte(nil), key...),
+		storedErr:   fmt.Errorf("%w: %w", store.ErrLegacySQLiteImport, sourceErr),
+	}
+
+	cipher, err := initializeCipherWithStore(
+		context.Background(), database, key, " /app/legacy/icloud-api.db ",
+	)
+	if cipher != nil || err == nil {
+		t.Fatalf("legacy SQLite initialization result = (%v, %v), want nil cipher and error", cipher, err)
+	}
+	if !errors.Is(err, sourceErr) {
+		t.Fatalf("legacy SQLite initialization error does not wrap source: %v", err)
+	}
+	for _, want := range []string{
+		"迁移旧 SQLite 数据并校验 PostgreSQL 主密钥",
+		`/app/legacy/icloud-api.db`,
+		"read legacy SQLite database",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("legacy SQLite initialization error %q lacks %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "校验 PostgreSQL 主密钥指纹:") {
+		t.Fatalf("legacy SQLite initialization retained misleading fingerprint-only prefix: %v", err)
+	}
+	if !bytes.Equal(key, make([]byte, len(key))) {
+		t.Fatal("master key was not cleared after legacy SQLite initialization failure")
+	}
+}
+
+func TestMasterKeyVerificationErrorKeepsFingerprintContextForPostgreSQLErrors(t *testing.T) {
+	t.Parallel()
+	for _, legacyPath := range []string{"", "/app/legacy/icloud-api.db"} {
+		sourceErr := errors.New("read stored master key fingerprint: unavailable")
+		err := masterKeyVerificationError(sourceErr, legacyPath)
+		if !errors.Is(err, sourceErr) {
+			t.Fatalf("master key verification error does not wrap source: %v", err)
+		}
+		if !strings.Contains(err.Error(), "校验 PostgreSQL 主密钥指纹:") {
+			t.Fatalf("master key verification error lacks fingerprint context: %v", err)
+		}
+		if strings.Contains(err.Error(), "旧 SQLite") {
+			t.Fatalf("PostgreSQL error unexpectedly labeled as legacy SQLite migration: %v", err)
+		}
 	}
 }
 

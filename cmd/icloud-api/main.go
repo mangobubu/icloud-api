@@ -184,14 +184,20 @@ func initializeCipherWithStore(
 	if err := database.InitializeMasterKeyWithLegacySQLite(
 		ctx, masterKey, legacySQLitePath, cipher,
 	); err != nil {
-		return nil, masterKeyVerificationError(err)
+		return nil, masterKeyVerificationError(err, legacySQLitePath)
 	}
 	return cipher, nil
 }
 
-func masterKeyVerificationError(err error) error {
+func masterKeyVerificationError(err error, legacySQLitePath string) error {
 	if errors.Is(err, store.ErrMasterKeyMismatch) {
 		return fmt.Errorf("主密钥与 PostgreSQL 数据库不匹配；请恢复与该数据库配套的 keys 卷或原 ICLOUD_API_MASTER_KEY: %w", err)
+	}
+	if errors.Is(err, store.ErrLegacySQLiteImport) {
+		if legacySQLitePath = strings.TrimSpace(legacySQLitePath); legacySQLitePath != "" {
+			return fmt.Errorf("迁移旧 SQLite 数据并校验 PostgreSQL 主密钥（路径 %q）: %w", legacySQLitePath, err)
+		}
+		return fmt.Errorf("迁移旧 SQLite 数据并校验 PostgreSQL 主密钥: %w", err)
 	}
 	return fmt.Errorf("校验 PostgreSQL 主密钥指纹: %w", err)
 }

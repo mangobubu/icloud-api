@@ -108,6 +108,12 @@ Compose 会先等待 PostgreSQL 健康，再启动应用。首次启动由应用
 
 升级时，原命名卷 `icloud_api_data` 会只读挂载到 `/app/legacy`。如果其中存在 `/app/legacy/icloud-api.db`，且新的 PostgreSQL 业务表仍为空，应用会在启动阶段自动把管理员、后台会话、主号、隐私邮箱、最新邮件快照、审计记录和 Apple Web 会话复制到 PostgreSQL。导入使用事务、数据库级互斥锁和完成标记；成功后重复启动不会重复写入。旧 SQLite 文件不存在时会直接跳过。
 
+旧版数据库采用 SQLite WAL 模式。迁移前必须停止所有仍可能写入旧库的应用和临时容器，确认没有其他读写挂载，并让 `icloud_api_data` 在整个迁移期间保持只读；程序还会在读取前后复核主文件及 sidecar 状态，发现变化就回滚导入。对于已干净关闭、且同时不存在 `icloud-api.db-wal`、`icloud-api.db-shm` 和 `icloud-api.db-journal` 的快照，程序会在不修改旧卷的前提下安全只读导入。只要任一 sidecar 存在，就必须将主文件和全部 sidecar 作为同一快照完整保留，并确保容器 UID `10001` 可读；WAL 快照的 `-wal` 和 `-shm` 必须同时存在，且不能混有 rollback journal。主文件和 sidecar 都必须是普通文件，不接受符号链接。
+
+不得删除、截断或改名 sidecar，也不得使用 `immutable` 强制忽略它们，否则可能丢失尚未写回主文件的数据。如果保存的快照只有 `-wal`、只有 `-shm`，或同时存在 WAL 与 rollback journal，不要自行补建或清理文件；应回到同一恢复点取得完整快照后再迁移。
+
+如果日志出现 `unable to open database file (14)`，先停止 `icloud-api` 应用，再核对旧卷是否挂载到 `/app/legacy`、目录和主文件的 UID/权限，以及所有 sidecar 的存在性、大小和可读性。在完成这些核对前，不要对旧卷或 sidecar 执行任何“清理”。
+
 升级前保留旧 `.env` 中的 `ICLOUD_API_ADMIN_USER`、`ICLOUD_API_ADMIN_PASSWORD`、`ICLOUD_API_OAUTH_TOKEN` 和 `ICLOUD_API_MASTER_KEY`。管理员记录及密码哈希会从 SQLite 原样导入，修改环境变量不会覆盖已有管理员；检测到旧 SQLite 时，入口也不会生成一个实际无法登录旧管理员的假密码，仍应使用原管理员密码。OAuth Token 原本不在数据库中，改变它会让旧调用方立即失效；IMAP 凭据和 Apple Web 会话密文则必须使用原主密钥解密。
 
 如果旧部署使用文件主密钥，并且 `/app/legacy/icloud-api.db.key` 与旧数据库同时存在，首次 PostgreSQL 引导会在没有显式 `ICLOUD_API_MASTER_KEY`、且 `icloud_api_keys` 中也没有 `master.key` 时复制旧密钥；已恢复的密钥文件和显式配置始终优先，不会被旧卷覆盖。如果检测到旧 SQLite 数据库但既没有该 `.key` 文件，也没有原环境变量主密钥，应用会停止启动，不会生成错误的新密钥。导入成功并完成登录、IMAP 同步和 API 验证前，保留 `icloud_api_data` 卷作为回退副本。

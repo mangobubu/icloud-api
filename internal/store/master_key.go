@@ -79,7 +79,7 @@ func (s *Store) InitializeMasterKeyWithLegacySQLite(
 	}
 	imported, err := s.importLegacySQLiteWithValidatorTx(ctx, tx, legacyPath, validator, true)
 	if err != nil {
-		return err
+		return wrapLegacySQLiteImportError(err)
 	}
 	if !bound || imported {
 		if err := validateStoredCiphertexts(ctx, tx, validator); err != nil {

@@ -17,6 +17,21 @@ const (
 	legacySQLiteMigrationName = "legacy_sqlite_import_v1"
 )
 
+// ErrLegacySQLiteImport identifies startup failures from the one-time SQLite
+// migration, while preserving the underlying error for diagnostics.
+var ErrLegacySQLiteImport = errors.New("legacy SQLite import failed")
+
+var legacySQLiteSidecarSuffixes = [...]string{"-wal", "-shm", "-journal"}
+
+type legacySQLiteSidecarState struct {
+	files map[string]os.FileInfo
+}
+
+type legacySQLiteSourceState struct {
+	database os.FileInfo
+	sidecars legacySQLiteSidecarState
+}
+
 type legacyCopySpec struct {
 	table          string
 	selectSQL      string
@@ -68,7 +83,7 @@ func (s *Store) ImportLegacySQLiteWithValidator(
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := s.importLegacySQLiteWithValidatorTx(ctx, tx, legacyPath, validator, false); err != nil {
-		return err
+		return wrapLegacySQLiteImportError(err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit legacy SQLite import: %w", err)
@@ -106,20 +121,18 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 		return false, nil
 	}
 
-	dsn, sourcePath, err := legacySQLiteReadOnlyDSN(legacyPath)
+	sourcePath, err := resolveLegacySQLitePath(legacyPath)
 	if err != nil {
 		return false, err
 	}
-	info, err := os.Stat(sourcePath)
-	if errors.Is(err, os.ErrNotExist) {
+	sourceState, sourceExists, err := inspectLegacySQLiteSource(sourcePath)
+	if err != nil {
+		return false, err
+	}
+	if !sourceExists {
 		return false, nil
 	}
-	if err != nil {
-		return false, fmt.Errorf("inspect legacy SQLite database: %w", err)
-	}
-	if info.IsDir() {
-		return false, fmt.Errorf("legacy SQLite path is a directory: %s", sourcePath)
-	}
+	dsn := legacySQLiteReadOnlyDSNForResolvedPath(sourcePath, sourceState.sidecars.hasAny())
 	if !allowBound {
 		var fingerprintExists bool
 		if err := tx.QueryRowContext(ctx, `
@@ -148,6 +161,9 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 	}
 	if targetHasData {
 		return false, errors.New("legacy SQLite import requires empty PostgreSQL business tables")
+	}
+	if err := verifyLegacySQLiteSourceUnchanged(sourcePath, sourceState); err != nil {
+		return false, err
 	}
 
 	legacyDB, err := sql.Open("sqlite", dsn)
@@ -215,6 +231,9 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 
 	if err := legacyTx.Commit(); err != nil {
 		return false, fmt.Errorf("finish legacy SQLite snapshot: %w", err)
+	}
+	if err := verifyLegacySQLiteSourceUnchanged(sourcePath, sourceState); err != nil {
+		return false, err
 	}
 	if err := markLegacySQLiteMigration(ctx, tx, s); err != nil {
 		return false, err
@@ -546,21 +565,40 @@ func markLegacySQLiteMigration(ctx context.Context, tx *sql.Tx, s *Store) error 
 	return nil
 }
 
+func wrapLegacySQLiteImportError(err error) error {
+	if errors.Is(err, ErrLegacySQLiteImport) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrLegacySQLiteImport, err)
+}
+
 func legacySQLiteReadOnlyDSN(path string) (dsn, resolvedPath string, err error) {
+	resolvedPath, err = resolveLegacySQLitePath(path)
+	if err != nil {
+		return "", "", err
+	}
+	sidecars, err := inspectLegacySQLiteSidecars(resolvedPath)
+	if err != nil {
+		return "", "", err
+	}
+	return legacySQLiteReadOnlyDSNForResolvedPath(resolvedPath, sidecars.hasAny()), resolvedPath, nil
+}
+
+func resolveLegacySQLitePath(path string) (resolvedPath string, err error) {
 	resolvedPath = path
 	if len(path) >= len("file:") && strings.EqualFold(path[:len("file:")], "file:") {
 		u, parseErr := url.Parse(path)
 		if parseErr != nil {
-			return "", "", fmt.Errorf("parse legacy SQLite path: %w", parseErr)
+			return "", fmt.Errorf("parse legacy SQLite path: %w", parseErr)
 		}
 		if u.Host != "" && u.Host != "localhost" {
-			return "", "", fmt.Errorf("legacy SQLite URL host is unsupported: %s", u.Host)
+			return "", fmt.Errorf("legacy SQLite URL host is unsupported: %s", u.Host)
 		}
 		decodedPath := u.Path
 		if decodedPath == "" && u.Opaque != "" {
 			decodedPath, err = url.PathUnescape(u.Opaque)
 			if err != nil {
-				return "", "", fmt.Errorf("decode legacy SQLite path: %w", err)
+				return "", fmt.Errorf("decode legacy SQLite path: %w", err)
 			}
 		}
 		resolvedPath = filepath.FromSlash(decodedPath)
@@ -569,12 +607,16 @@ func legacySQLiteReadOnlyDSN(path string) (dsn, resolvedPath string, err error) 
 		}
 	}
 	if resolvedPath == "" {
-		return "", "", errors.New("legacy SQLite path is empty")
+		return "", errors.New("legacy SQLite path is empty")
 	}
 	resolvedPath, err = filepath.Abs(resolvedPath)
 	if err != nil {
-		return "", "", fmt.Errorf("resolve legacy SQLite path: %w", err)
+		return "", fmt.Errorf("resolve legacy SQLite path: %w", err)
 	}
+	return resolvedPath, nil
+}
+
+func legacySQLiteReadOnlyDSNForResolvedPath(resolvedPath string, hasSidecars bool) string {
 	normalized := filepath.ToSlash(resolvedPath)
 	if !strings.HasPrefix(normalized, "/") {
 		normalized = "/" + normalized
@@ -582,8 +624,131 @@ func legacySQLiteReadOnlyDSN(path string) (dsn, resolvedPath string, err error) 
 	u := &url.URL{Scheme: "file", Path: normalized}
 	query := u.Query()
 	query.Set("mode", "ro")
+	if !hasSidecars {
+		// A cleanly closed WAL database keeps WAL mode in its header after SQLite
+		// removes the WAL/SHM files. immutable lets that snapshot open from the
+		// read-only legacy volume without creating new sidecars. Never use it when
+		// any journal sidecar exists, because immutable would silently ignore WAL.
+		query.Set("immutable", "1")
+	}
 	query.Add("_pragma", "query_only(1)")
 	query.Add("_pragma", "busy_timeout(5000)")
 	u.RawQuery = query.Encode()
-	return u.String(), resolvedPath, nil
+	return u.String()
+}
+
+func inspectLegacySQLiteSidecars(databasePath string) (legacySQLiteSidecarState, error) {
+	state := legacySQLiteSidecarState{files: make(map[string]os.FileInfo)}
+	for _, suffix := range legacySQLiteSidecarSuffixes {
+		sidecarPath := databasePath + suffix
+		info, err := os.Lstat(sidecarPath)
+		if err == nil {
+			if !info.Mode().IsRegular() {
+				return legacySQLiteSidecarState{}, fmt.Errorf(
+					"legacy SQLite sidecar is not a regular file: %s",
+					sidecarPath,
+				)
+			}
+			state.files[suffix] = info
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return legacySQLiteSidecarState{}, fmt.Errorf(
+				"inspect legacy SQLite sidecar %s: %w",
+				sidecarPath,
+				err,
+			)
+		}
+	}
+
+	hasWAL := state.has("-wal")
+	hasSHM := state.has("-shm")
+	if hasWAL != hasSHM {
+		return legacySQLiteSidecarState{}, fmt.Errorf(
+			"legacy SQLite WAL snapshot is incomplete: %s-wal and %s-shm must either both exist or both be absent",
+			databasePath,
+			databasePath,
+		)
+	}
+	if hasWAL && state.has("-journal") {
+		return legacySQLiteSidecarState{}, fmt.Errorf(
+			"legacy SQLite snapshot mixes WAL and rollback journal sidecars: %s",
+			databasePath,
+		)
+	}
+	return state, nil
+}
+
+func inspectLegacySQLiteSource(path string) (legacySQLiteSourceState, bool, error) {
+	database, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		sidecars, sidecarErr := inspectLegacySQLiteSidecars(path)
+		if sidecarErr != nil {
+			return legacySQLiteSourceState{}, false, sidecarErr
+		}
+		if sidecars.hasAny() {
+			return legacySQLiteSourceState{}, false, fmt.Errorf(
+				"legacy SQLite database is missing while journal sidecars exist: %s",
+				path,
+			)
+		}
+		return legacySQLiteSourceState{}, false, nil
+	}
+	if err != nil {
+		return legacySQLiteSourceState{}, false, fmt.Errorf("inspect legacy SQLite database: %w", err)
+	}
+	if database.IsDir() {
+		return legacySQLiteSourceState{}, false, fmt.Errorf("legacy SQLite path is a directory: %s", path)
+	}
+	if !database.Mode().IsRegular() {
+		return legacySQLiteSourceState{}, false, fmt.Errorf(
+			"legacy SQLite path is not a regular file: %s",
+			path,
+		)
+	}
+
+	sidecars, err := inspectLegacySQLiteSidecars(path)
+	if err != nil {
+		return legacySQLiteSourceState{}, false, err
+	}
+	return legacySQLiteSourceState{database: database, sidecars: sidecars}, true, nil
+}
+
+func verifyLegacySQLiteSourceUnchanged(path string, expected legacySQLiteSourceState) error {
+	actual, exists, err := inspectLegacySQLiteSource(path)
+	if err != nil {
+		return fmt.Errorf("reinspect legacy SQLite source before import commit: %w", err)
+	}
+	if !exists || !legacySQLiteFileStateEqual(expected.database, actual.database) ||
+		!expected.sidecars.equal(actual.sidecars) {
+		return errors.New(
+			"legacy SQLite source changed during import; stop every process with write access and retry",
+		)
+	}
+	return nil
+}
+
+func (state legacySQLiteSidecarState) has(suffix string) bool {
+	_, exists := state.files[suffix]
+	return exists
+}
+
+func (state legacySQLiteSidecarState) hasAny() bool {
+	return len(state.files) != 0
+}
+
+func (state legacySQLiteSidecarState) equal(other legacySQLiteSidecarState) bool {
+	for _, suffix := range legacySQLiteSidecarSuffixes {
+		left, leftExists := state.files[suffix]
+		right, rightExists := other.files[suffix]
+		if leftExists != rightExists || leftExists && !legacySQLiteFileStateEqual(left, right) {
+			return false
+		}
+	}
+	return true
+}
+
+func legacySQLiteFileStateEqual(left, right os.FileInfo) bool {
+	return os.SameFile(left, right) &&
+		left.Mode() == right.Mode() &&
+		left.Size() == right.Size() &&
+		left.ModTime().Equal(right.ModTime())
 }

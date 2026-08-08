@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -67,8 +68,8 @@ func TestLegacySQLiteReadOnlyDSN(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse read-only DSN: %v", err)
 	}
-	if parsed.Query().Get("immutable") != "" {
-		t.Fatalf("read-only DSN unexpectedly disables SQLite locking: %q", dsn)
+	if parsed.Query().Get("immutable") != "1" {
+		t.Fatalf("clean read-only snapshot is not immutable: %q", dsn)
 	}
 
 	readOnly, err := sql.Open("sqlite", dsn)
@@ -92,6 +93,205 @@ func TestLegacySQLiteReadOnlyDSN(t *testing.T) {
 	}
 	if _, err := readOnly.ExecContext(ctx, `DELETE FROM fixture`); err == nil {
 		t.Fatal("read-only fixture unexpectedly accepted a write")
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNOpensCleanWALDatabaseFromReadOnlyDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("read-only directory permissions are POSIX-specific")
+	}
+
+	ctx := context.Background()
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "legacy.db")
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open WAL fixture: %v", err)
+	}
+	var journalMode string
+	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode = WAL`).Scan(&journalMode); err != nil {
+		_ = db.Close()
+		t.Fatalf("enable WAL fixture: %v", err)
+	}
+	if strings.ToLower(journalMode) != "wal" {
+		_ = db.Close()
+		t.Fatalf("fixture journal mode = %q, want wal", journalMode)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE fixture(value TEXT NOT NULL);
+		INSERT INTO fixture(value) VALUES('preserved');
+	`); err != nil {
+		_ = db.Close()
+		t.Fatalf("write WAL fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close WAL fixture: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Lstat(databasePath + suffix); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cleanly closed fixture retained %s sidecar: %v", suffix, err)
+		}
+	}
+
+	if err := os.Chmod(databasePath, 0o400); err != nil {
+		t.Fatalf("make WAL fixture read-only: %v", err)
+	}
+	if err := os.Chmod(directory, 0o500); err != nil {
+		t.Fatalf("make WAL fixture directory read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+
+	dsn, _, err := legacySQLiteReadOnlyDSN(databasePath)
+	if err != nil {
+		t.Fatalf("build read-only WAL DSN: %v", err)
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse read-only WAL DSN: %v", err)
+	}
+	if parsed.Query().Get("immutable") != "1" {
+		t.Fatalf("clean WAL snapshot is not immutable: %q", dsn)
+	}
+	readOnly, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open read-only WAL fixture: %v", err)
+	}
+	defer readOnly.Close()
+	var value string
+	if err := readOnly.QueryRowContext(ctx, `SELECT value FROM fixture`).Scan(&value); err != nil {
+		t.Fatalf("read clean WAL fixture from read-only directory: %v", err)
+	}
+	if value != "preserved" {
+		t.Fatalf("read-only WAL fixture value = %q, want preserved", value)
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNReadsUncheckpointedWALFromReadOnlyDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("read-only directory permissions are POSIX-specific")
+	}
+
+	ctx := context.Background()
+	sourceDirectory := t.TempDir()
+	sourcePath := filepath.Join(sourceDirectory, "legacy.db")
+	sourceDB, err := sql.Open("sqlite", sourcePath)
+	if err != nil {
+		t.Fatalf("open WAL source: %v", err)
+	}
+	t.Cleanup(func() { _ = sourceDB.Close() })
+	sourceConn, err := sourceDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("reserve WAL source connection: %v", err)
+	}
+	t.Cleanup(func() { _ = sourceConn.Close() })
+
+	var journalMode string
+	if err := sourceConn.QueryRowContext(ctx, `PRAGMA journal_mode = WAL`).Scan(&journalMode); err != nil {
+		t.Fatalf("enable WAL source: %v", err)
+	}
+	if strings.ToLower(journalMode) != "wal" {
+		t.Fatalf("source journal mode = %q, want wal", journalMode)
+	}
+	if _, err := sourceConn.ExecContext(ctx, `CREATE TABLE fixture(value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create WAL source schema: %v", err)
+	}
+	var busy, logFrames, checkpointedFrames int
+	if err := sourceConn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(
+		&busy, &logFrames, &checkpointedFrames,
+	); err != nil {
+		t.Fatalf("checkpoint WAL source schema: %v", err)
+	}
+	if busy != 0 || logFrames != 0 || checkpointedFrames != 0 {
+		t.Fatalf(
+			"schema checkpoint result = busy:%d log:%d checkpointed:%d, want 0:0:0",
+			busy, logFrames, checkpointedFrames,
+		)
+	}
+	if _, err := sourceConn.ExecContext(ctx, `PRAGMA wal_autocheckpoint = 0`); err != nil {
+		t.Fatalf("disable automatic WAL checkpoints: %v", err)
+	}
+	if _, err := sourceConn.ExecContext(ctx, `INSERT INTO fixture(value) VALUES('wal-only')`); err != nil {
+		t.Fatalf("insert WAL-only row: %v", err)
+	}
+	if info, err := os.Stat(sourcePath + "-wal"); err != nil {
+		t.Fatalf("inspect uncheckpointed WAL: %v", err)
+	} else if info.Size() <= 32 {
+		t.Fatalf("uncheckpointed WAL size = %d, want header and at least one frame", info.Size())
+	}
+
+	copyFixture := func(source, destination string) {
+		t.Helper()
+		contents, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatalf("read SQLite snapshot file %s: %v", source, err)
+		}
+		if err := os.WriteFile(destination, contents, 0o600); err != nil {
+			t.Fatalf("write SQLite snapshot file %s: %v", destination, err)
+		}
+	}
+
+	mainOnlyDirectory := t.TempDir()
+	mainOnlyPath := filepath.Join(mainOnlyDirectory, "legacy.db")
+	copyFixture(sourcePath, mainOnlyPath)
+	mainOnlyURL := &url.URL{Scheme: "file", Path: filepath.ToSlash(mainOnlyPath)}
+	mainOnlyQuery := mainOnlyURL.Query()
+	mainOnlyQuery.Set("mode", "ro")
+	mainOnlyQuery.Set("immutable", "1")
+	mainOnlyURL.RawQuery = mainOnlyQuery.Encode()
+	mainOnly, err := sql.Open("sqlite", mainOnlyURL.String())
+	if err != nil {
+		t.Fatalf("open main-only snapshot: %v", err)
+	}
+	var mainOnlyRows int
+	if err := mainOnly.QueryRowContext(ctx, `SELECT COUNT(*) FROM fixture`).Scan(&mainOnlyRows); err != nil {
+		_ = mainOnly.Close()
+		t.Fatalf("read main-only snapshot: %v", err)
+	}
+	if err := mainOnly.Close(); err != nil {
+		t.Fatalf("close main-only snapshot: %v", err)
+	}
+	if mainOnlyRows != 0 {
+		t.Fatalf("main database already contains %d rows, want WAL-only row", mainOnlyRows)
+	}
+
+	snapshotDirectory := t.TempDir()
+	snapshotPath := filepath.Join(snapshotDirectory, "legacy.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		copyFixture(sourcePath+suffix, snapshotPath+suffix)
+	}
+	for _, path := range []string{snapshotPath, snapshotPath + "-wal", snapshotPath + "-shm"} {
+		if err := os.Chmod(path, 0o400); err != nil {
+			t.Fatalf("make SQLite snapshot file read-only: %v", err)
+		}
+	}
+	if err := os.Chmod(snapshotDirectory, 0o500); err != nil {
+		t.Fatalf("make SQLite snapshot directory read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(snapshotDirectory, 0o700) })
+
+	dsn, _, err := legacySQLiteReadOnlyDSN(snapshotPath)
+	if err != nil {
+		t.Fatalf("build WAL snapshot DSN: %v", err)
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse WAL snapshot DSN: %v", err)
+	}
+	if parsed.Query().Get("immutable") != "" {
+		t.Fatalf("DSN would ignore an uncheckpointed WAL: %q", dsn)
+	}
+
+	readOnly, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open WAL snapshot: %v", err)
+	}
+	defer readOnly.Close()
+	var value string
+	if err := readOnly.QueryRowContext(ctx, `SELECT value FROM fixture`).Scan(&value); err != nil {
+		t.Fatalf("read row from uncheckpointed WAL: %v", err)
+	}
+	if value != "wal-only" {
+		t.Fatalf("WAL snapshot value = %q, want wal-only", value)
 	}
 }
 
@@ -186,6 +386,11 @@ func TestLegacySQLiteReadOnlyDSNDropsUnsafeURIOptions(t *testing.T) {
 	query.Set("immutable", "1")
 	query.Add("_pragma", "journal_mode(WAL)")
 	legacyURL.RawQuery = query.Encode()
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(databasePath+suffix, []byte("pending WAL state"), 0o600); err != nil {
+			t.Fatalf("create %s fixture: %v", suffix, err)
+		}
+	}
 
 	dsn, resolvedPath, err := legacySQLiteReadOnlyDSN(legacyURL.String())
 	if err != nil {
@@ -211,20 +416,187 @@ func TestLegacySQLiteReadOnlyDSNDropsUnsafeURIOptions(t *testing.T) {
 func TestLegacySQLiteReadOnlyDSNNeverIgnoresSQLiteJournals(t *testing.T) {
 	t.Parallel()
 
+	tests := []struct {
+		name     string
+		suffixes []string
+	}{
+		{name: "WAL snapshot", suffixes: []string{"-wal", "-shm"}},
+		{name: "rollback journal", suffixes: []string{"-journal"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			databasePath := filepath.Join(t.TempDir(), "legacy.db")
+			for _, suffix := range test.suffixes {
+				if err := os.WriteFile(databasePath+suffix, []byte("pending SQLite sidecar"), 0o600); err != nil {
+					t.Fatalf("create %s fixture: %v", suffix, err)
+				}
+			}
+			dsn, _, err := legacySQLiteReadOnlyDSN(databasePath)
+			if err != nil {
+				t.Fatalf("build read-only DSN: %v", err)
+			}
+			parsed, err := url.Parse(dsn)
+			if err != nil {
+				t.Fatalf("parse read-only DSN: %v", err)
+			}
+			if parsed.Query().Get("immutable") != "" {
+				t.Fatalf("DSN would ignore existing %s: %q", test.name, dsn)
+			}
+		})
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNRejectsIncompleteJournalState(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		suffixes []string
+	}{
+		{name: "WAL without SHM", suffixes: []string{"-wal"}},
+		{name: "SHM without WAL", suffixes: []string{"-shm"}},
+		{name: "WAL mixed with rollback journal", suffixes: []string{"-wal", "-shm", "-journal"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			databasePath := filepath.Join(t.TempDir(), "legacy.db")
+			for _, suffix := range test.suffixes {
+				if err := os.WriteFile(databasePath+suffix, []byte("SQLite sidecar"), 0o600); err != nil {
+					t.Fatalf("create %s fixture: %v", suffix, err)
+				}
+			}
+			if _, _, err := legacySQLiteReadOnlyDSN(databasePath); err == nil {
+				t.Fatalf("incomplete journal state %v was accepted", test.suffixes)
+			}
+		})
+	}
+}
+
+func TestInspectLegacySQLiteSourceRejectsOrphanSidecars(t *testing.T) {
+	t.Parallel()
+
 	databasePath := filepath.Join(t.TempDir(), "legacy.db")
-	if err := os.WriteFile(databasePath+"-wal", []byte("pending WAL"), 0o600); err != nil {
-		t.Fatalf("create WAL fixture: %v", err)
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(databasePath+suffix, []byte("orphan WAL state"), 0o600); err != nil {
+			t.Fatalf("create orphan %s: %v", suffix, err)
+		}
 	}
-	dsn, _, err := legacySQLiteReadOnlyDSN(databasePath)
-	if err != nil {
-		t.Fatalf("build read-only DSN: %v", err)
+	if _, _, err := inspectLegacySQLiteSource(databasePath); err == nil ||
+		!strings.Contains(err.Error(), "database is missing") {
+		t.Fatalf("orphan SQLite source error = %v", err)
 	}
-	parsed, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatalf("parse read-only DSN: %v", err)
+}
+
+func TestVerifyLegacySQLiteSourceUnchangedDetectsChanges(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{
+			name: "database content",
+			mutate: func(t *testing.T, databasePath string) {
+				t.Helper()
+				if err := os.WriteFile(databasePath, []byte("changed source contents"), 0o600); err != nil {
+					t.Fatalf("change source fixture: %v", err)
+				}
+			},
+		},
+		{
+			name: "new journal sidecar",
+			mutate: func(t *testing.T, databasePath string) {
+				t.Helper()
+				if err := os.WriteFile(databasePath+"-journal", []byte("new journal"), 0o600); err != nil {
+					t.Fatalf("create concurrent journal fixture: %v", err)
+				}
+			},
+		},
 	}
-	if parsed.Query().Get("immutable") != "" {
-		t.Fatalf("DSN would ignore an existing WAL: %q", dsn)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			databasePath := filepath.Join(t.TempDir(), "legacy.db")
+			if err := os.WriteFile(databasePath, []byte("stable source"), 0o600); err != nil {
+				t.Fatalf("create source fixture: %v", err)
+			}
+			state, exists, err := inspectLegacySQLiteSource(databasePath)
+			if err != nil || !exists {
+				t.Fatalf("inspect source fixture = (%v, %v), want existing source", exists, err)
+			}
+			if err := verifyLegacySQLiteSourceUnchanged(databasePath, state); err != nil {
+				t.Fatalf("unchanged source rejected: %v", err)
+			}
+
+			test.mutate(t, databasePath)
+			if err := verifyLegacySQLiteSourceUnchanged(databasePath, state); err == nil ||
+				!strings.Contains(err.Error(), "source changed during import") {
+				t.Fatalf("changed source verification error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNRejectsNonRegularSidecars(t *testing.T) {
+	tests := []struct {
+		name                   string
+		suffix                 string
+		kind                   string
+		precedingRegularSuffix string
+		windowsSkip            bool
+	}{
+		{name: "WAL directory", suffix: "-wal", kind: "directory"},
+		{
+			name:                   "SHM symbolic link after regular WAL",
+			suffix:                 "-shm",
+			kind:                   "symlink",
+			precedingRegularSuffix: "-wal",
+			windowsSkip:            true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.windowsSkip && runtime.GOOS == "windows" {
+				t.Skip("symbolic link creation may require elevated privileges on Windows")
+			}
+
+			directory := t.TempDir()
+			databasePath := filepath.Join(directory, "legacy.db")
+			sidecarPath := databasePath + test.suffix
+			if test.precedingRegularSuffix != "" {
+				if err := os.WriteFile(
+					databasePath+test.precedingRegularSuffix,
+					[]byte("regular preceding sidecar"),
+					0o600,
+				); err != nil {
+					t.Fatalf("create preceding regular sidecar: %v", err)
+				}
+			}
+			switch test.kind {
+			case "directory":
+				if err := os.Mkdir(sidecarPath, 0o700); err != nil {
+					t.Fatalf("create sidecar directory: %v", err)
+				}
+			case "symlink":
+				targetPath := filepath.Join(directory, "sidecar-target")
+				if err := os.WriteFile(targetPath, []byte("sidecar"), 0o600); err != nil {
+					t.Fatalf("create sidecar link target: %v", err)
+				}
+				if err := os.Symlink(targetPath, sidecarPath); err != nil {
+					t.Fatalf("create sidecar symbolic link: %v", err)
+				}
+			default:
+				t.Fatalf("unknown sidecar fixture kind %q", test.kind)
+			}
+
+			if _, _, err := legacySQLiteReadOnlyDSN(databasePath); err == nil {
+				t.Fatalf("non-regular %s sidecar was accepted", test.suffix)
+			} else if !strings.Contains(err.Error(), "not a regular file") ||
+				!strings.Contains(err.Error(), sidecarPath) {
+				t.Fatalf("non-regular %s sidecar error = %v", test.suffix, err)
+			}
+		})
 	}
 }
 
@@ -235,6 +607,19 @@ func TestImportLegacySQLiteRequiresCiphertextValidator(t *testing.T) {
 	if err := database.ImportLegacySQLite(context.Background(), "legacy.db"); err == nil ||
 		!strings.Contains(err.Error(), "ciphertext validator") {
 		t.Fatalf("unvalidated legacy import error = %v", err)
+	}
+}
+
+func TestWrapLegacySQLiteImportErrorPreservesClassificationAndCause(t *testing.T) {
+	t.Parallel()
+
+	sourceErr := errors.New("legacy source unavailable")
+	wrapped := wrapLegacySQLiteImportError(sourceErr)
+	if !errors.Is(wrapped, ErrLegacySQLiteImport) || !errors.Is(wrapped, sourceErr) {
+		t.Fatalf("wrapped legacy error does not preserve classification and cause: %v", wrapped)
+	}
+	if rewrapped := wrapLegacySQLiteImportError(wrapped); rewrapped != wrapped {
+		t.Fatalf("already classified legacy error was wrapped again: %v", rewrapped)
 	}
 }
 
