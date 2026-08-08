@@ -23,6 +23,19 @@ function functionBody(source, signature) {
   assert.fail(`unterminated body for ${signature}`);
 }
 
+function autoCreationErrorFormatter(source) {
+  const messagesMatch = source.match(
+    /const AUTO_CREATION_ERROR_MESSAGES = Object\.freeze\((\{[\s\S]*?\})\);/,
+  );
+  assert.ok(messagesMatch, "missing automatic creation error messages");
+  const messages = Function(`"use strict"; return (${messagesMatch[1]});`)();
+  const body = functionBody(source, "function autoCreationErrorMessage");
+  return Function(
+    "AUTO_CREATION_ERROR_MESSAGES",
+    `"use strict"; return function (value) ${body}`,
+  )(messages);
+}
+
 test("account detail exposes automatic alias creation and safe key handling", async () => {
   const source = await readFile(viewPath, "utf8");
 
@@ -34,6 +47,29 @@ test("account detail exposes automatic alias creation and safe key handling", as
   assert.match(source, /aliasId: item\.alias\?\.id/);
   assert.match(source, /@click="acknowledgeAndCloseBatchSecrets"/);
   assert.match(source, /@click="dismissBatchSecrets"/);
+  assert.match(
+    source,
+    /autoCreationErrorMessage\(autoCreation\.lastError\)/,
+  );
+
+  const formatAutoCreationError = autoCreationErrorFormatter(source);
+  assert.equal(
+    formatAutoCreationError("APPLE_ACCOUNT_MISMATCH"),
+    "Apple 登录账户或隐藏邮件地址的默认转发目标与当前主号不匹配，请确认登录了正确的 Apple 账户，并在 iCloud 设置中把‘转发到’改为当前主号后重新开启",
+  );
+  assert.equal(
+    formatAutoCreationError("APPLE_SESSION_EXPIRED"),
+    "Apple 登录已过期，请点击“同步隐私邮箱”并重新登录后重试",
+  );
+  assert.equal(
+    formatAutoCreationError("APPLE_RATE_LIMITED"),
+    "Apple 请求过于频繁，请稍后再试；自动创建会按计划继续执行",
+  );
+  assert.equal(
+    formatAutoCreationError(" unknown upstream detail "),
+    " unknown upstream detail ",
+  );
+  assert.equal(formatAutoCreationError("constructor"), "constructor");
 
   const acknowledge = functionBody(
     source,

@@ -415,6 +415,32 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		}
 		defer releaseAccount()
 	}
+	expireAutoSession := func(sessionErr error) error {
+		var deleteErr error
+		if releaseAccount != nil {
+			// The production locker is deliberately non-reentrant. The account
+			// lock already protects this deletion across the remote operation.
+			deleteErr = s.repo.DeleteAppleWebSession(ctx, accountID)
+		} else {
+			deleteErr = s.locker.WithAccountLock(ctx, accountID, func() error {
+				err := s.repo.DeleteAppleWebSession(ctx, accountID)
+				if errors.Is(err, store.ErrNotFound) {
+					return nil
+				}
+				return err
+			})
+		}
+		if errors.Is(deleteErr, store.ErrNotFound) {
+			deleteErr = nil
+		}
+		if deleteErr == nil {
+			return sessionErr
+		}
+		return wrapError(CodeSessionExpired, ErrSessionExpired, errors.Join(
+			sessionErr,
+			fmt.Errorf("delete expired Apple session: %w", deleteErr),
+		))
+	}
 
 	account, err := s.repo.GetAccount(ctx, accountID)
 	if err != nil {
@@ -434,7 +460,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	record, session, err := s.loadSession(ctx, accountID)
 	if err != nil {
 		if errors.Is(err, ErrSessionExpired) {
-			s.expireSession(ctx, accountID)
+			err = expireAutoSession(err)
 		}
 		return domain.Alias{}, err
 	}
@@ -442,7 +468,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	if err != nil {
 		mapped := mapAppleError(err, false)
 		if errors.Is(mapped, ErrSessionExpired) {
-			s.expireSession(ctx, accountID)
+			mapped = expireAutoSession(mapped)
 		}
 		return domain.Alias{}, mapped
 	}
@@ -451,14 +477,119 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 	}
 	normalizeSession(&validated, record.AppleID, session.Region, s.now())
-	created, updated, err := autoClient.CreateAlias(ctx, validated, autoCreateLabel, autoCreateNote)
+
+	// Apple reserve uses the account-wide selectedForwardTo setting and does
+	// not accept a per-request forwarding address. Confirm that target before
+	// the irreversible reserve call. The reserve response may omit
+	// forwardToEmail, so checking only after creation both misclassifies a valid
+	// response and can leave an untracked remote alias.
+	settings, listedSession, err := s.client.ListAliases(ctx, validated)
 	if err != nil {
 		mapped := mapAppleError(err, false)
 		if errors.Is(mapped, ErrSessionExpired) {
-			s.expireSession(ctx, accountID)
+			mapped = expireAutoSession(mapped)
 		}
 		return domain.Alias{}, mapped
 	}
+	if strings.TrimSpace(listedSession.AppleID) != "" &&
+		!strings.EqualFold(strings.TrimSpace(listedSession.AppleID), strings.TrimSpace(record.AppleID)) {
+		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	normalizeSession(&listedSession, record.AppleID, validated.Region, s.now())
+	listedRegion, err := normalizeRegion(listedSession.Region)
+	if err != nil {
+		return domain.Alias{}, err
+	}
+	listedSession.Region = listedRegion
+	checkpointSession := func(session apple.Session) error {
+		if releaseAccount != nil {
+			_, err := s.saveSession(ctx, accountID, session)
+			return err
+		}
+		_, err := s.persistSession(ctx, accountID, identityOf(account), session)
+		return err
+	}
+	checkpointReturnedSession := func(returned *apple.Session, fallbackRegion apple.Region) error {
+		if strings.TrimSpace(returned.AppleID) != "" &&
+			!strings.EqualFold(strings.TrimSpace(returned.AppleID), strings.TrimSpace(record.AppleID)) {
+			return wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+		}
+		normalizeSession(returned, record.AppleID, fallbackRegion, s.now())
+		region, err := normalizeRegion(returned.Region)
+		if err != nil {
+			return err
+		}
+		returned.Region = region
+		return checkpointSession(*returned)
+	}
+	// ListAliases may rotate cookies even when the forwarding preflight rejects
+	// the operation. Preserve that valid checkpoint so a corrected setting does
+	// not force an otherwise unnecessary Apple login.
+	if err := checkpointSession(listedSession); err != nil {
+		return domain.Alias{}, err
+	}
+	if strings.TrimSpace(settings.SelectedForwardTo) == "" {
+		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream,
+			errors.New("Apple response omitted the selected forwarding address"))
+	}
+	if !sameEmail(settings.SelectedForwardTo, account.Email) {
+		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+
+	// Prepare every locally fallible key operation before reserve so a local key
+	// failure cannot strand an address after Apple's irreversible side effect.
+	rawKey, hash, prefix, err := secure.NewAPIKey()
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("generate automatic alias API key: %w", err)
+	}
+	ciphertext, err := keyCipher.EncryptPendingAliasAPIKey(rawKey)
+	rawKey = ""
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("encrypt automatic alias API key: %w", err)
+	}
+
+	created, updated, err := autoClient.CreateAlias(ctx, listedSession, autoCreateLabel, autoCreateNote)
+	if err != nil {
+		mapped := mapAppleError(err, false)
+		if errors.Is(mapped, ErrSessionExpired) {
+			return domain.Alias{}, expireAutoSession(mapped)
+		}
+		if !errors.Is(mapped, context.Canceled) && !errors.Is(mapped, context.DeadlineExceeded) &&
+			hasAppleSessionState(updated) {
+			if checkpointErr := checkpointReturnedSession(&updated, listedSession.Region); checkpointErr != nil {
+				return domain.Alias{}, checkpointErr
+			}
+		}
+		return domain.Alias{}, mapped
+	}
+	if err := checkpointReturnedSession(&updated, listedSession.Region); err != nil {
+		return domain.Alias{}, err
+	}
+
+	if strings.TrimSpace(created.ForwardToEmail) == "" {
+		// A minimal reserve response does not identify the forwarding mailbox.
+		// Re-read the new HME entry rather than treating the pre-reserve setting
+		// as proof; it can be changed concurrently from another Apple session.
+		confirmed, confirmedSession, listErr := s.client.ListAliases(ctx, updated)
+		if listErr != nil {
+			mapped := mapAppleError(listErr, false)
+			if errors.Is(mapped, ErrSessionExpired) {
+				mapped = expireAutoSession(mapped)
+			}
+			return domain.Alias{}, mapped
+		}
+		if err := checkpointReturnedSession(&confirmedSession, updated.Region); err != nil {
+			return domain.Alias{}, err
+		}
+		confirmedAlias, found := findAppleAlias(confirmed.Aliases, created.HME)
+		if !found {
+			return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream,
+				errors.New("Apple list omitted the newly reserved alias"))
+		}
+		created = confirmedAlias
+		updated = confirmedSession
+	}
+
 	address := domain.NormalizeEmail(created.HME)
 	parsed, parseErr := mail.ParseAddress(address)
 	if address == "" || parseErr != nil || parsed.Name != "" || domain.NormalizeEmail(parsed.Address) != address {
@@ -469,16 +600,6 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	}
 	if !sameEmail(created.ForwardToEmail, account.Email) {
 		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
-	}
-
-	rawKey, hash, prefix, err := secure.NewAPIKey()
-	if err != nil {
-		return domain.Alias{}, fmt.Errorf("generate automatic alias API key: %w", err)
-	}
-	ciphertext, err := keyCipher.EncryptPendingAliasAPIKey(rawKey)
-	rawKey = ""
-	if err != nil {
-		return domain.Alias{}, fmt.Errorf("encrypt automatic alias API key: %w", err)
 	}
 	updatedRegion, err := normalizeRegion(updated.Region)
 	if err != nil {
@@ -548,6 +669,24 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		return domain.Alias{}, err
 	}
 	return saved, nil
+}
+
+func findAppleAlias(aliases []apple.Alias, address string) (apple.Alias, bool) {
+	wanted := domain.NormalizeEmail(address)
+	for _, alias := range aliases {
+		if domain.NormalizeEmail(alias.HME) == wanted {
+			return alias, true
+		}
+	}
+	return apple.Alias{}, false
+}
+
+func hasAppleSessionState(session apple.Session) bool {
+	return strings.TrimSpace(session.AppleID) != "" ||
+		strings.TrimSpace(session.DSID) != "" ||
+		strings.TrimSpace(session.PremiumMailSettingsURL) != "" ||
+		strings.TrimSpace(session.SessionToken) != "" ||
+		len(session.Cookies) > 0
 }
 
 // CreateAlias is a convenience alias for callers that treat one background

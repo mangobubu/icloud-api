@@ -578,6 +578,14 @@ func decodeReservedAlias(result json.RawMessage, candidate string) (Alias, error
 	if err := json.Unmarshal(rawAlias, &reserved); err != nil {
 		return Alias{}, fmt.Errorf("decode reserve result.hme: %w", err)
 	}
+	// A successful reserve response is not guaranteed to repeat every field
+	// returned by the authoritative list endpoint. In particular, Apple may
+	// omit isActive; reserve success itself means the new alias is active. Keep
+	// an explicit false value intact so callers can still reject contradictory
+	// responses.
+	if _, present := aliasFields["isActive"]; !present {
+		reserved.IsActive = true
+	}
 	return reserved, nil
 }
 

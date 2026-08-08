@@ -1174,7 +1174,7 @@ components:
               value:
                 error:
                   code: APPLE_ACCOUNT_MISMATCH
-                  message: Apple 账户的转发邮箱与该主号不匹配
+                  message: Apple 登录账户或转发邮箱与该主号不匹配
                   request_id: 6oe7j0x3x3pJv9Dv
             aliasOwnershipConflict:
               value:

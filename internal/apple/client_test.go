@@ -423,7 +423,7 @@ func TestCreateAliasGeneratesThenReserves(t *testing.T) {
 				t.Fatal(err)
 			}
 			if requestCount != 2 || alias.HME != test.candidate ||
-				alias.AnonymousID != "remote-id" || alias.Label != "Saved label" {
+				alias.AnonymousID != "remote-id" || alias.Label != "Saved label" || !alias.IsActive {
 				t.Fatalf("requests=%d alias=%#v", requestCount, alias)
 			}
 			cookieNames := make(map[string]bool, len(updated.Cookies))
@@ -480,6 +480,19 @@ func TestCreateAliasRejectsInvalidResponses(t *testing.T) {
 				t.Fatalf("error=%v requests=%d, want ErrInvalidResponse/%d", err, requests, test.wantRequests)
 			}
 		})
+	}
+}
+
+func TestDecodeReservedAliasPreservesExplicitInactiveState(t *testing.T) {
+	alias, err := decodeReservedAlias(
+		json.RawMessage(`{"hme":{"hme":"candidate@icloud.com","isActive":false}}`),
+		"candidate@icloud.com",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alias.IsActive {
+		t.Fatalf("explicit inactive reserve result became active: %#v", alias)
 	}
 }
 

@@ -121,6 +121,7 @@ func (s *Store) EnableAliasCreation(ctx context.Context, accountID int64, planne
 			enabled = TRUE,
 			planned_at_json = excluded.planned_at_json,
 			next_run_at = excluded.next_run_at,
+			last_error = '',
 			updated_at = excluded.updated_at`,
 		accountID, plannedJSON, next, timestamp(now), timestamp(now))
 	if err != nil {

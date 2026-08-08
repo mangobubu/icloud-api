@@ -443,7 +443,7 @@
 
           <div v-if="autoCreation.lastError" class="auto-creation-error" role="status">
             <strong>最近错误</strong>
-            <span>{{ autoCreation.lastError }}</span>
+            <span>{{ autoCreationErrorMessage(autoCreation.lastError) }}</span>
           </div>
         </div>
 
@@ -843,6 +843,38 @@ function emptySyncSummary() {
     importedDisabledCount: 0,
     conflictCount: 0,
   };
+}
+
+const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
+  APPLE_LOGIN_REQUIRED:
+    "Apple 账户尚未登录，请点击“同步隐私邮箱”并完成登录后重试",
+  APPLE_SESSION_EXPIRED:
+    "Apple 登录已过期，请点击“同步隐私邮箱”并重新登录后重试",
+  APPLE_CREDENTIALS_INVALID:
+    "Apple 登录凭据无效，请退出 Apple 登录并重新登录后重试",
+  APPLE_VERIFICATION_INVALID:
+    "Apple 验证码无效，请重新登录 Apple 账户并完成双重认证后重试",
+  APPLE_FLOW_EXPIRED:
+    "Apple 验证流程已过期，请重新登录 Apple 账户并完成双重认证后重试",
+  APPLE_RATE_LIMITED:
+    "Apple 请求过于频繁，请稍后再试；自动创建会按计划继续执行",
+  APPLE_UPSTREAM_ERROR:
+    "Apple 服务暂时异常，请稍后再试；自动创建会按计划继续执行",
+  APPLE_ACCOUNT_MISMATCH:
+    "Apple 登录账户或隐藏邮件地址的默认转发目标与当前主号不匹配，请确认登录了正确的 Apple 账户，并在 iCloud 设置中把‘转发到’改为当前主号后重新开启",
+  ACCOUNT_CHANGED: "主号信息在创建过程中发生变化，请刷新页面并确认主号信息后重试",
+  ALIAS_OWNERSHIP_CONFLICT:
+    "Apple 创建的隐私邮箱已属于其他主号，请检查主号归属后重试",
+  ACCOUNT_DISABLED: "当前主号已停用，请先启用主号后再开启自动创建",
+  AUTO_CREATION_UNAVAILABLE: "自动创建服务暂不可用，请稍后重试",
+});
+
+function autoCreationErrorMessage(value) {
+  const original = String(value ?? "");
+  const code = original.trim();
+  return Object.prototype.hasOwnProperty.call(AUTO_CREATION_ERROR_MESSAGES, code)
+    ? AUTO_CREATION_ERROR_MESSAGES[code]
+    : original;
 }
 
 function normalizedAutoCreationStatus(item) {

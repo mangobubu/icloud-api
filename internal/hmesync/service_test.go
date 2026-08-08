@@ -264,6 +264,310 @@ func TestSyncRejectsMismatchedAppleAccountWithoutWrites(t *testing.T) {
 	}
 }
 
+func TestCreateAutoAliasChecksSelectedForwardBeforeReserve(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			session.SessionToken = "rotated-by-forwarding-preflight"
+			return apple.ListResult{
+				SelectedForwardTo: "other@example.com",
+				ForwardToEmails:   []string{"primary@icloud.com", "other@example.com"},
+			}, session, nil
+		},
+		create: func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error) {
+			t.Fatal("mismatched forwarding target reached Apple reserve")
+			return apple.Alias{}, apple.Session{}, nil
+		},
+	}
+	service := newTestService(t, repo, client, newFakeAcquiringLocker(), func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if !errors.Is(err, ErrAccountMismatch) || Code(err) != CodeAccountMismatch {
+		t.Fatalf("forwarding mismatch error = %v code=%q", err, Code(err))
+	}
+	if client.createCalls.Load() != 0 || repo.creates.Load() != 0 {
+		t.Fatalf("mismatched target caused side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("forwarding preflight session checkpoint re-entered the account lock: %v", ctx.Err())
+	}
+	stored, decryptErr := service.decryptSession(repo.mustSession(t, 3))
+	if decryptErr != nil || stored.SessionToken != "rotated-by-forwarding-preflight" {
+		t.Fatalf("rotated preflight session was not preserved: session=%#v err=%v", stored, decryptErr)
+	}
+}
+
+func TestCreateAutoAliasAcceptsMinimalReserveResponseAfterPreflight(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "Primary@icloud.com", Enabled: true}, now)
+	var listCalls atomic.Int32
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			session.SessionToken = "listed-session-token"
+			result := apple.ListResult{
+				SelectedForwardTo: "primary@icloud.com",
+				ForwardToEmails:   []string{"primary@icloud.com"},
+			}
+			if listCalls.Add(1) == 2 {
+				result.Aliases = []apple.Alias{{
+					HME:            "New-Alias@icloud.com",
+					IsActive:       true,
+					ForwardToEmail: "primary@icloud.com",
+					Label:          autoCreateLabel,
+					Note:           autoCreateNote,
+				}}
+			}
+			return result, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, label, note string) (apple.Alias, apple.Session, error) {
+			if label != autoCreateLabel || note != autoCreateNote {
+				t.Fatalf("automatic alias metadata = %q/%q", label, note)
+			}
+			if session.SessionToken != "listed-session-token" {
+				t.Fatalf("automatic alias creation did not use the session returned by preflight: %#v", session)
+			}
+			// Apple may omit forwardToEmail from a successful reserve response.
+			return apple.Alias{HME: "New-Alias@icloud.com", IsActive: true, Label: label}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	created, err := service.CreateAutoAlias(ctx, 3)
+	if err != nil {
+		t.Fatalf("create automatic alias: %v", err)
+	}
+	if created.ID == 0 || created.Address != "new-alias@icloud.com" ||
+		client.createCalls.Load() != 1 || listCalls.Load() != 2 || repo.creates.Load() != 1 {
+		t.Fatalf("created=%#v lists=%d reserves=%d writes=%d", created, listCalls.Load(), client.createCalls.Load(), repo.creates.Load())
+	}
+}
+
+func TestCreateAutoAliasConfirmsMissingReserveForwardFromAuthoritativeList(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	var listCalls atomic.Int32
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			result := apple.ListResult{SelectedForwardTo: "primary@icloud.com"}
+			if listCalls.Add(1) == 2 {
+				result.SelectedForwardTo = "other@example.com"
+				result.Aliases = []apple.Alias{{
+					HME:            "new-alias@icloud.com",
+					IsActive:       true,
+					ForwardToEmail: "other@example.com",
+					Label:          autoCreateLabel,
+					Note:           autoCreateNote,
+				}}
+			}
+			return result, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			return apple.Alias{HME: "new-alias@icloud.com", IsActive: true}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if !errors.Is(err, ErrAccountMismatch) || Code(err) != CodeAccountMismatch {
+		t.Fatalf("post-reserve forwarding mismatch error = %v code=%q", err, Code(err))
+	}
+	if listCalls.Load() != 2 || client.createCalls.Load() != 1 || repo.creates.Load() != 0 {
+		t.Fatalf("post-reserve mismatch calls: lists=%d reserves=%d writes=%d", listCalls.Load(), client.createCalls.Load(), repo.creates.Load())
+	}
+}
+
+func TestCreateAutoAliasPreservesRotatedSessionWhenReserveFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			session.SessionToken = "preflight-session-token"
+			return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			session.SessionToken = "rotated-during-reserve"
+			return apple.Alias{}, session, errors.New("ambiguous reserve failure")
+		},
+	}
+	service := newTestService(t, repo, client, newFakeAcquiringLocker(), func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if !errors.Is(err, ErrUpstream) || Code(err) != CodeUpstreamError {
+		t.Fatalf("reserve failure error = %v code=%q", err, Code(err))
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("reserve failure checkpoint re-entered the account lock: %v", ctx.Err())
+	}
+	stored, decryptErr := service.decryptSession(repo.mustSession(t, 3))
+	if decryptErr != nil || stored.SessionToken != "rotated-during-reserve" {
+		t.Fatalf("reserve failure lost rotated session: session=%#v err=%v", stored, decryptErr)
+	}
+	if client.createCalls.Load() != 1 || repo.creates.Load() != 0 {
+		t.Fatalf("reserve failure calls: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
+	}
+}
+
+func TestCreateAutoAliasRejectsMissingSelectedForwardBeforeReserve(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
+		},
+		create: func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error) {
+			t.Fatal("missing selected forwarding target reached Apple reserve")
+			return apple.Alias{}, apple.Session{}, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if !errors.Is(err, ErrUpstream) || Code(err) != CodeUpstreamError {
+		t.Fatalf("missing selected target error = %v code=%q", err, Code(err))
+	}
+	if client.createCalls.Load() != 0 || repo.creates.Load() != 0 {
+		t.Fatalf("missing target caused side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
+	}
+}
+
+func TestCreateAutoAliasRejectsExplicitReserveForwardMismatch(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			return apple.Alias{
+				HME:            "new-alias@icloud.com",
+				IsActive:       true,
+				ForwardToEmail: "other@example.com",
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if !errors.Is(err, ErrAccountMismatch) || Code(err) != CodeAccountMismatch {
+		t.Fatalf("reserve forwarding mismatch error = %v code=%q", err, Code(err))
+	}
+	if client.createCalls.Load() != 1 || repo.creates.Load() != 0 {
+		t.Fatalf("reserve mismatch side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
+	}
+}
+
+func TestCreateAutoAliasRejectsExplicitInactiveReserveResult(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			return apple.Alias{
+				HME:            "new-alias@icloud.com",
+				IsActive:       false,
+				ForwardToEmail: "primary@icloud.com",
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if !errors.Is(err, ErrUpstream) || Code(err) != CodeUpstreamError {
+		t.Fatalf("inactive reserve error = %v code=%q", err, Code(err))
+	}
+	if client.createCalls.Load() != 1 || repo.creates.Load() != 0 {
+		t.Fatalf("inactive reserve side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
+	}
+}
+
+func TestCreateAutoAliasExpiresSessionWithoutReenteringAccountLock(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(context.Context, apple.Session) (apple.Session, error) {
+			return apple.Session{}, apple.ErrInvalidSession
+		},
+	}
+	locker := newFakeAcquiringLocker()
+	service := newTestService(t, repo, client, locker, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if !errors.Is(err, ErrSessionExpired) || Code(err) != CodeSessionExpired {
+		t.Fatalf("expired session error = %v code=%q", err, Code(err))
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("session expiry deadlocked until the context ended: %v", ctx.Err())
+	}
+	if repo.sessionCount() != 0 {
+		t.Fatal("expired session was not deleted while the account lock was held")
+	}
+}
+
+func TestCreateAutoAliasKeepsStableExpiryCodeWhenSessionDeletionFails(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.deleteSessionErr = errors.New("database unavailable")
+	client := &fakeAppleClient{
+		validate: func(context.Context, apple.Session) (apple.Session, error) {
+			return apple.Session{}, apple.ErrInvalidSession
+		},
+	}
+	service := newTestService(t, repo, client, newFakeAcquiringLocker(), func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if !errors.Is(err, ErrSessionExpired) || Code(err) != CodeSessionExpired || err.Error() != CodeSessionExpired {
+		t.Fatalf("session deletion failure lost stable expiry error: %v code=%q", err, Code(err))
+	}
+	if repo.sessionCount() != 1 {
+		t.Fatal("failed session deletion unexpectedly removed the persisted session")
+	}
+}
+
 func TestSyncAllowsEmptyDirectoryWhenForwardingMetadataOwnsMailbox(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
@@ -406,8 +710,10 @@ type fakeAppleClient struct {
 	verify   func(context.Context, apple.Session, string) (apple.Session, error)
 	validate func(context.Context, apple.Session) (apple.Session, error)
 	list     func(context.Context, apple.Session) (apple.ListResult, apple.Session, error)
+	create   func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error)
 
 	verifyCalls atomic.Int32
+	createCalls atomic.Int32
 }
 
 func (c *fakeAppleClient) SignIn(ctx context.Context, appleID, password string, region apple.Region, previous *apple.Session) (apple.Session, bool, error) {
@@ -439,6 +745,14 @@ func (c *fakeAppleClient) ListAliases(ctx context.Context, session apple.Session
 	return c.list(ctx, session)
 }
 
+func (c *fakeAppleClient) CreateAlias(ctx context.Context, session apple.Session, label, note string) (apple.Alias, apple.Session, error) {
+	c.createCalls.Add(1)
+	if c.create == nil {
+		panic("unexpected CreateAlias")
+	}
+	return c.create(ctx, session, label, note)
+}
+
 type fakeLocker struct {
 	held atomic.Int32
 }
@@ -456,18 +770,52 @@ func assertNetworkOutsideAccountLock(t *testing.T, locker *fakeLocker) {
 	}
 }
 
+type fakeAcquiringLocker struct {
+	token chan struct{}
+}
+
+func newFakeAcquiringLocker() *fakeAcquiringLocker {
+	locker := &fakeAcquiringLocker{token: make(chan struct{}, 1)}
+	locker.token <- struct{}{}
+	return locker
+}
+
+func (l *fakeAcquiringLocker) AcquireAccountLock(ctx context.Context, _ int64) (func(), error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-l.token:
+		return func() { l.token <- struct{}{} }, nil
+	}
+}
+
+func (l *fakeAcquiringLocker) WithAccountLock(ctx context.Context, accountID int64, operation func() error) error {
+	release, err := l.AcquireAccountLock(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return operation()
+}
+
 type fakeRepository struct {
-	mu       sync.Mutex
-	account  domain.Account
-	sessions map[int64]domain.AppleWebSession
-	now      time.Time
-	importFn func(context.Context, int64, []domain.AliasImportCandidate) (domain.AliasImportResult, error)
-	upserts  atomic.Int32
-	imports  atomic.Int32
+	mu               sync.Mutex
+	account          domain.Account
+	sessions         map[int64]domain.AppleWebSession
+	now              time.Time
+	deleteSessionErr error
+	importFn         func(context.Context, int64, []domain.AliasImportCandidate) (domain.AliasImportResult, error)
+	upserts          atomic.Int32
+	imports          atomic.Int32
+	creates          atomic.Int32
 }
 
 func newFakeRepository(account domain.Account, now time.Time) *fakeRepository {
-	return &fakeRepository{account: account, sessions: make(map[int64]domain.AppleWebSession), now: now}
+	return &fakeRepository{
+		account:  account,
+		sessions: make(map[int64]domain.AppleWebSession),
+		now:      now,
+	}
 }
 
 func (r *fakeRepository) GetAccount(_ context.Context, id int64) (domain.Account, error) {
@@ -506,6 +854,9 @@ func (r *fakeRepository) UpsertAppleWebSession(_ context.Context, session domain
 func (r *fakeRepository) DeleteAppleWebSession(_ context.Context, accountID int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.deleteSessionErr != nil {
+		return r.deleteSessionErr
+	}
 	if _, ok := r.sessions[accountID]; !ok {
 		return sql.ErrNoRows
 	}
@@ -519,6 +870,28 @@ func (r *fakeRepository) ImportAliases(ctx context.Context, accountID int64, can
 		return r.importFn(ctx, accountID, candidates)
 	}
 	return domain.AliasImportResult{}, nil
+}
+
+func (r *fakeRepository) CountEnabledAliasesByAccount(context.Context, int64) (int, error) {
+	return 0, nil
+}
+
+func (r *fakeRepository) CreateAliasWithPendingAPIKey(
+	_ context.Context,
+	session domain.AppleWebSession,
+	alias domain.Alias,
+	apiKeyCiphertext string,
+) (domain.Alias, domain.AppleWebSession, error) {
+	r.creates.Add(1)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if alias.AccountID != r.account.ID || len(alias.APIKeyHash) != 32 ||
+		alias.APIKeyPrefix == "" || strings.TrimSpace(apiKeyCiphertext) == "" {
+		return domain.Alias{}, domain.AppleWebSession{}, errors.New("invalid automatic alias publication")
+	}
+	alias.ID = 100 + int64(r.creates.Load())
+	r.sessions[session.AccountID] = session
+	return alias, session, nil
 }
 
 func (r *fakeRepository) setAccountEmail(email string) {

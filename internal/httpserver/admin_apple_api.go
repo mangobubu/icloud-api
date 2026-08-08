@@ -463,7 +463,7 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 	case hmesync.CodeRateLimited:
 		return adminAPIAppleError{Status: http.StatusTooManyRequests, Code: code, Message: "Apple 请求过于频繁，请稍后再试"}
 	case hmesync.CodeAccountMismatch:
-		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 账户的转发邮箱与该主号不匹配"}
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 登录账户或转发邮箱与该主号不匹配"}
 	case hmesync.CodeAccountChanged:
 		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "主号信息已发生变化，请重新操作"}
 	case hmesync.CodeAliasOwnershipConflict:

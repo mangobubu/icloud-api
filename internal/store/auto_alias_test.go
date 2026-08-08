@@ -61,7 +61,20 @@ func TestAliasCreationScheduleCASAndLifecycle(t *testing.T) {
 	if err != nil || disabled.Enabled || disabled.NextRunAt != nil || len(disabled.PlannedAt) != 0 {
 		t.Fatalf("disabled schedule = %#v, err=%v", disabled, err)
 	}
-	if err := db.DisableAliasCreation(ctx, account.ID, anchor.Add(7*time.Minute)); err != nil {
+	if disabled.LastError != "temporary upstream failure" {
+		t.Fatalf("disabled schedule lost the diagnostic error: %#v", disabled)
+	}
+	if err := db.EnableAliasCreation(ctx, account.ID, planned, anchor.Add(7*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	reenabled, err := db.GetAliasCreationSchedule(ctx, account.ID)
+	if err != nil || !reenabled.Enabled || reenabled.LastError != "" {
+		t.Fatalf("re-enabled schedule retained a stale error: %#v, err=%v", reenabled, err)
+	}
+	if err := db.DisableAliasCreation(ctx, account.ID, anchor.Add(8*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DisableAliasCreation(ctx, account.ID, anchor.Add(9*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.GetAliasCreationSchedule(ctx, account.ID+100); !errors.Is(err, store.ErrNotFound) {
