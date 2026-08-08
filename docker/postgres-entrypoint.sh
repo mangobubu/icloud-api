@@ -8,99 +8,241 @@ die() {
 }
 
 random_hex() {
-	byte_count="$1"
-	value="$(od -An -N "$byte_count" -tx1 /dev/urandom | tr -d ' \n')"
-	[ "${#value}" -eq "$((byte_count * 2))" ] || die "生成数据库凭据失败"
-	printf '%s' "$value"
+	random_hex_byte_count="$1"
+	random_hex_value="$(od -An -N "$random_hex_byte_count" -tx1 /dev/urandom | tr -d ' \n')"
+	[ "${#random_hex_value}" -eq "$((random_hex_byte_count * 2))" ] || die "生成数据库凭据失败"
+	printf '%s' "$random_hex_value"
 }
 
 load_credentials() {
-	file="$1"
-	[ -f "$file" ] || die "凭据文件不存在"
-	[ "$(wc -l < "$file" | tr -d ' ')" = "4" ] || die "凭据文件格式错误"
-	LOADED_USER="$(sed -n '1p' "$file")"
-	LOADED_DATABASE="$(sed -n '2p' "$file")"
-	LOADED_PASSWORD="$(sed -n '3p' "$file")"
-	LOADED_INSTALLATION_ID="$(sed -n '4p' "$file")"
+	load_credentials_file="$1"
+	[ -f "$load_credentials_file" ] || die "凭据文件不存在：$load_credentials_file"
+	[ "$(wc -l < "$load_credentials_file" | tr -d ' ')" = "4" ] || \
+		die "凭据文件格式错误：$load_credentials_file"
+	LOADED_USER="$(sed -n '1p' "$load_credentials_file")"
+	LOADED_DATABASE="$(sed -n '2p' "$load_credentials_file")"
+	LOADED_PASSWORD="$(sed -n '3p' "$load_credentials_file")"
+	LOADED_INSTALLATION_ID="$(sed -n '4p' "$load_credentials_file")"
 	case "$LOADED_USER" in
 		[a-z][a-z0-9_]*) ;;
-		*) die "数据库用户名格式错误" ;;
+		*) die "数据库用户名格式错误：$load_credentials_file" ;;
 	esac
 	case "$LOADED_USER" in
-		*[!a-z0-9_]*) die "数据库用户名格式错误" ;;
+		*[!a-z0-9_]*) die "数据库用户名格式错误：$load_credentials_file" ;;
 	esac
 	case "$LOADED_DATABASE" in
 		[a-z][a-z0-9_]*) ;;
-		*) die "数据库名格式错误" ;;
+		*) die "数据库名格式错误：$load_credentials_file" ;;
 	esac
 	case "$LOADED_DATABASE" in
-		*[!a-z0-9_]*) die "数据库名格式错误" ;;
+		*[!a-z0-9_]*) die "数据库名格式错误：$load_credentials_file" ;;
 	esac
-	[ "${#LOADED_PASSWORD}" -eq 64 ] || die "数据库密码格式错误"
+	[ "${#LOADED_PASSWORD}" -eq 64 ] || die "数据库密码格式错误：$load_credentials_file"
 	case "$LOADED_PASSWORD" in
-		*[!0-9a-f]*) die "数据库密码格式错误" ;;
+		*[!0-9a-f]*) die "数据库密码格式错误：$load_credentials_file" ;;
 	esac
-	[ "${#LOADED_INSTALLATION_ID}" -eq 32 ] || die "安装标识格式错误"
+	[ "${#LOADED_INSTALLATION_ID}" -eq 32 ] || die "安装标识格式错误：$load_credentials_file"
 	case "$LOADED_INSTALLATION_ID" in
-		*[!0-9a-f]*) die "安装标识格式错误" ;;
+		*[!0-9a-f]*) die "安装标识格式错误：$load_credentials_file" ;;
 	esac
+	load_credentials_expected_bytes="$((
+		${#LOADED_USER} +
+		${#LOADED_DATABASE} +
+		${#LOADED_PASSWORD} +
+		${#LOADED_INSTALLATION_ID} +
+		4
+	))"
+	[ "$(wc -c < "$load_credentials_file" | tr -d ' ')" = "$load_credentials_expected_bytes" ] || \
+		die "凭据文件包含尾部数据或格式错误：$load_credentials_file"
 }
 
 validate_bound_marker() {
-	marker="$1"
-	expected_value="$2"
-	marker_description="$3"
-	[ -f "$marker" ] && [ ! -L "$marker" ] || die "$marker_description 不存在或不是普通文件"
-	[ "$(stat -c '%h' "$marker")" = "1" ] || die "$marker_description 不能是硬链接"
-	[ "$(wc -l < "$marker" | tr -d ' ')" = "1" ] || die "$marker_description 格式错误"
-	[ "$(wc -c < "$marker" | tr -d ' ')" -eq "$(( ${#expected_value} + 1 ))" ] || \
-		die "$marker_description 格式错误"
-	[ "$(sed -n '1p' "$marker")" = "$expected_value" ] || die "$marker_description 与当前安装不匹配"
+	validate_marker_path="$1"
+	validate_marker_expected_value="$2"
+	validate_marker_description="$3"
+	[ -f "$validate_marker_path" ] && [ ! -L "$validate_marker_path" ] || \
+		die "$validate_marker_description 不存在或不是普通文件"
+	[ "$(stat -c '%h' "$validate_marker_path")" = "1" ] || \
+		die "$validate_marker_description 不能是硬链接"
+	[ "$(wc -l < "$validate_marker_path" | tr -d ' ')" = "1" ] || \
+		die "$validate_marker_description 格式错误"
+	[ "$(wc -c < "$validate_marker_path" | tr -d ' ')" -eq \
+		"$(( ${#validate_marker_expected_value} + 1 ))" ] || \
+		die "$validate_marker_description 格式错误"
+	[ "$(sed -n '1p' "$validate_marker_path")" = "$validate_marker_expected_value" ] || \
+		die "$validate_marker_description 与当前安装不匹配"
 }
 
 write_shared_credentials() {
-	user="$1"
-	database="$2"
-	password="$3"
-	installation_id="$4"
+	write_credentials_user="$1"
+	write_credentials_database="$2"
+	write_credentials_password="$3"
+	write_credentials_installation_id="$4"
 	mkdir -p "$config_directory"
 	chown 0:0 "$config_directory"
 	chmod 755 "$config_directory"
-	temporary="$(mktemp "${credentials_file}.tmp.XXXXXX")"
+	write_credentials_temporary="$(mktemp "${credentials_file}.tmp.XXXXXX")"
 	umask 077
-	printf '%s\n%s\n%s\n%s\n' "$user" "$database" "$password" "$installation_id" > "$temporary"
-	chown 0:10001 "$temporary"
-	chmod 640 "$temporary"
-	mv -f "$temporary" "$credentials_file"
+	printf '%s\n%s\n%s\n%s\n' \
+		"$write_credentials_user" \
+		"$write_credentials_database" \
+		"$write_credentials_password" \
+		"$write_credentials_installation_id" > "$write_credentials_temporary"
+	chown 0:10001 "$write_credentials_temporary"
+	chmod 640 "$write_credentials_temporary"
+	sync || die "同步数据库配置凭据临时文件失败"
+	mv -f "$write_credentials_temporary" "$credentials_file"
+}
+
+write_pgdata_credentials() {
+	write_pgdata_user="$1"
+	write_pgdata_database="$2"
+	write_pgdata_password="$3"
+	write_pgdata_installation_id="$4"
+	write_pgdata_temporary="$(mktemp "${state_file}.tmp.XXXXXX")"
+	umask 077
+	printf '%s\n%s\n%s\n%s\n' \
+		"$write_pgdata_user" \
+		"$write_pgdata_database" \
+		"$write_pgdata_password" \
+		"$write_pgdata_installation_id" > "$write_pgdata_temporary"
+	chown 70:70 "$write_pgdata_temporary"
+	chmod 600 "$write_pgdata_temporary"
+	sync || die "同步 PGDATA 凭据状态临时文件失败"
+	mv -f "$write_pgdata_temporary" "$state_file"
 }
 
 write_key_marker() {
-	marker="$1"
-	installation_id="$2"
+	write_key_marker_path="$1"
+	write_key_marker_value="$2"
 	mkdir -p "$app_state_directory"
 	chown 10001:10001 "$app_state_directory"
 	chmod 700 "$app_state_directory"
-	temporary="$(mktemp "${marker}.tmp.XXXXXX")"
+	write_key_marker_temporary="$(mktemp "${write_key_marker_path}.tmp.XXXXXX")"
 	umask 077
-	printf '%s\n' "$installation_id" > "$temporary"
-	chown 10001:10001 "$temporary"
-	chmod 600 "$temporary"
-	mv -f "$temporary" "$marker"
+	printf '%s\n' "$write_key_marker_value" > "$write_key_marker_temporary"
+	chown 10001:10001 "$write_key_marker_temporary"
+	chmod 600 "$write_key_marker_temporary"
+	sync || die "同步主密钥状态临时文件失败"
+	mv -f "$write_key_marker_temporary" "$write_key_marker_path"
 }
 
 write_cluster_marker() {
-	marker="$1"
-	installation_id="$2"
-	directory="${marker%/*}"
-	mkdir -p "$directory"
-	chown 70:70 "$directory"
-	chmod 700 "$directory"
-	temporary="$(mktemp "${marker}.tmp.XXXXXX")"
+	write_cluster_marker_path="$1"
+	write_cluster_marker_value="$2"
+	write_cluster_marker_directory="${write_cluster_marker_path%/*}"
+	mkdir -p "$write_cluster_marker_directory"
+	chown 70:70 "$write_cluster_marker_directory"
+	chmod 700 "$write_cluster_marker_directory"
+	write_cluster_marker_temporary="$(mktemp "${write_cluster_marker_path}.tmp.XXXXXX")"
 	umask 077
-	printf '%s\n' "$installation_id" > "$temporary"
-	chown 70:70 "$temporary"
-	chmod 600 "$temporary"
-	mv -f "$temporary" "$marker"
+	printf '%s\n' "$write_cluster_marker_value" > "$write_cluster_marker_temporary"
+	chown 70:70 "$write_cluster_marker_temporary"
+	chmod 600 "$write_cluster_marker_temporary"
+	sync || die "同步数据库状态临时文件失败"
+	mv -f "$write_cluster_marker_temporary" "$write_cluster_marker_path"
+}
+
+repair_legacy_pgdata_binding_state() {
+	repair_user="$1"
+	repair_database="$2"
+	repair_password="$3"
+	repair_installation_id="$4"
+	repair_pgdata_binding="$5"
+
+	for repair_directory in \
+		"$config_directory" \
+		"$config_cluster_state_directory" \
+		"$installation_state_directory" \
+		"$cluster_state_directory" \
+		"$app_state_directory" \
+		"$postgres_data"; do
+		[ -d "$repair_directory" ] && [ ! -L "$repair_directory" ] || \
+			die "旧版安装标识修复要求状态目录不是软链接"
+	done
+	[ -f "$credentials_file" ] && [ ! -L "$credentials_file" ] || \
+		die "旧版安装标识修复要求数据库配置凭据为普通文件"
+	[ "$(stat -c '%h' "$credentials_file")" = "1" ] || \
+		die "旧版安装标识修复拒绝硬链接数据库配置凭据"
+	[ "$(stat -c '%u:%g:%a' "$credentials_file")" = "0:10001:640" ] || \
+		die "旧版安装标识修复要求数据库配置凭据权限为 0:10001/0640"
+	[ -f "$state_file" ] && [ ! -L "$state_file" ] || \
+		die "旧版安装标识修复要求 PGDATA 凭据状态为普通文件"
+	[ "$(stat -c '%h' "$state_file")" = "1" ] || \
+		die "旧版安装标识修复拒绝硬链接 PGDATA 凭据状态"
+	[ "$(stat -c '%u:%g:%a' "$state_file")" = "70:70:600" ] || \
+		die "旧版安装标识修复要求 PGDATA 凭据状态权限为 70:70/0600"
+	[ -f "${postgres_data}/PG_VERSION" ] && [ ! -L "${postgres_data}/PG_VERSION" ] || \
+		die "旧版安装标识修复要求 PG_VERSION 为普通文件"
+	[ -s "${postgres_data}/PG_VERSION" ] || \
+		die "旧版安装标识修复要求 PG_VERSION 非空"
+	[ "$(stat -c '%h' "${postgres_data}/PG_VERSION")" = "1" ] || \
+		die "旧版安装标识修复拒绝硬链接 PG_VERSION"
+	[ ! -e "${postgres_data}/postmaster.pid" ] && [ ! -L "${postgres_data}/postmaster.pid" ] || \
+		die "旧版安装标识修复要求 PostgreSQL 已完全停止"
+	[ "$(wc -l < "$state_file" | tr -d ' ')" = "4" ] || \
+		die "旧版安装标识修复要求 PGDATA 凭据状态恰好四行"
+	[ "$(sed -n '1p' "$state_file")" = "$repair_user" ] && \
+		[ "$(sed -n '2p' "$state_file")" = "$repair_database" ] && \
+		[ "$(sed -n '3p' "$state_file")" = "$repair_password" ] && \
+		[ "$(sed -n '4p' "$state_file")" = "$repair_pgdata_binding" ] || \
+		die "旧版安装标识修复拒绝不匹配的 PGDATA 凭据状态"
+	repair_state_expected_bytes="$((
+		${#repair_user} +
+		${#repair_database} +
+		${#repair_password} +
+		${#repair_pgdata_binding} +
+		4
+	))"
+	[ "$(wc -c < "$state_file" | tr -d ' ')" = "$repair_state_expected_bytes" ] || \
+		die "旧版安装标识修复拒绝带尾部数据的 PGDATA 凭据状态"
+
+	for repair_cluster_marker in \
+		"$config_cluster_initialized_marker" "$cluster_initialized_marker"; do
+		[ -f "$repair_cluster_marker" ] && [ ! -L "$repair_cluster_marker" ] || \
+			die "旧版安装标识修复要求数据库完成标记为普通文件"
+		repair_cluster_marker_value="$(sed -n '1p' "$repair_cluster_marker")"
+		case "$repair_cluster_marker_value" in
+			"$repair_pgdata_binding"|"$repair_installation_id") ;;
+			*) die "旧版安装标识修复拒绝不匹配的数据库完成标记" ;;
+		esac
+		validate_bound_marker "$repair_cluster_marker" "$repair_cluster_marker_value" \
+			"旧版数据库完成标记"
+		[ "$(stat -c '%u:%g:%a' "$repair_cluster_marker")" = "70:70:600" ] || \
+			die "旧版安装标识修复要求数据库完成标记权限为 70:70/0600"
+	done
+
+	repair_app_marker_count=0
+	for repair_app_marker in "$bootstrap_marker" "$initialized_marker"; do
+		if [ -e "$repair_app_marker" ] || [ -L "$repair_app_marker" ]; then
+			validate_bound_marker "$repair_app_marker" "$repair_installation_id" \
+				"旧版应用主密钥状态标记"
+			[ "$(stat -c '%u:%g:%a' "$repair_app_marker")" = "10001:10001:600" ] || \
+				die "旧版安装标识修复要求应用状态标记权限为 10001:10001/0600"
+			repair_app_marker_count="$((repair_app_marker_count + 1))"
+		fi
+	done
+	[ "$repair_app_marker_count" -eq 1 ] || \
+		die "旧版安装标识修复要求恰好一个应用主密钥状态标记"
+
+	for repair_stale_marker in \
+		"$config_cluster_bootstrap_marker" \
+		"$config_pgdata_bootstrap_binding" \
+		"$cluster_bootstrap_marker" \
+		"$cluster_pgdata_bootstrap_binding"; do
+		[ ! -e "$repair_stale_marker" ] && [ ! -L "$repair_stale_marker" ] || \
+			die "旧版安装标识修复拒绝仍含首次初始化标记的状态"
+	done
+
+	# Publish and sync the markers first. If interrupted, the still-legacy
+	# PGDATA credential keeps this exact repair signature discoverable.
+	write_cluster_marker "$cluster_initialized_marker" "$repair_installation_id"
+	write_cluster_marker "$config_cluster_initialized_marker" "$repair_installation_id"
+	sync || die "持久化旧版安装标识修复标记失败"
+	write_pgdata_credentials \
+		"$repair_user" "$repair_database" "$repair_password" "$repair_installation_id"
+	sync || die "持久化旧版安装标识修复失败"
+	printf '%s\n' "PostgreSQL：已修复旧版 PGDATA 绑定变量污染的安装标识。" >&2
 }
 
 config_directory="${ICLOUD_API_DATABASE_CONFIG_DIR:-/run/icloud-api-database}"
@@ -541,6 +683,26 @@ if [ "$config_exists" = true ]; then
 	config_installation_id="$LOADED_INSTALLATION_ID"
 fi
 
+if [ "$config_exists" = true ] && [ "$state_exists" = true ] && \
+	[ "$postgres_initialized" = true ] && [ -f "$state_file" ] && [ ! -L "$state_file" ]; then
+	legacy_state_installation_id="$(sed -n '4p' "$state_file")"
+	case "$legacy_state_installation_id" in
+		"${config_installation_id}:"*)
+			pgdata_root_identity="$(stat -Lc '%d:%i' "$postgres_data")" || \
+				die "读取 PGDATA 根目录标识失败"
+			legacy_pgdata_binding="${config_installation_id}:${pgdata_root_identity}"
+			if [ "$legacy_state_installation_id" = "$legacy_pgdata_binding" ]; then
+				repair_legacy_pgdata_binding_state \
+					"$config_user" \
+					"$config_database" \
+					"$config_password" \
+					"$config_installation_id" \
+					"$legacy_pgdata_binding"
+			fi
+			;;
+	esac
+fi
+
 if [ "$state_exists" = true ]; then
 	load_credentials "$state_file"
 	state_user="$LOADED_USER"
@@ -658,6 +820,11 @@ fi
 # Credentials and every pre-init marker must reach their backing volumes before
 # initdb can leave a partially populated PGDATA directory.
 sync || die "持久化 PostgreSQL 首次初始化状态失败"
+
+[ "${#installation_id}" -eq 32 ] || die "内部安装标识格式错误"
+case "$installation_id" in
+	*[!0-9a-f]*) die "内部安装标识格式错误" ;;
+esac
 
 POSTGRES_DB="$database_name"
 POSTGRES_APP_USER="$database_user"

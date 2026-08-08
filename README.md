@@ -102,6 +102,8 @@ TZ=Asia/Shanghai
 
 Compose 会先等待 PostgreSQL 健康，再启动应用。首次启动由应用自动创建 PostgreSQL 表和索引；后续启动会在事务中检查并执行数据库结构迁移。
 
+早期 PostgreSQL 镜像在首次初始化时可能把仅用于绑定 PGDATA 卷的“安装标识 + 设备号/inode”复合值误写为安装标识，表现为 PostgreSQL 反复报告“安装标识格式错误”。更新后的数据库入口会在启动前识别并修复这一种精确状态：`postgres_config` 中必须仍有合法的 32 位安装标识，PGDATA 中的前三行凭据必须完全相同，第 4 行必须精确等于该标识与当前 PGDATA 目录身份的绑定值，两个数据库完成标记和应用主密钥状态也必须相互印证。修复使用可重入的分阶段原子写入；任何字段、权限、链接或卷身份不匹配时仍会停止启动，不会截断未知值或猜测卷归属。升级时保留全部命名卷并使用 `docker compose up -d --build --wait` 重建镜像；不要使用 `docker compose down -v`。
+
 ### 从 SQLite 旧版本升级
 
 升级时，原命名卷 `icloud_api_data` 会只读挂载到 `/app/legacy`。如果其中存在 `/app/legacy/icloud-api.db`，且新的 PostgreSQL 业务表仍为空，应用会在启动阶段自动把管理员、后台会话、主号、隐私邮箱、最新邮件快照、审计记录和 Apple Web 会话复制到 PostgreSQL。导入使用事务、数据库级互斥锁和完成标记；成功后重复启动不会重复写入。旧 SQLite 文件不存在时会直接跳过。
