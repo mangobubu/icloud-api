@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -59,7 +61,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
+	closeDBOnReturn := true
+	defer func() {
+		if closeDBOnReturn {
+			_ = db.Close()
+		}
+	}()
 	if keyCreated {
 		logger.Warn("已生成本机主密钥文件，请与数据库一起安全备份", "path", cfg.MasterKeyFile)
 	}
@@ -89,8 +96,12 @@ func run() error {
 	fetcher.MaxBodyBytes = int(cfg.MaxBodyBytes)
 	fetcher.AllowWeakRecipientHeaders = cfg.AllowWeakRecipientHeaders
 
-	appContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	signalContext, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignal()
+	requestContext, cancelRequests := context.WithCancel(context.Background())
+	defer cancelRequests()
+	workerContext, cancelWorkers := context.WithCancel(context.Background())
+	defer cancelWorkers()
 	manager := syncer.New(db, cipher, fetcher, logger, cfg.PollInterval, cfg.SyncConcurrency)
 	manager.SetSyncTimeout(cfg.SyncTimeout)
 	appleClient, err := apple.NewClient(apple.Config{})
@@ -115,19 +126,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("初始化隐私邮箱自动创建服务: %w", err)
 	}
-	syncDone := make(chan struct{})
-	go func() {
-		defer close(syncDone)
-		manager.Run(appContext)
-	}()
-	autoCreateDone := make(chan struct{})
-	go func() {
-		defer close(autoCreateDone)
-		autoManager.Run(appContext)
-	}()
+	seenWorker := syncer.NewSeenWorker(db, cipher, fetcher, manager, logger, cfg.PollInterval)
+	seenWorker.SetOperationTimeout(seenOperationTimeout(cfg.IMAPTimeout))
 
 	web, err := httpserver.New(db, cipher, cfg, logger, func(accountID int64) error {
-		return manager.SyncAccountWithTimeout(appContext, accountID)
+		return manager.SyncAccountWithTimeout(requestContext, accountID)
 	})
 	cfg.OAuthToken = ""
 	if err != nil {
@@ -136,13 +139,16 @@ func run() error {
 	web.SetAccountLocker(manager.WithAccountLock)
 	web.SetHMESyncService(hmeService)
 	web.SetAliasAutoCreationService(autoManager)
+	web.SetSeenNotifier(seenWorker.Notify)
 	router, err := web.Router()
 	if err != nil {
 		return err
 	}
+	drainingRouter := newDrainingHandler(router)
 	httpService := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           router,
+		Handler:           drainingRouter,
+		BaseContext:       func(net.Listener) context.Context { return requestContext },
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       20 * time.Second,
 		WriteTimeout:      httpWriteTimeout(cfg.SyncTimeout),
@@ -150,42 +156,224 @@ func run() error {
 		MaxHeaderBytes:    32 << 10,
 	}
 
+	var background sync.WaitGroup
+	background.Add(3)
+	go func() {
+		defer background.Done()
+		manager.Run(workerContext)
+	}()
+	go func() {
+		defer background.Done()
+		seenWorker.Run(workerContext)
+	}()
+	go func() {
+		defer background.Done()
+		autoManager.Run(workerContext)
+	}()
+	backgroundDone := make(chan struct{})
+	go func() {
+		background.Wait()
+		close(backgroundDone)
+	}()
+
 	serverErrors := make(chan error, 1)
 	go func() {
 		logger.Info("服务已启动", "address", cfg.Addr, "admin", "http://"+cfg.Addr+"/admin")
 		serverErrors <- httpService.ListenAndServe()
 	}()
 
+	var serveErr error
 	select {
 	case err := <-serverErrors:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("HTTP 服务异常退出: %w", err)
+			serveErr = fmt.Errorf("HTTP 服务异常退出: %w", err)
 		}
-	case <-appContext.Done():
+	case <-signalContext.Done():
 	}
-	stop()
-
 	shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-	if err := httpService.Shutdown(shutdownContext); err != nil {
-		return fmt.Errorf("关闭 HTTP 服务: %w", err)
+	requestDone := drainingRouter.Stop()
+	// Stop background loops only after new HTTP work is rejected. Existing
+	// requests retain requestContext until HTTP draining finishes or times out.
+	manager.BeginShutdown()
+	cancelWorkers()
+	stopSignal()
+	shutdownErr := shutdownHTTPAndWaitForBackground(
+		shutdownContext,
+		httpService,
+		requestDone,
+		backgroundDone,
+		cancelRequests,
+	)
+	if !channelsClosed(requestDone, backgroundDone) {
+		// Do not close the shared database while an owner is still running. The
+		// process will exit on the returned error; if it remains alive, close the
+		// handle after both owners release it.
+		closeDBOnReturn = false
+		go func() {
+			<-requestDone
+			<-backgroundDone
+			_ = db.Close()
+		}()
 	}
-	select {
-	case <-syncDone:
-	case <-shutdownContext.Done():
-		return fmt.Errorf("等待同步任务结束: %w", shutdownContext.Err())
-	}
-	select {
-	case <-autoCreateDone:
-	case <-shutdownContext.Done():
-		return fmt.Errorf("等待自动创建任务结束: %w", shutdownContext.Err())
+	if err := errors.Join(serveErr, shutdownErr); err != nil {
+		return err
 	}
 	logger.Info("服务已关闭")
 	return nil
 }
 
 func httpWriteTimeout(syncTimeout time.Duration) time.Duration {
-	return syncTimeout + 10*time.Second
+	if syncTimeout <= 0 {
+		return 10 * time.Second
+	}
+	return 2*syncTimeout + 10*time.Second
+}
+
+func seenOperationTimeout(imapTimeout time.Duration) time.Duration {
+	const (
+		minimum = 2 * time.Minute
+		maximum = 5 * time.Minute
+		stages  = 6
+		grace   = 10 * time.Second
+	)
+	if imapTimeout <= (minimum-grace)/stages {
+		return minimum
+	}
+	if imapTimeout >= (maximum-grace)/stages {
+		return maximum
+	}
+	return stages*imapTimeout + grace
+}
+
+type httpShutdowner interface {
+	Shutdown(context.Context) error
+	Close() error
+}
+
+func shutdownHTTPAndWaitForBackground(
+	ctx context.Context,
+	service httpShutdowner,
+	requestDone <-chan struct{},
+	backgroundDone <-chan struct{},
+	cancelRequests context.CancelFunc,
+) error {
+	var shutdownErr error
+	forcedClose := false
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- service.Shutdown(ctx)
+	}()
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			shutdownErr = fmt.Errorf("关闭 HTTP 服务: %w", err)
+		}
+	case <-ctx.Done():
+		shutdownErr = fmt.Errorf("关闭 HTTP 服务: %w", ctx.Err())
+		forcedClose = true
+		if cancelRequests != nil {
+			cancelRequests()
+		}
+		if closeErr := service.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("强制关闭 HTTP 服务: %w", closeErr))
+		}
+	}
+	if shutdownErr != nil && !forcedClose {
+		// Shutdown may have returned a non-context error before the deadline;
+		// close active connections before waiting for the ownership markers.
+		if cancelRequests != nil {
+			cancelRequests()
+		}
+		if closeErr := service.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("强制关闭 HTTP 服务: %w", closeErr))
+		}
+	}
+	if cancelRequests != nil {
+		cancelRequests()
+	}
+	return errors.Join(
+		shutdownErr,
+		waitForOwnedTasks(ctx, "HTTP 请求", requestDone),
+		waitForOwnedTasks(ctx, "后台任务", backgroundDone),
+	)
+}
+
+func waitForOwnedTasks(ctx context.Context, name string, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+	}
+	return fmt.Errorf("等待%s结束: %w", name, ctx.Err())
+}
+
+func channelsClosed(channels ...<-chan struct{}) bool {
+	for _, channel := range channels {
+		select {
+		case <-channel:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+type drainingHandler struct {
+	handler http.Handler
+
+	mu        sync.Mutex
+	accepting bool
+	active    int
+	done      chan struct{}
+}
+
+func newDrainingHandler(handler http.Handler) *drainingHandler {
+	return &drainingHandler{
+		handler:   handler,
+		accepting: true,
+		done:      make(chan struct{}),
+	}
+}
+
+func (h *drainingHandler) ServeHTTP(response http.ResponseWriter, request *http.Request) {
+	h.mu.Lock()
+	if !h.accepting {
+		h.mu.Unlock()
+		response.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	h.active++
+	h.mu.Unlock()
+
+	defer h.finishRequest()
+	h.handler.ServeHTTP(response, request)
+}
+
+func (h *drainingHandler) Stop() <-chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.accepting {
+		h.accepting = false
+		if h.active == 0 {
+			close(h.done)
+		}
+	}
+	return h.done
+}
+
+func (h *drainingHandler) finishRequest() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.active--
+	if !h.accepting && h.active == 0 {
+		close(h.done)
+	}
 }
 
 type startupStore interface {

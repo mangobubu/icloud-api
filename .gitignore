@@ -13,4 +13,5 @@
 !/.env.example
 /.cache/
 /.gocache-review/
+/.tmp-gocache*/
 **/.gocache/

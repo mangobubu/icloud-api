@@ -161,6 +161,8 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 			UNION ALL SELECT 1 FROM apple_web_sessions
 			UNION ALL SELECT 1 FROM alias_creation_schedules
 			UNION ALL SELECT 1 FROM pending_alias_api_keys
+			UNION ALL SELECT 1 FROM consumed_messages
+			UNION ALL SELECT 1 FROM imap_seen_tasks
 			LIMIT 1
 		)`).Scan(&targetHasData); err != nil {
 		return false, fmt.Errorf("check PostgreSQL import target: %w", err)
@@ -229,6 +231,11 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 	if hasPendingAliasKeys {
 		specs = append(specs, legacySQLitePendingAliasKeyCopySpec())
 	}
+	seenSpecs, err := legacySQLiteSeenCopySpecs(ctx, legacyTx)
+	if err != nil {
+		return false, err
+	}
+	specs = append(specs, seenSpecs...)
 	for _, spec := range specs {
 		if err := prepareLegacyBooleanColumns(ctx, tx, &spec); err != nil {
 			return false, err
@@ -386,6 +393,37 @@ func legacySQLitePendingAliasKeyCopySpec() legacyCopySpec {
 		insertSQL: `INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
 			VALUES($1, $2, $3)`,
 	}
+}
+
+func legacySQLiteSeenCopySpecs(ctx context.Context, tx *sql.Tx) ([]legacyCopySpec, error) {
+	candidates := []legacyCopySpec{
+		{
+			table: "consumed_messages", columnCount: 4,
+			selectSQL: `SELECT alias_id, uid_validity, uid, consumed_at
+				FROM consumed_messages ORDER BY alias_id, uid_validity, uid`,
+			insertSQL: `INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
+				VALUES($1, $2, $3, $4)`,
+		},
+		{
+			table: "imap_seen_tasks", columnCount: 4,
+			selectSQL: `SELECT account_id, uid_validity, uid, created_at
+				FROM imap_seen_tasks ORDER BY account_id, uid_validity, uid`,
+			insertSQL: `INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
+				VALUES($1, $2, $3, $4)`,
+		},
+	}
+
+	specs := make([]legacyCopySpec, 0, len(candidates))
+	for _, candidate := range candidates {
+		exists, err := legacySQLiteTableExists(ctx, tx, candidate.table)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			specs = append(specs, candidate)
+		}
+	}
+	return specs, nil
 }
 
 func copyLegacySQLiteTable(

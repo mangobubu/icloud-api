@@ -83,7 +83,7 @@ func Load() (Config, error) {
 	if cfg.IMAPTimeout, err = envDuration("ICLOUD_API_IMAP_TIMEOUT", 25*time.Second); err != nil {
 		return Config{}, err
 	}
-	if cfg.SyncTimeout, err = envDuration("ICLOUD_API_SYNC_TIMEOUT", 2*time.Minute); err != nil {
+	if cfg.SyncTimeout, err = envDuration("ICLOUD_API_SYNC_TIMEOUT", 10*time.Minute); err != nil {
 		return Config{}, err
 	}
 	if cfg.ShutdownTimeout, err = envDuration("ICLOUD_API_SHUTDOWN_TIMEOUT", 10*time.Second); err != nil {

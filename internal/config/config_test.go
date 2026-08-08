@@ -211,8 +211,8 @@ func TestSyncTimeoutDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SyncTimeout != 2*time.Minute {
-		t.Fatalf("默认同步总时限 = %v, want %v", cfg.SyncTimeout, 2*time.Minute)
+	if cfg.SyncTimeout != 10*time.Minute {
+		t.Fatalf("默认同步总时限 = %v, want %v", cfg.SyncTimeout, 10*time.Minute)
 	}
 }
 

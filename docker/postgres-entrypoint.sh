@@ -400,9 +400,64 @@ case "${1:-}" in
 		' "$restore_toc"; then
 			die "恢复归档不包含任何数据库对象"
 		fi
+		auto_alias_table_count=0
+		for auto_alias_table in alias_creation_schedules pending_alias_api_keys; do
+			if awk -v required_table="$auto_alias_table" '
+				$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
+					$6 == required_table { found = 1 }
+				END { exit(found ? 0 : 1) }
+			' "$restore_toc"; then
+				auto_alias_table_count=$((auto_alias_table_count + 1))
+			fi
+		done
+		case "$auto_alias_table_count" in
+			0)
+				;;
+			2)
+				;;
+			*)
+				die "恢复归档中的自动别名 schema 表不完整"
+				;;
+		esac
+		seen_table_count=0
+		for seen_table in consumed_messages imap_seen_tasks; do
+			if awk -v required_table="$seen_table" '
+				$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
+					$6 == required_table { found = 1 }
+				END { exit(found ? 0 : 1) }
+			' "$restore_toc"; then
+				seen_table_count=$((seen_table_count + 1))
+			fi
+		done
+		case "$seen_table_count" in
+			0)
+				;;
+			2)
+				;;
+			*)
+				die "恢复归档中的消费与 IMAP Seen schema 表不完整"
+				;;
+		esac
+		optional_required_tables=""
+		optional_required_constraints=""
+		optional_required_foreign_keys=""
+		optional_required_indexes=""
+		if [ "$auto_alias_table_count" -eq 2 ]; then
+			optional_required_tables="alias_creation_schedules pending_alias_api_keys"
+			optional_required_constraints="alias_creation_schedules:alias_creation_schedules_pkey pending_alias_api_keys:pending_alias_api_keys_pkey"
+			optional_required_foreign_keys="alias_creation_schedules:alias_creation_schedules_account_id_fkey pending_alias_api_keys:pending_alias_api_keys_alias_id_fkey"
+			optional_required_indexes="alias_creation_schedules_due_idx"
+		fi
+		if [ "$seen_table_count" -eq 2 ]; then
+			optional_required_tables="$optional_required_tables consumed_messages imap_seen_tasks"
+			optional_required_constraints="$optional_required_constraints consumed_messages:consumed_messages_pkey imap_seen_tasks:imap_seen_tasks_pkey"
+			optional_required_foreign_keys="$optional_required_foreign_keys consumed_messages:consumed_messages_alias_id_fkey imap_seen_tasks:imap_seen_tasks_account_id_fkey"
+			optional_required_indexes="$optional_required_indexes imap_seen_tasks_account_created_idx"
+		fi
 		for required_table in \
 			schema_migrations app_metadata admins admin_sessions accounts aliases \
-			latest_messages audit_logs apple_web_sessions imap_sync_states data_migrations; do
+			latest_messages audit_logs apple_web_sessions imap_sync_states data_migrations \
+			$optional_required_tables; do
 			if ! awk -v required_table="$required_table" '
 				$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
 					$6 == required_table { found_table = 1 }
@@ -433,7 +488,8 @@ case "${1:-}" in
 			aliases:aliases_pkey aliases:aliases_address_key aliases:aliases_api_key_hash_key \
 			latest_messages:latest_messages_pkey audit_logs:audit_logs_pkey \
 			apple_web_sessions:apple_web_sessions_pkey \
-			imap_sync_states:imap_sync_states_pkey data_migrations:data_migrations_pkey; do
+			imap_sync_states:imap_sync_states_pkey data_migrations:data_migrations_pkey \
+			$optional_required_constraints; do
 			required_constraint_table="${required_constraint%%:*}"
 			required_constraint_name="${required_constraint#*:}"
 			if ! awk \
@@ -452,7 +508,8 @@ case "${1:-}" in
 			latest_messages:latest_messages_alias_id_fkey \
 			audit_logs:audit_logs_admin_id_fkey \
 			apple_web_sessions:apple_web_sessions_account_id_fkey \
-			imap_sync_states:imap_sync_states_account_id_fkey; do
+			imap_sync_states:imap_sync_states_account_id_fkey \
+			$optional_required_foreign_keys; do
 			required_foreign_key_table="${required_foreign_key%%:*}"
 			required_foreign_key_name="${required_foreign_key#*:}"
 			if ! awk \
@@ -470,7 +527,8 @@ case "${1:-}" in
 			admin_sessions_expires_at_idx admin_sessions_admin_id_idx \
 			accounts_enabled_email_idx aliases_account_id_idx \
 			aliases_account_address_idx aliases_enabled_account_address_idx \
-			audit_logs_created_at_idx audit_logs_admin_id_idx; do
+			audit_logs_created_at_idx audit_logs_admin_id_idx \
+			$optional_required_indexes; do
 			if ! awk -v required_index="$required_index" '
 				$1 ~ /^[0-9]+;$/ && $4 == "INDEX" && $5 == "public" && \
 					$6 == required_index { found = 1 }
@@ -495,7 +553,45 @@ case "${1:-}" in
 DO $icloud_api_restore_validation$
 DECLARE
 	missing_object TEXT;
+	restored_schema_version INTEGER;
+	auto_alias_table_count INTEGER;
+	seen_table_count INTEGER;
 BEGIN
+	SELECT version
+	INTO restored_schema_version
+	FROM public.schema_migrations
+	WHERE id = 1;
+	IF restored_schema_version IS NULL OR restored_schema_version NOT IN (4, 5, 6) THEN
+		RAISE EXCEPTION 'restored schema version % is not supported', restored_schema_version;
+	END IF;
+
+	SELECT count(*)
+	INTO auto_alias_table_count
+	FROM (VALUES ('alias_creation_schedules'), ('pending_alias_api_keys')) AS extension(table_name)
+	WHERE pg_catalog.to_regclass('public.' || extension.table_name) IS NOT NULL;
+	SELECT count(*)
+	INTO seen_table_count
+	FROM (VALUES ('consumed_messages'), ('imap_seen_tasks')) AS extension(table_name)
+	WHERE pg_catalog.to_regclass('public.' || extension.table_name) IS NOT NULL;
+	IF auto_alias_table_count NOT IN (0, 2) THEN
+		RAISE EXCEPTION 'restored schema contains a partial automatic-alias table group';
+	END IF;
+	IF seen_table_count NOT IN (0, 2) THEN
+		RAISE EXCEPTION 'restored schema contains a partial seen-queue table group';
+	END IF;
+	IF restored_schema_version = 4 AND
+		(auto_alias_table_count <> 0 OR seen_table_count <> 0) THEN
+		RAISE EXCEPTION 'restored schema v4 contains later-version objects';
+	END IF;
+	IF restored_schema_version = 5 AND
+		auto_alias_table_count = 0 AND seen_table_count = 0 THEN
+		RAISE EXCEPTION 'restored schema v5 contains neither recognized v5 table group';
+	END IF;
+	IF restored_schema_version = 6 AND
+		(auto_alias_table_count <> 2 OR seen_table_count <> 2) THEN
+		RAISE EXCEPTION 'restored schema v6 is missing required table groups';
+	END IF;
+
 	SELECT required.table_name || '.' || required.constraint_name
 	INTO missing_object
 	FROM (VALUES
@@ -570,6 +666,133 @@ BEGIN
 	LIMIT 1;
 	IF missing_object IS NOT NULL THEN
 		RAISE EXCEPTION 'restored schema is missing required index %', missing_object;
+	END IF;
+
+	SELECT required.table_name || '.' || required.constraint_name
+	INTO missing_object
+	FROM (VALUES
+		('auto', 'alias_creation_schedules', 'alias_creation_schedules_pkey', ARRAY['account_id']::TEXT[]),
+		('auto', 'pending_alias_api_keys', 'pending_alias_api_keys_pkey', ARRAY['alias_id']::TEXT[]),
+		('seen', 'consumed_messages', 'consumed_messages_pkey', ARRAY['alias_id', 'uid_validity', 'uid']::TEXT[]),
+		('seen', 'imap_seen_tasks', 'imap_seen_tasks_pkey', ARRAY['account_id', 'uid_validity', 'uid']::TEXT[])
+	) AS required(extension_group, table_name, constraint_name, key_columns)
+	WHERE ((required.extension_group = 'auto' AND auto_alias_table_count = 2) OR
+		(required.extension_group = 'seen' AND seen_table_count = 2))
+		AND NOT EXISTS (
+			SELECT 1
+			FROM pg_catalog.pg_constraint AS constraint_state
+			JOIN pg_catalog.pg_class AS table_state
+				ON table_state.oid = constraint_state.conrelid
+			JOIN pg_catalog.pg_namespace AS schema_state
+				ON schema_state.oid = table_state.relnamespace
+			WHERE schema_state.nspname = 'public'
+				AND table_state.relname = required.table_name
+				AND constraint_state.conname = required.constraint_name
+				AND constraint_state.contype = 'p'
+				AND constraint_state.convalidated
+				AND (
+					SELECT array_agg(attribute_state.attname::TEXT ORDER BY key_column.ordinality)
+					FROM unnest(constraint_state.conkey) WITH ORDINALITY
+						AS key_column(attnum, ordinality)
+					JOIN pg_catalog.pg_attribute AS attribute_state
+						ON attribute_state.attrelid = constraint_state.conrelid
+						AND attribute_state.attnum = key_column.attnum
+				) = required.key_columns
+		)
+	LIMIT 1;
+	IF missing_object IS NOT NULL THEN
+		RAISE EXCEPTION 'restored schema has invalid primary key columns for %', missing_object;
+	END IF;
+
+	SELECT required.table_name || '.' || required.constraint_name
+	INTO missing_object
+	FROM (VALUES
+		('auto', 'alias_creation_schedules', 'alias_creation_schedules_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[]),
+		('auto', 'pending_alias_api_keys', 'pending_alias_api_keys_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[]),
+		('seen', 'consumed_messages', 'consumed_messages_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[]),
+		('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[])
+	) AS required(extension_group, table_name, constraint_name, referenced_table, local_columns, referenced_columns)
+	WHERE ((required.extension_group = 'auto' AND auto_alias_table_count = 2) OR
+		(required.extension_group = 'seen' AND seen_table_count = 2))
+		AND NOT EXISTS (
+			SELECT 1
+			FROM pg_catalog.pg_constraint AS constraint_state
+			JOIN pg_catalog.pg_class AS table_state
+				ON table_state.oid = constraint_state.conrelid
+			JOIN pg_catalog.pg_namespace AS schema_state
+				ON schema_state.oid = table_state.relnamespace
+			WHERE schema_state.nspname = 'public'
+				AND table_state.relname = required.table_name
+				AND constraint_state.conname = required.constraint_name
+				AND constraint_state.contype = 'f'
+				AND constraint_state.convalidated
+				AND constraint_state.confrelid = pg_catalog.to_regclass('public.' || required.referenced_table)
+				AND constraint_state.confdeltype = 'c'
+				AND (
+					SELECT array_agg(attribute_state.attname::TEXT ORDER BY key_column.ordinality)
+					FROM unnest(constraint_state.conkey) WITH ORDINALITY
+						AS key_column(attnum, ordinality)
+					JOIN pg_catalog.pg_attribute AS attribute_state
+						ON attribute_state.attrelid = constraint_state.conrelid
+						AND attribute_state.attnum = key_column.attnum
+				) = required.local_columns
+				AND (
+					SELECT array_agg(attribute_state.attname::TEXT ORDER BY key_column.ordinality)
+					FROM unnest(constraint_state.confkey) WITH ORDINALITY
+						AS key_column(attnum, ordinality)
+					JOIN pg_catalog.pg_attribute AS attribute_state
+						ON attribute_state.attrelid = constraint_state.confrelid
+						AND attribute_state.attnum = key_column.attnum
+				) = required.referenced_columns
+		)
+	LIMIT 1;
+	IF missing_object IS NOT NULL THEN
+		RAISE EXCEPTION 'restored schema has invalid foreign key %', missing_object;
+	END IF;
+
+	SELECT required.table_name || '.' || required.index_name
+	INTO missing_object
+	FROM (VALUES
+		('auto', 'alias_creation_schedules', 'alias_creation_schedules_due_idx', ARRAY['enabled', 'next_run_at', 'account_id']::TEXT[]),
+		('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_created_idx', ARRAY['account_id', 'created_at', 'uid_validity', 'uid']::TEXT[])
+	) AS required(extension_group, table_name, index_name, key_columns)
+	WHERE ((required.extension_group = 'auto' AND auto_alias_table_count = 2) OR
+		(required.extension_group = 'seen' AND seen_table_count = 2))
+		AND NOT EXISTS (
+			SELECT 1
+			FROM pg_catalog.pg_class AS index_state
+			JOIN pg_catalog.pg_namespace AS schema_state
+				ON schema_state.oid = index_state.relnamespace
+			JOIN pg_catalog.pg_index AS index_metadata
+				ON index_metadata.indexrelid = index_state.oid
+			JOIN pg_catalog.pg_class AS table_state
+				ON table_state.oid = index_metadata.indrelid
+			JOIN pg_catalog.pg_am AS access_method
+				ON access_method.oid = index_state.relam
+			WHERE schema_state.nspname = 'public'
+				AND table_state.relname = required.table_name
+				AND index_state.relname = required.index_name
+				AND index_state.relkind IN ('i', 'I')
+				AND access_method.amname = 'btree'
+				AND index_metadata.indisvalid
+				AND index_metadata.indisready
+				AND NOT index_metadata.indisunique
+				AND index_metadata.indnkeyatts = array_length(required.key_columns, 1)
+				AND index_metadata.indnatts = array_length(required.key_columns, 1)
+				AND index_metadata.indpred IS NULL
+				AND index_metadata.indexprs IS NULL
+				AND (
+					SELECT array_agg(attribute_state.attname::TEXT ORDER BY key_column.ordinality)
+					FROM unnest(index_metadata.indkey::SMALLINT[]) WITH ORDINALITY
+						AS key_column(attnum, ordinality)
+					JOIN pg_catalog.pg_attribute AS attribute_state
+						ON attribute_state.attrelid = index_metadata.indrelid
+						AND attribute_state.attnum = key_column.attnum
+				) = required.key_columns
+		)
+	LIMIT 1;
+	IF missing_object IS NOT NULL THEN
+		RAISE EXCEPTION 'restored schema has invalid index %', missing_object;
 	END IF;
 END
 $icloud_api_restore_validation$;

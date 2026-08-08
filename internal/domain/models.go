@@ -163,15 +163,27 @@ type LatestMessage struct {
 }
 
 // IMAPSyncState is the account-level cursor for one selected mailbox
-// generation. LastUID is the consumed high-water mark. A reset establishes a
-// bounded recent baseline; normal incremental runs never advance it past an
-// existing UID that was not processed. UpdatedAt is when this mailbox position
-// was observed, not when it committed.
+// generation. LastUID is the examined high-water mark. A reset establishes a
+// bounded recent baseline; normal incremental runs may skip UIDs already marked
+// Seen by this service, but never advance past an unread UID omitted from the
+// committed batch. UpdatedAt is when this mailbox position was observed, not
+// when it committed.
 type IMAPSyncState struct {
 	AccountID   int64
 	UIDValidity uint32
 	LastUID     uint32
 	UpdatedAt   time.Time
+}
+
+// SeenTask is a durable request to mark one message as seen in its
+// account's selected mailbox. UIDVALIDITY scopes UID to one mailbox
+// generation, so workers must compare it with the currently selected mailbox
+// before applying the task.
+type SeenTask struct {
+	AccountID   int64
+	UIDValidity uint32
+	UID         uint32
+	CreatedAt   time.Time
 }
 
 // MailboxSnapshotPosition identifies the locally published latest message for
@@ -192,7 +204,7 @@ type MailboxSyncResult struct {
 	Messages map[int64]LatestMessage
 	State    IMAPSyncState
 	Reset    bool
-	// HasMore means later actual UIDs remain beyond State.LastUID.
+	// HasMore means later unread UIDs remain beyond State.LastUID.
 	HasMore bool
 }
 

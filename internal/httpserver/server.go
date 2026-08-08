@@ -33,6 +33,7 @@ type Server struct {
 	hmeSync              HMESyncService
 	autoCreate           AliasAutoCreationService
 	lockAccount          func(context.Context, int64, func() error) error
+	seenNotify           func()
 	adminSPA             *adminSPA
 	oauthTokenHash       []byte
 	oauthTokenConfigured bool
@@ -78,6 +79,12 @@ type adminSPA struct {
 // lock. It must be configured before Router starts serving requests.
 func (s *Server) SetAccountLocker(locker func(context.Context, int64, func() error) error) {
 	s.lockAccount = locker
+}
+
+// SetSeenNotifier wakes the durable IMAP flag worker after a direct-link
+// request queues a message for marking as read.
+func (s *Server) SetSeenNotifier(notify func()) {
+	s.seenNotify = notify
 }
 
 func (s *Server) withAccountLock(ctx context.Context, accountID int64, operation func() error) error {

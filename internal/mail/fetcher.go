@@ -20,17 +20,23 @@ import (
 )
 
 const (
-	defaultIMAPHost            = "imap.mail.me.com"
-	defaultIMAPPort            = 993
-	defaultIMAPTimeout         = 25 * time.Second
-	defaultMaxAliases          = domain.MaxEnabledAliasesPerAccount
-	defaultMaxCandidates       = 1024
-	defaultMaxHeaderBytes      = 128 << 10
-	defaultMaxMessageBytes     = 10 << 20
-	defaultMaxBodyBytes        = 1 << 20
-	defaultMaxFetchResultBytes = 64 << 20
-	candidateHeaderFetchBatch  = 64
-	messageFetchBatch          = 8
+	defaultIMAPHost                 = "imap.mail.me.com"
+	defaultIMAPPort                 = 993
+	defaultIMAPTimeout              = 25 * time.Second
+	defaultMaxAliases               = domain.MaxEnabledAliasesPerAccount
+	defaultMaxCandidates            = 1024
+	defaultMaxIncrementalCandidates = 256
+	defaultMaxHeaderBytes           = 128 << 10
+	defaultMaxMessageBytes          = 10 << 20
+	defaultMaxBodyBytes             = 1 << 20
+	defaultMaxFetchResultBytes      = 64 << 20
+	// Content FETCHes use the ordinary incremental window as their UID ceiling.
+	// Header commands may use fewer UIDs to retain the configured per-message
+	// header limit within the aggregate literal budget.
+	candidateHeaderFetchBatch   = defaultMaxIncrementalCandidates
+	messageFetchBatch           = defaultMaxIncrementalCandidates
+	maxContentFetchLiteralBytes = 12 << 20
+	maxSequenceFetchMessages    = defaultMaxCandidates + 1
 )
 
 var (
@@ -47,6 +53,7 @@ type imapSession interface {
 	Fetch(seqset *imap.SeqSet, items []imap.FetchItem, ch chan *imap.Message) error
 	UidSearch(criteria *imap.SearchCriteria) ([]uint32, error)
 	UidFetch(seqset *imap.SeqSet, items []imap.FetchItem, ch chan *imap.Message) error
+	UidStore(seqset *imap.SeqSet, item imap.StoreItem, value interface{}, ch chan *imap.Message) error
 	Logout() error
 	Terminate() error
 }
@@ -56,9 +63,12 @@ type dialSessionFunc func(ctx context.Context, address, serverName string, timeo
 // Fetcher retrieves the latest message delivered to each alias through one
 // account-level IMAP connection. All connections use implicit TLS.
 type Fetcher struct {
-	IMAPTimeout               time.Duration
-	MaxAliases                int
-	MaxCandidates             int
+	IMAPTimeout time.Duration
+	MaxAliases  int
+	// MaxCandidates bounds reset and missing-snapshot recent-window scans.
+	MaxCandidates int
+	// MaxIncrementalCandidates bounds each ordinary incremental UID batch.
+	MaxIncrementalCandidates  int
 	MaxHeaderBytes            int
 	MaxMessageBytes           int
 	MaxBodyBytes              int
@@ -74,14 +84,15 @@ type Fetcher struct {
 // overwritten directly, for example from the application configuration.
 func NewFetcher() *Fetcher {
 	return &Fetcher{
-		IMAPTimeout:     defaultIMAPTimeout,
-		MaxAliases:      defaultMaxAliases,
-		MaxCandidates:   defaultMaxCandidates,
-		MaxHeaderBytes:  defaultMaxHeaderBytes,
-		MaxMessageBytes: defaultMaxMessageBytes,
-		MaxBodyBytes:    defaultMaxBodyBytes,
-		dial:            dialIMAPTLS,
-		now:             time.Now,
+		IMAPTimeout:              defaultIMAPTimeout,
+		MaxAliases:               defaultMaxAliases,
+		MaxCandidates:            defaultMaxCandidates,
+		MaxIncrementalCandidates: defaultMaxIncrementalCandidates,
+		MaxHeaderBytes:           defaultMaxHeaderBytes,
+		MaxMessageBytes:          defaultMaxMessageBytes,
+		MaxBodyBytes:             defaultMaxBodyBytes,
+		dial:                     dialIMAPTLS,
+		now:                      time.Now,
 	}
 }
 
@@ -113,11 +124,8 @@ func (f *Fetcher) FetchIncremental(
 	if err := ctx.Err(); err != nil {
 		return failure, err
 	}
-	if !account.Enabled {
-		return failure, ErrAccountDisabled
-	}
-	if password == "" {
-		return failure, fmt.Errorf("%w: empty password", ErrInvalidIMAPConfig)
+	if err := validateIMAPAccount(account, password); err != nil {
+		return failure, err
 	}
 
 	aliasAddresses, err := prepareAliases(account, aliases, settings.maxAliases)
@@ -237,10 +245,10 @@ func (f *Fetcher) FetchIncremental(
 		// A new baseline intentionally keeps only the newest actual messages.
 		// Sequence numbers make the limit message-based even when UIDs are sparse.
 		candidateUIDs, err = fetchRecentMailboxUIDs(ctx, session, mailbox.Messages, settings.maxCandidates)
-		if mailbox.Messages <= uint32(settings.maxCandidates) {
+		if uint64(mailbox.Messages) <= uint64(settings.maxCandidates) {
 			authoritativeEmpty = idSet(aliasIDs)
 		}
-		if err == nil && mailbox.Messages > uint32(settings.maxCandidates) {
+		if err == nil && uint64(mailbox.Messages) > uint64(settings.maxCandidates) {
 			currentPositions := make(map[int64]domain.MailboxSnapshotPosition, len(snapshotPositions))
 			for aliasID, position := range snapshotPositions {
 				if position.UIDValidity == uidValidity {
@@ -258,15 +266,15 @@ func (f *Fetcher) FetchIncremental(
 		}
 	} else {
 		if previous.LastUID < upperUID {
-			// Incremental runs process the oldest outstanding actual messages first.
-			// Sequence lookup bounds both the command response and local allocation.
+			// Incremental runs examine the oldest outstanding actual messages first,
+			// then retain only unread UIDs for header and body fetching.
 			candidateUIDs, result.State.LastUID, result.HasMore, err = fetchIncrementalMailboxUIDs(
 				ctx,
 				session,
 				mailbox.Messages,
 				previous.LastUID,
 				upperUID,
-				settings.maxCandidates,
+				settings.maxIncrementalCandidates,
 			)
 		}
 		if err == nil {
@@ -409,21 +417,22 @@ func fetchCandidateWinners(
 	maxHeaderBytes int,
 	allowWeak bool,
 ) (map[int64]uint32, error) {
-	section := &imap.BodySectionName{
-		Peek: true,
-		BodyPartName: imap.BodyPartName{
-			Specifier: imap.HeaderSpecifier,
-			Fields:    recipientHeaderFieldsForFetch(),
-		},
-		Partial: []int{0, maxHeaderBytes + 1},
-	}
+	headerBytes, headerFetchBatch := boundedHeaderFetchLimits(maxHeaderBytes)
 	winners := make(map[int64]uint32)
-	for start := 0; start < len(candidateUIDs); start += candidateHeaderFetchBatch {
+	for start := 0; start < len(candidateUIDs); start += headerFetchBatch {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		end := min(start+candidateHeaderFetchBatch, len(candidateUIDs))
+		end := min(start+headerFetchBatch, len(candidateUIDs))
 		uids := candidateUIDs[start:end]
+		section := &imap.BodySectionName{
+			Peek: true,
+			BodyPartName: imap.BodyPartName{
+				Specifier: imap.HeaderSpecifier,
+				Fields:    recipientHeaderFieldsForFetch(),
+			},
+			Partial: []int{0, headerBytes + 1},
+		}
 		requested := make(map[uint32]struct{}, len(uids))
 		for _, uid := range uids {
 			requested[uid] = struct{}{}
@@ -442,7 +451,7 @@ func fetchCandidateWinners(
 			if body == nil {
 				return nil
 			}
-			raw, truncated, readErr := readLiteral(body, maxHeaderBytes)
+			raw, truncated, readErr := readLiteral(body, headerBytes)
 			if readErr != nil {
 				return fmt.Errorf("read candidate UID %d header: %w", message.Uid, readErr)
 			}
@@ -500,9 +509,11 @@ func classifyScannedRecipientAlias(
 }
 
 type fetchSettings struct {
-	timeout                   time.Duration
-	maxAliases                int
+	timeout    time.Duration
+	maxAliases int
+	// maxCandidates is the reset and missing-snapshot recent-window limit.
 	maxCandidates             int
+	maxIncrementalCandidates  int
 	maxHeaderBytes            int
 	maxMessageBytes           int
 	maxBodyBytes              int
@@ -515,15 +526,16 @@ type fetchSettings struct {
 
 func (f *Fetcher) settings() fetchSettings {
 	settings := fetchSettings{
-		timeout:             defaultIMAPTimeout,
-		maxAliases:          defaultMaxAliases,
-		maxCandidates:       defaultMaxCandidates,
-		maxHeaderBytes:      defaultMaxHeaderBytes,
-		maxMessageBytes:     defaultMaxMessageBytes,
-		maxBodyBytes:        defaultMaxBodyBytes,
-		maxFetchResultBytes: defaultMaxFetchResultBytes,
-		dial:                dialIMAPTLS,
-		now:                 time.Now,
+		timeout:                  defaultIMAPTimeout,
+		maxAliases:               defaultMaxAliases,
+		maxCandidates:            defaultMaxCandidates,
+		maxIncrementalCandidates: defaultMaxIncrementalCandidates,
+		maxHeaderBytes:           defaultMaxHeaderBytes,
+		maxMessageBytes:          defaultMaxMessageBytes,
+		maxBodyBytes:             defaultMaxBodyBytes,
+		maxFetchResultBytes:      defaultMaxFetchResultBytes,
+		dial:                     dialIMAPTLS,
+		now:                      time.Now,
 	}
 	if f == nil {
 		return settings
@@ -535,7 +547,10 @@ func (f *Fetcher) settings() fetchSettings {
 		settings.maxAliases = f.MaxAliases
 	}
 	if f.MaxCandidates > 0 {
-		settings.maxCandidates = f.MaxCandidates
+		settings.maxCandidates = min(f.MaxCandidates, defaultMaxCandidates)
+	}
+	if f.MaxIncrementalCandidates > 0 {
+		settings.maxIncrementalCandidates = min(f.MaxIncrementalCandidates, defaultMaxIncrementalCandidates)
 	}
 	if f.MaxHeaderBytes > 0 {
 		settings.maxHeaderBytes = f.MaxHeaderBytes
@@ -790,6 +805,16 @@ func accountEndpoint(account domain.Account) (host, address, username string, er
 	return defaultIMAPHost, "imap.mail.me.com:993", username, nil
 }
 
+func validateIMAPAccount(account domain.Account, password string) error {
+	if !account.Enabled {
+		return ErrAccountDisabled
+	}
+	if password == "" {
+		return fmt.Errorf("%w: empty password", ErrInvalidIMAPConfig)
+	}
+	return nil
+}
+
 // fetchRecentMailboxUIDs returns the newest actual message UIDs in descending
 // order. Sequence numbers are used for discovery because UIDs can be sparse
 // after messages are expunged; the caller then uses UID FETCH for headers and
@@ -827,11 +852,10 @@ func fetchRecentMailboxUIDs(
 	return uids, nil
 }
 
-// fetchIncrementalMailboxUIDs returns at most limit oldest outstanding actual
-// UIDs in descending order. Small numeric ranges use one bounded UID SEARCH;
-// large ranges locate the first sequence after lastUID with bounded binary
-// probes, then fetch one contiguous sequence batch plus a sentinel. Response
-// size is O(limit), even for very large or sparse UID sets.
+// fetchIncrementalMailboxUIDs returns at most limit oldest outstanding unread
+// UIDs in descending order. Small numeric UID ranges use one naturally bounded
+// UNSEEN search. Large or sparse ranges use bounded sequence probes and one
+// UID/FLAGS window, keeping every discovery response O(limit).
 func fetchIncrementalMailboxUIDs(
 	ctx context.Context,
 	session imapSession,
@@ -846,7 +870,14 @@ func fetchIncrementalMailboxUIDs(
 	if limit <= 0 {
 		return nil, lastUID, false, errors.New("candidate limit must be positive")
 	}
-	if lastUID >= upperUID {
+	if lastUID > upperUID {
+		return nil, lastUID, false, fmt.Errorf(
+			"stored cursor UID %d exceeds mailbox upper UID %d",
+			lastUID,
+			upperUID,
+		)
+	}
+	if lastUID == upperUID {
 		return nil, upperUID, false, nil
 	}
 	if uint64(upperUID)-uint64(lastUID) <= uint64(limit) {
@@ -854,6 +885,7 @@ func fetchIncrementalMailboxUIDs(
 		set.AddRange(lastUID+1, upperUID)
 		criteria := imap.NewSearchCriteria()
 		criteria.Uid = set
+		criteria.WithoutFlags = []string{imap.SeenFlag}
 		discovered, searchErr := session.UidSearch(criteria)
 		if searchErr != nil {
 			return nil, lastUID, false, fmt.Errorf("search UID range %d:%d: %w", lastUID+1, upperUID, searchErr)
@@ -891,36 +923,103 @@ func fetchIncrementalMailboxUIDs(
 	if first > 1 {
 		rangeFirst--
 	}
-	rangeLast := firstSequence + uint64(limit)
-	if rangeLast > uint64(messagesCount) {
-		rangeLast = uint64(messagesCount)
+	rangeLast := uint64(messagesCount)
+	remaining := uint64(messagesCount) - firstSequence + 1
+	if uint64(limit) < remaining {
+		rangeLast = firstSequence + uint64(limit) - 1
 	}
-	discovered, err := fetchMailboxUIDSequenceRange(ctx, session, rangeFirst, uint32(rangeLast))
+	// Sequence numbers can move while a FETCH response is being streamed. Keep
+	// one message immediately after this window as a UID sentinel when there is
+	// one. If a message in the window is expunged after its response was sent,
+	// a server that continues iterating by sequence can skip the next message;
+	// the trailing sentinel then shifts and exposes that race before advancing
+	// the cursor.
+	var trailingUID uint32
+	trailingSequence := uint32(0)
+	if rangeLast < uint64(messagesCount) {
+		trailingSequence = uint32(rangeLast + 1)
+		trailing, sentinelErr := fetchMailboxUIDSequenceRange(
+			ctx,
+			session,
+			trailingSequence,
+			trailingSequence,
+		)
+		if sentinelErr != nil {
+			return nil, lastUID, false, fmt.Errorf("read incremental trailing sequence sentinel: %w", sentinelErr)
+		}
+		trailingUID = trailing[0]
+	}
+	discovered, err := fetchMailboxUIDFlagsSequenceRange(ctx, session, rangeFirst, uint32(rangeLast))
 	if err != nil {
 		return nil, lastUID, false, err
 	}
-	if first > 1 {
-		if discovered[0] > lastUID {
-			return nil, lastUID, false, fmt.Errorf("mailbox sequence boundary changed before batch fetch")
+	if trailingSequence != 0 {
+		trailing, sentinelErr := fetchMailboxUIDSequenceRange(
+			ctx,
+			session,
+			trailingSequence,
+			trailingSequence,
+		)
+		if sentinelErr != nil {
+			return nil, lastUID, false, fmt.Errorf("recheck incremental trailing sequence sentinel: %w", sentinelErr)
 		}
+		if trailing[0] != trailingUID {
+			return nil, lastUID, false, fmt.Errorf(
+				"mailbox trailing sequence sentinel changed from UID %d to UID %d",
+				trailingUID,
+				trailing[0],
+			)
+		}
+	}
+	leadingUID := discovered[0].uid
+	if first > 1 {
+		if leadingUID > lastUID {
+			return nil, lastUID, false, errors.New("mailbox sequence boundary changed before batch fetch")
+		}
+	}
+	// Re-read the first sequence after the window command even when the
+	// window starts at sequence 1. Without this check an EXPUNGE of the first
+	// message can shift a later UID into the response while preserving the
+	// response length and sequence numbers.
+	leading, leadingErr := fetchMailboxUIDSequenceRange(ctx, session, rangeFirst, rangeFirst)
+	if leadingErr != nil {
+		return nil, lastUID, false, fmt.Errorf("recheck mailbox leading sequence: %w", leadingErr)
+	}
+	if len(leading) != 1 || leading[0] != leadingUID {
+		return nil, lastUID, false, errors.New("mailbox sequence boundary changed after batch fetch")
+	}
+	if first > 1 {
+		// Sequence-number FETCH responses can be interleaved with an EXPUNGE.
+		// Re-read the boundary after the window command so a response that began
+		// with the old sentinel cannot silently skip the UID that shifted into
+		// that sequence slot. A changed boundary invalidates the whole batch;
+		// the caller will retry from the committed cursor.
 		discovered = discovered[1:]
 	}
-	for _, uid := range discovered {
-		if uid <= lastUID || uid > upperUID {
-			return nil, lastUID, false, fmt.Errorf("incremental sequence batch returned unexpected UID %d", uid)
+	for _, message := range discovered {
+		if message.uid <= lastUID || message.uid > upperUID {
+			return nil, lastUID, false, fmt.Errorf("incremental sequence batch returned unexpected UID %d", message.uid)
 		}
 	}
-	hasMore = len(discovered) > limit
+
+	hasMore = rangeLast < uint64(messagesCount)
 	if hasMore {
-		discovered = discovered[:limit]
-		processedThrough = discovered[len(discovered)-1]
+		processedThrough = discovered[len(discovered)-1].uid
 	} else {
+		// The window reached SELECT's fixed message count, so every UID through
+		// its upper bound has been examined, including sparse UID gaps.
 		processedThrough = upperUID
 	}
-	for left, right := 0, len(discovered)-1; left < right; left, right = left+1, right-1 {
-		discovered[left], discovered[right] = discovered[right], discovered[left]
+	uids = make([]uint32, 0, len(discovered))
+	for _, message := range discovered {
+		if !message.seen {
+			uids = append(uids, message.uid)
+		}
 	}
-	return discovered, processedThrough, hasMore, nil
+	for left, right := 0, len(uids)-1; left < right; left, right = left+1, right-1 {
+		uids[left], uids[right] = uids[right], uids[left]
+	}
+	return uids, processedThrough, hasMore, nil
 }
 
 func findFirstSequenceAfterUID(
@@ -930,19 +1029,51 @@ func findFirstSequenceAfterUID(
 	lastUID uint32,
 	upperUID uint32,
 ) (uint64, error) {
+	if messagesCount == 0 {
+		return 1, nil
+	}
 	low, high := uint64(1), uint64(messagesCount)+1
-	for low < high {
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		middle := low + (high-low)/2
-		uids, err := fetchMailboxUIDSequenceRange(ctx, session, uint32(middle), uint32(middle))
+	probe := func(sequence uint64) (uint32, error) {
+		uids, err := fetchMailboxUIDSequenceRange(ctx, session, uint32(sequence), uint32(sequence))
 		if err != nil {
 			return 0, err
 		}
 		uid := uids[0]
 		if uid > upperUID {
-			return 0, fmt.Errorf("sequence %d returned UID %d beyond selected upper UID %d", middle, uid, upperUID)
+			return 0, fmt.Errorf("sequence %d returned UID %d beyond selected upper UID %d", sequence, uid, upperUID)
+		}
+		return uid, nil
+	}
+
+	// In the common dense-mailbox case UID and sequence numbers advance
+	// together. One guarded probe usually identifies the boundary exactly;
+	// sparse or shifted UIDs simply leave a smaller interval for binary search.
+	guess := uint64(lastUID) + 1
+	if guess > uint64(messagesCount) {
+		guess = uint64(messagesCount)
+	}
+	if guess >= 1 {
+		uid, err := probe(guess)
+		if err != nil {
+			return 0, err
+		}
+		if uint64(uid) == uint64(lastUID)+1 {
+			return guess, nil
+		}
+		if uid <= lastUID {
+			low = guess + 1
+		} else {
+			high = guess
+		}
+	}
+	for low < high {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		middle := low + (high-low)/2
+		uid, err := probe(middle)
+		if err != nil {
+			return 0, err
 		}
 		if uid <= lastUID {
 			low = middle + 1
@@ -959,26 +1090,66 @@ func fetchMailboxUIDSequenceRange(
 	first uint32,
 	last uint32,
 ) ([]uint32, error) {
+	discovered, err := fetchMailboxSequenceRange(ctx, session, first, last, false)
+	if err != nil {
+		return nil, err
+	}
+	uids := make([]uint32, len(discovered))
+	for index, message := range discovered {
+		uids[index] = message.uid
+	}
+	return uids, nil
+}
+
+type mailboxSequenceMessage struct {
+	sequence uint32
+	uid      uint32
+	seen     bool
+}
+
+func fetchMailboxUIDFlagsSequenceRange(
+	ctx context.Context,
+	session imapSession,
+	first uint32,
+	last uint32,
+) ([]mailboxSequenceMessage, error) {
+	return fetchMailboxSequenceRange(ctx, session, first, last, true)
+}
+
+func fetchMailboxSequenceRange(
+	ctx context.Context,
+	session imapSession,
+	first uint32,
+	last uint32,
+	includeFlags bool,
+) ([]mailboxSequenceMessage, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if first == 0 || last < first {
 		return nil, fmt.Errorf("invalid mailbox sequence range %d:%d", first, last)
 	}
+	want := uint64(last) - uint64(first) + 1
+	if want > uint64(maxSequenceFetchMessages) {
+		return nil, fmt.Errorf(
+			"fetch sequence range %d:%d exceeds bounded response limit %d",
+			first,
+			last,
+			maxSequenceFetchMessages,
+		)
+	}
 	set := new(imap.SeqSet)
 	set.AddRange(first, last)
 	messages := make(chan *imap.Message)
 	done := make(chan error, 1)
-	go func() {
-		done <- session.Fetch(set, []imap.FetchItem{imap.FetchUid}, messages)
-	}()
-
-	type sequenceUID struct {
-		sequence uint32
-		uid      uint32
+	items := []imap.FetchItem{imap.FetchUid}
+	if includeFlags {
+		items = append(items, imap.FetchFlags)
 	}
-	want := uint64(last) - uint64(first) + 1
-	discovered := make([]sequenceUID, 0, int(want))
+	go func() {
+		done <- session.Fetch(set, items, messages)
+	}()
+	discovered := make([]mailboxSequenceMessage, 0, int(want))
 	seenSequences := make(map[uint32]struct{}, int(want))
 	seenUIDs := make(map[uint32]struct{}, int(want))
 	malformed := false
@@ -997,7 +1168,11 @@ func fetchMailboxUIDSequenceRange(
 		}
 		seenSequences[message.SeqNum] = struct{}{}
 		seenUIDs[message.Uid] = struct{}{}
-		discovered = append(discovered, sequenceUID{sequence: message.SeqNum, uid: message.Uid})
+		discovered = append(discovered, mailboxSequenceMessage{
+			sequence: message.SeqNum,
+			uid:      message.Uid,
+			seen:     containsIMAPFlag(message.Flags, imap.SeenFlag),
+		})
 	}
 	if err := <-done; err != nil {
 		return nil, fmt.Errorf("fetch sequence range %d:%d: %w", first, last, err)
@@ -1020,11 +1195,17 @@ func fetchMailboxUIDSequenceRange(
 	if malformed {
 		return nil, fmt.Errorf("fetch sequence range %d:%d returned an unstable mailbox view", first, last)
 	}
-	uids := make([]uint32, len(discovered))
-	for index, item := range discovered {
-		uids[index] = item.uid
+	return discovered, nil
+}
+
+func containsIMAPFlag(flags []string, want string) bool {
+	want = imap.CanonicalFlag(want)
+	for _, flag := range flags {
+		if imap.CanonicalFlag(flag) == want {
+			return true
+		}
 	}
-	return uids, nil
+	return false
 }
 
 type fetchedMessage struct {
@@ -1044,10 +1225,18 @@ func fetchMessages(
 	if remainingResultBytes < 0 {
 		remainingResultBytes = 0
 	}
-	section := &imap.BodySectionName{Peek: true, Partial: []int{0, maxMessageBytes + 1}}
+	messageBytes := boundedWinnerMessageBytes(
+		maxMessageBytes,
+		len(uids),
+		limits.maxBodyBytes,
+		limits.maxResultBytes,
+		remainingResultBytes,
+	)
 	result := make(map[uint32]fetchedMessage, len(uids))
 	for start := 0; start < len(uids); start += messageFetchBatch {
 		end := min(start+messageFetchBatch, len(uids))
+		batchMessageBytes := boundedContentLiteralBytes(messageBytes, end-start)
+		section := &imap.BodySectionName{Peek: true, Partial: []int{0, batchMessageBytes + 1}}
 		batchUIDs := make(map[uint32]struct{}, end-start)
 		batchResult := make(map[uint32]fetchedMessage, end-start)
 		seenUIDs := make(map[uint32]struct{}, end-start)
@@ -1077,11 +1266,11 @@ func fetchMessages(
 			if body == nil || message.Uid == 0 {
 				return nil
 			}
-			raw, truncated, readErr := readLiteral(body, maxMessageBytes)
+			raw, truncated, readErr := readLiteral(body, batchMessageBytes)
 			if readErr != nil {
 				return nil
 			}
-			truncated = truncated || uint64(message.Size) > uint64(maxMessageBytes)
+			truncated = truncated || uint64(message.Size) > uint64(batchMessageBytes)
 			parsed, parseErr := parseMIMEMessageWithOptions(raw, limits, truncated)
 			if parseErr != nil {
 				// Recipient routing was already established from the bounded header
@@ -1125,6 +1314,83 @@ func fetchMessages(
 		}
 	}
 	return result, nil
+}
+
+// boundedHeaderFetchLimits keeps the per-message header allowance intact and
+// reduces UID cardinality instead. Only a configured single-header allowance
+// larger than the aggregate command budget is reduced.
+func boundedHeaderFetchLimits(maxHeaderBytes int) (headerBytes, batchSize int) {
+	if maxHeaderBytes < 0 {
+		maxHeaderBytes = 0
+	}
+	headerBytes = min(maxHeaderBytes, maxContentFetchLiteralBytes-1)
+	batchSize = min(candidateHeaderFetchBatch, maxContentFetchLiteralBytes/(headerBytes+1))
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	return headerBytes, batchSize
+}
+
+// boundedContentLiteralBytes returns the readable bytes per message while
+// reserving one additional requested byte as the truncation sentinel. The
+// sentinel is part of the aggregate command budget.
+func boundedContentLiteralBytes(maxBytes, batchSize int) int {
+	if maxBytes <= 0 || batchSize <= 0 {
+		return 0
+	}
+	partialBytes := maxContentFetchLiteralBytes / batchSize
+	if partialBytes <= 1 {
+		return 0
+	}
+	return min(maxBytes, partialBytes-1)
+}
+
+// boundedWinnerMessageBytes keeps multi-winner network reads proportional to
+// the result budget. A single winner retains the configured per-message limit.
+func boundedWinnerMessageBytes(
+	maxMessageBytes int,
+	winnerCount int,
+	fairBodyBytes int64,
+	fairParsedBytes int64,
+	resultDynamicBudget int64,
+) int {
+	if maxMessageBytes <= 0 {
+		return 0
+	}
+	if winnerCount <= 1 {
+		return maxMessageBytes
+	}
+	if fairBodyBytes < 0 {
+		fairBodyBytes = 0
+	}
+	if fairParsedBytes < parsedMessageBaseBytes {
+		fairParsedBytes = parsedMessageBaseBytes
+	}
+	if resultDynamicBudget < 0 {
+		resultDynamicBudget = 0
+	}
+
+	maxBytes := int64(maxMessageBytes)
+	fairLimit := min(maxBytes, fairParsedBytes)
+	if fairBodyBytes >= maxBytes-fairLimit {
+		fairLimit = maxBytes
+	} else {
+		fairLimit += fairBodyBytes
+	}
+
+	resultLimit := min(maxBytes, int64(parsedMessageBaseBytes))
+	perWinnerDynamic := resultDynamicBudget / int64(winnerCount)
+	if perWinnerDynamic >= (maxBytes-resultLimit+1)/2 {
+		resultLimit = maxBytes
+	} else {
+		resultLimit += 2 * perWinnerDynamic
+	}
+
+	limit := min(maxBytes, fairLimit, resultLimit)
+	if limit < 1 {
+		limit = 1
+	}
+	return int(limit)
 }
 
 func uidFetchEach(session imapSession, uids []uint32, items []imap.FetchItem, visit func(*imap.Message) error) error {

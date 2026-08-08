@@ -335,6 +335,10 @@ func TestSyncAccountFailureUsesOneBulkRecord(t *testing.T) {
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("同步错误 = %v, want %v", err, wantErr)
 	}
+	wantMessage := "fetch IMAP mailbox increment: " + wantErr.Error()
+	if err.Error() != wantMessage {
+		t.Fatalf("sync error = %q, want %q", err, wantMessage)
+	}
 	if len(repo.applyCalls()) != 0 {
 		t.Fatalf("抓取失败后不应提交结果: %#v", repo.applyCalls())
 	}
@@ -343,8 +347,22 @@ func TestSyncAccountFailureUsesOneBulkRecord(t *testing.T) {
 		t.Fatalf("165 个隐私邮箱的失败写入次数 = %d, want 1", len(failures))
 	}
 	if failures[0].accountID != account.ID || !failures[0].version.Equal(accountVersion) ||
-		failures[0].message != wantErr.Error() || failures[0].at.IsZero() {
+		failures[0].message != wantMessage || failures[0].at.IsZero() {
 		t.Fatalf("批量失败记录错误: %#v", failures[0])
+	}
+}
+
+func TestFailureRecorderSkipsProcessShutdownCancellation(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, UpdatedAt: time.Unix(10, 0).UTC()}
+	repo := newFakeRepo(account)
+	manager := New(repo, cipherFunc(fixedCipher), nil, discardLogger(), time.Minute, 1)
+	manager.BeginShutdown()
+	shutdownContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := newFailureRecorder(manager, shutdownContext, account.ID, account.UpdatedAt)
+	recorder.record(context.Canceled)
+	if failures := repo.failureCalls(); len(failures) != 0 {
+		t.Fatalf("shutdown cancellation recorded failures = %#v, want none", failures)
 	}
 }
 
@@ -426,8 +444,172 @@ func TestSyncAccountWithTimeoutCancelsFetcherAndRecordsFailure(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("同步超时错误 = %v, want %v", err, context.DeadlineExceeded)
 	}
-	if len(repo.failureCalls()) != 1 || !recordContextActive {
-		t.Fatalf("超时后的批量失败记录未使用独立 context: calls=%d active=%v", len(repo.failureCalls()), recordContextActive)
+	wantMessage := "fetch IMAP mailbox increment: " + context.DeadlineExceeded.Error()
+	if err.Error() != wantMessage {
+		t.Fatalf("sync timeout error = %q, want %q", err, wantMessage)
+	}
+	failures := repo.failureCalls()
+	if len(failures) != 1 || failures[0].message != wantMessage || !recordContextActive {
+		t.Fatalf("超时后的批量失败记录错误: calls=%#v active=%v", failures, recordContextActive)
+	}
+}
+
+func TestSyncAccountWithTimeoutStartsFreshWorkBudgetAfterQueueing(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	remainingBudget := make(chan time.Duration, 1)
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			remainingBudget <- 0
+		} else {
+			remainingBudget <- time.Until(deadline)
+		}
+		return domain.MailboxSyncResult{State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1}}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
+	const syncTimeout = 300 * time.Millisecond
+	manager.SetSyncTimeout(syncTimeout)
+
+	var timeoutMu sync.Mutex
+	timeoutCalls := 0
+	waitBudgetStarted := make(chan struct{})
+	manager.withTimeout = func(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+		timeoutMu.Lock()
+		timeoutCalls++
+		call := timeoutCalls
+		timeoutMu.Unlock()
+		if call == 1 {
+			close(waitBudgetStarted)
+		}
+		return context.WithTimeout(ctx, timeout)
+	}
+
+	releaseAccount, err := manager.acquireAccount(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var releaseAccountOnce sync.Once
+	releaseAccountLock := func() { releaseAccountOnce.Do(releaseAccount) }
+	defer releaseAccountLock()
+	releaseSlot, err := manager.acquireSyncSlot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var releaseSlotOnce sync.Once
+	releaseGlobalSlot := func() { releaseSlotOnce.Do(releaseSlot) }
+	defer releaseGlobalSlot()
+
+	done := make(chan error, 1)
+	go func() { done <- manager.SyncAccountWithTimeout(context.Background(), account.ID) }()
+	select {
+	case <-waitBudgetStarted:
+	case <-time.After(time.Second):
+		t.Fatal("manual sync did not start its queue wait budget")
+	}
+
+	time.Sleep(60 * time.Millisecond)
+	releaseAccountLock()
+	time.Sleep(60 * time.Millisecond)
+	timeoutMu.Lock()
+	callsWhileWaitingForSlot := timeoutCalls
+	timeoutMu.Unlock()
+	if callsWhileWaitingForSlot != 1 {
+		t.Fatalf("timeout budgets before global slot acquisition = %d, want one shared wait budget", callsWhileWaitingForSlot)
+	}
+	releaseGlobalSlot()
+
+	var remaining time.Duration
+	select {
+	case remaining = <-remainingBudget:
+	case <-time.After(time.Second):
+		t.Fatal("fetch did not start after account lock and global slot were released")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("manual sync after queueing: %v", err)
+	}
+	if remaining < 240*time.Millisecond {
+		t.Fatalf("work budget after queueing = %v, want at least 240ms of %v", remaining, syncTimeout)
+	}
+	timeoutMu.Lock()
+	finalTimeoutCalls := timeoutCalls
+	timeoutMu.Unlock()
+	if finalTimeoutCalls != 2 {
+		t.Fatalf("manual sync timeout budgets = %d, want wait and work budgets", finalTimeoutCalls)
+	}
+}
+
+func TestSyncAllStartsFreshWorkBudgetAfterSlotQueueing(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	remainingBudget := make(chan time.Duration, 1)
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			remainingBudget <- 0
+		} else {
+			remainingBudget <- time.Until(deadline)
+		}
+		return domain.MailboxSyncResult{State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1}}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
+	const syncTimeout = 300 * time.Millisecond
+	manager.SetSyncTimeout(syncTimeout)
+
+	var timeoutMu sync.Mutex
+	timeoutCalls := 0
+	waitBudgetStarted := make(chan struct{})
+	manager.withTimeout = func(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+		timeoutMu.Lock()
+		timeoutCalls++
+		call := timeoutCalls
+		timeoutMu.Unlock()
+		if call == 1 {
+			close(waitBudgetStarted)
+		}
+		return context.WithTimeout(ctx, timeout)
+	}
+
+	releaseSlot, err := manager.acquireSyncSlot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var releaseSlotOnce sync.Once
+	releaseGlobalSlot := func() { releaseSlotOnce.Do(releaseSlot) }
+	defer releaseGlobalSlot()
+
+	roundDone := make(chan struct{})
+	go func() {
+		manager.syncAll(context.Background())
+		close(roundDone)
+	}()
+	select {
+	case <-waitBudgetStarted:
+	case <-time.After(time.Second):
+		t.Fatal("periodic sync did not start its slot wait budget")
+	}
+	time.Sleep(120 * time.Millisecond)
+	releaseGlobalSlot()
+
+	var remaining time.Duration
+	select {
+	case remaining = <-remainingBudget:
+	case <-time.After(time.Second):
+		t.Fatal("periodic fetch did not start after the global slot was released")
+	}
+	select {
+	case <-roundDone:
+	case <-time.After(time.Second):
+		t.Fatal("periodic sync round did not finish")
+	}
+	if remaining < 240*time.Millisecond {
+		t.Fatalf("periodic work budget after slot queueing = %v, want at least 240ms of %v", remaining, syncTimeout)
+	}
+	timeoutMu.Lock()
+	finalTimeoutCalls := timeoutCalls
+	timeoutMu.Unlock()
+	if finalTimeoutCalls != 2 {
+		t.Fatalf("periodic sync timeout budgets = %d, want wait and work budgets", finalTimeoutCalls)
 	}
 }
 
@@ -701,6 +883,71 @@ func TestManualAndPeriodicSyncsShareGlobalConcurrencyWithoutBlockingOnAccountLoc
 	}
 }
 
+func TestWithAccountIMAPSlotAcquiresAccountLockBeforeGlobalSlot(t *testing.T) {
+	manager := New(newFakeRepo(), cipherFunc(fixedCipher), nil, discardLogger(), time.Minute, 1)
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- manager.WithAccountIMAPSlot(context.Background(), 1, func() error {
+			close(firstEntered)
+			<-releaseFirst
+			return nil
+		})
+	}()
+	<-firstEntered
+
+	secondEntered := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- manager.WithAccountIMAPSlot(context.Background(), 2, func() error {
+			close(secondEntered)
+			return nil
+		})
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		manager.locksMu.Lock()
+		secondHoldsAccountLock := manager.locks[2] != nil
+		manager.locksMu.Unlock()
+		if secondHoldsAccountLock {
+			break
+		}
+		if time.Now().After(deadline) {
+			close(releaseFirst)
+			t.Fatal("second IMAP operation did not acquire its account lock while waiting for the global slot")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-secondEntered:
+		close(releaseFirst)
+		t.Fatal("second IMAP operation exceeded the global concurrency limit")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first IMAP operation: %v", err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second IMAP operation did not start after the global slot was released")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second IMAP operation: %v", err)
+	}
+}
+
+func TestWithAccountIMAPSlotRejectsNilOperation(t *testing.T) {
+	manager := New(newFakeRepo(), cipherFunc(fixedCipher), nil, discardLogger(), time.Minute, 1)
+	if err := manager.WithAccountIMAPSlot(context.Background(), 1, nil); err == nil {
+		t.Fatal("nil account IMAP operation succeeded")
+	}
+}
+
 func TestCanceledAccountLockWaiterDoesNotPreventReclamation(t *testing.T) {
 	manager := New(newFakeRepo(), cipherFunc(fixedCipher), nil, discardLogger(), time.Minute, 1)
 	release, err := manager.acquireAccount(context.Background(), 7)
@@ -744,6 +991,425 @@ func TestCanceledContextDoesNotEnterAccountPipeline(t *testing.T) {
 	manager.locksMu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("已取消同步后锁表大小 = %d, want 0", remaining)
+	}
+}
+
+func TestRunDrainsPendingBatchesBeforeWaiting(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	callEvents := make(chan int, 4)
+	var callsMu sync.Mutex
+	calls := 0
+	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		callEvents <- call
+		return domain.MailboxSyncResult{
+			State:   domain.IMAPSyncState{AccountID: got.ID, UIDValidity: 1, LastUID: uint32(call)},
+			HasMore: call < 3,
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), 10*time.Minute, 1)
+	waitEvents := make(chan time.Duration, 2)
+	manager.waitInterval = func(_ context.Context, interval time.Duration) bool {
+		waitEvents <- interval
+		return false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(done)
+	}()
+
+	for want := 1; want <= 3; want++ {
+		select {
+		case got := <-callEvents:
+			if got != want {
+				t.Fatalf("batch call = %d, want %d", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("waiting for batch %d", want)
+		}
+	}
+	select {
+	case interval := <-waitEvents:
+		if interval != 10*time.Minute {
+			t.Fatalf("wait interval = %v, want %v", interval, 10*time.Minute)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("final batch did not enter the interval wait")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("periodic sync did not stop after the interval hook returned false")
+	}
+	callsMu.Lock()
+	gotCalls := calls
+	callsMu.Unlock()
+	if gotCalls != 3 {
+		t.Fatalf("batch calls = %d, want 3", gotCalls)
+	}
+}
+
+func TestRunDrainsPendingBatchesFairlyAcrossAccounts(t *testing.T) {
+	accounts := []domain.Account{
+		{ID: 1, Enabled: true, PasswordCiphertext: "encrypted-1"},
+		{ID: 2, Enabled: true, PasswordCiphertext: "encrypted-2"},
+	}
+	repo := newFakeRepo(accounts...)
+	var callsMu sync.Mutex
+	calls := make(map[int64]int)
+	order := make([]int64, 0, 4)
+	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		callsMu.Lock()
+		calls[account.ID]++
+		call := calls[account.ID]
+		order = append(order, account.ID)
+		callsMu.Unlock()
+		return domain.MailboxSyncResult{
+			State:   domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1, LastUID: uint32(call)},
+			HasMore: call == 1,
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), 10*time.Minute, 1)
+	waitCalls := 0
+	manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+		waitCalls++
+		return false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fair periodic sync did not finish")
+	}
+
+	callsMu.Lock()
+	gotCalls := map[int64]int{1: calls[1], 2: calls[2]}
+	gotOrder := append([]int64(nil), order...)
+	callsMu.Unlock()
+	if !reflect.DeepEqual(gotCalls, map[int64]int{1: 2, 2: 2}) {
+		t.Fatalf("per-account batch calls = %#v, want two each", gotCalls)
+	}
+	if len(gotOrder) != 4 || gotOrder[0] == gotOrder[1] {
+		t.Fatalf("batch order = %#v, want one batch for each account before round two", gotOrder)
+	}
+	if gotOrder[2] == gotOrder[3] {
+		t.Fatalf("batch order = %#v, want one batch for each account in round two", gotOrder)
+	}
+	if waitCalls != 1 {
+		t.Fatalf("interval waits = %d, want one after all pending batches drain", waitCalls)
+	}
+}
+
+func TestRunDoesNotResyncCaughtUpAccountDuringContinuation(t *testing.T) {
+	accounts := []domain.Account{
+		{ID: 1, Enabled: true, PasswordCiphertext: "encrypted-1"},
+		{ID: 2, Enabled: true, PasswordCiphertext: "encrypted-2"},
+	}
+	repo := newFakeRepo(accounts...)
+	var callsMu sync.Mutex
+	calls := make(map[int64]int)
+	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		callsMu.Lock()
+		calls[account.ID]++
+		call := calls[account.ID]
+		callsMu.Unlock()
+		return domain.MailboxSyncResult{
+			State:   domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1, LastUID: uint32(call)},
+			HasMore: account.ID == 1 && call == 1,
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 1)
+	waitCalls := 0
+	manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+		waitCalls++
+		return false
+	}
+	done := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sync run did not finish after the pending account caught up")
+	}
+	callsMu.Lock()
+	gotCalls := map[int64]int{1: calls[1], 2: calls[2]}
+	callsMu.Unlock()
+	if !reflect.DeepEqual(gotCalls, map[int64]int{1: 2, 2: 1}) {
+		t.Fatalf("per-account batch calls = %#v, want only the pending account in the continuation round", gotCalls)
+	}
+	if waitCalls != 1 {
+		t.Fatalf("interval waits = %d, want one after the pending account caught up", waitCalls)
+	}
+}
+
+func TestRunContinuesOtherPendingAfterOrdinaryFailure(t *testing.T) {
+	accounts := []domain.Account{
+		{ID: 1, Enabled: true, PasswordCiphertext: "encrypted-1"},
+		{ID: 2, Enabled: true, PasswordCiphertext: "encrypted-2"},
+	}
+	repo := newFakeRepo(accounts...)
+	var callsMu sync.Mutex
+	calls := make(map[int64]int)
+	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		callsMu.Lock()
+		calls[account.ID]++
+		call := calls[account.ID]
+		callsMu.Unlock()
+		if account.ID == 2 {
+			return domain.MailboxSyncResult{}, errors.New("transient IMAP failure")
+		}
+		return domain.MailboxSyncResult{
+			State:   domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1, LastUID: uint32(call)},
+			HasMore: call == 1,
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 2)
+	waitCalls := 0
+	manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+		waitCalls++
+		return false
+	}
+	done := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sync run did not stop after the interval hook returned false")
+	}
+	callsMu.Lock()
+	gotCalls := map[int64]int{1: calls[1], 2: calls[2]}
+	callsMu.Unlock()
+	if !reflect.DeepEqual(gotCalls, map[int64]int{1: 2, 2: 1}) {
+		t.Fatalf("calls after mixed pending/error round = %#v, want pending account to continue alone", gotCalls)
+	}
+	if waitCalls != 1 {
+		t.Fatalf("interval waits after healthy continuation drained = %d, want 1", waitCalls)
+	}
+}
+
+func TestRunPreservesPendingContinuationWhileAccountBusy(t *testing.T) {
+	t.Run("lock released within queue budget", func(t *testing.T) {
+		account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+		repo := newFakeRepo(account)
+		firstFetchStarted := make(chan struct{})
+		releaseFirstFetch := make(chan struct{})
+		var releaseFirstOnce sync.Once
+		releaseFirst := func() { releaseFirstOnce.Do(func() { close(releaseFirstFetch) }) }
+		defer releaseFirst()
+		secondFetchStarted := make(chan struct{})
+		var callsMu sync.Mutex
+		calls := 0
+		fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+			callsMu.Lock()
+			calls++
+			call := calls
+			callsMu.Unlock()
+			switch call {
+			case 1:
+				close(firstFetchStarted)
+				<-releaseFirstFetch
+			case 2:
+				close(secondFetchStarted)
+			}
+			return domain.MailboxSyncResult{
+				State:   domain.IMAPSyncState{AccountID: got.ID, UIDValidity: 1, LastUID: uint32(call)},
+				HasMore: call == 1,
+			}, nil
+		})
+		manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 1)
+		manager.SetSyncTimeout(time.Second)
+		waitEvents := make(chan struct{}, 2)
+		manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+			waitEvents <- struct{}{}
+			return false
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			manager.Run(ctx)
+			close(done)
+		}()
+		select {
+		case <-firstFetchStarted:
+		case <-time.After(time.Second):
+			t.Fatal("first pending batch did not start")
+		}
+
+		manualEntered := make(chan struct{})
+		releaseManual := make(chan struct{})
+		var releaseManualOnce sync.Once
+		releaseManualLock := func() { releaseManualOnce.Do(func() { close(releaseManual) }) }
+		defer releaseManualLock()
+		manualDone := make(chan error, 1)
+		go func() {
+			manualDone <- manager.WithAccountLock(ctx, account.ID, func() error {
+				close(manualEntered)
+				<-releaseManual
+				return nil
+			})
+		}()
+		deadline := time.Now().Add(time.Second)
+		for {
+			manager.locksMu.Lock()
+			lock := manager.locks[account.ID]
+			manualQueued := lock != nil && lock.refs >= 2
+			manager.locksMu.Unlock()
+			if manualQueued {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("manual operation did not queue behind the first batch")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		releaseFirst()
+		select {
+		case <-manualEntered:
+		case <-time.After(time.Second):
+			t.Fatal("manual operation did not acquire the account lock")
+		}
+		select {
+		case <-secondFetchStarted:
+			t.Fatal("pending continuation bypassed the busy account lock")
+		case <-time.After(30 * time.Millisecond):
+		}
+		select {
+		case <-waitEvents:
+			t.Fatal("busy pending continuation waited for the full poll interval")
+		default:
+		}
+
+		releaseManualLock()
+		if err := <-manualDone; err != nil {
+			t.Fatalf("manual account operation: %v", err)
+		}
+		select {
+		case <-secondFetchStarted:
+		case <-time.After(time.Second):
+			t.Fatal("pending continuation did not resume after the account lock was released")
+		}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("sync run did not finish after the continuation drained")
+		}
+		callsMu.Lock()
+		gotCalls := calls
+		callsMu.Unlock()
+		if gotCalls != 2 {
+			t.Fatalf("batch calls = %d, want 2", gotCalls)
+		}
+		if len(waitEvents) != 1 {
+			t.Fatalf("interval waits = %d, want one final wait", len(waitEvents))
+		}
+	})
+
+	t.Run("queue timeout defers to normal poll", func(t *testing.T) {
+		account := domain.Account{
+			ID:                 1,
+			Enabled:            true,
+			PasswordCiphertext: "encrypted",
+			LastSyncStatus:     domain.SyncStatusPending,
+		}
+		repo := newFakeRepo(account)
+		fetchCalls := 0
+		fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+			fetchCalls++
+			return domain.MailboxSyncResult{
+				State: domain.IMAPSyncState{AccountID: got.ID, UIDValidity: 1, LastUID: 1},
+			}, nil
+		})
+		manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 1)
+		manager.SetSyncTimeout(40 * time.Millisecond)
+		releaseBusy, err := manager.acquireAccount(context.Background(), account.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var releaseBusyOnce sync.Once
+		releaseBusyLock := func() { releaseBusyOnce.Do(releaseBusy) }
+		defer releaseBusyLock()
+		waitCalls := 0
+		manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+			waitCalls++
+			if waitCalls == 1 {
+				releaseBusyLock()
+				return true
+			}
+			return false
+		}
+		done := make(chan struct{})
+		go func() {
+			manager.Run(context.Background())
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("deferred continuation did not retry on the normal poll")
+		}
+		if fetchCalls != 1 {
+			t.Fatalf("fetch calls after busy timeout = %d, want one normal-poll retry", fetchCalls)
+		}
+		if waitCalls != 2 {
+			t.Fatalf("interval waits after busy timeout = %d, want defer and final waits", waitCalls)
+		}
+		if failures := repo.failureCalls(); len(failures) != 0 {
+			t.Fatalf("account-lock timeout recorded as sync failure: %#v", failures)
+		}
+	})
+}
+
+func TestRunStopsOnCanceledContextWithoutWaiting(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	fetchCalls := 0
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetchCalls++
+		return domain.MailboxSyncResult{}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 1)
+	waitCalls := 0
+	manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+		waitCalls++
+		return true
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		manager.Run(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled sync run did not stop")
+	}
+	if fetchCalls != 0 {
+		t.Fatalf("fetch calls for canceled run = %d, want 0", fetchCalls)
+	}
+	if waitCalls != 0 {
+		t.Fatalf("interval waits for canceled run = %d, want 0", waitCalls)
 	}
 }
 

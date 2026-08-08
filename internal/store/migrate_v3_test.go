@@ -10,7 +10,7 @@ import (
 	"icloud-api/internal/store"
 )
 
-func TestMigrateV2ToV3(t *testing.T) {
+func TestMigrateV2ToV6(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -20,6 +20,14 @@ func TestMigrateV2ToV3(t *testing.T) {
 		t.Fatalf("create current database: %v", err)
 	}
 	account := createAccount(t, ctx, current, "Legacy v2", "legacy-v2@icloud.com")
+	if _, err := current.DB().ExecContext(ctx, `DROP TABLE imap_seen_tasks`); err != nil {
+		_ = current.Close()
+		t.Fatalf("remove v6 seen queue from fixture: %v", err)
+	}
+	if _, err := current.DB().ExecContext(ctx, `DROP TABLE consumed_messages`); err != nil {
+		_ = current.Close()
+		t.Fatalf("remove v6 consumption table from fixture: %v", err)
+	}
 	if _, err := current.DB().ExecContext(ctx, `DROP TABLE imap_sync_states`); err != nil {
 		_ = current.Close()
 		t.Fatalf("remove v4 table from fixture: %v", err)
@@ -30,11 +38,11 @@ func TestMigrateV2ToV3(t *testing.T) {
 	}
 	if _, err := current.DB().ExecContext(ctx, `DROP TABLE pending_alias_api_keys`); err != nil {
 		_ = current.Close()
-		t.Fatalf("remove v5 pending key table from fixture: %v", err)
+		t.Fatalf("remove v6 pending key table from fixture: %v", err)
 	}
 	if _, err := current.DB().ExecContext(ctx, `DROP TABLE alias_creation_schedules`); err != nil {
 		_ = current.Close()
-		t.Fatalf("remove v5 schedule table from fixture: %v", err)
+		t.Fatalf("remove v6 schedule table from fixture: %v", err)
 	}
 	if _, err := current.DB().ExecContext(ctx, `PRAGMA user_version = 2`); err != nil {
 		_ = current.Close()
@@ -58,8 +66,8 @@ func TestMigrateV2ToV3(t *testing.T) {
 	if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 5 {
-		t.Fatalf("schema version = %d, want 5", version)
+	if version != 6 {
+		t.Fatalf("schema version = %d, want 6", version)
 	}
 	retained, err := migrated.GetAccount(ctx, account.ID)
 	if err != nil {
@@ -76,7 +84,7 @@ func TestMigrateV2ToV3(t *testing.T) {
 	}
 }
 
-func TestMigrateV1ToV3RollsBackAsAUnit(t *testing.T) {
+func TestMigrateV1ToV6RollsBackAsAUnit(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()

@@ -16,7 +16,7 @@ func TestPostgresAdminSessionAdminIDIndexMigrationStructure(t *testing.T) {
 	t.Parallel()
 
 	const freshIndex = "create index admin_sessions_admin_id_idx on admin_sessions(admin_id)"
-	if !containsNormalizedSQL(postgresSchemaV4, freshIndex) {
+	if !containsNormalizedSQL(postgresSchemaV6, freshIndex) {
 		t.Fatalf("fresh PostgreSQL schema is missing %q", freshIndex)
 	}
 
@@ -42,7 +42,7 @@ func TestPostgresQueryIndexesMigrationStructure(t *testing.T) {
 		statements  []string
 		ifNotExists bool
 	}{
-		{"fresh v4", postgresSchemaV4, false},
+		{"fresh v6", postgresSchemaV6, false},
 		{"v3 to v4", postgresMigrateV3ToV4, true},
 		{"v4 convergence", postgresSchemaConvergence, true},
 	}
@@ -61,6 +61,39 @@ func TestPostgresQueryIndexesMigrationStructure(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPostgresSeenQueueMigrationStructure(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []struct {
+		name       string
+		statements []string
+	}{
+		{"fresh v6", postgresSchemaV6},
+		{"v5 to v6", postgresMigrateV5ToV6},
+	} {
+		t.Run(path.name, func(t *testing.T) {
+			t.Parallel()
+			joined := normalizeSQL(strings.Join(path.statements, " "))
+			for _, wanted := range []string{
+				"create table consumed_messages",
+				"alias_id bigint not null references aliases(id) on delete cascade",
+				"primary key(alias_id, uid_validity, uid)",
+				"create table imap_seen_tasks",
+				"primary key(account_id, uid_validity, uid)",
+				"imap_seen_tasks_account_created_idx",
+			} {
+				if !strings.Contains(joined, wanted) {
+					t.Errorf("%s is missing %q", path.name, wanted)
+				}
+			}
+		})
+	}
+	const convergenceIndex = `create index if not exists imap_seen_tasks_account_created_idx on imap_seen_tasks(account_id, created_at, uid_validity, uid)`
+	if !containsNormalizedSQL(postgresSchemaConvergence, convergenceIndex) {
+		t.Fatalf("PostgreSQL v6 convergence is missing %q", convergenceIndex)
 	}
 }
 

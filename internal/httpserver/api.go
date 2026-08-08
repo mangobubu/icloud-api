@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"icloud-api/internal/domain"
+	"icloud-api/internal/store"
 )
 
 const recentMailWindow = time.Hour
@@ -102,6 +104,37 @@ func (s *Server) recentMail(c *gin.Context) {
 	sentAt := message.InternalDate
 	if message.HeaderDate != nil && !message.HeaderDate.IsZero() {
 		sentAt = *message.HeaderDate
+	}
+	consumed, err := s.store.ConsumeLatestMessage(
+		c.Request.Context(),
+		binding.Alias.ID,
+		binding.Alias.APIKeyHash,
+		*binding.Alias.LastSyncedAt,
+		message.SyncedAt,
+		message.UIDValidity,
+		message.UID,
+		now,
+	)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			s.writeAPIError(c, http.StatusNotFound, "MAIL_NOT_FOUND", "最近一小时内没有邮件")
+			return
+		}
+		s.logger.Error(
+			"消费直达邮件失败",
+			"alias_id", binding.Alias.ID,
+			"error", err,
+			"request_id", requestID(c),
+		)
+		s.writeAPIError(c, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库暂不可用")
+		return
+	}
+	if !consumed {
+		s.writeAPIError(c, http.StatusNotFound, "MAIL_NOT_FOUND", "最近一小时内没有邮件")
+		return
+	}
+	if s.seenNotify != nil {
+		s.seenNotify()
 	}
 	c.JSON(http.StatusOK, recentMailResponse{
 		Data: recentMailData{

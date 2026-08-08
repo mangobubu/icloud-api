@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: iCloud 隐私邮箱 API
-  version: 1.4.0
+  version: 2.0.0
   description: |
     每个隐私邮箱使用独立的 API Key。服务端根据该 Key 绑定到唯一隐私邮箱，
     只返回该隐私邮箱通过所属 iCloud 主号 IMAP 同步到的最新邮件快照。
@@ -9,14 +9,16 @@ info:
     `/api/v1/aliases` 使用部署时配置的独立 OAuth Bearer 令牌，将已存在的隐私邮箱登记到现有主号；
     管理端可按主号选择性开启 Apple Hide My Email 自动创建，每 60 分钟最多尝试 5 次，
     每次间隔至少 5 分钟。自动创建的原始 API Key 进入加密的待领取队列，不会出现在日志中。
-    `/api/v1/mail/latest` 使用 Bearer Header 并返回已保存快照的完整 UTC 数据；
-    `/api/v1/mail/recent` 使用 URL 查询参数，只在 IMAP 收件时间位于最近一小时时
-    返回按服务端 `TZ` 格式化的紧凑数据。
+    `/api/v1/mail/latest` 使用 Bearer Header，可重复返回已保存快照的完整 UTC 数据，
+    且不消费邮件或改变已读状态；`/api/v1/mail/recent` 使用 URL 查询参数，一次性消费
+    IMAP 收件时间位于最近一小时内的当前最新邮件，并返回按服务端 `TZ` 格式化的紧凑数据。
 
     管理端 Apple 接口使用 Apple 账户密码和双重认证建立受信任 Web 会话，并通过
     `/v2/hme/list` 读取完整 Hide My Email 目录；账户密码和验证码不落库，仅加密保存会话。
-    该会话不参与邮件获取。邮件正文、文件夹和已读/收件状态始终通过
-    `imap.mail.me.com:993` 与 App 专用密码同步。
+    该会话不参与邮件获取。邮件同步通过 `imap.mail.me.com:993` 与 App 专用密码执行主号级
+    有界检查游标后的 UID/FLAGS 并只增量读取未读邮件，再用 `BODY.PEEK` 读取正文；首次同步、UIDVALIDITY
+    变化和最近窗口回退仍扫描窗口内实际邮件。部署前提是没有其他邮件客户端或外部流程在服务同步前
+    读取该 INBOX。直达接口成功消费后，后台按主号异步把对应 UID 标记为 `\Seen`。
 servers:
   - url: http://127.0.0.1:8080
     description: 默认本地服务地址，可由 ICLOUD_API_ADDR 调整
@@ -56,7 +58,9 @@ paths:
 
         成功响应中的 `api_key` 是新隐私邮箱仅显示一次的原始邮件 API Key；
         `mail_api_direct_link` 是同源相对路径，其 `api_key` 查询参数是服务端生成的派生直达凭据，
-        不是原始 `api_key`。新地址初始为 `pending`，须等待下一轮同步确认后才能按收件 API 规则使用。
+        不是原始 `api_key`。直达链接按当前 UID 一次性消费邮件并异步设置主号全局 `\Seen`；链接本身
+        在成功消费后仍有效，后续未消费的新 UID 到来时可再次使用。新地址初始为 `pending`，须等待
+        下一轮同步确认后才能按收件 API 规则使用。
         所有成功及错误响应均包含 `Cache-Control: no-store`。
       security:
         - externalOAuthToken: []
@@ -138,7 +142,7 @@ paths:
       tags:
         - Mail
       operationId: getLatestMail
-      summary: 获取当前隐私邮箱的最新一封邮件
+      summary: 可重复获取当前隐私邮箱的最新一封邮件
       description: |
         使用隐私邮箱自己的 API Key 鉴权。Key 只会解析到它绑定的隐私邮箱，
         因此响应不会包含同一主号下其他隐私邮箱的邮件。
@@ -152,12 +156,16 @@ paths:
         才继续判断最新邮件快照。快照存在时返回 200，不额外限制邮件年龄；快照不存在时返回 404；
         其他同步状态返回 503。
 
+        本接口不检查或写入一次性消费状态，不创建 IMAP `\Seen` 任务。重复请求同一个
+        `message.id` 仍可返回 200；即使同一 UID 已通过 `/api/v1/mail/recent` 消费，
+        本接口仍按上述快照与同步状态规则返回它。
+
         成功响应保留完整邮件结构，所有时间字段统一使用 RFC 3339/UTC，不受服务端 `TZ` 影响。
       security:
         - aliasApiKey: []
       responses:
         "200":
-          description: 当前隐私邮箱同步结果仍新鲜，且存在已保存的最新邮件快照
+          description: 当前隐私邮箱同步结果仍新鲜，且存在已保存的最新邮件快照；同一快照可重复读取且不触发消费或 `\Seen`
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -275,7 +283,7 @@ paths:
       tags:
         - Mail
       operationId: getRecentMail
-      summary: 通过可直接访问的链接获取最近一小时内的最新邮件
+      summary: 通过可直接访问的链接一次性消费最近一小时内的最新邮件
       description: |
         使用必填且只能出现一次的查询参数 `api_key` 鉴权；Bearer Header 不能替代该查询参数。
         查询参数既接受隐私邮箱的原始 API Key，也接受管理端操作列复制的派生直达凭据。
@@ -283,10 +291,20 @@ paths:
         派生直达凭据不能用于 `/api/v1/mail/latest` 的 Bearer 鉴权，并会在隐私邮箱 API Key 轮换后失效。
 
         只有该隐私邮箱状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过三倍轮询周期，
-        并且当前最新邮件快照的 IMAP INTERNALDATE 位于最近一小时内时才返回 200。
-        接口只检查当前最新快照，不会回退到次新邮件。没有快照或最新邮件的 IMAP INTERNALDATE
-        缺失、为未来时间或不在最近一小时时返回 404，
+        当前最新邮件快照的 IMAP INTERNALDATE 位于最近一小时内，并且该隐私邮箱从未消费当前
+        `UIDVALIDITY + UID` 时才返回 200。接口只检查当前最新快照，不会回退到次新邮件。
+
+        返回 200 前，服务会在同一个 PostgreSQL 事务中原子确认当前快照、记录该 UID 已消费，
+        并写入持久化的 IMAP `\Seen` 队列。对同一 UID 的并发请求中只有一个请求会成功；消费成功后，
+        同一 UID 的后续请求返回 404 `MAIL_NOT_FOUND`，直到同步到未消费的新 UID。服务按隐私邮箱保留
+        已消费 `(UIDVALIDITY, UID)` 的严格历史；邮件删除或快照回退后重新成为最新快照的已消费旧 UID
+        仍返回 404，`UIDVALIDITY` 则隔离不同邮箱代际的相同 UID。没有快照、快照在消费事务提交前发生变化、
+        最新邮件的 IMAP INTERNALDATE 缺失、为未来时间、不在最近一小时或已经消费时均返回 404；
         同步状态不可用时返回 503。
+
+        `\Seen` 写回由后台按主号异步执行，不阻塞本接口。iCloud 已读状态可能短暂延迟；IMAP 操作失败时
+        持久任务会等待重试，已提交的消费不会回滚。`\Seen` 是主号 `INBOX` 中该邮件的全局状态，
+        Apple Mail、iCloud Mail 和其他 IMAP 客户端也会看到该邮件变为已读。
 
         成功响应是仅包含 `data` 的顶层 JSON 对象；`data` 仅包含 `address`、`subject`、`snippet`
         和 `sent_at`。`sent_at` 优先使用邮件 Date 头，缺失或无效时回退到 IMAP 收件时间，
@@ -297,16 +315,20 @@ paths:
         只有收件时间处于 `[当前时间-1小时, 当前时间]` 区间的快照才会返回；时区转换只影响显示，
         不改变最近一小时的绝对时间窗口。
 
-        注意：查询参数中的 Key 会出现在浏览器历史中，并可能被反向代理或外围监控记录、
-        通过 Referer 泄露。本应用内置 HTTP 日志只记录 URL 路径，不记录查询字符串，但不能
-        代替外围系统的脱敏配置。完整 URL 必须按密钥保护，只能通过 HTTPS 使用，并应在代理层
-        删除或脱敏查询字符串日志。能设置请求头的客户端应优先使用 `/api/v1/mail/latest`；
-        怀疑链接泄露后应立即轮换 Key。
+        消费事务在响应写出前提交，因此客户端超时、断线或未收到 200 时，邮件仍可能已经消费，
+        重试将得到 404；需要可恢复或可重复读取时应使用 `/api/v1/mail/latest`。
+
+        注意：这是具有一次性消费和异步已读副作用的 `GET`。浏览器预取、链接预览和安全扫描器
+        可能在实际访客之前访问并消费邮件，不要把直达链接交给会自动访问 URL 的系统。查询参数中的
+        Key 会出现在浏览器历史中，并可能被反向代理或外围监控记录、通过 Referer 泄露。本应用内置
+        HTTP 日志只记录 URL 路径，不记录查询字符串，但不能代替外围系统的脱敏配置。完整 URL 必须
+        按密钥保护，只能通过 HTTPS 使用，并应在代理层删除或脱敏查询字符串日志。能设置请求头的
+        客户端应优先使用可重复读取且不触发消费的 `/api/v1/mail/latest`；怀疑链接泄露后应立即轮换 Key。
       security:
         - aliasApiKeyQuery: []
       responses:
         "200":
-          description: 当前隐私邮箱同步结果仍新鲜，且当前最新邮件的 IMAP 收件时间位于最近一小时内
+          description: 当前隐私邮箱同步结果仍新鲜，当前最新邮件位于最近一小时内且从未消费；响应前已原子记录消费并持久化 `\Seen` 任务
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -339,7 +361,7 @@ paths:
                   message: API Key 无效
                   request_id: 6oe7j0x3x3pJv9Dv
         "404":
-          description: 当前隐私邮箱同步结果仍新鲜，但没有邮件快照，或当前最新邮件的 IMAP 收件时间不在 [当前时间-1小时, 当前时间] 区间内
+          description: 当前隐私邮箱同步结果仍新鲜，但没有邮件快照、快照在消费前变化、当前最新邮件不在 [当前时间-1小时, 当前时间] 区间内，或该 (UIDVALIDITY, UID) 已在消费历史中；这些情况均返回 MAIL_NOT_FOUND
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -374,7 +396,8 @@ paths:
           description: |
             当前隐私邮箱状态不是 ok、从未完成同步、最后同步时间晚于当前时间，
             或最后同步时间已超过三倍轮询周期时返回 SYNC_UNAVAILABLE；
-            查询 Key 或最新邮件快照时数据库暂不可用则返回 DATABASE_UNAVAILABLE。
+            查询 Key 或最新邮件快照、原子记录消费或持久化 `\Seen` 任务时数据库暂不可用，
+            则返回 DATABASE_UNAVAILABLE；消费记录与 `\Seen` 任务在同一事务中一起提交或一起回滚。
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -438,7 +461,22 @@ paths:
       summary: 立即同步主号邮件
       description: |
         使用该主号的一条 IMAP 连接执行一个有界增量批次，并把邮件快照写入 PostgreSQL。
-        隐私邮箱不会分别连接 iCloud。若执行后已经追平，返回 200，响应中省略
+        普通增量按当前游标使用主号级有界发现，每批最多提交 256 封；已读 UID 会被游标跳过，
+        没有未读候选时也会推进到当前 UID 上界。首次同步、UIDVALIDITY 变化和删除后的最近窗口
+        回退仍按实际邮件扫描，不依赖 `UNSEEN`。因此部署时不要让其他客户端或外部流程在本服务同步前
+        标记邮件已读。邮件头和正文通过 `BODY.PEEK` 读取，本操作本身不会改变 `\Seen`。隐私邮箱不会
+        分别连接 iCloud，本接口也不等待或执行直达消费产生的异步 `\Seen` 队列。
+
+        较小的 UID 数值区间使用有界 `UID SEARCH ... UNSEEN`；较大或稀疏的区间先用少量
+        sequence `FETCH UID` 探测定位起点，再用一次最多返回 257 条的 `FETCH (UID FLAGS)`
+        检查窗口。后续邮件头和正文始终只处理其中最早的最多 256 封未读邮件，成功提交游标后
+        再继续下一批。
+
+        服务先等待取得该主号的账号同步锁和全局 IMAP 连接额度，随后才开始计算整轮同步预算。
+        `ICLOUD_API_SYNC_TIMEOUT` 默认 `10m`，这 10 分钟全部用于实际数据库读取、IMAP 收取和事务提交；
+        排队等待不占用该预算。每条 IMAP 网络命令仍分别受默认 `25s` 的 `ICLOUD_API_IMAP_TIMEOUT` 限制。
+
+        若执行后已经追平，返回 200，响应中省略
         `sync_pending`；若本批已成功提交但仍有积压，返回 202，并明确返回
         `sync_pending: true`。后续轮询或再次调用本接口会继续处理剩余批次。
       security:
@@ -898,7 +936,7 @@ paths:
         并同时包含启用与停用地址。服务只处理 `forwardToEmail` 与当前主号邮箱匹配的条目。
 
         新地址以幂等方式导入并生成只显示一次的独立邮件 API Key；已有地址保留原 ID、Key、
-        本地启停状态和邮件快照。Apple 已停用的地址以本地 `disabled` 状态导入；达到本地 1000 个启用地址容量后，
+        本地启停状态、邮件快照、消费历史和待处理 `\Seen` 任务。Apple 已停用的地址以本地 `disabled` 状态导入；达到本地 1000 个启用地址容量后，
         其余地址仍会导入并标记为 `disabled`。邮件内容不会经过本接口获取，后续仍由
         `imap.mail.me.com:993` 与 App 专用密码同步。会话过期时返回 `APPLE_SESSION_EXPIRED`，
         调用方应重新完成 Apple 登录与双重认证。
@@ -1016,10 +1054,15 @@ components:
         可以使用隐私邮箱的原始 API Key，也可以使用管理端操作列复制的派生直达凭据。
         派生凭据由服务端主密钥签名、不写入数据库、只对当前 API Key 状态有效，
         不能用于 Bearer 接口；轮换隐私邮箱 API Key 会使此前复制的派生凭据失效。
+        `/api/v1/mail/recent` 是具有副作用的 `GET`，会按 `(UIDVALIDITY, UID)` 一次性消费
+        当前最新邮件并异步设置主号全局 `\Seen`。成功消费后链接本身仍然有效；当前 UID 的
+        后续请求返回 404，新 UID 到来后同一链接可再次消费。消费事务在响应写出前提交，
+        客户端断线或超时也可能已经消费邮件。浏览器预取、链接预览和安全扫描器可能提前
+        触发这些副作用；应优先使用可重复读取且不触发消费的 `/api/v1/mail/latest`。
         查询参数会进入浏览器历史，并可能被代理或外围监控记录、通过 Referer 泄露。
         本应用内置 HTTP 日志不记录查询字符串，但外围日志仍须删除或脱敏查询参数。
         完整 URL 必须按密钥保护，并且只能通过 HTTPS 使用。
-        能设置 Authorization Header 的客户端应优先使用 `aliasApiKey`；泄露后应立即轮换 Key。
+        泄露链接即使当前返回 404，仍可消费未来新邮件；泄露后应立即轮换 Key。
 
   parameters:
     AdminAccountID:
@@ -1294,7 +1337,7 @@ components:
               request_id: 6oe7j0x3x3pJv9Dv
 
     AdminSyncBadGateway:
-      description: 主号 IMAP 同步失败，当前批次未成功完成
+      description: 主号 IMAP 同步失败，当前批次未成功完成；实际同步默认预算为取得主号锁和全局连接额度后的 10m，单条 IMAP 命令默认超时仍为 25s
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestID"
@@ -1921,7 +1964,7 @@ components:
           type: string
           format: uri-reference
           pattern: "^(|/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])$"
-          description: 使用派生凭据的同源收件直达路径，不含原始 API Key；派生链接生成失败时为空字符串。
+          description: 使用派生凭据、按当前邮件一次性消费的同源收件直达路径，不含原始 API Key；成功访问会消费当前 UID 并异步标记主号邮件为已读，链接本身仍可等待后续未消费的新 UID；派生链接生成失败时为空字符串。
         enabled:
           type: boolean
         last_sync_status:
@@ -2045,7 +2088,7 @@ components:
           type: string
           format: uri-reference
           pattern: "^(|/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])$"
-          description: 使用派生凭据的同源收件直达路径，不含 api_key 字段中的原始 Key；派生失败时为空字符串。
+          description: 使用派生凭据、按当前邮件一次性消费的同源收件直达路径，不含 api_key 字段中的原始 Key；成功访问会消费当前 UID 并异步标记主号邮件为已读，链接本身仍可等待后续未消费的新 UID；派生失败时为空字符串。
 
     AdminAppleErrorResponse:
       type: object
@@ -2134,11 +2177,16 @@ components:
           format: uri-reference
           pattern: "^/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
           description: |
-            可直接访问的同源相对路径。查询参数是服务端生成的派生直达凭据，
+            可直接访问、按当前邮件一次性消费的同源相对路径。查询参数是服务端生成的派生直达凭据，
             不是 `api_key` 字段中的原始邮件 API Key；轮换邮件 API Key 后该链接失效。
+            成功访问会消费当前 UID，并异步把主号收件箱中的该邮件标记为已读；链接本身仍可等待
+            后续未消费的新 UID。
 
     RecentMailResponse:
       type: object
+      description: |
+        返回此 200 响应前，本地消费历史和持久化 IMAP `\Seen` 任务已经在同一事务中提交。
+        `\Seen` 由后台异步写回 iCloud，收到响应时主号中的邮件仍可能暂时显示为未读。
       additionalProperties: false
       required:
         - data

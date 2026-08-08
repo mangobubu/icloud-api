@@ -13,7 +13,7 @@ import (
 	"icloud-api/internal/store"
 )
 
-func TestMigrateV1ToV3(t *testing.T) {
+func TestMigrateV1ToV6(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -105,8 +105,8 @@ func TestMigrateV1ToV3(t *testing.T) {
 	if err := db.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatalf("read migrated schema version: %v", err)
 	}
-	if schemaVersion != 5 {
-		t.Fatalf("schema version = %d, want 5", schemaVersion)
+	if schemaVersion != 6 {
+		t.Fatalf("schema version = %d, want 6", schemaVersion)
 	}
 
 	var adminPasswordVersion, sessionPasswordVersion int64
@@ -162,11 +162,11 @@ func TestMigrateV1ToV3(t *testing.T) {
 	}
 }
 
-func TestSQLiteV4ConvergenceAddsAliasQueryIndexes(t *testing.T) {
+func TestSQLiteV6ConvergenceRestoresQueryIndexes(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	databasePath := filepath.Join(t.TempDir(), "v4-index-convergence.db")
+	databasePath := filepath.Join(t.TempDir(), "v6-index-convergence.db")
 	current, err := store.Open(databasePath)
 	if err != nil {
 		t.Fatalf("create current database: %v", err)
@@ -174,25 +174,27 @@ func TestSQLiteV4ConvergenceAddsAliasQueryIndexes(t *testing.T) {
 	for _, index := range []string{
 		"aliases_account_address_idx",
 		"aliases_enabled_account_address_idx",
+		"imap_seen_tasks_account_created_idx",
 	} {
 		if _, err := current.DB().ExecContext(ctx, `DROP INDEX `+index); err != nil {
 			_ = current.Close()
-			t.Fatalf("drop %s from v4 fixture: %v", index, err)
+			t.Fatalf("drop %s from v6 fixture: %v", index, err)
 		}
 	}
 	if err := current.Close(); err != nil {
-		t.Fatalf("close v4 fixture: %v", err)
+		t.Fatalf("close v6 fixture: %v", err)
 	}
 
 	converged, err := store.Open(databasePath)
 	if err != nil {
-		t.Fatalf("reopen and converge v4 database: %v", err)
+		t.Fatalf("reopen and converge v6 database: %v", err)
 	}
 	t.Cleanup(func() { _ = converged.Close() })
 
 	wanted := map[string]string{
 		"aliases_account_address_idx":         "create index aliases_account_address_idx on aliases(account_id, address, id)",
 		"aliases_enabled_account_address_idx": "create index aliases_enabled_account_address_idx on aliases(account_id, enabled, address, id)",
+		"imap_seen_tasks_account_created_idx": "create index imap_seen_tasks_account_created_idx on imap_seen_tasks(account_id, created_at, uid_validity, uid)",
 	}
 	for name, definition := range wanted {
 		var got string

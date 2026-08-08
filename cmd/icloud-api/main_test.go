@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -20,13 +22,217 @@ import (
 func TestHTTPWriteTimeoutCoversConfiguredSyncTimeout(t *testing.T) {
 	for _, syncTimeout := range []time.Duration{10 * time.Second, 2 * time.Minute, 30 * time.Minute} {
 		writeTimeout := httpWriteTimeout(syncTimeout)
-		if writeTimeout <= syncTimeout {
+		if writeTimeout <= 2*syncTimeout {
 			t.Fatalf("同步时限 %v 对应的 HTTP 写超时 = %v", syncTimeout, writeTimeout)
 		}
-		if writeTimeout-syncTimeout != 10*time.Second {
-			t.Fatalf("HTTP 写超时余量 = %v, want %v", writeTimeout-syncTimeout, 10*time.Second)
+		if writeTimeout-(2*syncTimeout) != 10*time.Second {
+			t.Fatalf("HTTP 写超时余量 = %v, want %v", writeTimeout-(2*syncTimeout), 10*time.Second)
 		}
 	}
+}
+
+func TestSeenOperationTimeoutIsShortAndTracksIMAPTimeout(t *testing.T) {
+	tests := []struct {
+		name        string
+		imapTimeout time.Duration
+		want        time.Duration
+	}{
+		{name: "non-positive", imapTimeout: 0, want: 2 * time.Minute},
+		{name: "small", imapTimeout: 5 * time.Second, want: 2 * time.Minute},
+		{name: "minimum range", imapTimeout: 18 * time.Second, want: 2 * time.Minute},
+		{name: "default", imapTimeout: 25 * time.Second, want: 160 * time.Second},
+		{name: "middle", imapTimeout: 45 * time.Second, want: 280 * time.Second},
+		{name: "maximum range", imapTimeout: 50 * time.Second, want: 5 * time.Minute},
+		{name: "large", imapTimeout: 90 * time.Second, want: 5 * time.Minute},
+		{name: "configured maximum", imapTimeout: 5 * time.Minute, want: 5 * time.Minute},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := seenOperationTimeout(test.imapTimeout); got != test.want {
+				t.Fatalf("seen operation timeout = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+type shutdownerStub struct {
+	shutdown func(context.Context) error
+	close    func() error
+}
+
+func (s shutdownerStub) Shutdown(ctx context.Context) error {
+	return s.shutdown(ctx)
+}
+
+func (s shutdownerStub) Close() error {
+	if s.close == nil {
+		return nil
+	}
+	return s.close()
+}
+
+func TestShutdownHTTPWaitsForBackgroundAfterShutdownError(t *testing.T) {
+	wantErr := errors.New("shutdown failed")
+	shutdownCalled := make(chan struct{})
+	closeCalled := make(chan struct{})
+	requestDone := make(chan struct{})
+	close(requestDone)
+	backgroundDone := make(chan struct{})
+	result := make(chan error, 1)
+
+	go func() {
+		result <- shutdownHTTPAndWaitForBackground(
+			context.Background(),
+			shutdownerStub{
+				shutdown: func(context.Context) error {
+					close(shutdownCalled)
+					return wantErr
+				},
+				close: func() error {
+					close(closeCalled)
+					return nil
+				},
+			},
+			requestDone,
+			backgroundDone,
+			nil,
+		)
+	}()
+
+	<-shutdownCalled
+	<-closeCalled
+	select {
+	case err := <-result:
+		t.Fatalf("background still running, shutdown returned early: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(backgroundDone)
+	select {
+	case err := <-result:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("shutdown error = %v, want wrapping %v", err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not return after background stopped")
+	}
+}
+
+func TestShutdownDeadlineReturnsWithoutWaitingForeverForOwners(t *testing.T) {
+	requestDone := make(chan struct{})
+	close(requestDone)
+	backgroundDone := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+
+	go func() {
+		result <- shutdownHTTPAndWaitForBackground(
+			ctx,
+			shutdownerStub{shutdown: func(context.Context) error { return nil }},
+			requestDone,
+			backgroundDone,
+			nil,
+		)
+	}()
+
+	<-ctx.Done()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("shutdown error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not return after deadline")
+	}
+}
+
+func TestShutdownDeadlineForcesHTTPCloseWhenShutdownStalls(t *testing.T) {
+	started := make(chan struct{})
+	releaseShutdown := make(chan struct{})
+	closeCalled := make(chan struct{})
+	requestDone := make(chan struct{})
+	close(requestDone)
+	backgroundDone := make(chan struct{})
+	close(backgroundDone)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+
+	go func() {
+		result <- shutdownHTTPAndWaitForBackground(
+			ctx,
+			shutdownerStub{
+				shutdown: func(context.Context) error {
+					close(started)
+					<-releaseShutdown
+					return nil
+				},
+				close: func() error {
+					close(closeCalled)
+					return nil
+				},
+			},
+			requestDone,
+			backgroundDone,
+			nil,
+		)
+	}()
+	<-started
+	select {
+	case <-closeCalled:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown deadline did not force HTTP close")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("shutdown error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not return after forcing HTTP close")
+	}
+	close(releaseShutdown)
+}
+
+func TestDrainingHandlerWaitsForActiveRequestsAndRejectsNewOnes(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan struct{})
+	handler := newDrainingHandler(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release
+		response.WriteHeader(http.StatusNoContent)
+	}))
+
+	go func() {
+		defer close(firstDone)
+		handler.ServeHTTP(
+			httptest.NewRecorder(),
+			httptest.NewRequest(http.MethodGet, "/", nil),
+		)
+	}()
+	<-entered
+	drained := handler.Stop()
+
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/", nil))
+	if second.Code != http.StatusServiceUnavailable {
+		t.Fatalf("request after draining status = %d, want %d", second.Code, http.StatusServiceUnavailable)
+	}
+	select {
+	case <-drained:
+		t.Fatal("handler reported drained while a request was active")
+	default:
+	}
+
+	close(release)
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("handler did not drain after active request finished")
+	}
+	<-firstDone
 }
 
 func TestInitializeCipherImportsValidatedLegacyDataBeforeFirstBinding(t *testing.T) {

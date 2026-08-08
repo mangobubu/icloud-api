@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"icloud-api/internal/domain"
@@ -52,8 +53,9 @@ type Manager struct {
 	withTimeout  func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	waitInterval func(context.Context, time.Duration) bool
 
-	locksMu sync.Mutex
-	locks   map[int64]*accountLock
+	locksMu  sync.Mutex
+	locks    map[int64]*accountLock
+	stopping atomic.Bool
 }
 
 func New(repo Repository, cipher CredentialCipher, fetcher MailFetcher, logger *slog.Logger, interval time.Duration, concurrency int) *Manager {
@@ -77,12 +79,26 @@ func (m *Manager) SetSyncTimeout(timeout time.Duration) {
 	}
 }
 
+// BeginShutdown prevents cancellation caused by process shutdown from being
+// persisted as an account synchronization failure.
+func (m *Manager) BeginShutdown() {
+	m.stopping.Store(true)
+}
+
 func (m *Manager) Run(ctx context.Context) {
+	var continuations accountIDSet
 	for {
-		m.syncAll(ctx)
+		continuations = m.syncAllRound(ctx, continuations)
+		if ctx.Err() != nil {
+			return
+		}
+		if len(continuations) > 0 {
+			continue
+		}
 		if !m.waitInterval(ctx, m.interval) {
 			return
 		}
+		continuations = nil
 	}
 }
 
@@ -97,52 +113,132 @@ func waitForInterval(ctx context.Context, interval time.Duration) bool {
 	}
 }
 
-func (m *Manager) syncAll(ctx context.Context) {
+// syncAll runs one bounded batch for every account that can acquire its
+// account lock and reports whether any account committed a pending batch.
+func (m *Manager) syncAll(ctx context.Context) bool {
+	return len(m.syncAllRound(ctx, nil)) > 0
+}
+
+type accountIDSet map[int64]struct{}
+
+// syncAllRound processes at most one batch per eligible account. A previous
+// continuation waits for its account lock with a bounded budget so manual and
+// seen work neither lose the continuation nor cause a busy retry loop.
+func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) accountIDSet {
+	pending := make(accountIDSet)
 	accounts, err := m.repo.ListEnabledAccounts(ctx)
 	if err != nil {
 		m.logger.Error("读取待同步主号失败", "error", err)
-		return
+		return pending
+	}
+	var statusMu sync.Mutex
+	markResult := func(accountID int64, syncErr error) {
+		if !errors.Is(syncErr, ErrSyncPending) {
+			return
+		}
+		statusMu.Lock()
+		defer statusMu.Unlock()
+		pending[accountID] = struct{}{}
 	}
 	var wg sync.WaitGroup
 	for _, account := range accounts {
 		account := account
+		_, continuing := continuations[account.ID]
+		if continuations != nil && !continuing {
+			continue
+		}
+		if continuations == nil {
+			continuing = account.LastSyncStatus == domain.SyncStatusPending
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			release, acquired := m.tryAcquireAccount(account.ID)
-			if !acquired {
-				return
+
+			var release func()
+			if continuing {
+				lockCtx, cancelLock := m.withTimeout(ctx, m.syncTimeout)
+				var err error
+				release, err = m.acquireAccount(lockCtx, account.ID)
+				if err == nil {
+					err = lockCtx.Err()
+				}
+				cancelLock()
+				if err != nil {
+					if release != nil {
+						release()
+					}
+					return
+				}
+			} else {
+				var acquired bool
+				release, acquired = m.tryAcquireAccount(account.ID)
+				if !acquired {
+					return
+				}
 			}
 			defer release()
 
-			syncCtx, cancel := m.withTimeout(ctx, m.syncTimeout)
-			defer cancel()
-			releaseSlot, err := m.acquireSyncSlot(syncCtx)
+			waitCtx, cancelWait := m.withTimeout(ctx, m.syncTimeout)
+			defer cancelWait()
+			releaseSlot, err := m.acquireSyncSlot(waitCtx)
 			if err != nil {
+				markResult(account.ID, err)
 				if !errors.Is(err, context.Canceled) {
 					m.logger.Warn("主号同步失败", "account_id", account.ID, "error", err)
 				}
 				return
 			}
 			defer releaseSlot()
-			if err := m.syncAccountLocked(syncCtx, account.ID); err != nil &&
-				!errors.Is(err, context.Canceled) && !errors.Is(err, ErrSyncPending) {
-				m.logger.Warn("主号同步失败", "account_id", account.ID, "error", err)
+			if err := waitCtx.Err(); err != nil {
+				markResult(account.ID, err)
+				if !errors.Is(err, context.Canceled) {
+					m.logger.Warn("主号同步失败", "account_id", account.ID, "error", err)
+				}
+				return
+			}
+			cancelWait()
+
+			syncCtx, cancelSync := m.withTimeout(ctx, m.syncTimeout)
+			defer cancelSync()
+			syncErr := m.syncAccountLocked(syncCtx, account.ID)
+			markResult(account.ID, syncErr)
+			if syncErr != nil &&
+				!errors.Is(syncErr, context.Canceled) && !errors.Is(syncErr, ErrSyncPending) {
+				m.logger.Warn("主号同步失败", "account_id", account.ID, "error", syncErr)
 			}
 		}()
 	}
 	wg.Wait()
+	return pending
 }
 
-// SyncAccountWithTimeout applies the same configured total limit to periodic
-// and manually requested account syncs.
+// SyncAccountWithTimeout bounds queueing and mailbox work separately so a busy
+// account or IMAP slot does not consume the mailbox operation's full budget.
 func (m *Manager) SyncAccountWithTimeout(ctx context.Context, accountID int64) error {
-	syncCtx, cancel := m.withTimeout(ctx, m.syncTimeout)
-	defer cancel()
-	return m.SyncAccount(syncCtx, accountID)
+	waitCtx, cancelWait := m.withTimeout(ctx, m.syncTimeout)
+	defer cancelWait()
+	return m.WithAccountIMAPSlot(waitCtx, accountID, func() error {
+		cancelWait()
+		syncCtx, cancelSync := m.withTimeout(ctx, m.syncTimeout)
+		defer cancelSync()
+		return m.syncAccountLocked(syncCtx, accountID)
+	})
 }
 
 func (m *Manager) SyncAccount(ctx context.Context, accountID int64) error {
+	return m.WithAccountIMAPSlot(ctx, accountID, func() error {
+		return m.syncAccountLocked(ctx, accountID)
+	})
+}
+
+// WithAccountIMAPSlot serializes work for one account and includes it in the
+// global IMAP connection limit. Keeping this acquisition order prevents a
+// worker holding a global slot while it waits for another operation on the
+// same account.
+func (m *Manager) WithAccountIMAPSlot(ctx context.Context, accountID int64, operation func() error) error {
+	if operation == nil {
+		return errors.New("account IMAP operation must not be nil")
+	}
 	release, err := m.acquireAccount(ctx, accountID)
 	if err != nil {
 		return err
@@ -153,7 +249,10 @@ func (m *Manager) SyncAccount(ctx context.Context, accountID int64) error {
 		return err
 	}
 	defer releaseSlot()
-	return m.syncAccountLocked(ctx, accountID)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return operation()
 }
 
 func (m *Manager) syncAccountLocked(ctx context.Context, accountID int64) (syncErr error) {
@@ -202,7 +301,7 @@ func (m *Manager) syncAccountLocked(ctx context.Context, accountID int64) (syncE
 	result, err := m.fetcher.FetchIncremental(ctx, account, password, enabled, previousState, snapshotPositions)
 	password = ""
 	if err != nil {
-		return err
+		return fmt.Errorf("fetch IMAP mailbox increment: %w", err)
 	}
 	now := time.Now().UTC()
 	if err := m.repo.ApplyMailboxSync(ctx, accountID, account.UpdatedAt, enabled, result, now); err != nil {
@@ -279,6 +378,9 @@ func (r *failureRecorder) update(operation func(context.Context) error) error {
 }
 
 func (r *failureRecorder) record(syncErr error) {
+	if r.manager.stopping.Load() {
+		return
+	}
 	messageRunes := []rune(strings.TrimSpace(syncErr.Error()))
 	if len(messageRunes) > 240 {
 		messageRunes = messageRunes[:240]

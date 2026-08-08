@@ -175,16 +175,16 @@ func TestVerifyMasterKeyIsPostgresOnly(t *testing.T) {
 	}
 }
 
-func TestPostgresBootstrapAddsMetadataToExistingV4WithoutSQLiteSchemaChange(t *testing.T) {
+func TestPostgresBootstrapAddsMetadataWithCurrentSchemaVersion(t *testing.T) {
 	t.Parallel()
-	if schemaVersion != 5 {
-		t.Fatalf("schema version = %d, want unchanged v5", schemaVersion)
+	if schemaVersion != 6 {
+		t.Fatalf("schema version = %d, want v6", schemaVersion)
 	}
 	bootstrap := strings.Join(postgresMigrationBootstrap, "\n")
 	if !strings.Contains(bootstrap, "CREATE TABLE IF NOT EXISTS app_metadata") {
-		t.Fatal("PostgreSQL bootstrap does not create app_metadata for existing v4 databases")
+		t.Fatal("PostgreSQL bootstrap does not create app_metadata for existing databases")
 	}
-	if strings.Contains(strings.Join(schemaV5, "\n"), "app_metadata") {
+	if strings.Contains(strings.Join(schemaV6, "\n"), "app_metadata") {
 		t.Fatal("SQLite runtime schema unexpectedly contains master key metadata")
 	}
 }

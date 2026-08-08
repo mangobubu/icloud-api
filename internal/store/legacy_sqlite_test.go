@@ -377,6 +377,186 @@ func TestLegacySQLiteCopySpecsHandleOlderSchemas(t *testing.T) {
 	}
 }
 
+func TestLegacySQLiteSeenCopySpecsHandleV4ThroughV6(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		statements []string
+		wantTables []string
+	}{
+		{name: "v4 or v5"},
+		{
+			name: "consumption table only",
+			statements: []string{`CREATE TABLE consumed_messages (
+				alias_id INTEGER NOT NULL,
+				uid_validity INTEGER NOT NULL,
+				uid INTEGER NOT NULL,
+				consumed_at INTEGER NOT NULL
+			)`},
+			wantTables: []string{"consumed_messages"},
+		},
+		{
+			name: "seen task table only",
+			statements: []string{`CREATE TABLE imap_seen_tasks (
+				account_id INTEGER NOT NULL,
+				uid_validity INTEGER NOT NULL,
+				uid INTEGER NOT NULL,
+				created_at INTEGER NOT NULL
+			)`},
+			wantTables: []string{"imap_seen_tasks"},
+		},
+		{
+			name: "v6",
+			statements: []string{
+				`CREATE TABLE consumed_messages (
+					alias_id INTEGER NOT NULL,
+					uid_validity INTEGER NOT NULL,
+					uid INTEGER NOT NULL,
+					consumed_at INTEGER NOT NULL
+				)`,
+				`CREATE TABLE imap_seen_tasks (
+					account_id INTEGER NOT NULL,
+					uid_validity INTEGER NOT NULL,
+					uid INTEGER NOT NULL,
+					created_at INTEGER NOT NULL
+				)`,
+			},
+			wantTables: []string{"consumed_messages", "imap_seen_tasks"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "legacy.db"))
+			if err != nil {
+				t.Fatalf("open legacy fixture: %v", err)
+			}
+			defer db.Close()
+			for _, statement := range test.statements {
+				if _, err := db.Exec(statement); err != nil {
+					t.Fatalf("create legacy fixture table: %v", err)
+				}
+			}
+			tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+			if err != nil {
+				t.Fatalf("begin legacy fixture snapshot: %v", err)
+			}
+			defer tx.Rollback()
+
+			specs, err := legacySQLiteSeenCopySpecs(context.Background(), tx)
+			if err != nil {
+				t.Fatalf("inspect optional v6 tables: %v", err)
+			}
+			if len(specs) != len(test.wantTables) {
+				t.Fatalf("copy spec count = %d, want %d", len(specs), len(test.wantTables))
+			}
+			for index, want := range test.wantTables {
+				if specs[index].table != want {
+					t.Fatalf("copy spec %d table = %q, want %q", index, specs[index].table, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLegacySQLiteSeenCopySpecsPreserveRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	source, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatalf("open source fixture: %v", err)
+	}
+	defer source.Close()
+	target, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "target.db"))
+	if err != nil {
+		t.Fatalf("open target fixture: %v", err)
+	}
+	defer target.Close()
+
+	statements := []string{
+		`CREATE TABLE consumed_messages (
+			alias_id INTEGER NOT NULL,
+			uid_validity INTEGER NOT NULL,
+			uid INTEGER NOT NULL,
+			consumed_at INTEGER NOT NULL,
+			PRIMARY KEY(alias_id, uid_validity, uid)
+		)`,
+		`CREATE TABLE imap_seen_tasks (
+			account_id INTEGER NOT NULL,
+			uid_validity INTEGER NOT NULL,
+			uid INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY(account_id, uid_validity, uid)
+		)`,
+	}
+	for _, db := range []*sql.DB{source, target} {
+		for _, statement := range statements {
+			if _, err := db.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("create fixture schema: %v", err)
+			}
+		}
+	}
+	if _, err := source.ExecContext(ctx, `
+		INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
+		VALUES(11, 4294967295, 4000000000, 123456789)`); err != nil {
+		t.Fatalf("insert consumed message fixture: %v", err)
+	}
+	if _, err := source.ExecContext(ctx, `
+		INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
+		VALUES(22, 4294967294, 3999999999, 987654321)`); err != nil {
+		t.Fatalf("insert seen task fixture: %v", err)
+	}
+
+	sourceTx, err := source.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin source snapshot: %v", err)
+	}
+	defer sourceTx.Rollback()
+	targetTx, err := target.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin target transaction: %v", err)
+	}
+	defer targetTx.Rollback()
+	specs, err := legacySQLiteSeenCopySpecs(ctx, sourceTx)
+	if err != nil {
+		t.Fatalf("build v6 copy specs: %v", err)
+	}
+	for _, spec := range specs {
+		if err := copyLegacySQLiteTable(ctx, sourceTx, targetTx, spec, nil); err != nil {
+			t.Fatalf("copy %s: %v", spec.table, err)
+		}
+	}
+	if err := targetTx.Commit(); err != nil {
+		t.Fatalf("commit target fixture: %v", err)
+	}
+	if err := sourceTx.Commit(); err != nil {
+		t.Fatalf("finish source snapshot: %v", err)
+	}
+
+	var aliasID, uidValidity, uid, consumedAt int64
+	if err := target.QueryRowContext(ctx, `
+		SELECT alias_id, uid_validity, uid, consumed_at FROM consumed_messages`,
+	).Scan(&aliasID, &uidValidity, &uid, &consumedAt); err != nil {
+		t.Fatalf("read copied consumed message: %v", err)
+	}
+	if aliasID != 11 || uidValidity != 4294967295 || uid != 4000000000 || consumedAt != 123456789 {
+		t.Fatalf("copied consumed message = (%d, %d, %d, %d)", aliasID, uidValidity, uid, consumedAt)
+	}
+
+	var accountID, createdAt int64
+	if err := target.QueryRowContext(ctx, `
+		SELECT account_id, uid_validity, uid, created_at FROM imap_seen_tasks`,
+	).Scan(&accountID, &uidValidity, &uid, &createdAt); err != nil {
+		t.Fatalf("read copied seen task: %v", err)
+	}
+	if accountID != 22 || uidValidity != 4294967294 || uid != 3999999999 || createdAt != 987654321 {
+		t.Fatalf("copied seen task = (%d, %d, %d, %d)", accountID, uidValidity, uid, createdAt)
+	}
+}
+
 func TestLegacySQLiteReadOnlyDSNDropsUnsafeURIOptions(t *testing.T) {
 	t.Parallel()
 

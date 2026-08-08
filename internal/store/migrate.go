@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strings"
 )
 
-const schemaVersion = 5
+const schemaVersion = 6
 
 // Migrate applies schema changes transactionally. Repeated calls are safe.
 func (s *Store) Migrate(ctx context.Context) error {
@@ -35,28 +37,38 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = schemaV5
-		migrationName = "schema v5"
+		statements = schemaV6
+		migrationName = "schema v6"
 	case 1:
 		statements = append([]string{}, migrateV1ToV2...)
 		statements = append(statements, migrateV2ToV3...)
 		statements = append(statements, migrateV3ToV4...)
 		statements = append(statements, migrateV4ToV5...)
-		migrationName = "migration v1 to v5"
+		statements = append(statements, migrateV5ToV6...)
+		migrationName = "migration v1 to v6"
 	case 2:
 		statements = append([]string{}, migrateV2ToV3...)
 		statements = append(statements, migrateV3ToV4...)
 		statements = append(statements, migrateV4ToV5...)
-		migrationName = "migration v2 to v5"
+		statements = append(statements, migrateV5ToV6...)
+		migrationName = "migration v2 to v6"
 	case 3:
 		statements = append([]string{}, migrateV3ToV4...)
 		statements = append(statements, migrateV4ToV5...)
-		migrationName = "migration v3 to v5"
+		statements = append(statements, migrateV5ToV6...)
+		migrationName = "migration v3 to v6"
 	case 4:
-		statements = migrateV4ToV5
-		migrationName = "migration v4 to v5"
+		statements = append([]string{}, migrateV4ToV5...)
+		statements = append(statements, migrateV5ToV6...)
+		migrationName = "migration v4 to v6"
+	case 5:
+		statements, err = sqliteV5CompatibilityMigration(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("inspect SQLite schema v5 compatibility: %w", err)
+		}
+		migrationName = "migration v5 to v6"
 	case schemaVersion:
-		migrationName = "schema v5 convergence"
+		migrationName = "schema v6 convergence"
 	}
 	for _, statement := range statements {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
@@ -68,8 +80,11 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 			return fmt.Errorf("converge sqlite schema: %w", err)
 		}
 	}
+	if err := s.convergeSQLiteV6Schema(ctx, tx); err != nil {
+		return fmt.Errorf("converge sqlite schema v6: %w", err)
+	}
 	if current != schemaVersion {
-		if _, err := s.txExecContext(ctx, tx, "PRAGMA user_version = 5"); err != nil {
+		if _, err := s.txExecContext(ctx, tx, "PRAGMA user_version = 6"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}
@@ -109,17 +124,22 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = postgresSchemaV5
-		migrationName = "postgres schema v5"
+		statements = postgresSchemaV6
+		migrationName = "postgres schema v6"
 	case 3:
 		statements = append([]string{}, postgresMigrateV3ToV4...)
 		statements = append(statements, postgresMigrateV4ToV5...)
-		migrationName = "postgres migration v3 to v5"
+		statements = append(statements, postgresMigrateV5ToV6...)
+		migrationName = "postgres migration v3 to v6"
 	case 4:
-		statements = postgresMigrateV4ToV5
-		migrationName = "postgres migration v4 to v5"
+		statements = append([]string{}, postgresMigrateV4ToV5...)
+		statements = append(statements, postgresMigrateV5ToV6...)
+		migrationName = "postgres migration v4 to v6"
+	case 5:
+		statements = postgresV5CompatibilityMigration
+		migrationName = "postgres migration v5 to v6"
 	case schemaVersion:
-		migrationName = "postgres schema v5 convergence"
+		migrationName = "postgres schema v6 convergence"
 	default:
 		return fmt.Errorf("postgres schema version %d has no migration path to version %d", current, schemaVersion)
 	}
@@ -258,8 +278,7 @@ var migrateV3ToV4 = []string{
 
 var schemaV4 = append(append([]string{}, schemaV3...), migrateV3ToV4...)
 
-var migrateV4ToV5 = []string{
-	`CREATE TABLE alias_creation_schedules (
+const sqliteCreateAliasCreationSchedules = `CREATE TABLE alias_creation_schedules (
 		account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
 		enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
 		planned_at_json TEXT NOT NULL DEFAULT '[]',
@@ -270,22 +289,545 @@ var migrateV4ToV5 = []string{
 		last_error TEXT NOT NULL DEFAULT '',
 		created_at INTEGER NOT NULL,
 		updated_at INTEGER NOT NULL
-	)`,
-	`CREATE INDEX alias_creation_schedules_due_idx
-		ON alias_creation_schedules(enabled, next_run_at, account_id)`,
-	`CREATE TABLE pending_alias_api_keys (
+	)`
+
+const sqliteCreatePendingAliasAPIKeys = `CREATE TABLE pending_alias_api_keys (
 		alias_id INTEGER PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
 		api_key_ciphertext TEXT NOT NULL CHECK(length(trim(api_key_ciphertext)) > 0),
 		created_at INTEGER NOT NULL
-	)`,
+	)`
+
+const sqliteCreateConsumedMessages = `CREATE TABLE consumed_messages (
+		alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		consumed_at INTEGER NOT NULL,
+		PRIMARY KEY(alias_id, uid_validity, uid)
+	)`
+
+const sqliteCreateIMAPSeenTasks = `CREATE TABLE imap_seen_tasks (
+		account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY(account_id, uid_validity, uid)
+	)`
+
+const sqliteCreateIMAPSeenTasksAccountCreatedIndex = `CREATE INDEX imap_seen_tasks_account_created_idx
+	ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`
+
+var migrateV4ToV5 = []string{
+	sqliteCreateAliasCreationSchedules,
+	`CREATE INDEX alias_creation_schedules_due_idx
+		ON alias_creation_schedules(enabled, next_run_at, account_id)`,
+	sqliteCreatePendingAliasAPIKeys,
 }
 
 var schemaV5 = append(append([]string{}, schemaV4...), migrateV4ToV5...)
+
+var migrateV5ToV6 = []string{
+	sqliteCreateConsumedMessages,
+	sqliteCreateIMAPSeenTasks,
+	sqliteCreateIMAPSeenTasksAccountCreatedIndex,
+}
+
+var schemaV6 = append(append([]string{}, schemaV5...), migrateV5ToV6...)
 
 var sqliteSchemaConvergence = []string{
 	`CREATE INDEX IF NOT EXISTS aliases_account_address_idx ON aliases(account_id, address, id)`,
 	`CREATE INDEX IF NOT EXISTS aliases_enabled_account_address_idx ON aliases(account_id, enabled, address, id)`,
 	`CREATE INDEX IF NOT EXISTS alias_creation_schedules_due_idx ON alias_creation_schedules(enabled, next_run_at, account_id)`,
+}
+
+// Both the main branch and an earlier release candidate used version 5 for
+// different table sets. Inspect the actual schema so either variant can
+// converge on the complete version 6 schema without replacing existing data.
+func sqliteV5CompatibilityMigration(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	type tableDefinition struct {
+		name      string
+		statement string
+	}
+	groups := []struct {
+		name   string
+		tables []tableDefinition
+	}{
+		{
+			name: "automatic alias creation",
+			tables: []tableDefinition{
+				{name: "alias_creation_schedules", statement: sqliteCreateAliasCreationSchedules},
+				{name: "pending_alias_api_keys", statement: sqliteCreatePendingAliasAPIKeys},
+			},
+		},
+		{
+			name: "message consumption and imap seen",
+			tables: []tableDefinition{
+				{name: "consumed_messages", statement: sqliteCreateConsumedMessages},
+				{name: "imap_seen_tasks", statement: sqliteCreateIMAPSeenTasks},
+			},
+		},
+	}
+
+	statements := make([]string, 0, 2)
+	presentGroups := 0
+	for _, group := range groups {
+		presentTables := 0
+		for _, table := range group.tables {
+			exists, err := sqliteSchemaObjectExists(ctx, tx, table.name, "table")
+			if err != nil {
+				return nil, err
+			}
+			if exists {
+				presentTables++
+			}
+		}
+		if presentTables != 0 && presentTables != len(group.tables) {
+			return nil, fmt.Errorf(
+				"SQLite schema v5 has incomplete %s table group (%d of %d tables)",
+				group.name, presentTables, len(group.tables),
+			)
+		}
+		if presentTables == len(group.tables) {
+			presentGroups++
+			continue
+		}
+		for _, table := range group.tables {
+			statements = append(statements, table.statement)
+		}
+	}
+	if presentGroups == 0 {
+		return nil, errors.New("SQLite schema v5 contains neither recognized v5 table group")
+	}
+	return statements, nil
+}
+
+type sqliteV6ColumnRequirement struct {
+	name          string
+	dataType      string
+	requiredCheck string
+}
+
+type sqliteV6ForeignKeyRequirement struct {
+	from     string
+	table    string
+	to       string
+	onDelete string
+}
+
+type sqliteV6TableRequirement struct {
+	name       string
+	columns    []sqliteV6ColumnRequirement
+	primaryKey []string
+	foreignKey sqliteV6ForeignKeyRequirement
+}
+
+var sqliteV6TableRequirements = []sqliteV6TableRequirement{
+	{
+		name: "consumed_messages",
+		columns: []sqliteV6ColumnRequirement{
+			{name: "alias_id", dataType: "INTEGER"},
+			{
+				name: "uid_validity", dataType: "INTEGER",
+				requiredCheck: "CHECK(uid_validity BETWEEN 1 AND 4294967295)",
+			},
+			{
+				name: "uid", dataType: "INTEGER",
+				requiredCheck: "CHECK(uid BETWEEN 1 AND 4294967295)",
+			},
+			{name: "consumed_at", dataType: "INTEGER"},
+		},
+		primaryKey: []string{"alias_id", "uid_validity", "uid"},
+		foreignKey: sqliteV6ForeignKeyRequirement{
+			from: "alias_id", table: "aliases", to: "id", onDelete: "CASCADE",
+		},
+	},
+	{
+		name: "imap_seen_tasks",
+		columns: []sqliteV6ColumnRequirement{
+			{name: "account_id", dataType: "INTEGER"},
+			{
+				name: "uid_validity", dataType: "INTEGER",
+				requiredCheck: "CHECK(uid_validity BETWEEN 1 AND 4294967295)",
+			},
+			{
+				name: "uid", dataType: "INTEGER",
+				requiredCheck: "CHECK(uid BETWEEN 1 AND 4294967295)",
+			},
+			{name: "created_at", dataType: "INTEGER"},
+		},
+		primaryKey: []string{"account_id", "uid_validity", "uid"},
+		foreignKey: sqliteV6ForeignKeyRequirement{
+			from: "account_id", table: "accounts", to: "id", onDelete: "CASCADE",
+		},
+	},
+}
+
+func (s *Store) convergeSQLiteV6Schema(ctx context.Context, tx *sql.Tx) error {
+	for _, requirement := range sqliteV6TableRequirements {
+		exists, err := sqliteSchemaObjectExists(ctx, tx, requirement.name, "table")
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("SQLite schema is missing required table %s", requirement.name)
+		}
+		if err := validateSQLiteV6Table(ctx, tx, requirement); err != nil {
+			return err
+		}
+	}
+
+	const indexName = "imap_seen_tasks_account_created_idx"
+	exists, err := sqliteSchemaObjectExists(ctx, tx, indexName, "index")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		if _, err := s.txExecContext(ctx, tx, sqliteCreateIMAPSeenTasksAccountCreatedIndex); err != nil {
+			return fmt.Errorf("create missing SQLite index %s: %w", indexName, err)
+		}
+	}
+	return validateSQLiteV6SeenTaskIndex(ctx, tx)
+}
+
+func sqliteSchemaObjectExists(
+	ctx context.Context,
+	tx *sql.Tx,
+	name string,
+	wantType string,
+) (bool, error) {
+	var exists bool
+	err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM sqlite_master
+			WHERE type = ? AND name = ? COLLATE NOCASE
+		)`, wantType, name,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("inspect SQLite schema object %s: %w", name, err)
+	}
+	return exists, nil
+}
+
+type sqliteV6Column struct {
+	dataType string
+	notNull  bool
+}
+
+func validateSQLiteV6Table(ctx context.Context, tx *sql.Tx, requirement sqliteV6TableRequirement) error {
+	var createSQL string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT sql FROM sqlite_master
+		WHERE type = 'table' AND name = ? COLLATE NOCASE`, requirement.name,
+	).Scan(&createSQL); err != nil {
+		return fmt.Errorf("inspect SQLite table %s definition: %w", requirement.name, err)
+	}
+	normalizedCreateSQL := normalizeSQLiteSchemaSQL(createSQL)
+
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+requirement.name+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect SQLite table %s columns: %w", requirement.name, err)
+	}
+	defer rows.Close()
+
+	columns := make(map[string]sqliteV6Column)
+	primaryKeyColumns := make(map[int]string)
+	primaryKeyColumnCount := 0
+	for rows.Next() {
+		var position, notNull, primaryKeyPosition int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(
+			&position, &name, &dataType, &notNull, &defaultValue, &primaryKeyPosition,
+		); err != nil {
+			return fmt.Errorf("scan SQLite table %s columns: %w", requirement.name, err)
+		}
+		columns[strings.ToLower(name)] = sqliteV6Column{
+			dataType: strings.TrimSpace(dataType),
+			notNull:  notNull != 0,
+		}
+		if primaryKeyPosition > 0 {
+			primaryKeyColumnCount++
+			primaryKeyColumns[primaryKeyPosition] = name
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate SQLite table %s columns: %w", requirement.name, err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close SQLite table %s column metadata: %w", requirement.name, err)
+	}
+
+	for _, wanted := range requirement.columns {
+		got, ok := columns[strings.ToLower(wanted.name)]
+		if !ok {
+			return fmt.Errorf("SQLite table %s is missing required column %s", requirement.name, wanted.name)
+		}
+		if !strings.EqualFold(got.dataType, wanted.dataType) {
+			return fmt.Errorf(
+				"SQLite table %s column %s has type %s, want %s",
+				requirement.name, wanted.name, got.dataType, wanted.dataType,
+			)
+		}
+		if !got.notNull {
+			return fmt.Errorf("SQLite table %s column %s must be NOT NULL", requirement.name, wanted.name)
+		}
+	}
+	if len(columns) != len(requirement.columns) {
+		return fmt.Errorf(
+			"SQLite table %s has %d columns, want exactly %d",
+			requirement.name, len(columns), len(requirement.columns),
+		)
+	}
+	for _, wanted := range requirement.columns {
+		if wanted.requiredCheck != "" &&
+			!strings.Contains(normalizedCreateSQL, normalizeSQLiteSchemaSQL(wanted.requiredCheck)) {
+			return fmt.Errorf(
+				"SQLite table %s column %s is missing required %s",
+				requirement.name, wanted.name, wanted.requiredCheck,
+			)
+		}
+	}
+
+	if primaryKeyColumnCount != len(requirement.primaryKey) || len(primaryKeyColumns) != len(requirement.primaryKey) {
+		return fmt.Errorf(
+			"SQLite table %s primary key has %d columns, want (%s)",
+			requirement.name, primaryKeyColumnCount, strings.Join(requirement.primaryKey, ", "),
+		)
+	}
+	for position, wanted := range requirement.primaryKey {
+		got, ok := primaryKeyColumns[position+1]
+		if !ok || !strings.EqualFold(got, wanted) {
+			return fmt.Errorf(
+				"SQLite table %s primary key position %d is %q, want %q",
+				requirement.name, position+1, got, wanted,
+			)
+		}
+	}
+
+	return validateSQLiteV6ForeignKey(ctx, tx, requirement)
+}
+
+func normalizeSQLiteSchemaSQL(statement string) string {
+	var normalized strings.Builder
+	normalized.Grow(len(statement))
+	for position := 0; position < len(statement); {
+		character := statement[position]
+		switch {
+		case character == '\'' || character == '"' || character == '`':
+			normalized.WriteByte(0)
+			position = skipSQLiteQuotedSQL(statement, position, character)
+		case character == '[':
+			normalized.WriteByte(0)
+			position++
+			for position < len(statement) && statement[position] != ']' {
+				position++
+			}
+			if position < len(statement) {
+				position++
+			}
+		case character == '-' && position+1 < len(statement) && statement[position+1] == '-':
+			normalized.WriteByte(0)
+			position += 2
+			for position < len(statement) && statement[position] != '\n' && statement[position] != '\r' {
+				position++
+			}
+		case character == '/' && position+1 < len(statement) && statement[position+1] == '*':
+			normalized.WriteByte(0)
+			position += 2
+			for position+1 < len(statement) &&
+				(statement[position] != '*' || statement[position+1] != '/') {
+				position++
+			}
+			if position+1 < len(statement) {
+				position += 2
+			} else {
+				position = len(statement)
+			}
+		case isSQLiteSQLWhitespace(character):
+			position++
+		default:
+			if character >= 'A' && character <= 'Z' {
+				character += 'a' - 'A'
+			}
+			normalized.WriteByte(character)
+			position++
+		}
+	}
+	return normalized.String()
+}
+
+func skipSQLiteQuotedSQL(statement string, position int, delimiter byte) int {
+	position++
+	for position < len(statement) {
+		if statement[position] != delimiter {
+			position++
+			continue
+		}
+		if position+1 < len(statement) && statement[position+1] == delimiter {
+			position += 2
+			continue
+		}
+		return position + 1
+	}
+	return position
+}
+
+func isSQLiteSQLWhitespace(character byte) bool {
+	switch character {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
+}
+
+type sqliteV6ForeignKey struct {
+	from     string
+	table    string
+	to       string
+	onDelete string
+}
+
+func validateSQLiteV6ForeignKey(ctx context.Context, tx *sql.Tx, requirement sqliteV6TableRequirement) error {
+	rows, err := tx.QueryContext(ctx, `PRAGMA foreign_key_list(`+requirement.name+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect SQLite table %s foreign keys: %w", requirement.name, err)
+	}
+	defer rows.Close()
+
+	var foreignKeys []sqliteV6ForeignKey
+	for rows.Next() {
+		var id, sequence int
+		var foreignKey sqliteV6ForeignKey
+		var onUpdate, match string
+		if err := rows.Scan(
+			&id, &sequence, &foreignKey.table, &foreignKey.from, &foreignKey.to,
+			&onUpdate, &foreignKey.onDelete, &match,
+		); err != nil {
+			return fmt.Errorf("scan SQLite table %s foreign keys: %w", requirement.name, err)
+		}
+		foreignKeys = append(foreignKeys, foreignKey)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate SQLite table %s foreign keys: %w", requirement.name, err)
+	}
+
+	wanted := requirement.foreignKey
+	if len(foreignKeys) != 1 {
+		return fmt.Errorf("SQLite table %s has %d foreign key entries, want 1", requirement.name, len(foreignKeys))
+	}
+	got := foreignKeys[0]
+	if !strings.EqualFold(got.from, wanted.from) ||
+		!strings.EqualFold(got.table, wanted.table) ||
+		!strings.EqualFold(got.to, wanted.to) ||
+		!strings.EqualFold(got.onDelete, wanted.onDelete) {
+		return fmt.Errorf(
+			"SQLite table %s foreign key is %s -> %s(%s) ON DELETE %s, want %s -> %s(%s) ON DELETE %s",
+			requirement.name,
+			got.from, got.table, got.to, got.onDelete,
+			wanted.from, wanted.table, wanted.to, wanted.onDelete,
+		)
+	}
+	return nil
+}
+
+func validateSQLiteV6SeenTaskIndex(ctx context.Context, tx *sql.Tx) error {
+	const (
+		indexName = "imap_seen_tasks_account_created_idx"
+		tableName = "imap_seen_tasks"
+	)
+	wantedColumns := []string{"account_id", "created_at", "uid_validity", "uid"}
+
+	var indexedTable string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT tbl_name FROM sqlite_master
+		WHERE type = 'index' AND name = ? COLLATE NOCASE`, indexName,
+	).Scan(&indexedTable); err != nil {
+		return fmt.Errorf("inspect SQLite index %s owner: %w", indexName, err)
+	}
+	if !strings.EqualFold(indexedTable, tableName) {
+		return fmt.Errorf("SQLite index %s belongs to table %s, want %s", indexName, indexedTable, tableName)
+	}
+
+	rows, err := tx.QueryContext(ctx, `PRAGMA index_list(`+tableName+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect SQLite table %s indexes: %w", tableName, err)
+	}
+	var found bool
+	for rows.Next() {
+		var sequence, unique, partial int
+		var name, origin string
+		if err := rows.Scan(&sequence, &name, &unique, &origin, &partial); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan SQLite table %s indexes: %w", tableName, err)
+		}
+		if !strings.EqualFold(name, indexName) {
+			continue
+		}
+		found = true
+		if unique != 0 {
+			_ = rows.Close()
+			return fmt.Errorf("SQLite index %s must be non-unique", indexName)
+		}
+		if !strings.EqualFold(origin, "c") {
+			_ = rows.Close()
+			return fmt.Errorf("SQLite index %s has origin %s, want created index", indexName, origin)
+		}
+		if partial != 0 {
+			_ = rows.Close()
+			return fmt.Errorf("SQLite index %s must not be partial", indexName)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close SQLite table %s index metadata: %w", tableName, err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate SQLite table %s indexes: %w", tableName, err)
+	}
+	if !found {
+		return fmt.Errorf("SQLite table %s is missing index %s", tableName, indexName)
+	}
+
+	rows, err = tx.QueryContext(ctx, `PRAGMA index_xinfo(`+indexName+`)`)
+	if err != nil {
+		return fmt.Errorf("inspect SQLite index %s columns: %w", indexName, err)
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var sequence, columnID, descending, key int
+		var name, collation sql.NullString
+		if err := rows.Scan(&sequence, &columnID, &name, &descending, &collation, &key); err != nil {
+			return fmt.Errorf("scan SQLite index %s columns: %w", indexName, err)
+		}
+		if key == 0 {
+			continue
+		}
+		if columnID < 0 || !name.Valid {
+			return fmt.Errorf("SQLite index %s contains an expression at position %d", indexName, sequence+1)
+		}
+		if descending != 0 {
+			return fmt.Errorf("SQLite index %s column %s must use ascending order", indexName, name.String)
+		}
+		columns = append(columns, name.String)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate SQLite index %s columns: %w", indexName, err)
+	}
+	if len(columns) != len(wantedColumns) {
+		return fmt.Errorf(
+			"SQLite index %s has columns (%s), want (%s)",
+			indexName, strings.Join(columns, ", "), strings.Join(wantedColumns, ", "),
+		)
+	}
+	for position, wanted := range wantedColumns {
+		if !strings.EqualFold(columns[position], wanted) {
+			return fmt.Errorf(
+				"SQLite index %s column position %d is %q, want %q",
+				indexName, position+1, columns[position], wanted,
+			)
+		}
+	}
+	return nil
 }
 
 var migrateV1ToV2 = []string{
@@ -477,6 +1019,85 @@ var postgresMigrateV4ToV5 = []string{
 
 var postgresSchemaV5 = append(append([]string{}, postgresSchemaV4...), postgresMigrateV4ToV5...)
 
+var postgresMigrateV5ToV6 = []string{
+	`CREATE TABLE consumed_messages (
+		alias_id BIGINT NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		consumed_at BIGINT NOT NULL,
+		PRIMARY KEY(alias_id, uid_validity, uid)
+	)`,
+	`CREATE TABLE imap_seen_tasks (
+		account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY(account_id, uid_validity, uid)
+	)`,
+	`CREATE INDEX imap_seen_tasks_account_created_idx
+		ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
+}
+
+var postgresSchemaV6 = append(append([]string{}, postgresSchemaV5...), postgresMigrateV5ToV6...)
+
+// Version 5 was released with two distinct feature-table layouts. These
+// idempotent statements preserve either layout while filling its missing half.
+var postgresV5CompatibilityMigration = []string{
+	`DO $migration$
+	DECLARE
+		automatic_alias_table_count INTEGER :=
+			(CASE WHEN pg_catalog.to_regclass('alias_creation_schedules') IS NULL THEN 0 ELSE 1 END) +
+			(CASE WHEN pg_catalog.to_regclass('pending_alias_api_keys') IS NULL THEN 0 ELSE 1 END);
+		seen_table_count INTEGER :=
+			(CASE WHEN pg_catalog.to_regclass('consumed_messages') IS NULL THEN 0 ELSE 1 END) +
+			(CASE WHEN pg_catalog.to_regclass('imap_seen_tasks') IS NULL THEN 0 ELSE 1 END);
+	BEGIN
+		IF automatic_alias_table_count NOT IN (0, 2) THEN
+			RAISE EXCEPTION 'PostgreSQL schema v5 has incomplete automatic alias table group (% of 2 tables)',
+				automatic_alias_table_count;
+		END IF;
+		IF seen_table_count NOT IN (0, 2) THEN
+			RAISE EXCEPTION 'PostgreSQL schema v5 has incomplete message consumption and IMAP Seen table group (% of 2 tables)',
+				seen_table_count;
+		END IF;
+		IF automatic_alias_table_count = 0 AND seen_table_count = 0 THEN
+			RAISE EXCEPTION 'PostgreSQL schema v5 contains neither recognized v5 table group';
+		END IF;
+	END;
+	$migration$`,
+	`CREATE TABLE IF NOT EXISTS alias_creation_schedules (
+		account_id BIGINT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		enabled BOOLEAN NOT NULL DEFAULT FALSE,
+		planned_at_json TEXT NOT NULL DEFAULT '[]',
+		next_run_at BIGINT,
+		last_attempted_at BIGINT,
+		last_created_at BIGINT,
+		last_alias_address TEXT NOT NULL DEFAULT '',
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at BIGINT NOT NULL,
+		updated_at BIGINT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS pending_alias_api_keys (
+		alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		api_key_ciphertext TEXT NOT NULL CHECK(length(trim(api_key_ciphertext)) > 0),
+		created_at BIGINT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS consumed_messages (
+		alias_id BIGINT NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		consumed_at BIGINT NOT NULL,
+		PRIMARY KEY(alias_id, uid_validity, uid)
+	)`,
+	`CREATE TABLE IF NOT EXISTS imap_seen_tasks (
+		account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY(account_id, uid_validity, uid)
+	)`,
+}
+
 var postgresMigrateV3ToV4 = []string{
 	`CREATE INDEX IF NOT EXISTS accounts_enabled_email_idx ON accounts(email, id) WHERE enabled`,
 	`CREATE INDEX IF NOT EXISTS aliases_account_address_idx ON aliases(account_id, address, id)`,
@@ -499,4 +1120,6 @@ var postgresSchemaConvergence = []string{
 	`CREATE INDEX IF NOT EXISTS aliases_account_address_idx ON aliases(account_id, address, id)`,
 	`CREATE INDEX IF NOT EXISTS aliases_enabled_account_address_idx ON aliases(account_id, address, id) WHERE enabled`,
 	`CREATE INDEX IF NOT EXISTS alias_creation_schedules_due_idx ON alias_creation_schedules(enabled, next_run_at, account_id)`,
+	`CREATE INDEX IF NOT EXISTS imap_seen_tasks_account_created_idx
+		ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
 }

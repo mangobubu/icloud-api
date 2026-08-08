@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -74,6 +76,118 @@ func TestRecentMailDirectLinkReturnsCompactOwnedMessageInConfiguredTimezone(t *t
 			t.Fatalf("compact response exposed forbidden value %q: %s", forbidden, response.Body.String())
 		}
 	}
+}
+
+func TestRecentMailDirectLinkConsumesEachSnapshotOnce(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	mailboxes := env.createMailboxFixture(t)
+	now := time.Date(2026, time.August, 7, 5, 15, 0, 0, time.UTC)
+	env.server.now = func() time.Time { return now }
+	setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-2 * time.Minute), Subject: "first consumable message",
+		TextBody: "first consumable body", SyncedAt: now,
+	})
+
+	var notifications atomic.Int32
+	env.server.SetSeenNotifier(func() { notifications.Add(1) })
+	query := url.Values{"api_key": {mailboxes.keyA}}
+
+	first := directMailRequest(t, env, query)
+	if first.Code != http.StatusOK || !strings.Contains(first.Body.String(), "first consumable body") {
+		t.Fatalf("first direct response = %d; body=%s", first.Code, first.Body.String())
+	}
+	second := directMailRequest(t, env, query)
+	assertAPIError(t, second, http.StatusNotFound, "MAIL_NOT_FOUND")
+	if got := notifications.Load(); got != 1 {
+		t.Fatalf("notifications after repeated snapshot = %d, want 1", got)
+	}
+
+	bearer := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+	if bearer.Code != http.StatusOK || !strings.Contains(bearer.Body.String(), "first consumable body") {
+		t.Fatalf("Bearer latest after direct consumption = %d; body=%s", bearer.Code, bearer.Body.String())
+	}
+
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 13,
+		InternalDate: now.Add(-time.Minute), Subject: "next consumable message",
+		TextBody: "next consumable body", SyncedAt: now,
+	})
+	third := directMailRequest(t, env, query)
+	if third.Code != http.StatusOK || !strings.Contains(third.Body.String(), "next consumable body") {
+		t.Fatalf("new UID direct response = %d; body=%s", third.Code, third.Body.String())
+	}
+	if got := notifications.Load(); got != 2 {
+		t.Fatalf("notifications after two consumed UIDs = %d, want 2", got)
+	}
+
+	if err := env.store.ReplaceLatestMessage(context.Background(), domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-30 * time.Second), Subject: "returned consumed message",
+		TextBody: "returned consumed body", SyncedAt: now,
+	}); err != nil {
+		t.Fatalf("replace latest message with consumed UID: %v", err)
+	}
+	returned := directMailRequest(t, env, query)
+	assertAPIError(t, returned, http.StatusNotFound, "MAIL_NOT_FOUND")
+	if got := notifications.Load(); got != 2 {
+		t.Fatalf("notifications after returning to consumed UID = %d, want 2", got)
+	}
+	returnedBearer := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+	if returnedBearer.Code != http.StatusOK || !strings.Contains(returnedBearer.Body.String(), "returned consumed body") {
+		t.Fatalf("Bearer latest after returning to consumed UID = %d; body=%s", returnedBearer.Code, returnedBearer.Body.String())
+	}
+	assertSeenPersistenceCounts(t, env, mailboxes.aliasA.ID, mailboxes.accountA.ID, 2, 2)
+}
+
+func TestRecentMailDirectLinkConcurrentRequestsConsumeOnce(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	mailboxes := env.createMailboxFixture(t)
+	now := time.Date(2026, time.August, 7, 5, 15, 0, 0, time.UTC)
+	env.server.now = func() time.Time { return now }
+	setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-time.Minute), TextBody: "concurrent body", SyncedAt: now,
+	})
+
+	var notifications atomic.Int32
+	env.server.SetSeenNotifier(func() { notifications.Add(1) })
+	const requestCount = 12
+	start := make(chan struct{})
+	statuses := make(chan int, requestCount)
+	var requests sync.WaitGroup
+	for range requestCount {
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			<-start
+			request := httptest.NewRequest(
+				http.MethodGet,
+				"/api/v1/mail/recent?api_key="+url.QueryEscape(mailboxes.keyA),
+				nil,
+			)
+			response := httptest.NewRecorder()
+			env.router.ServeHTTP(response, request)
+			statuses <- response.Code
+		}()
+	}
+	close(start)
+	requests.Wait()
+	close(statuses)
+
+	counts := make(map[int]int)
+	for status := range statuses {
+		counts[status]++
+	}
+	if counts[http.StatusOK] != 1 || counts[http.StatusNotFound] != requestCount-1 || len(counts) != 2 {
+		t.Fatalf("concurrent direct statuses = %v, want one 200 and %d 404 responses", counts, requestCount-1)
+	}
+	if got := notifications.Load(); got != 1 {
+		t.Fatalf("concurrent notifications = %d, want 1", got)
+	}
+	assertSeenPersistenceCounts(t, env, mailboxes.aliasA.ID, mailboxes.accountA.ID, 1, 1)
 }
 
 func TestRecentMailDirectLinkExtractsPlainTextFromHTMLBody(t *testing.T) {
@@ -251,10 +365,11 @@ func TestMailEndpointsValidateSyncFreshnessWindow(t *testing.T) {
 			mailboxes := env.createMailboxFixture(t)
 			now := time.Date(2026, time.August, 7, 6, 0, 0, 123456789, time.UTC)
 			env.server.now = func() time.Time { return now }
-			setAliasSyncedAt(t, env, mailboxes.aliasA, test.syncedAt(now))
+			syncedAt := test.syncedAt(now)
+			setAliasSyncedAt(t, env, mailboxes.aliasA, syncedAt)
 			env.upsertMessage(t, domain.LatestMessage{
 				AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
-				InternalDate: now.Add(-time.Minute), TextBody: "fresh body", SyncedAt: now,
+				InternalDate: now.Add(-time.Minute), TextBody: "fresh body", SyncedAt: syncedAt,
 			})
 
 			direct := directMailRequest(t, env, url.Values{"api_key": {mailboxes.keyA}})
@@ -323,7 +438,7 @@ func TestRecentMailDirectLinkAcceptsDerivedCredentialOnlyInQueryAndTracksRotatio
 	bearer := env.apiRequest(t, "/api/v1/mail/latest", derived)
 	assertAPIError(t, bearer, http.StatusUnauthorized, "INVALID_API_KEY")
 
-	_, rotatedHash, rotatedPrefix, err := secure.NewAPIKey()
+	rotatedKey, rotatedHash, rotatedPrefix, err := secure.NewAPIKey()
 	if err != nil {
 		t.Fatalf("generate rotated API key: %v", err)
 	}
@@ -338,8 +453,13 @@ func TestRecentMailDirectLinkAcceptsDerivedCredentialOnlyInQueryAndTracksRotatio
 		t.Fatalf("derive rotated direct-link credential: %v", err)
 	}
 	current := directMailRequest(t, env, url.Values{"api_key": {rotatedDerived}})
-	if current.Code != http.StatusOK || !strings.Contains(current.Body.String(), "derived direct body") {
-		t.Fatalf("rotated derived direct-link response = %d; body=%s", current.Code, current.Body.String())
+	assertAPIError(t, current, http.StatusNotFound, "MAIL_NOT_FOUND")
+	if strings.Contains(current.Body.String(), "derived direct body") {
+		t.Fatalf("rotated direct-link credential exposed consumed snapshot: %s", current.Body.String())
+	}
+	latestAfterRotation := env.apiRequest(t, "/api/v1/mail/latest", rotatedKey)
+	if latestAfterRotation.Code != http.StatusOK || !strings.Contains(latestAfterRotation.Body.String(), "derived direct body") {
+		t.Fatalf("Bearer latest after credential rotation = %d; body=%s", latestAfterRotation.Code, latestAfterRotation.Body.String())
 	}
 
 	if err := env.store.SetAliasEnabled(context.Background(), mailboxes.aliasA.ID, false); err != nil {
@@ -349,14 +469,230 @@ func TestRecentMailDirectLinkAcceptsDerivedCredentialOnlyInQueryAndTracksRotatio
 	assertAPIError(t, disabled, http.StatusUnauthorized, "INVALID_API_KEY")
 }
 
+func TestRecentMailDirectLinkRejectsBindingChangedAfterAuthentication(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *httpTestEnv, mailboxFixture, time.Time)
+	}{
+		{
+			name: "API key rotated",
+			mutate: func(t *testing.T, env *httpTestEnv, mailboxes mailboxFixture, _ time.Time) {
+				rotated := testAPIKey(0x72)
+				if _, err := env.store.RotateAliasAPIKey(
+					context.Background(), mailboxes.aliasA.ID, secure.HashToken(rotated), rotated[:12],
+				); err != nil {
+					t.Fatalf("rotate API key after authentication: %v", err)
+				}
+			},
+		},
+		{
+			name: "sync marked unavailable",
+			mutate: func(t *testing.T, env *httpTestEnv, mailboxes mailboxFixture, now time.Time) {
+				failedAt := now.Add(time.Second)
+				if err := env.store.UpdateAliasSyncStatus(
+					context.Background(), mailboxes.aliasA.ID, domain.SyncStatusError, "sync failed", &failedAt,
+				); err != nil {
+					t.Fatalf("mark sync unavailable after authentication: %v", err)
+				}
+			},
+		},
+		{
+			name: "same UID republished",
+			mutate: func(t *testing.T, env *httpTestEnv, mailboxes mailboxFixture, now time.Time) {
+				refreshedAt := now.Add(time.Second)
+				if err := env.store.ReplaceLatestMessage(context.Background(), domain.LatestMessage{
+					AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+					InternalDate: now.Add(-time.Minute), TextBody: "republished body", SyncedAt: refreshedAt,
+				}); err != nil {
+					t.Fatalf("republish same UID after authentication: %v", err)
+				}
+				setAliasSyncedAt(t, env, mailboxes.aliasA, refreshedAt)
+			},
+		},
+		{
+			name: "alias deleted",
+			mutate: func(t *testing.T, env *httpTestEnv, mailboxes mailboxFixture, _ time.Time) {
+				if err := env.store.DeleteAlias(context.Background(), mailboxes.aliasA.ID); err != nil {
+					t.Fatalf("delete alias after authentication: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newHTTPTestEnv(t)
+			mailboxes := env.createMailboxFixture(t)
+			now := time.Date(2026, time.August, 7, 5, 15, 0, 0, time.UTC)
+			env.server.now = func() time.Time { return now }
+			setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+			env.upsertMessage(t, domain.LatestMessage{
+				AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+				InternalDate: now.Add(-time.Minute), TextBody: "authenticated body", SyncedAt: now,
+			})
+
+			var notifications atomic.Int32
+			env.server.SetSeenNotifier(func() { notifications.Add(1) })
+			const route = "/test/recent-binding-cas"
+			router := gin.New()
+			router.Use(env.server.requestContext(), env.server.securityHeaders(), env.server.recovery())
+			router.GET(route, env.server.apiKeyQueryAuth(), func(c *gin.Context) {
+				test.mutate(t, env, mailboxes, now)
+				env.server.recentMail(c)
+			})
+			request := httptest.NewRequest(
+				http.MethodGet, route+"?api_key="+url.QueryEscape(mailboxes.keyA), nil,
+			)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			assertAPIError(t, response, http.StatusNotFound, "MAIL_NOT_FOUND")
+			if strings.Contains(response.Body.String(), "authenticated body") ||
+				strings.Contains(response.Body.String(), "republished body") {
+				t.Fatalf("stale binding response exposed mail body: %s", response.Body.String())
+			}
+			if got := notifications.Load(); got != 0 {
+				t.Fatalf("notifications after rejected CAS = %d, want 0", got)
+			}
+			assertSeenPersistenceCounts(t, env, mailboxes.aliasA.ID, mailboxes.accountA.ID, 0, 0)
+		})
+	}
+}
+
+func TestLatestMailRemainsRepeatableWithoutConsumptionSideEffects(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	mailboxes := env.createMailboxFixture(t)
+	now := time.Date(2026, time.August, 7, 5, 15, 0, 0, time.UTC)
+	env.server.now = func() time.Time { return now }
+	setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-time.Minute), TextBody: "repeatable latest body", SyncedAt: now,
+	})
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		response := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "repeatable latest body") {
+			t.Fatalf("latest attempt %d = %d; body=%s", attempt, response.Code, response.Body.String())
+		}
+	}
+	assertSeenPersistenceCounts(t, env, mailboxes.aliasA.ID, mailboxes.accountA.ID, 0, 0)
+}
+
+func TestRecentMailConsumesRetainedSnapshotAfterNoNewMailSync(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	mailboxes := env.createMailboxFixture(t)
+	now := time.Date(2026, time.August, 7, 5, 15, 0, 0, time.UTC)
+	messageSyncedAt := now.Add(-time.Minute)
+	env.server.now = func() time.Time { return now }
+	setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-time.Minute), TextBody: "retained snapshot body", SyncedAt: messageSyncedAt,
+	})
+
+	response := directMailRequest(t, env, url.Values{"api_key": {mailboxes.keyA}})
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "retained snapshot body") {
+		t.Fatalf("retained snapshot response = %d; body=%s", response.Code, response.Body.String())
+	}
+	assertSeenPersistenceCounts(t, env, mailboxes.aliasA.ID, mailboxes.accountA.ID, 1, 1)
+}
+
 func TestRecentMailDirectLinkReportsDatabaseFailure(t *testing.T) {
 	env := newHTTPTestEnv(t)
 	mailboxes := env.createMailboxFixture(t)
-	if err := env.store.Close(); err != nil {
-		t.Fatalf("close test database: %v", err)
+	now := time.Now().UTC().Truncate(time.Second)
+	env.server.now = func() time.Time { return now }
+	setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-time.Minute), TextBody: "database failure body", SyncedAt: now,
+	})
+	var notifications atomic.Int32
+	env.server.SetSeenNotifier(func() { notifications.Add(1) })
+	if _, err := env.store.DB().ExecContext(context.Background(), `DROP TABLE consumed_messages`); err != nil {
+		t.Fatalf("remove consumption table fixture: %v", err)
 	}
 	response := directMailRequest(t, env, url.Values{"api_key": {mailboxes.keyA}})
 	assertAPIError(t, response, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE")
+	if got := notifications.Load(); got != 0 {
+		t.Fatalf("notifications after failed consumption = %d, want 0", got)
+	}
+	var queued int
+	if err := env.store.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM imap_seen_tasks WHERE account_id = ?`, mailboxes.accountA.ID,
+	).Scan(&queued); err != nil {
+		t.Fatalf("count queued seen tasks after failed consumption: %v", err)
+	}
+	if queued != 0 {
+		t.Fatalf("queued seen tasks after failed consumption = %d, want 0", queued)
+	}
+	bearer := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+	if bearer.Code != http.StatusOK || !strings.Contains(bearer.Body.String(), "database failure body") {
+		t.Fatalf("Bearer latest after failed consumption = %d; body=%s", bearer.Code, bearer.Body.String())
+	}
+}
+
+func TestRecentMailDirectLinkDoesNotConsumeOrNotifyRejectedRequests(t *testing.T) {
+	tests := []struct {
+		name       string
+		prepare    func(*testing.T, *httpTestEnv, mailboxFixture, time.Time)
+		key        func(mailboxFixture) string
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "expired message",
+			prepare: func(t *testing.T, env *httpTestEnv, mailboxes mailboxFixture, now time.Time) {
+				setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+				env.upsertMessage(t, domain.LatestMessage{
+					AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+					InternalDate: now.Add(-time.Hour - time.Nanosecond), TextBody: "expired body", SyncedAt: now,
+				})
+			},
+			key:        func(mailboxes mailboxFixture) string { return mailboxes.keyA },
+			wantStatus: http.StatusNotFound,
+			wantCode:   "MAIL_NOT_FOUND",
+		},
+		{
+			name: "sync unavailable",
+			prepare: func(t *testing.T, env *httpTestEnv, mailboxes mailboxFixture, now time.Time) {
+				if err := env.store.UpdateAliasSyncStatus(
+					context.Background(), mailboxes.aliasA.ID, domain.SyncStatusError, "sync failed", &now,
+				); err != nil {
+					t.Fatalf("mark alias sync failed: %v", err)
+				}
+			},
+			key:        func(mailboxes mailboxFixture) string { return mailboxes.keyA },
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "SYNC_UNAVAILABLE",
+		},
+		{
+			name:       "invalid credential",
+			prepare:    func(*testing.T, *httpTestEnv, mailboxFixture, time.Time) {},
+			key:        func(mailboxFixture) string { return testAPIKey(0x7f) },
+			wantStatus: http.StatusUnauthorized,
+			wantCode:   "INVALID_API_KEY",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newHTTPTestEnv(t)
+			mailboxes := env.createMailboxFixture(t)
+			now := time.Date(2026, time.August, 7, 5, 15, 0, 0, time.UTC)
+			env.server.now = func() time.Time { return now }
+			test.prepare(t, env, mailboxes, now)
+			var notifications atomic.Int32
+			env.server.SetSeenNotifier(func() { notifications.Add(1) })
+
+			response := directMailRequest(t, env, url.Values{"api_key": {test.key(mailboxes)}})
+			assertAPIError(t, response, test.wantStatus, test.wantCode)
+			if got := notifications.Load(); got != 0 {
+				t.Fatalf("notifications = %d, want 0", got)
+			}
+			assertSeenPersistenceCounts(t, env, mailboxes.aliasA.ID, mailboxes.accountA.ID, 0, 0)
+		})
+	}
 }
 
 func TestRecoveryDoesNotLogQueryAPIKey(t *testing.T) {
@@ -422,5 +758,32 @@ func setAliasSyncedAt(t *testing.T, env *httpTestEnv, alias domain.Alias, synced
 		context.Background(), alias.ID, domain.SyncStatusOK, "", &syncedAt,
 	); err != nil {
 		t.Fatalf("set alias sync time: %v", err)
+	}
+}
+
+func assertSeenPersistenceCounts(
+	t *testing.T,
+	env *httpTestEnv,
+	aliasID, accountID int64,
+	wantConsumed, wantQueued int,
+) {
+	t.Helper()
+	var consumed int
+	if err := env.store.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM consumed_messages WHERE alias_id = ?`, aliasID,
+	).Scan(&consumed); err != nil {
+		t.Fatalf("count consumed messages: %v", err)
+	}
+	if consumed != wantConsumed {
+		t.Fatalf("consumed message rows = %d, want %d", consumed, wantConsumed)
+	}
+	var queued int
+	if err := env.store.DB().QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM imap_seen_tasks WHERE account_id = ?`, accountID,
+	).Scan(&queued); err != nil {
+		t.Fatalf("count queued seen tasks: %v", err)
+	}
+	if queued != wantQueued {
+		t.Fatalf("queued seen task rows = %d, want %d", queued, wantQueued)
 	}
 }
