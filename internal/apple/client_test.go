@@ -310,6 +310,217 @@ func TestSignInVerifyAndListAliases(t *testing.T) {
 	}
 }
 
+func TestCreateAliasGeneratesThenReserves(t *testing.T) {
+	tests := []struct {
+		name            string
+		region          Region
+		host            string
+		home            string
+		language        string
+		candidate       string
+		generatedResult string
+	}{
+		{
+			name:            "global string candidate",
+			region:          RegionGlobal,
+			host:            "p01-maildomainws.icloud.com",
+			home:            "https://www.icloud.com",
+			language:        "en-us",
+			candidate:       "global-alias@icloud.com",
+			generatedResult: `{"hme":"global-alias@icloud.com"}`,
+		},
+		{
+			name:            "China nested candidate",
+			region:          RegionChina,
+			host:            "p01-maildomainws.icloud.com.cn",
+			home:            "https://www.icloud.com.cn",
+			language:        "zh-cn",
+			candidate:       "china-alias@icloud.com",
+			generatedResult: `{"hme":{"hme":"china-alias@icloud.com"}}`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requestCount := 0
+			transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				requestCount++
+				if request.Method != http.MethodPost {
+					return nil, fmt.Errorf("method = %s, want POST", request.Method)
+				}
+				if request.URL.Hostname() != test.host {
+					return nil, fmt.Errorf("host = %s, want %s", request.URL.Hostname(), test.host)
+				}
+				query := request.URL.Query()
+				if query.Get("clientBuildNumber") != "build-test" ||
+					query.Get("clientMasteringNumber") != "mastering-test" ||
+					query.Get("clientId") != "client-id" || query.Get("dsid") != "42" {
+					return nil, fmt.Errorf("unexpected query: %s", request.URL.RawQuery)
+				}
+				if request.Header.Get("Accept") != "application/json" ||
+					request.Header.Get("Content-Type") != "application/json" ||
+					request.Header.Get("Origin") != test.home {
+					return nil, fmt.Errorf("unexpected service headers: %#v", request.Header)
+				}
+				if !strings.Contains(request.Header.Get("Cookie"), "existing=session") {
+					return nil, errors.New("persisted session cookie was not restored")
+				}
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					return nil, err
+				}
+				switch request.URL.Path {
+				case "/v1/hme/generate":
+					var payload map[string]string
+					if err := json.Unmarshal(body, &payload); err != nil ||
+						len(payload) != 1 || payload["langCode"] != test.language {
+						return nil, fmt.Errorf("generate payload = %s", body)
+					}
+					headers := make(http.Header)
+					headers.Add("Set-Cookie", "generated=session; Path=/; Secure; HttpOnly")
+					return testResponse(request, http.StatusOK,
+						`{"success":true,"result":`+test.generatedResult+`}`, headers), nil
+				case "/v1/hme/reserve":
+					if !strings.Contains(request.Header.Get("Cookie"), "generated=session") {
+						return nil, errors.New("generate response cookie was not reused for reserve")
+					}
+					var payload map[string]string
+					if err := json.Unmarshal(body, &payload); err != nil || len(payload) != 3 ||
+						payload["hme"] != test.candidate || payload["label"] != "Test label" ||
+						payload["note"] != "Test note" {
+						return nil, fmt.Errorf("reserve payload = %s", body)
+					}
+					headers := make(http.Header)
+					headers.Add("Set-Cookie", "reserved=complete; Path=/; Secure; HttpOnly")
+					return testResponse(request, http.StatusOK,
+						fmt.Sprintf(`{"success":true,"result":{"hme":{"anonymousId":"remote-id","hme":%q,"label":"Saved label"}}}`, test.candidate),
+						headers), nil
+				default:
+					return nil, fmt.Errorf("unexpected path %s", request.URL.Path)
+				}
+			})
+			client, err := NewClient(Config{
+				Transport:             transport,
+				ClientBuildNumber:     "build-test",
+				ClientMasteringNumber: "mastering-test",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := Session{
+				Region:                 test.region,
+				DSID:                   "42",
+				ClientID:               "client-id",
+				PremiumMailSettingsURL: "https://" + test.host,
+				Cookies: []PersistentCookie{{
+					Name: "existing", Value: "session", Domain: test.host,
+					Path: "/", HostOnly: true, Secure: true,
+				}},
+			}
+			alias, updated, err := client.CreateAlias(
+				context.Background(), session, "Test label", "Test note",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if requestCount != 2 || alias.HME != test.candidate ||
+				alias.AnonymousID != "remote-id" || alias.Label != "Saved label" {
+				t.Fatalf("requests=%d alias=%#v", requestCount, alias)
+			}
+			cookieNames := make(map[string]bool, len(updated.Cookies))
+			for _, cookie := range updated.Cookies {
+				cookieNames[cookie.Name] = true
+			}
+			if !cookieNames["existing"] || !cookieNames["generated"] || !cookieNames["reserved"] {
+				t.Fatalf("updated cookies = %#v", updated.Cookies)
+			}
+		})
+	}
+}
+
+func TestCreateAliasRejectsInvalidResponses(t *testing.T) {
+	validGenerate := `{"success":true,"result":{"hme":"candidate@icloud.com"}}`
+	validReserve := `{"success":true,"result":{"hme":{"hme":"candidate@icloud.com"}}}`
+	tests := []struct {
+		name         string
+		generateBody string
+		reserveBody  string
+		wantRequests int
+	}{
+		{name: "generate missing success", generateBody: `{"result":{"hme":"candidate@icloud.com"}}`, reserveBody: validReserve, wantRequests: 1},
+		{name: "generate missing result", generateBody: `{"success":true}`, reserveBody: validReserve, wantRequests: 1},
+		{name: "generate missing nested address", generateBody: `{"success":true,"result":{"hme":{}}}`, reserveBody: validReserve, wantRequests: 1},
+		{name: "generate invalid address", generateBody: `{"success":true,"result":{"hme":"not-an-email"}}`, reserveBody: validReserve, wantRequests: 1},
+		{name: "reserve hme must be object", generateBody: validGenerate, reserveBody: `{"success":true,"result":{"hme":"candidate@icloud.com"}}`, wantRequests: 2},
+		{name: "reserve missing nested address", generateBody: validGenerate, reserveBody: `{"success":true,"result":{"hme":{}}}`, wantRequests: 2},
+		{name: "reserve candidate mismatch", generateBody: validGenerate, reserveBody: `{"success":true,"result":{"hme":{"hme":"different@icloud.com"}}}`, wantRequests: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				requests++
+				if request.URL.Path == "/v1/hme/generate" {
+					return testResponse(request, http.StatusOK, test.generateBody, nil), nil
+				}
+				if request.URL.Path == "/v1/hme/reserve" {
+					return testResponse(request, http.StatusOK, test.reserveBody, nil), nil
+				}
+				return nil, fmt.Errorf("unexpected path %s", request.URL.Path)
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = client.CreateAlias(context.Background(), Session{
+				Region:                 RegionGlobal,
+				DSID:                   "42",
+				ClientID:               "client-id",
+				PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+			}, "label", "note")
+			if !errors.Is(err, ErrInvalidResponse) || requests != test.wantRequests {
+				t.Fatalf("error=%v requests=%d, want ErrInvalidResponse/%d", err, requests, test.wantRequests)
+			}
+		})
+	}
+}
+
+func TestCreateAliasReserveFailureIsNotRetryableOrRetried(t *testing.T) {
+	generateRequests := 0
+	reserveRequests := 0
+	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/v1/hme/generate":
+			generateRequests++
+			return testResponse(request, http.StatusOK,
+				`{"success":true,"result":{"hme":"candidate@icloud.com"}}`, nil), nil
+		case "/v1/hme/reserve":
+			reserveRequests++
+			return testResponse(request, http.StatusServiceUnavailable,
+				`{"success":false,"error":{"errorCode":"TEMPORARY"}}`, nil), nil
+		default:
+			return nil, fmt.Errorf("unexpected path %s", request.URL.Path)
+		}
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = client.CreateAlias(context.Background(), Session{
+		Region:                 RegionGlobal,
+		DSID:                   "42",
+		ClientID:               "client-id",
+		PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+	}, "label", "note")
+	if !errors.Is(err, ErrService) {
+		t.Fatalf("error = %v, want ErrService", err)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) || typed.Retryable {
+		t.Fatalf("reserve error = %#v, want non-retryable", typed)
+	}
+	if generateRequests != 1 || reserveRequests != 1 {
+		t.Fatalf("generate/reserve requests = %d/%d, want 1/1", generateRequests, reserveRequests)
+	}
+}
+
 func TestSignInWithoutChallengeSkipsTrust(t *testing.T) {
 	fixture := newAuthFixture(t, http.StatusOK)
 	client := newFixtureClient(t, fixture)

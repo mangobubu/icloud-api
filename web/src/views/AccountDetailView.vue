@@ -124,7 +124,11 @@
               :loading="appleAuthLoading"
               @click="appleAuthStep === 'verification' ? submitAppleVerification() : submitAppleLogin()"
             >
-              {{ appleAuthStep === "verification" ? "验证并同步" : "继续" }}
+              {{
+                appleAuthStep === "verification"
+                  ? appleVerificationActionLabel()
+                  : "继续"
+              }}
             </el-button>
           </div>
         </template>
@@ -133,7 +137,7 @@
       <el-dialog
         v-model="batchSecretsVisible"
         class="batch-secrets-dialog"
-        title="保存新隐私邮箱的 API Key"
+        :title="batchSecretsSource === 'auto' ? '保存自动创建隐私邮箱的 API Key' : '保存新隐私邮箱的 API Key'"
         width="min(960px, calc(100vw - 28px))"
         align-center
         append-to-body
@@ -142,8 +146,17 @@
         :before-close="confirmBatchSecretsClose"
       >
         <el-alert
-          title="这些完整 API Key 只显示这一次，请下载 CSV 或逐项保存后再关闭。"
+          :title="batchSecretsSource === 'auto'
+            ? '这些自动创建的完整 API Key 只显示这一次。保存后点击“我已保存，关闭”确认；取消或关闭仍可稍后再次领取。'
+            : '这些完整 API Key 只显示这一次，请下载 CSV 或逐项保存后再关闭。'"
           type="warning"
+          :closable="false"
+          show-icon
+        />
+        <el-alert
+          v-if="batchSecretsSource === 'auto'"
+          title="自动创建队列会在确认保存后清空；离开此弹窗不会清空队列。"
+          type="info"
           :closable="false"
           show-icon
         />
@@ -155,7 +168,11 @@
           show-icon
         />
 
-        <dl class="sync-summary-grid" aria-label="同步结果">
+        <dl
+          v-if="batchSecretsSource === 'sync'"
+          class="sync-summary-grid"
+          aria-label="同步结果"
+        >
           <div><dt>Apple 地址</dt><dd>{{ batchSummary.total }}</dd></div>
           <div><dt>新建</dt><dd>{{ batchSummary.createdCount }}</dd></div>
           <div><dt>已存在</dt><dd>{{ batchSummary.existingCount }}</dd></div>
@@ -214,12 +231,31 @@
 
         <template #footer>
           <div class="dialog-actions dialog-actions--spread">
-            <el-button :icon="Download" @click="downloadBatchSecrets">
-              下载 CSV
-            </el-button>
-            <el-button type="primary" @click="closeBatchSecrets">
-              我已保存，关闭
-            </el-button>
+            <div class="dialog-actions__group">
+              <el-button :icon="Download" @click="downloadBatchSecrets">
+                下载 CSV
+              </el-button>
+            </div>
+            <div class="dialog-actions__group">
+              <el-button
+                v-if="batchSecretsSource === 'auto'"
+                :disabled="pendingAutoKeysClearing"
+                @click="dismissBatchSecrets"
+              >
+                取消
+              </el-button>
+              <el-button
+                v-if="batchSecretsSource === 'auto'"
+                type="primary"
+                :loading="pendingAutoKeysClearing"
+                @click="acknowledgeAndCloseBatchSecrets"
+              >
+                我已保存，关闭
+              </el-button>
+              <el-button v-else type="primary" @click="closeBatchSecrets">
+                我已保存，关闭
+              </el-button>
+            </div>
           </div>
         </template>
       </el-dialog>
@@ -285,7 +321,7 @@
               v-if="appleSessionAuthenticated"
               :icon="SwitchButton"
               :loading="appleDisconnectLoading"
-              :disabled="oneTimeSecretVisible || aliasesSyncLoading"
+              :disabled="appleAliasControlsDisabled || aliasesSyncLoading"
               @click="disconnectAppleSession"
             >
               退出 Apple 登录
@@ -294,7 +330,7 @@
               type="primary"
               :icon="Refresh"
               :loading="aliasesSyncLoading"
-              :disabled="oneTimeSecretVisible || appleDisconnectLoading"
+              :disabled="appleAliasControlsDisabled || appleDisconnectLoading"
               @click="syncAliasesFromApple"
             >
               同步隐私邮箱
@@ -319,6 +355,95 @@
             {{ aliasSyncSummary.inactiveCount }}，因本地容量暂未启用
             {{ aliasSyncSummary.importedDisabledCount }}，冲突
             {{ aliasSyncSummary.conflictCount }}
+          </div>
+        </div>
+
+        <div
+          v-if="autoCreation"
+          class="auto-creation-panel"
+          aria-labelledby="auto-creation-title"
+        >
+          <div class="auto-creation-panel__header">
+            <div class="auto-creation-panel__copy">
+              <div class="auto-creation-panel__title-row">
+                <h3 id="auto-creation-title">自动创建隐私邮箱</h3>
+                <el-tag
+                  :type="autoCreationStatusType(autoCreation)"
+                  effect="plain"
+                  size="small"
+                >
+                  {{ autoCreationStatusLabel(autoCreation) }}
+                </el-tag>
+                <el-tag
+                  v-if="autoCreation.pendingKeyCount"
+                  type="warning"
+                  effect="plain"
+                  size="small"
+                >
+                  待领取 {{ autoCreation.pendingKeyCount }} 个 Key
+                </el-tag>
+              </div>
+              <p>
+                每小时 5 个 · 随机间隔 · 最短 5 分钟。自动创建的完整 API Key
+                会在领取后显示一次。
+              </p>
+            </div>
+            <div class="auto-creation-panel__actions">
+              <el-switch
+                :model-value="Boolean(autoCreation.enabled)"
+                :loading="autoCreationLoading"
+                :disabled="autoCreationToggleDisabled"
+                active-text="开启"
+                inactive-text="关闭"
+                :aria-label="`${autoCreation.enabled ? '关闭' : '开启'}自动创建隐私邮箱`"
+                @change="toggleAutoCreation"
+              />
+              <el-button
+                :icon="Key"
+                :loading="pendingAutoKeysLoading"
+                :disabled="pendingAutoKeysDisabled"
+                @click="openPendingAutoCreationKeys"
+              >
+                {{
+                  autoCreation.pendingKeyCount
+                    ? `领取 ${autoCreation.pendingKeyCount} 个 API Key`
+                    : "暂无待领取 Key"
+                }}
+              </el-button>
+            </div>
+          </div>
+
+          <dl class="auto-creation-metrics">
+            <div>
+              <dt>下次执行</dt>
+              <dd>{{ formatTime(autoCreation.nextRunAt, { seconds: true }) }}</dd>
+            </div>
+            <div>
+              <dt>计划时间</dt>
+              <dd>{{ formatAutoPlannedAt(autoCreation.plannedAt) }}</dd>
+            </div>
+            <div>
+              <dt>最近尝试</dt>
+              <dd>{{ formatTime(autoCreation.lastAttemptedAt, { seconds: true }) }}</dd>
+            </div>
+            <div>
+              <dt>最近创建</dt>
+              <dd>
+                <span>{{ formatTime(autoCreation.lastCreatedAt, { seconds: true }) }}</span>
+                <small v-if="autoCreation.lastAliasAddress">
+                  {{ autoCreation.lastAliasAddress }}
+                </small>
+              </dd>
+            </div>
+            <div>
+              <dt>待领取 Key</dt>
+              <dd>{{ autoCreation.pendingKeyCount }}</dd>
+            </div>
+          </dl>
+
+          <div v-if="autoCreation.lastError" class="auto-creation-error" role="status">
+            <strong>最近错误</strong>
+            <span>{{ autoCreation.lastError }}</span>
           </div>
         </div>
 
@@ -562,13 +687,16 @@ import {
 } from "vue-router";
 
 import {
+  clearAliasAutoCreationKeys,
   createAlias,
   deleteAccount,
   deleteAlias,
   deleteAppleSession,
+  getAliasAutoCreationKeys,
   getAccount,
   loginAppleSession,
   rotateAlias,
+  setAliasAutoCreation,
   setAliasEnabled,
   syncAccount,
   syncAccountAliases,
@@ -622,10 +750,15 @@ const appleAuthLoading = ref(false);
 const appleAuthError = ref(null);
 const appleLoginFormRef = ref(null);
 const appleVerificationFormRef = ref(null);
+const autoCreation = ref(null);
+const autoCreationLoading = ref(false);
+const pendingAutoKeysLoading = ref(false);
+const pendingAutoKeysClearing = ref(false);
 const aliasSyncSummary = ref(null);
 const batchSecretsVisible = ref(false);
 const batchSecrets = ref([]);
 const batchSummary = ref(emptySyncSummary());
+const batchSecretsSource = ref("sync");
 const copyLoading = reactive({});
 const toggleLoading = reactive({});
 const rotateLoading = reactive({});
@@ -635,9 +768,12 @@ const createLock = createActionLock();
 const aliasActionLock = createActionLock();
 const accountDeleteLock = createActionLock();
 const appleDisconnectLock = createActionLock();
+const autoCreationLock = createActionLock();
+const pendingAutoKeysLock = createActionLock();
 const secretNavigationLock = createActionLock();
 let viewActive = true;
 let resumeAliasSyncAfterAuth = false;
+let resumeAutoCreationAfterAuth = false;
 
 const aliasForm = reactive({ address: "", label: "" });
 const appleLoginForm = reactive({ appleId: "", password: "", region: "global" });
@@ -661,8 +797,41 @@ const appleVerificationRules = {
 const appleSessionAuthenticated = computed(
   () => appleSession.value?.status === "authenticated",
 );
+function appleVerificationActionLabel() {
+  if (resumeAutoCreationAfterAuth) return "验证并开启";
+  if (resumeAliasSyncAfterAuth) return "验证并同步";
+  return "验证";
+}
 const oneTimeSecretVisible = computed(
   () => Boolean(apiKey.value || batchSecrets.value.length),
+);
+const autoCreationControlDisabled = computed(
+  () =>
+    oneTimeSecretVisible.value ||
+    autoCreationLoading.value ||
+    aliasesSyncLoading.value ||
+    appleDisconnectLoading.value ||
+    appleAuthLoading.value ||
+    pendingAutoKeysLoading.value ||
+    pendingAutoKeysClearing.value,
+);
+const autoCreationToggleDisabled = computed(
+  () =>
+    autoCreationControlDisabled.value ||
+    (!account.value?.enabled && !autoCreation.value?.enabled),
+);
+const appleAliasControlsDisabled = computed(
+  () =>
+    oneTimeSecretVisible.value ||
+    autoCreationLoading.value ||
+    appleAuthLoading.value ||
+    pendingAutoKeysLoading.value ||
+    pendingAutoKeysClearing.value,
+);
+const pendingAutoKeysDisabled = computed(
+  () =>
+    autoCreationControlDisabled.value ||
+    !Number(autoCreation.value?.pendingKeyCount || 0),
 );
 
 function emptySyncSummary() {
@@ -674,6 +843,76 @@ function emptySyncSummary() {
     importedDisabledCount: 0,
     conflictCount: 0,
   };
+}
+
+function normalizedAutoCreationStatus(item) {
+  return String(item?.status || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("-", "_");
+}
+
+function autoCreationStatusLabel(item) {
+  if (account.value && !account.value.enabled) return "主号已停用";
+  if (!item?.enabled) return "已关闭";
+  switch (normalizedAutoCreationStatus(item)) {
+    case "running":
+    case "creating":
+    case "in_progress":
+      return "创建中";
+    case "error":
+    case "failed":
+      return "最近失败";
+    case "paused":
+      return "已暂停";
+    case "login_required":
+      return "需要 Apple 登录";
+    case "pending":
+      return "等待执行";
+    case "verification_required":
+      return "需验证 Apple";
+    case "scheduled":
+    case "enabled":
+    case "ready":
+    case "idle":
+    case "":
+      return "已开启";
+    default:
+      return item.status || "已开启";
+  }
+}
+
+function autoCreationStatusType(item) {
+  if (!item?.enabled) return "info";
+  switch (normalizedAutoCreationStatus(item)) {
+    case "running":
+    case "creating":
+    case "in_progress":
+    case "pending":
+      return "warning";
+    case "error":
+    case "failed":
+      return "danger";
+    case "paused":
+      return "info";
+    case "login_required":
+      return "warning";
+    case "verification_required":
+      return "warning";
+    default:
+      return "success";
+  }
+}
+
+function formatAutoPlannedAt(value) {
+  const planned = Array.isArray(value)
+    ? value.filter(Boolean)
+    : value
+      ? [value]
+      : [];
+  if (!planned.length) return "-";
+  const first = formatTime(planned[0], { seconds: true });
+  return planned.length > 1 ? `${first} 等 ${planned.length} 个` : first;
 }
 
 function detailRouteKey(id = route.params.id) {
@@ -692,7 +931,13 @@ function hasPendingSecretRequest() {
   return (
     createLoading.value ||
     aliasesSyncLoading.value ||
-    Object.keys(rotateLoading).length > 0
+    appleAuthLoading.value ||
+    autoCreationLoading.value ||
+    pendingAutoKeysLoading.value ||
+    pendingAutoKeysClearing.value ||
+    Object.keys(rotateLoading).length > 0 ||
+    autoCreationLock.hasAny() ||
+    pendingAutoKeysLock.hasAny()
   );
 }
 
@@ -769,9 +1014,14 @@ function detailMutationPending() {
     aliasesSyncLoading.value ||
     appleAuthLoading.value ||
     appleDisconnectLoading.value ||
+    autoCreationLoading.value ||
+    pendingAutoKeysLoading.value ||
+    pendingAutoKeysClearing.value ||
     createLoading.value ||
     accountDeleteLoading.value ||
-    aliasActionLock.hasAny()
+    aliasActionLock.hasAny() ||
+    autoCreationLock.hasAny() ||
+    pendingAutoKeysLock.hasAny()
   );
 }
 
@@ -780,7 +1030,12 @@ function beginDetailMutation() {
 }
 
 async function loadDetail({ silent = false } = {}) {
-  if (silent && (loading.value || detailMutationPending())) return;
+  if (
+    silent &&
+    (loading.value || detailMutationPending() || oneTimeSecretVisible.value)
+  ) {
+    return;
+  }
   const accountId = detailRouteKey();
   const ticket = detailGate.begin(accountId);
   if (!silent) {
@@ -793,6 +1048,7 @@ async function loadDetail({ silent = false } = {}) {
     account.value = detail.account;
     aliases.value = detail.aliases;
     appleSession.value = detail.appleSession;
+    autoCreation.value = detail.autoCreation || null;
     loadError.value = null;
     setPageHeader(
       detail.account.email,
@@ -837,6 +1093,9 @@ async function syncNow() {
     if (!isCurrentAccount(accountId)) return;
     account.value = detail.account;
     aliases.value = detail.aliases;
+    if (detail.autoCreation) {
+      autoCreation.value = detail.autoCreation;
+    }
     if (detail.syncPending) {
       ElMessage({ type: "warning", message: "已提交一批，仍在追平。" });
     } else {
@@ -858,9 +1117,14 @@ function resetAppleAuthForm() {
   Object.assign(appleAuthChallenge, { challengeId: "", flow: "" });
 }
 
-function openAppleLogin({ error = null, resumeSync = false } = {}) {
+function openAppleLogin({
+  error = null,
+  resumeSync = false,
+  resumeAutoCreation = false,
+} = {}) {
   if (!account.value || oneTimeSecretVisible.value) return;
   resumeAliasSyncAfterAuth = resumeSync;
+  resumeAutoCreationAfterAuth = resumeAutoCreation;
   appleAuthStep.value = "login";
   appleAuthError.value = error;
   appleLoginForm.appleId = appleSession.value?.appleId || account.value.email || "";
@@ -875,6 +1139,7 @@ function openAppleLogin({ error = null, resumeSync = false } = {}) {
 function cancelAppleAuth() {
   if (appleAuthLoading.value) return;
   resumeAliasSyncAfterAuth = false;
+  resumeAutoCreationAfterAuth = false;
   appleAuthVisible.value = false;
   resetAppleAuthForm();
 }
@@ -882,6 +1147,7 @@ function cancelAppleAuth() {
 function closeAppleAuthDialog(done) {
   if (appleAuthLoading.value) return;
   resumeAliasSyncAfterAuth = false;
+  resumeAutoCreationAfterAuth = false;
   resetAppleAuthForm();
   done();
 }
@@ -910,10 +1176,16 @@ async function finishAppleAuthentication(result, accountId) {
   if (!isCurrentAccount(accountId)) return;
   appleSession.value = mergedAppleSession(result);
   const shouldResumeSync = resumeAliasSyncAfterAuth;
+  const shouldResumeAutoCreation = resumeAutoCreationAfterAuth;
   resumeAliasSyncAfterAuth = false;
+  resumeAutoCreationAfterAuth = false;
   appleAuthVisible.value = false;
   resetAppleAuthForm();
   successMessage("Apple 账户已登录。");
+  if (shouldResumeAutoCreation) {
+    await nextTick();
+    await performSetAutoCreation(true);
+  }
   if (shouldResumeSync) {
     await nextTick();
     await performAliasesSync();
@@ -998,7 +1270,11 @@ async function submitAppleVerification() {
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;
     if (isAppleSessionInvalid(error)) {
-      openAppleLogin({ error, resumeSync: resumeAliasSyncAfterAuth });
+      openAppleLogin({
+        error,
+        resumeSync: resumeAliasSyncAfterAuth,
+        resumeAutoCreation: resumeAutoCreationAfterAuth,
+      });
       return;
     }
     appleAuthError.value = error;
@@ -1007,8 +1283,169 @@ async function submitAppleVerification() {
   }
 }
 
+async function toggleAutoCreation(enabled) {
+  const desiredEnabled = Boolean(enabled);
+  if (
+    !account.value ||
+    autoCreationControlDisabled.value ||
+    Boolean(autoCreation.value?.enabled) === desiredEnabled
+  ) {
+    return;
+  }
+  if (desiredEnabled && !account.value.enabled) {
+    ElMessage.warning("主号已停用，不能开启自动创建。");
+    return;
+  }
+  if (desiredEnabled && !appleSessionAuthenticated.value) {
+    openAppleLogin({ resumeAutoCreation: true });
+    return;
+  }
+  await performSetAutoCreation(desiredEnabled);
+}
+
+async function performSetAutoCreation(enabled) {
+  if (!account.value || !autoCreationLock.acquire()) return false;
+  const accountId = account.value.id;
+  const desiredEnabled = Boolean(enabled);
+  beginDetailMutation();
+  autoCreationLoading.value = true;
+  try {
+    const updated = await setAliasAutoCreation(
+      accountId,
+      desiredEnabled,
+      auth.state.csrfToken,
+    );
+    if (!isCurrentAccount(accountId)) return false;
+    autoCreation.value = updated;
+    successMessage(
+      desiredEnabled
+        ? "自动创建隐私邮箱已开启。"
+        : "自动创建隐私邮箱已关闭。",
+    );
+    return true;
+  } catch (error) {
+    if (!isCurrentAccount(accountId)) return false;
+    if (desiredEnabled && isAppleSessionInvalid(error)) {
+      if (appleSession.value) {
+        appleSession.value = { ...appleSession.value, status: "expired" };
+      }
+      openAppleLogin({ error, resumeAutoCreation: true });
+      return false;
+    }
+    showRequestError(error, "自动创建设置更新失败，请稍后重试。");
+    return false;
+  } finally {
+    autoCreationLoading.value = false;
+    autoCreationLock.release();
+  }
+}
+
+async function openPendingAutoCreationKeys() {
+  if (
+    !account.value ||
+    pendingAutoKeysDisabled.value ||
+    !pendingAutoKeysLock.acquire()
+  ) {
+    return;
+  }
+  const accountId = account.value.id;
+  beginDetailMutation();
+  pendingAutoKeysLoading.value = true;
+  try {
+    const result = await getAliasAutoCreationKeys(accountId);
+    if (!isCurrentAccount(accountId)) return;
+    const created = (result?.created || [])
+      .filter((item) => item.apiKey)
+      .map((item) => ({
+        aliasId: item.alias?.id,
+        address: item.alias.address,
+        apiKey: item.apiKey,
+        mailApiDirectLink: batchDirectLink(item),
+      }));
+    if (!created.length) {
+      if (autoCreation.value) {
+        autoCreation.value = {
+          ...autoCreation.value,
+          pendingKeyCount: 0,
+        };
+      }
+      ElMessage({
+        type: "info",
+        message: "当前没有待领取的自动创建 API Key。",
+        grouping: true,
+      });
+      return;
+    }
+    batchSecretsSource.value = "auto";
+    batchSummary.value = emptySyncSummary();
+    batchSecrets.value = created;
+    batchSecretsVisible.value = true;
+  } catch (error) {
+    if (!isCurrentAccount(accountId)) return;
+    showRequestError(error, "自动创建 API Key 领取失败，请稍后重试。");
+  } finally {
+    pendingAutoKeysLoading.value = false;
+    pendingAutoKeysLock.release();
+  }
+}
+
+async function acknowledgeAndCloseBatchSecrets() {
+  if (
+    batchSecretsSource.value !== "auto" ||
+    !batchSecrets.value.length ||
+    !account.value ||
+    !pendingAutoKeysLock.acquire()
+  ) {
+    return;
+  }
+  const accountId = account.value.id;
+  const aliasIds = batchSecrets.value
+    .map((item) => Number(item.aliasId))
+    .filter((id) => Number.isInteger(id) && id > 0);
+  if (!aliasIds.length) {
+    ElMessage.error("待确认的自动创建 Key 缺少隐私邮箱标识，请刷新后重试。");
+    pendingAutoKeysLock.release();
+    return;
+  }
+  beginDetailMutation();
+  pendingAutoKeysClearing.value = true;
+  try {
+    await clearAliasAutoCreationKeys(
+      accountId,
+      aliasIds,
+      auth.state.csrfToken,
+    );
+    if (!isCurrentAccount(accountId)) return;
+    if (autoCreation.value) {
+      autoCreation.value = {
+        ...autoCreation.value,
+        pendingKeyCount: Math.max(
+          0,
+          Number(autoCreation.value.pendingKeyCount || 0) - aliasIds.length,
+        ),
+      };
+    }
+    clearBatchSecrets();
+    successMessage("本次自动创建的 API Key 已确认保存。");
+  } catch (error) {
+    if (!isCurrentAccount(accountId)) return;
+    showRequestError(error, "确认保存失败，API Key 仍保留在待领取队列中。");
+  } finally {
+    pendingAutoKeysClearing.value = false;
+    pendingAutoKeysLock.release();
+  }
+}
+
 function syncAliasesFromApple() {
-  if (aliasesSyncLoading.value || oneTimeSecretVisible.value) return;
+  if (
+    aliasesSyncLoading.value ||
+    oneTimeSecretVisible.value ||
+    autoCreationLoading.value ||
+    pendingAutoKeysLoading.value ||
+    pendingAutoKeysClearing.value
+  ) {
+    return;
+  }
   if (!appleSessionAuthenticated.value) {
     openAppleLogin({ resumeSync: true });
     return;
@@ -1017,7 +1454,7 @@ function syncAliasesFromApple() {
 }
 
 function batchDirectLink(item) {
-  const value = item.mailApiDirectLink || item.alias.directLinkPath || "";
+  const value = item.mailApiDirectLink || item.alias?.directLinkPath || "";
   if (!value.startsWith("/")) return value;
   try {
     return buildRecentMailDirectLink(value);
@@ -1030,6 +1467,9 @@ async function performAliasesSync() {
   if (
     aliasesSyncLoading.value ||
     oneTimeSecretVisible.value ||
+    autoCreationLoading.value ||
+    pendingAutoKeysLoading.value ||
+    pendingAutoKeysClearing.value ||
     !account.value
   ) {
     return;
@@ -1043,15 +1483,20 @@ async function performAliasesSync() {
     account.value = result.account;
     aliases.value = result.aliases;
     appleSession.value = result.appleSession || appleSession.value;
+    if (result.autoCreation) {
+      autoCreation.value = result.autoCreation;
+    }
     aliasSyncSummary.value = result.summary;
     const created = result.created
       .filter((item) => item.apiKey)
       .map((item) => ({
+        aliasId: item.alias?.id,
         address: item.alias.address,
         apiKey: item.apiKey,
         mailApiDirectLink: batchDirectLink(item),
       }));
     if (created.length) {
+      batchSecretsSource.value = "sync";
       batchSummary.value = result.summary;
       batchSecrets.value = created;
       batchSecretsVisible.value = true;
@@ -1081,6 +1526,9 @@ async function performAliasesSync() {
 async function disconnectAppleSession() {
   if (
     !appleSessionAuthenticated.value ||
+    autoCreationLoading.value ||
+    pendingAutoKeysLoading.value ||
+    pendingAutoKeysClearing.value ||
     !appleDisconnectLock.acquire() ||
     !account.value
   ) {
@@ -1167,6 +1615,11 @@ function clearBatchSecrets() {
   batchSecretsVisible.value = false;
   batchSecrets.value = [];
   batchSummary.value = emptySyncSummary();
+  batchSecretsSource.value = "sync";
+}
+
+function dismissBatchSecrets() {
+  clearBatchSecrets();
 }
 
 function closeBatchSecrets() {
@@ -1174,6 +1627,12 @@ function closeBatchSecrets() {
 }
 
 async function confirmBatchSecretsClose(done) {
+  if (pendingAutoKeysClearing.value) return;
+  if (batchSecretsSource.value === "auto") {
+    dismissBatchSecrets();
+    done();
+    return;
+  }
   try {
     await ElMessageBox.confirm(
       "关闭后完整 API Key 将从页面清除，且不能再次查看。确定已保存吗？",
@@ -1403,12 +1862,25 @@ function clearSecret() {
   clearBatchSecrets();
 }
 
+function pendingSecretRequestMessage() {
+  if (appleAuthLoading.value) {
+    return "正在验证 Apple 账户，请等待操作完成。";
+  }
+  if (pendingAutoKeysLoading.value || pendingAutoKeysClearing.value) {
+    return "正在处理自动创建 API Key，请等待操作完成。";
+  }
+  if (autoCreationLoading.value) {
+    return "正在更新自动创建设置，请等待操作完成。";
+  }
+  return "正在生成 API Key，请等待操作完成。";
+}
+
 async function confirmSecretNavigation() {
   const mode = secretNavigationMode();
   if (mode === "block") {
     ElMessage({
       type: "warning",
-      message: "正在生成 API Key，请等待操作完成。",
+      message: pendingSecretRequestMessage(),
       grouping: true,
     });
     return false;
@@ -1420,8 +1892,11 @@ async function confirmSecretNavigation() {
   if (!secretNavigationLock.acquire()) return false;
 
   try {
+    const queuedAutoKeys = batchSecretsSource.value === "auto";
     await ElMessageBox.confirm(
-      "完整 API Key 只显示这一次。离开后将无法再次查看，确定离开吗？",
+      queuedAutoKeys
+        ? "这些自动创建的完整 API Key 尚未确认保存。离开会清除页面显示，但服务端队列仍会保留，之后可再次领取。确定离开吗？"
+        : "完整 API Key 只显示这一次。离开后将无法再次查看，确定离开吗？",
       "尚未保存 API Key",
       {
         type: "warning",
@@ -1459,6 +1934,7 @@ watch(
       account.value = null;
       aliases.value = [];
       appleSession.value = null;
+      autoCreation.value = null;
       aliasSyncSummary.value = null;
       loadDetail();
     }
@@ -1480,5 +1956,6 @@ onBeforeUnmount(() => {
   detailGate.deactivate();
   window.removeEventListener("beforeunload", protectSecretBeforeUnload);
   clearSecret();
+  autoCreation.value = null;
 });
 </script>

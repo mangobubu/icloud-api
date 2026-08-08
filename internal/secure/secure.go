@@ -20,6 +20,7 @@ import (
 const (
 	credentialAAD             = "icloud-api/imap-credential/v1"
 	appleSessionAAD           = "icloud-api/apple-web-session/v1"
+	pendingAliasAPIKeyAAD     = "icloud-api/pending-alias-api-key/v1"
 	directLinkKeyContext      = "icloud-api/direct-link/key/v1"
 	directLinkTokenContext    = "icloud-api/direct-link/token/v1"
 	directLinkTokenPrefix     = "icm_"
@@ -62,6 +63,13 @@ func (c *Cipher) EncryptAppleSession(plaintext string) (string, error) {
 	return c.encrypt("as1", appleSessionAAD, plaintext)
 }
 
+// EncryptPendingAliasAPIKey encrypts a one-time API key that was created by a
+// background job. A dedicated version and AAD prevent this ciphertext from
+// being accepted as either an IMAP credential or an Apple web session.
+func (c *Cipher) EncryptPendingAliasAPIKey(plaintext string) (string, error) {
+	return c.encrypt("ak1", pendingAliasAPIKeyAAD, plaintext)
+}
+
 func (c *Cipher) encrypt(version, aad, plaintext string) (string, error) {
 	nonce := make([]byte, c.aead.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
@@ -78,6 +86,10 @@ func (c *Cipher) Decrypt(value string) (string, error) {
 
 func (c *Cipher) DecryptAppleSession(value string) (string, error) {
 	return c.decrypt("as1", appleSessionAAD, value)
+}
+
+func (c *Cipher) DecryptPendingAliasAPIKey(value string) (string, error) {
+	return c.decrypt("ak1", pendingAliasAPIKeyAAD, value)
 }
 
 func (c *Cipher) decrypt(expectedVersion, aad, value string) (string, error) {

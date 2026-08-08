@@ -113,6 +113,55 @@ export function normalizeAppleSession(raw) {
   };
 }
 
+export function normalizeAutoCreation(raw = {}) {
+  const value = raw && typeof raw === "object" ? raw : {};
+  const pendingRaw = firstDefined(
+    value,
+    "pending_key_count",
+    "pending_auto_created_key_count",
+    "pendingKeyCount",
+    "PendingKeyCount",
+  );
+  const pendingNumber = Number(pendingRaw);
+  const pendingKeyCount =
+    Number.isFinite(pendingNumber) && pendingNumber >= 0
+      ? Math.floor(pendingNumber)
+      : 0;
+
+  return {
+    enabled: Boolean(firstDefined(value, "enabled", "Enabled")),
+    status: firstDefined(value, "status", "Status") || "",
+    nextRunAt:
+      firstDefined(value, "next_run_at", "nextRunAt", "NextRunAt") || null,
+    plannedAt:
+      firstDefined(value, "planned_at", "plannedAt", "PlannedAt") || null,
+    lastAttemptedAt:
+      firstDefined(
+        value,
+        "last_attempted_at",
+        "lastAttemptedAt",
+        "LastAttemptedAt",
+      ) || null,
+    lastCreatedAt:
+      firstDefined(
+        value,
+        "last_created_at",
+        "lastCreatedAt",
+        "LastCreatedAt",
+      ) || null,
+    lastAliasAddress:
+      firstDefined(
+        value,
+        "last_alias_address",
+        "lastAliasAddress",
+        "LastAliasAddress",
+      ) || "",
+    lastError:
+      firstDefined(value, "last_error", "lastError", "LastError") || "",
+    pendingKeyCount,
+  };
+}
+
 export function normalizeAuditLog(raw = {}) {
   return {
     id: firstDefined(raw, "id", "ID"),
@@ -188,6 +237,9 @@ function normalizeAccountDetail(data = {}) {
     aliases: listFrom(data, "aliases").map(normalizeAlias),
     appleSession: normalizeAppleSession(
       firstDefined(data, "apple_session", "appleSession", "AppleSession"),
+    ),
+    autoCreation: normalizeAutoCreation(
+      firstDefined(data, "auto_creation", "autoCreation", "AutoCreation"),
     ),
     syncPending: Boolean(
       firstDefined(data, "sync_pending", "syncPending", "SyncPending"),
@@ -360,6 +412,55 @@ function normalizeCreatedAlias(raw = {}) {
   };
 }
 
+function normalizeAutoCreationResult(data) {
+  const nested = firstDefined(
+    data,
+    "auto_creation",
+    "autoCreation",
+    "AutoCreation",
+  );
+  return normalizeAutoCreation(nested === undefined ? data : nested);
+}
+
+export async function setAliasAutoCreation(accountId, enabled, csrfToken) {
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/aliases/auto-create`,
+    {
+      method: "PUT",
+      body: { enabled },
+      csrfToken,
+    },
+  );
+  return normalizeAutoCreationResult(data);
+}
+
+export async function getAliasAutoCreationKeys(accountId) {
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/aliases/auto-create/keys`,
+  );
+  return {
+    created: listFrom(data, "created", "Created").map(normalizeCreatedAlias),
+  };
+}
+
+export function clearAliasAutoCreationKeys(accountId, aliasIds, csrfToken) {
+  const hasAliasIDs = Array.isArray(aliasIds);
+  const requestCSRF = hasAliasIDs ? csrfToken : csrfToken ?? aliasIds;
+  const options = {
+    method: "DELETE",
+    csrfToken: requestCSRF,
+  };
+  if (hasAliasIDs) {
+    options.body = {
+      alias_ids: aliasIds,
+    };
+  }
+  return apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/aliases/auto-create/keys`,
+    options,
+  );
+}
+
 export async function syncAccountAliases(accountId, csrfToken) {
   const data =
     (await apiRequest(
@@ -393,8 +494,12 @@ export async function createAlias(accountId, payload, csrfToken) {
   );
 }
 
-export async function getAliases() {
-  const data = await apiRequest("/aliases");
+export async function getAliases(accountId = "") {
+  const normalizedAccountId = String(accountId ?? "").trim();
+  const query = normalizedAccountId
+    ? `?account_id=${encodeURIComponent(normalizedAccountId)}`
+    : "";
+  const data = await apiRequest(`/aliases${query}`);
   return listFrom(data, "aliases", "items").map(normalizeAlias);
 }
 

@@ -56,6 +56,32 @@ type AppleWebSession struct {
 	UpdatedAt       time.Time
 }
 
+// AliasCreationSchedule is the persisted per-account plan used by the
+// Hide My Email auto-creation worker. PlannedAt contains only future attempts
+// and is stored as absolute UTC times so process restarts do not reshuffle a
+// live cycle.
+type AliasCreationSchedule struct {
+	AccountID        int64
+	Enabled          bool
+	PlannedAt        []time.Time
+	NextRunAt        *time.Time
+	LastAttemptedAt  *time.Time
+	LastCreatedAt    *time.Time
+	LastAliasAddress string
+	LastError        string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// PendingAliasAPIKey is an automatically created alias whose one-time raw API
+// key is still waiting for an administrator to retrieve and acknowledge.
+// APIKeyCiphertext is never exposed outside trusted persistence/service code.
+type PendingAliasAPIKey struct {
+	Alias            Alias
+	APIKeyCiphertext string
+	CreatedAt        time.Time
+}
+
 type Alias struct {
 	ID               int64
 	AccountID        int64

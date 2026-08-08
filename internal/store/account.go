@@ -99,6 +99,17 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	if err := requireAffected(result, "account"); err != nil {
 		return domain.Account{}, err
 	}
+	if !account.Enabled {
+		// A disabled primary account must not retain a live background creation
+		// plan. Clearing future slots in this transaction prevents the worker
+		// from making another remote request after the account update commits.
+		if _, err := s.txExecContext(ctx, tx, `
+			UPDATE alias_creation_schedules
+			SET enabled = FALSE, planned_at_json = '[]', next_run_at = NULL, updated_at = ?
+			WHERE account_id = ?`, timestamp(now), account.ID); err != nil {
+			return domain.Account{}, fmt.Errorf("disable alias creation after account update: %w", err)
+		}
+	}
 
 	passwordChanged := account.PasswordCiphertext != "" && account.PasswordCiphertext != currentPassword
 	reenabled := !currentEnabled && account.Enabled

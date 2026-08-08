@@ -6,9 +6,22 @@
   {{template "sidebar" .}}
   <main class="main-area">
     {{template "topbar" .}}
-    <div class="content" data-sync-poll-page="aliases" data-sync-poll-endpoint="/admin/api/v1/aliases">
+    <div class="content" data-sync-poll-page="aliases" data-sync-poll-endpoint="/admin/api/v1/aliases{{if .SelectedAccountID}}?account_id={{.SelectedAccountID}}{{end}}">
       {{template "flash" .}}
-      <div class="section-toolbar"><div><h2>全部隐私邮箱</h2><p>API Key 的权限始终固定在单个地址。</p></div></div>
+      <div class="section-toolbar">
+        <div><h2>全部隐私邮箱</h2><p>API Key 的权限始终固定在单个地址。</p></div>
+        <form method="get" action="/admin/aliases" class="topbar-actions" aria-label="按主号筛选隐私邮箱">
+          <div class="field">
+            <label for="alias-account-filter">所属主号</label>
+            <select id="alias-account-filter" name="account_id" class="select">
+              <option value=""{{if not .SelectedAccountID}} selected{{end}}>全部主号</option>
+              {{range .Accounts}}<option value="{{.ID}}"{{if eq $.SelectedAccountID .ID}} selected{{end}}>{{.Email}}{{if .Name}}（{{.Name}}）{{end}}</option>{{end}}
+            </select>
+          </div>
+          <button class="button button-primary" type="submit">筛选</button>
+          {{if .SelectedAccountID}}<a class="button" href="/admin/aliases">清除筛选</a>{{end}}
+        </form>
+      </div>
       {{if .Aliases}}
       <div class="table-wrap"><table class="table">
         <thead><tr><th>隐私邮箱</th><th>所属主号</th><th>Key 前缀</th><th>最近调用</th><th>最新邮件</th><th>状态</th></tr></thead>
@@ -21,6 +34,7 @@
           <td data-label="状态" data-sync-status-cell data-sync-details>{{template "alias-status" .}}</td>
         </tr>{{end}}</tbody>
       </table></div>
+      {{else if .SelectedAccountID}}<div class="empty"><h2>这个主号还没有隐私邮箱</h2><p>进入该主号详情页添加地址。</p><a class="button button-primary" href="/admin/accounts/{{.SelectedAccountID}}">管理主号</a></div>
       {{else}}<div class="empty"><h2>还没有隐私邮箱</h2><p>进入某个主号详情页添加地址。</p><a class="button button-primary" href="/admin">查看主号</a></div>{{end}}
     </div>
   </main>

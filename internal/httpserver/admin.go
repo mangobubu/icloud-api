@@ -219,15 +219,49 @@ func (s *Server) createAlias(c *gin.Context) {
 }
 
 func (s *Server) aliasesPage(c *gin.Context) {
-	aliases, err := s.store.ListAliases(c.Request.Context())
+	accounts, err := s.store.ListAccounts(c.Request.Context())
+	if err != nil {
+		s.renderPageError(c, err)
+		return
+	}
+	selectedAccountID := legacyAliasAccountFilter(c.Query("account_id"), accounts)
+	var aliases []domain.Alias
+	if selectedAccountID > 0 {
+		aliases, err = s.store.ListAliasesByAccount(c.Request.Context(), selectedAccountID)
+	} else {
+		aliases, err = s.store.ListAliases(c.Request.Context())
+	}
 	if err != nil {
 		s.renderPageError(c, err)
 		return
 	}
 	data := s.pageData(c, "隐私邮箱", "aliases")
 	data.Subtitle = "查看每个地址的主号归属、Key 状态和最新收件时间"
+	data.Accounts = accounts
+	data.SelectedAccountID = selectedAccountID
 	data.Aliases = aliases
 	c.HTML(http.StatusOK, "aliases.html", data)
+}
+
+// legacyAliasAccountFilter returns a positive account ID only when the query
+// names an account that still exists. Legacy pages intentionally fall back to
+// the unfiltered list for malformed or stale links, keeping the page useful
+// after an account is removed or a bookmarked URL is edited by hand.
+func legacyAliasAccountFilter(raw string, accounts []domain.Account) int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	id, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || id < 1 {
+		return 0
+	}
+	for _, account := range accounts {
+		if account.ID == id {
+			return id
+		}
+	}
+	return 0
 }
 
 func (s *Server) rotateAliasKey(c *gin.Context) {

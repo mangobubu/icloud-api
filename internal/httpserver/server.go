@@ -31,6 +31,7 @@ type Server struct {
 	now                  func() time.Time
 	sync                 func(int64) error
 	hmeSync              HMESyncService
+	autoCreate           AliasAutoCreationService
 	lockAccount          func(context.Context, int64, func() error) error
 	adminSPA             *adminSPA
 	oauthTokenHash       []byte
@@ -47,6 +48,24 @@ type Server struct {
 // directory synchronization. It must be called before Router starts serving.
 func (s *Server) SetHMESyncService(service HMESyncService) {
 	s.hmeSync = service
+}
+
+// AliasAutoCreationService supplies the durable per-account scheduler to the
+// administrator API. It is optional so embedders that do not run the worker
+// can still use the rest of the server.
+type AliasAutoCreationService interface {
+	GetSchedule(context.Context, int64) (domain.AliasCreationSchedule, error)
+	SetEnabled(context.Context, int64, bool) (domain.AliasCreationSchedule, error)
+}
+
+func (s *Server) SetAliasAutoCreationService(service AliasAutoCreationService) {
+	s.autoCreate = service
+}
+
+// SetAutoCreationService is an alias retained for embedders using the shorter
+// name introduced during the worker integration.
+func (s *Server) SetAutoCreationService(service AliasAutoCreationService) {
+	s.SetAliasAutoCreationService(service)
 }
 
 type adminSPA struct {
@@ -78,22 +97,23 @@ func (s *Server) recovery() gin.HandlerFunc {
 }
 
 type PageData struct {
-	Title         string
-	Subtitle      string
-	Active        string
-	AdminUsername string
-	CSRF          string
-	Flash         string
-	FlashKind     string
-	RequestID     string
-	LoginUsername string
-	Accounts      []domain.Account
-	Account       domain.Account
-	Aliases       []domain.Alias
-	AuditLogs     []domain.AuditLog
-	Secret        string
-	FormAction    string
-	IsEdit        bool
+	Title             string
+	Subtitle          string
+	Active            string
+	AdminUsername     string
+	CSRF              string
+	Flash             string
+	FlashKind         string
+	RequestID         string
+	LoginUsername     string
+	Accounts          []domain.Account
+	Account           domain.Account
+	Aliases           []domain.Alias
+	SelectedAccountID int64
+	AuditLogs         []domain.AuditLog
+	Secret            string
+	FormAction        string
+	IsEdit            bool
 }
 
 func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog.Logger, syncFn func(int64) error) (*Server, error) {

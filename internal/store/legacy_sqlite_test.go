@@ -33,6 +33,10 @@ func (validator *legacyCipherValidatorStub) DecryptAppleSession(value string) (s
 	return "", validator.err
 }
 
+func (validator *legacyCipherValidatorStub) DecryptPendingAliasAPIKey(value string) (string, error) {
+	return "", validator.err
+}
+
 func TestLegacySQLiteReadOnlyDSN(t *testing.T) {
 	t.Parallel()
 

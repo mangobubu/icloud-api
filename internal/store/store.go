@@ -22,6 +22,7 @@ var (
 	ErrAliasLimit             = errors.New("enabled alias limit reached")
 	ErrAliasOwnershipConflict = errors.New("alias address belongs to another account")
 	ErrAccountIdentityLocked  = errors.New("account identity is locked by aliases")
+	ErrAccountDisabled        = errors.New("primary account is disabled")
 	ErrCredentialsChanged     = errors.New("administrator credentials changed")
 	memoryID                  atomic.Uint64
 )

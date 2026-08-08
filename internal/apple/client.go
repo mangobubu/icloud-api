@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"strings"
 	"sync"
@@ -304,21 +305,14 @@ func (c *Client) ListAliases(ctx context.Context, session Session) (list ListRes
 	if result.PremiumMailSettingsURL == "" || result.DSID == "" {
 		return list, result, operationError("list Hide My Email aliases", ErrInvalidSession, 0, nil)
 	}
-	base, err := url.Parse(result.PremiumMailSettingsURL)
-	if err != nil || !validICloudServiceURL(base) {
+	requestURL, err := c.premiumMailSettingsRequestURL(result, "/v2/hme/list")
+	if err != nil {
 		return list, result, fmt.Errorf("%w: invalid premium mail service URL", ErrInvalidSession)
 	}
-	base.Path = strings.TrimRight(base.Path, "/") + "/v2/hme/list"
-	query := base.Query()
-	query.Set("clientBuildNumber", c.clientBuildNumber)
-	query.Set("clientMasteringNumber", c.clientMasteringNumber)
-	query.Set("clientId", result.ClientID)
-	query.Set("dsid", result.DSID)
-	base.RawQuery = query.Encode()
 	headers := op.serviceHeaders()
 	headers.Set("Accept", "*/*")
 	headers.Set("Content-Type", "text/plain")
-	response, err := op.request(ctx, "list Hide My Email aliases", http.MethodGet, base.String(), nil, headers)
+	response, err := op.request(ctx, "list Hide My Email aliases", http.MethodGet, requestURL, nil, headers)
 	if err != nil {
 		return list, result, err
 	}
@@ -396,6 +390,244 @@ func (c *Client) ListAliases(ctx context.Context, session Session) (list ListRes
 		}
 	}
 	return list, result, nil
+}
+
+// CreateAlias generates and reserves one new Hide My Email address. The
+// reserve request is a remote side effect, so errors after it starts are
+// deliberately marked non-retryable even when Apple returns a transient HTTP
+// status or the response is lost.
+func (c *Client) CreateAlias(ctx context.Context, session Session, label, note string) (created Alias, result Session, err error) {
+	result = session
+	op, err := c.newOperation(&result)
+	if err != nil {
+		return created, result, err
+	}
+	defer op.persist(&result)
+	if result.PremiumMailSettingsURL == "" || result.DSID == "" {
+		return created, result, operationError("create Hide My Email alias", ErrInvalidSession, 0, nil)
+	}
+
+	generateURL, err := c.premiumMailSettingsRequestURL(result, "/v1/hme/generate")
+	if err != nil {
+		return created, result, fmt.Errorf("%w: invalid premium mail service URL", ErrInvalidSession)
+	}
+	language := "en-us"
+	if result.Region == RegionChina {
+		language = "zh-cn"
+	}
+	response, err := op.request(
+		ctx,
+		"generate Hide My Email alias",
+		http.MethodPost,
+		generateURL,
+		map[string]string{"langCode": language},
+		op.serviceHeaders(),
+	)
+	if err != nil {
+		return created, result, err
+	}
+	generatedResult, err := decodeHMEResult("generate Hide My Email alias", response)
+	if err != nil {
+		return created, result, err
+	}
+	candidate, err := decodeGeneratedHME(generatedResult)
+	if err != nil {
+		return created, result, operationError("decode generated Hide My Email alias", ErrInvalidResponse, response.status, err)
+	}
+
+	reserveURL, err := c.premiumMailSettingsRequestURL(result, "/v1/hme/reserve")
+	if err != nil {
+		return created, result, fmt.Errorf("%w: invalid premium mail service URL", ErrInvalidSession)
+	}
+	response, err = op.request(
+		ctx,
+		"reserve Hide My Email alias",
+		http.MethodPost,
+		reserveURL,
+		map[string]string{"hme": candidate, "label": label, "note": note},
+		op.serviceHeaders(),
+	)
+	if err != nil {
+		return created, result, nonRetryableAppleError(err)
+	}
+	reservedResult, err := decodeHMEResult("reserve Hide My Email alias", response)
+	if err != nil {
+		return created, result, nonRetryableAppleError(err)
+	}
+	created, err = decodeReservedAlias(reservedResult, candidate)
+	if err != nil {
+		err = operationError("decode reserved Hide My Email alias", ErrInvalidResponse, response.status, err)
+		return Alias{}, result, nonRetryableAppleError(err)
+	}
+	return created, result, nil
+}
+
+func (c *Client) premiumMailSettingsRequestURL(session Session, endpoint string) (string, error) {
+	base, err := url.Parse(session.PremiumMailSettingsURL)
+	if err != nil || !validICloudServiceURL(base) {
+		return "", errors.New("invalid premium mail service URL")
+	}
+	base.Path = strings.TrimRight(base.Path, "/") + endpoint
+	query := base.Query()
+	query.Set("clientBuildNumber", c.clientBuildNumber)
+	query.Set("clientMasteringNumber", c.clientMasteringNumber)
+	query.Set("clientId", session.ClientID)
+	query.Set("dsid", session.DSID)
+	base.RawQuery = query.Encode()
+	return base.String(), nil
+}
+
+func decodeHMEResult(operation string, response responseData) (json.RawMessage, error) {
+	if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == 450 {
+		return nil, operationError(operation, ErrInvalidSession, response.status, nil)
+	}
+	if response.status < 200 || response.status >= 300 {
+		return nil, operationError(operation, ErrService, response.status, nil)
+	}
+	var envelope struct {
+		Success *bool           `json:"success"`
+		Result  json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(response.body, &envelope); err != nil {
+		return nil, operationError("decode "+operation, ErrInvalidResponse, response.status, err)
+	}
+	if envelope.Success == nil {
+		return nil, operationError("decode "+operation, ErrInvalidResponse, response.status, errors.New("success must be a boolean"))
+	}
+	if !*envelope.Success {
+		return nil, &Error{
+			Op:          operation,
+			Kind:        ErrService,
+			StatusCode:  response.status,
+			ServiceCode: responseServiceCode(response.body),
+		}
+	}
+	trimmed := bytes.TrimSpace(envelope.Result)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, operationError("decode "+operation, ErrInvalidResponse, response.status, errors.New("result is required"))
+	}
+	return envelope.Result, nil
+}
+
+func decodeGeneratedHME(result json.RawMessage) (string, error) {
+	fields, err := decodeJSONObject(result, "generate result")
+	if err != nil {
+		return "", err
+	}
+	rawHME, present := fields["hme"]
+	if !present {
+		return "", errors.New("generate result.hme is required")
+	}
+	trimmed := bytes.TrimSpace(rawHME)
+	if len(trimmed) == 0 {
+		return "", errors.New("generate result.hme is required")
+	}
+	if trimmed[0] == '{' {
+		nested, err := decodeJSONObject(rawHME, "generate result.hme")
+		if err != nil {
+			return "", err
+		}
+		rawHME, present = nested["hme"]
+		if !present {
+			return "", errors.New("generate result.hme.hme is required")
+		}
+	}
+	address, err := decodeJSONString(rawHME, "generate result.hme")
+	if err != nil {
+		return "", err
+	}
+	if _, err := normalizeHMEAddress(address); err != nil {
+		return "", fmt.Errorf("generate result.hme: %w", err)
+	}
+	return strings.TrimSpace(address), nil
+}
+
+func decodeReservedAlias(result json.RawMessage, candidate string) (Alias, error) {
+	fields, err := decodeJSONObject(result, "reserve result")
+	if err != nil {
+		return Alias{}, err
+	}
+	rawAlias, present := fields["hme"]
+	if !present {
+		return Alias{}, errors.New("reserve result.hme is required")
+	}
+	aliasFields, err := decodeJSONObject(rawAlias, "reserve result.hme")
+	if err != nil {
+		return Alias{}, err
+	}
+	rawAddress, present := aliasFields["hme"]
+	if !present {
+		return Alias{}, errors.New("reserve result.hme.hme is required")
+	}
+	address, err := decodeJSONString(rawAddress, "reserve result.hme.hme")
+	if err != nil {
+		return Alias{}, err
+	}
+	normalizedAddress, err := normalizeHMEAddress(address)
+	if err != nil {
+		return Alias{}, fmt.Errorf("reserve result.hme.hme: %w", err)
+	}
+	normalizedCandidate, err := normalizeHMEAddress(candidate)
+	if err != nil {
+		return Alias{}, fmt.Errorf("generated candidate: %w", err)
+	}
+	if normalizedAddress != normalizedCandidate {
+		return Alias{}, errors.New("reserved Hide My Email alias does not match generated candidate")
+	}
+	var reserved Alias
+	if err := json.Unmarshal(rawAlias, &reserved); err != nil {
+		return Alias{}, fmt.Errorf("decode reserve result.hme: %w", err)
+	}
+	return reserved, nil
+}
+
+func decodeJSONObject(raw json.RawMessage, name string) (map[string]json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, fmt.Errorf("%s must be an object", name)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("%s must be an object: %w", name, err)
+	}
+	if fields == nil {
+		return nil, fmt.Errorf("%s must be an object", name)
+	}
+	return fields, nil
+}
+
+func decodeJSONString(raw json.RawMessage, name string) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return "", fmt.Errorf("%s must be a string", name)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", fmt.Errorf("%s must be a string", name)
+	}
+	if strings.TrimSpace(value) == "" {
+		return "", fmt.Errorf("%s must not be empty", name)
+	}
+	return value, nil
+}
+
+func normalizeHMEAddress(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	parsed, err := mail.ParseAddress(value)
+	if value == "" || err != nil || parsed.Name != "" || !strings.EqualFold(strings.TrimSpace(parsed.Address), value) {
+		return "", errors.New("must be a valid email address")
+	}
+	return strings.ToLower(value), nil
+}
+
+func nonRetryableAppleError(err error) error {
+	var typed *Error
+	if !errors.As(err, &typed) {
+		return err
+	}
+	copy := *typed
+	copy.Retryable = false
+	return &copy
 }
 
 type operation struct {

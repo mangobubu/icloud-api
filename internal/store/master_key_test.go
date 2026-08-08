@@ -177,14 +177,14 @@ func TestVerifyMasterKeyIsPostgresOnly(t *testing.T) {
 
 func TestPostgresBootstrapAddsMetadataToExistingV4WithoutSQLiteSchemaChange(t *testing.T) {
 	t.Parallel()
-	if schemaVersion != 4 {
-		t.Fatalf("schema version = %d, want unchanged v4", schemaVersion)
+	if schemaVersion != 5 {
+		t.Fatalf("schema version = %d, want unchanged v5", schemaVersion)
 	}
 	bootstrap := strings.Join(postgresMigrationBootstrap, "\n")
 	if !strings.Contains(bootstrap, "CREATE TABLE IF NOT EXISTS app_metadata") {
 		t.Fatal("PostgreSQL bootstrap does not create app_metadata for existing v4 databases")
 	}
-	if strings.Contains(strings.Join(schemaV4, "\n"), "app_metadata") {
+	if strings.Contains(strings.Join(schemaV5, "\n"), "app_metadata") {
 		t.Fatal("SQLite runtime schema unexpectedly contains master key metadata")
 	}
 }
@@ -219,6 +219,12 @@ func openMasterKeyFixture(t *testing.T, databaseDialect dialect) (*Store, *sql.D
 		session_ciphertext TEXT NOT NULL
 	)`); err != nil {
 		t.Fatalf("create Apple session fixture: %v", err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE pending_alias_api_keys (
+		alias_id INTEGER PRIMARY KEY,
+		api_key_ciphertext TEXT NOT NULL
+	)`); err != nil {
+		t.Fatalf("create pending alias key fixture: %v", err)
 	}
 	return newStore(raw, databaseDialect), raw
 }

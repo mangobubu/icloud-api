@@ -7,6 +7,8 @@ info:
     只返回该隐私邮箱通过所属 iCloud 主号 IMAP 同步到的最新邮件快照。
     邮件可用性按隐私邮箱自身的同步状态和同步时间独立判断，而不是直接使用主号的整体同步状态。
     `/api/v1/aliases` 使用部署时配置的独立 OAuth Bearer 令牌，将已存在的隐私邮箱登记到现有主号；
+    管理端可按主号选择性开启 Apple Hide My Email 自动创建，每 60 分钟最多尝试 5 次，
+    每次间隔至少 5 分钟。自动创建的原始 API Key 进入加密的待领取队列，不会出现在日志中。
     `/api/v1/mail/latest` 使用 Bearer Header 并返回已保存快照的完整 UTC 数据；
     `/api/v1/mail/recent` 使用 URL 查询参数，只在 IMAP 收件时间位于最近一小时时
     返回按服务端 `TZ` 格式化的紧凑数据。
@@ -41,7 +43,8 @@ paths:
         使用部署时通过 `ICLOUD_API_OAUTH_TOKEN` 配置的独立 OAuth Bearer 令牌鉴权。
         令牌必须包含 32 至 4096 个字符且不得包含空白；本接口不接受隐私邮箱自己的 `icm_` 邮件 API Key。
 
-        本接口只在本地登记已经由 Apple/iCloud 创建并启用的隐私邮箱，不会调用 Apple 创建地址。
+        本接口只在本地登记已经由 Apple/iCloud 创建并启用的隐私邮箱，不会调用 Apple 创建地址；
+        Apple 地址的自动创建只通过管理端主号级开关触发。
         `add_hide_my_eamil` 是兼容契约中保留的字段拼写，表示待登记的隐私邮箱；
         `icloud` 表示已在管理端登记的所属 iCloud 主号邮箱。
         隐私邮箱不能与任何已登记主号邮箱或所选主号的 IMAP 用户名相同。
@@ -397,6 +400,36 @@ paths:
                       message: 数据库暂不可用
                       request_id: 6oe7j0x3x3pJv9Dv
 
+  /admin/api/v1/accounts/{id}:
+    get:
+      tags:
+        - Admin Accounts
+      operationId: getAdminAccount
+      summary: 获取主号详情
+      description: 返回主号、所属隐私邮箱、Apple 会话状态和自动创建计划。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+      responses:
+        "200":
+          description: 主号详情
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAccountDetailResponse"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "404":
+          $ref: "#/components/responses/AdminAccountNotFound"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
   /admin/api/v1/accounts/{id}/sync:
     post:
       tags:
@@ -469,6 +502,18 @@ paths:
                       created_at: "2026-08-07T12:05:00Z"
                       updated_at: "2026-08-08T12:30:00Z"
                   apple_session: null
+                  auto_creation:
+                    enabled: false
+                    status: disabled
+                    planned_at: null
+                    planned_times: []
+                    next_run_at: null
+                    last_attempted_at: null
+                    last_created_at: null
+                    last_alias_address: ""
+                    last_error: ""
+                    pending_key_count: 0
+                    pending_auto_created_key_count: 0
                   sync_pending: true
         "400":
           description: id 不是正整数
@@ -690,6 +735,156 @@ paths:
           $ref: "#/components/responses/AdminAppleUnavailable"
         "504":
           $ref: "#/components/responses/AdminAppleTimeout"
+
+  /admin/api/v1/accounts/{id}/aliases/auto-create:
+    put:
+      tags:
+        - Admin Apple
+      operationId: setAdminAliasAutoCreation
+      summary: 开关主号的隐私邮箱自动创建
+      description: |
+        该开关按主号独立保存。开启时以当前 UTC 时间为锚点生成一小时计划，包含 5 个尝试槽；
+        每个随机间隔至少 5 分钟，5 段间隔合计 60 分钟。计划会持久化，服务重启后不会重新洗牌。
+        开启前必须已有有效的 Apple Web 会话。会话失效不会自动关闭开关，后台任务会记录错误并等待
+        管理员重新登录；达到每主号 1000 个启用隐私邮箱上限后，任务会自动关闭该开关。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminAliasAutoCreationRequest"
+            example:
+              enabled: true
+      responses:
+        "200":
+          description: 最新自动创建计划状态
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAutoCreationResponse"
+        "400":
+          $ref: "#/components/responses/AdminAppleBadRequest"
+        "413":
+          $ref: "#/components/responses/AdminJSONTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAccountNotFound"
+        "409":
+          description: Apple 会话未登录或主号状态不允许开启
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+        "410":
+          $ref: "#/components/responses/AdminAppleFlowExpired"
+        "422":
+          $ref: "#/components/responses/AdminAppleRejected"
+        "429":
+          $ref: "#/components/responses/AdminAppleRateLimited"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+        "502":
+          $ref: "#/components/responses/AdminAppleBadGateway"
+        "504":
+          $ref: "#/components/responses/AdminAppleTimeout"
+        "503":
+          $ref: "#/components/responses/AdminAutoCreationUnavailable"
+
+  /admin/api/v1/accounts/{id}/aliases/auto-create/keys:
+    get:
+      tags:
+        - Admin Apple
+      operationId: getAdminPendingAliasAutoCreationKeys
+      summary: 领取自动创建隐私邮箱的待领取 API Key
+      description: |
+        解密并返回当前队列中的原始 API Key。响应设置为 no-store；每个 Key 只有在管理员随后
+        以 alias ID 确认保存时才会从队列删除。关闭页面或请求失败不会删除队列记录。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+      responses:
+        "200":
+          description: 当前待领取 Key（可能为空）
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/NoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminPendingAliasKeysResponse"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "404":
+          $ref: "#/components/responses/AdminAccountNotFound"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+    delete:
+      tags:
+        - Admin Apple
+      operationId: acknowledgeAdminPendingAliasAutoCreationKeys
+      summary: 确认已保存指定自动创建 API Key
+      description: |
+        只删除请求中列出的 alias ID，避免领取期间新产生的 Key 被误删。请求必须明确列出本次
+        已保存的 ID；重复 ID 会被服务端去重。该确认操作是幂等的，未知、已经确认或不属于
+        当前主号的 ID 会被静默忽略。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminPendingAliasKeysRequest"
+            example:
+              alias_ids: [44, 45]
+      responses:
+        "204":
+          description: 指定 Key 已幂等确认；仍在队列中的对应记录已删除
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+        "400":
+          $ref: "#/components/responses/AdminAppleBadRequest"
+        "413":
+          $ref: "#/components/responses/AdminJSONTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAccountNotFound"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
 
   /admin/api/v1/accounts/{id}/aliases/sync:
     post:
@@ -1149,6 +1344,23 @@ components:
               message: Apple 同步服务暂时不可用，请稍后再试
               request_id: 6oe7j0x3x3pJv9Dv
 
+    AdminAutoCreationUnavailable:
+      description: 隐私邮箱自动创建服务尚未初始化
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          example:
+            error:
+              code: AUTO_CREATION_UNAVAILABLE
+              message: 自动创建服务暂不可用
+              request_id: 6oe7j0x3x3pJv9Dv
+
     AdminAppleTimeout:
       description: Apple 上游服务响应超时
       headers:
@@ -1470,6 +1682,7 @@ components:
         - account
         - aliases
         - apple_session
+        - auto_creation
       properties:
         account:
           $ref: "#/components/schemas/AdminAccount"
@@ -1484,11 +1697,130 @@ components:
           oneOf:
             - $ref: "#/components/schemas/AdminAppleSession"
             - type: "null"
+        auto_creation:
+          $ref: "#/components/schemas/AdminAliasAutoCreation"
         sync_pending:
           type: boolean
           description: |
             仅在手动邮件同步返回 202 时出现且恒为 true，表示当前有界批次已提交，
             但主号仍有邮件积压等待后续批次；同步已追平时该字段省略。
+
+    AdminAliasAutoCreationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+          description: 是否开启该主号每小时 5 次的自动创建计划。
+
+    AdminAutoCreationResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAliasAutoCreation"
+
+    AdminAliasAutoCreation:
+      type: object
+      additionalProperties: false
+      required:
+        - enabled
+        - status
+        - planned_at
+        - planned_times
+        - next_run_at
+        - last_attempted_at
+        - last_created_at
+        - last_alias_address
+        - last_error
+        - pending_key_count
+        - pending_auto_created_key_count
+      properties:
+        enabled:
+          type: boolean
+        status:
+          type: string
+          enum:
+            - disabled
+            - scheduled
+            - paused
+            - login_required
+            - error
+          description: 当前计划状态；login_required 表示需重新登录 Apple，会话失效不会自动关闭开关。
+        planned_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: 当前剩余计划的第一个时间点；没有剩余计划时为 null。
+        planned_times:
+          type: array
+          items:
+            type: string
+            format: date-time
+          description: 当前剩余计划的全部 UTC 时间点，最多 5 个。
+        next_run_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        last_attempted_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        last_created_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        last_alias_address:
+          type: string
+        last_error:
+          type: string
+          description: 最近一次尝试的截断错误信息；不会包含原始 API Key 或 Apple 会话材料。
+        pending_key_count:
+          type: integer
+          minimum: 0
+        pending_auto_created_key_count:
+          type: integer
+          minimum: 0
+
+    AdminPendingAliasKeysRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - alias_ids
+      properties:
+        alias_ids:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+
+    AdminPendingAliasKeysResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required:
+            - created
+          properties:
+            created:
+              type: array
+              items:
+                $ref: "#/components/schemas/AdminAppleCreatedAlias"
 
     AdminAccount:
       type: object
@@ -1588,8 +1920,8 @@ components:
         direct_link_path:
           type: string
           format: uri-reference
-          pattern: "^/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
-          description: 使用派生凭据的同源收件直达路径，不含原始 API Key。
+          pattern: "^(|/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])$"
+          description: 使用派生凭据的同源收件直达路径，不含原始 API Key；派生链接生成失败时为空字符串。
         enabled:
           type: boolean
         last_sync_status:
@@ -1634,6 +1966,7 @@ components:
         - account
         - aliases
         - apple_session
+        - auto_creation
         - summary
         - created
       properties:
@@ -1645,6 +1978,8 @@ components:
             $ref: "#/components/schemas/AdminAlias"
         apple_session:
           $ref: "#/components/schemas/AdminAppleSession"
+        auto_creation:
+          $ref: "#/components/schemas/AdminAliasAutoCreation"
         summary:
           $ref: "#/components/schemas/AdminAppleSyncSummary"
         created:
@@ -1705,12 +2040,12 @@ components:
         api_key:
           type: string
           pattern: "^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
-          description: 新导入地址的原始邮件 API Key，仅在本次同步成功响应中显示一次。
+          description: 新导入或自动创建地址的原始邮件 API Key；仅在本次受保护响应中显示，自动创建 Key 还需按 alias ID 确认保存后才会从待领取队列删除。
         mail_api_direct_link:
           type: string
           format: uri-reference
-          pattern: "^/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
-          description: 使用派生凭据的同源收件直达路径，不含 api_key 字段中的原始 Key。
+          pattern: "^(|/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])$"
+          description: 使用派生凭据的同源收件直达路径，不含 api_key 字段中的原始 Key；派生失败时为空字符串。
 
     AdminAppleErrorResponse:
       type: object
@@ -1747,6 +2082,8 @@ components:
             - APPLE_FLOW_EXPIRED
             - APPLE_RATE_LIMITED
             - APPLE_UPSTREAM_ERROR
+            - AUTO_CREATION_UNAVAILABLE
+            - ACCOUNT_DISABLED
             - APPLE_ACCOUNT_MISMATCH
             - ACCOUNT_CHANGED
             - ALIAS_OWNERSHIP_CONFLICT

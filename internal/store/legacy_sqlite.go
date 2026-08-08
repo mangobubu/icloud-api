@@ -49,6 +49,10 @@ type LegacySQLiteCipherValidator interface {
 	DecryptAppleSession(string) (string, error)
 }
 
+type legacyPendingAliasKeyCipherValidator interface {
+	DecryptPendingAliasAPIKey(string) (string, error)
+}
+
 // ImportLegacySQLite is retained for source compatibility. Legacy ciphertext
 // must be authenticated, so callers must use ImportLegacySQLiteWithValidator.
 func (s *Store) ImportLegacySQLite(ctx context.Context, legacyPath string) error {
@@ -155,6 +159,8 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 			UNION ALL SELECT 1 FROM latest_messages
 			UNION ALL SELECT 1 FROM audit_logs
 			UNION ALL SELECT 1 FROM apple_web_sessions
+			UNION ALL SELECT 1 FROM alias_creation_schedules
+			UNION ALL SELECT 1 FROM pending_alias_api_keys
 			LIMIT 1
 		)`).Scan(&targetHasData); err != nil {
 		return false, fmt.Errorf("check PostgreSQL import target: %w", err)
@@ -207,8 +213,22 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 	if err != nil {
 		return false, err
 	}
+	hasAliasSchedules, err := legacySQLiteTableExists(ctx, legacyTx, "alias_creation_schedules")
+	if err != nil {
+		return false, err
+	}
+	hasPendingAliasKeys, err := legacySQLiteTableExists(ctx, legacyTx, "pending_alias_api_keys")
+	if err != nil {
+		return false, err
+	}
 
 	specs := legacySQLiteCopySpecs(adminHasPasswordVersion, sessionHasPasswordVersion, hasAppleSessions)
+	if hasAliasSchedules {
+		specs = append(specs, legacySQLiteAliasScheduleCopySpec())
+	}
+	if hasPendingAliasKeys {
+		specs = append(specs, legacySQLitePendingAliasKeyCopySpec())
+	}
 	for _, spec := range specs {
 		if err := prepareLegacyBooleanColumns(ctx, tx, &spec); err != nil {
 			return false, err
@@ -344,6 +364,30 @@ func legacySQLiteCopySpecs(adminHasVersion, sessionHasVersion, hasAppleSessions 
 	return specs
 }
 
+func legacySQLiteAliasScheduleCopySpec() legacyCopySpec {
+	return legacyCopySpec{
+		table: "alias_creation_schedules", columnCount: 10,
+		selectSQL: `SELECT account_id, enabled, planned_at_json, next_run_at,
+			last_attempted_at, last_created_at, last_alias_address, last_error,
+			created_at, updated_at FROM alias_creation_schedules ORDER BY account_id`,
+		insertSQL: `INSERT INTO alias_creation_schedules(
+			account_id, enabled, planned_at_json, next_run_at, last_attempted_at,
+			last_created_at, last_alias_address, last_error, created_at, updated_at
+		) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		booleanColumns: map[int]string{1: "enabled"},
+	}
+}
+
+func legacySQLitePendingAliasKeyCopySpec() legacyCopySpec {
+	return legacyCopySpec{
+		table: "pending_alias_api_keys", columnCount: 3,
+		selectSQL: `SELECT alias_id, api_key_ciphertext, created_at
+			FROM pending_alias_api_keys ORDER BY alias_id`,
+		insertSQL: `INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
+			VALUES($1, $2, $3)`,
+	}
+}
+
 func copyLegacySQLiteTable(
 	ctx context.Context,
 	source *sql.Tx,
@@ -398,7 +442,8 @@ func prepareLegacySQLiteValues(
 	}
 	for index, value := range values {
 		if (table == "accounts" && index == 6) ||
-			(table == "apple_web_sessions" && index == 1) {
+			(table == "apple_web_sessions" && index == 1) ||
+			(table == "pending_alias_api_keys" && index == 1) {
 			continue
 		}
 		if text, ok := value.(string); ok {
@@ -435,6 +480,16 @@ func validateLegacySQLiteCiphertext(
 		}
 		ciphertext = values[1]
 		validate = validator.DecryptAppleSession
+	case "pending_alias_api_keys":
+		if len(values) <= 1 {
+			return errors.New("legacy SQLite pending alias row is missing ciphertext")
+		}
+		ciphertext = values[1]
+		pendingValidator, ok := validator.(legacyPendingAliasKeyCipherValidator)
+		if !ok {
+			return errors.New("legacy SQLite pending alias key requires a pending-key ciphertext validator")
+		}
+		validate = pendingValidator.DecryptPendingAliasAPIKey
 	default:
 		return nil
 	}

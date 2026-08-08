@@ -21,6 +21,8 @@ import (
 const (
 	defaultChallengeTTL         = 10 * time.Minute
 	defaultVerificationAttempts = 5
+	autoCreateLabel             = "自动创建"
+	autoCreateNote              = "icloud-api 自动创建"
 )
 
 type Option func(*Service)
@@ -373,6 +375,185 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		Created: created,
 		Session: sessionInfoFromRecord(saved, updated, StatusAuthenticated),
 	}, nil
+}
+
+// CreateAutoAlias reserves exactly one Hide My Email address and publishes it
+// locally with a one-time API key sealed for administrator retrieval. The
+// method intentionally performs no retry: reserve is a remote side effect and
+// repeating it after an ambiguous response could create duplicates.
+func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.Alias, error) {
+	if accountID < 1 {
+		return domain.Alias{}, errors.New("account ID must be positive")
+	}
+	autoRepo, ok := s.repo.(AutoCreateRepository)
+	if !ok {
+		return domain.Alias{}, errors.New("automatic alias creation persistence is unavailable")
+	}
+	autoClient, ok := s.client.(AutoAliasClient)
+	if !ok {
+		return domain.Alias{}, errors.New("automatic alias creation client is unavailable")
+	}
+	keyCipher, ok := s.cipher.(PendingAPIKeyCipher)
+	if !ok {
+		return domain.Alias{}, errors.New("automatic alias key encryption is unavailable")
+	}
+	release, err := s.acquireOperation(ctx, accountID)
+	if err != nil {
+		return domain.Alias{}, err
+	}
+	defer release()
+
+	// A successful Apple reserve cannot be rolled back. The production sync
+	// manager therefore holds its keyed account lock across the capacity check,
+	// remote request, and local publication so account deletion, disabling, or
+	// another local alias write cannot consume the last slot in the meantime.
+	var releaseAccount func()
+	if acquirer, ok := s.locker.(AccountLockAcquirer); ok {
+		releaseAccount, err = acquirer.AcquireAccountLock(ctx, accountID)
+		if err != nil {
+			return domain.Alias{}, err
+		}
+		defer releaseAccount()
+	}
+
+	account, err := s.repo.GetAccount(ctx, accountID)
+	if err != nil {
+		return domain.Alias{}, err
+	}
+	if !account.Enabled {
+		return domain.Alias{}, errors.New("主号已停用")
+	}
+	count, err := autoRepo.CountEnabledAliasesByAccount(ctx, accountID)
+	if err != nil {
+		return domain.Alias{}, err
+	}
+	if count >= domain.MaxEnabledAliasesPerAccount {
+		return domain.Alias{}, store.ErrAliasLimit
+	}
+
+	record, session, err := s.loadSession(ctx, accountID)
+	if err != nil {
+		if errors.Is(err, ErrSessionExpired) {
+			s.expireSession(ctx, accountID)
+		}
+		return domain.Alias{}, err
+	}
+	validated, err := s.client.Validate(ctx, session)
+	if err != nil {
+		mapped := mapAppleError(err, false)
+		if errors.Is(mapped, ErrSessionExpired) {
+			s.expireSession(ctx, accountID)
+		}
+		return domain.Alias{}, mapped
+	}
+	if strings.TrimSpace(validated.AppleID) != "" &&
+		!strings.EqualFold(strings.TrimSpace(validated.AppleID), strings.TrimSpace(record.AppleID)) {
+		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	normalizeSession(&validated, record.AppleID, session.Region, s.now())
+	created, updated, err := autoClient.CreateAlias(ctx, validated, autoCreateLabel, autoCreateNote)
+	if err != nil {
+		mapped := mapAppleError(err, false)
+		if errors.Is(mapped, ErrSessionExpired) {
+			s.expireSession(ctx, accountID)
+		}
+		return domain.Alias{}, mapped
+	}
+	address := domain.NormalizeEmail(created.HME)
+	parsed, parseErr := mail.ParseAddress(address)
+	if address == "" || parseErr != nil || parsed.Name != "" || domain.NormalizeEmail(parsed.Address) != address {
+		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("Apple returned an invalid alias address"))
+	}
+	if !created.IsActive {
+		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("Apple returned an inactive alias"))
+	}
+	if !sameEmail(created.ForwardToEmail, account.Email) {
+		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+
+	rawKey, hash, prefix, err := secure.NewAPIKey()
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("generate automatic alias API key: %w", err)
+	}
+	ciphertext, err := keyCipher.EncryptPendingAliasAPIKey(rawKey)
+	rawKey = ""
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("encrypt automatic alias API key: %w", err)
+	}
+	updatedRegion, err := normalizeRegion(updated.Region)
+	if err != nil {
+		return domain.Alias{}, err
+	}
+	updated.Region = updatedRegion
+	if strings.TrimSpace(updated.AppleID) != "" &&
+		!strings.EqualFold(strings.TrimSpace(updated.AppleID), strings.TrimSpace(record.AppleID)) {
+		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	normalizeSession(&updated, record.AppleID, session.Region, s.now())
+	updatedPayload, err := json.Marshal(updated)
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("encode rotated Apple session: %w", err)
+	}
+	sessionCiphertext, err := s.cipher.EncryptAppleSession(string(updatedPayload))
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("encrypt rotated Apple session: %w", err)
+	}
+	alias := domain.Alias{
+		AccountID:      accountID,
+		AccountEmail:   account.Email,
+		Address:        address,
+		Label:          strings.TrimSpace(created.Label),
+		APIKeyHash:     hash,
+		APIKeyPrefix:   prefix,
+		Enabled:        true,
+		LastSyncStatus: domain.SyncStatusPending,
+	}
+	sessionRecord := domain.AppleWebSession{
+		AccountID:       accountID,
+		Ciphertext:      sessionCiphertext,
+		AppleID:         strings.TrimSpace(updated.AppleID),
+		Region:          publicRegion(string(updated.Region)),
+		Authenticated:   true,
+		LastValidatedAt: &updated.ValidatedAt,
+	}
+	if sessionRecord.LastValidatedAt.IsZero() {
+		validatedAt := s.now().UTC()
+		sessionRecord.LastValidatedAt = &validatedAt
+	}
+	var saved domain.Alias
+	publish := func() error {
+		current, err := s.repo.GetAccount(ctx, accountID)
+		if err != nil {
+			return err
+		}
+		if !current.Enabled {
+			return errors.New("主号已停用")
+		}
+		if !sameIdentity(identityOf(current), identityOf(account)) {
+			return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+		}
+		var saveErr error
+		saved, _, saveErr = autoRepo.CreateAliasWithPendingAPIKey(ctx, sessionRecord, alias, ciphertext)
+		return saveErr
+	}
+	if releaseAccount != nil {
+		err = publish()
+	} else {
+		err = s.locker.WithAccountLock(ctx, accountID, publish)
+	}
+	if errors.Is(err, store.ErrAliasOwnershipConflict) {
+		return domain.Alias{}, wrapError(CodeAliasOwnershipConflict, ErrAliasOwnershipConflict, err)
+	}
+	if err != nil {
+		return domain.Alias{}, err
+	}
+	return saved, nil
+}
+
+// CreateAlias is a convenience alias for callers that treat one background
+// slot as a normal single-alias operation.
+func (s *Service) CreateAlias(ctx context.Context, accountID int64) (domain.Alias, error) {
+	return s.CreateAutoAlias(ctx, accountID)
 }
 
 func (s *Service) persistSession(ctx context.Context, accountID int64, expected accountIdentity, session apple.Session) (domain.AppleWebSession, error) {

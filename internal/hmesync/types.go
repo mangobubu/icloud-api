@@ -28,9 +28,22 @@ type Repository interface {
 	ImportAliases(context.Context, int64, []domain.AliasImportCandidate) (domain.AliasImportResult, error)
 }
 
+// AutoCreateRepository is the additional persistence surface used only by the
+// background creator. Keeping it separate preserves source compatibility for
+// callers that only implement interactive Apple directory sync.
+type AutoCreateRepository interface {
+	Repository
+	CountEnabledAliasesByAccount(context.Context, int64) (int, error)
+	CreateAliasWithPendingAPIKey(context.Context, domain.AppleWebSession, domain.Alias, string) (domain.Alias, domain.AppleWebSession, error)
+}
+
 type SessionCipher interface {
 	EncryptAppleSession(string) (string, error)
 	DecryptAppleSession(string) (string, error)
+}
+
+type PendingAPIKeyCipher interface {
+	EncryptPendingAliasAPIKey(string) (string, error)
 }
 
 type AppleClient interface {
@@ -40,10 +53,22 @@ type AppleClient interface {
 	ListAliases(context.Context, apple.Session) (apple.ListResult, apple.Session, error)
 }
 
-// AccountLocker is shared with IMAP synchronization. Apple network requests
-// complete before this lock is acquired.
+type AutoAliasClient interface {
+	CreateAlias(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error)
+}
+
+// AccountLocker is shared with IMAP synchronization. Interactive Apple flows
+// do their network work before acquiring this publication lock.
 type AccountLocker interface {
 	WithAccountLock(context.Context, int64, func() error) error
+}
+
+// AccountLockAcquirer is an optional stronger boundary used by operations that
+// have an irreversible remote side effect followed by local publication. The
+// production sync manager implements it; keeping it separate preserves source
+// compatibility for embedders that only provide AccountLocker.
+type AccountLockAcquirer interface {
+	AcquireAccountLock(context.Context, int64) (func(), error)
 }
 
 type SessionInfo struct {

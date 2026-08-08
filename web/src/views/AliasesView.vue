@@ -6,6 +6,35 @@
       description="查看每个地址的主号归属、Key 状态和最近使用情况。"
     >
       <template #actions>
+        <div class="alias-filter" role="group" aria-label="按主号筛选">
+          <span class="alias-filter__label">所属主号</span>
+          <el-select
+            v-model="selectedAccountId"
+            class="alias-filter__select"
+            filterable
+            clearable
+            :disabled="accountsLoading || accounts.length === 0"
+            :loading="accountsLoading"
+            placeholder="全部主号"
+            aria-label="按所属主号筛选"
+            no-data-text="暂无主号"
+            no-match-text="没有匹配的主号"
+            @change="handleAccountFilterChange"
+          >
+            <el-option label="全部主号" value="" />
+            <el-option
+              v-for="account in accounts"
+              :key="account.id"
+              :label="account.email"
+              :value="account.id"
+            >
+              <div class="primary-stack">
+                <strong>{{ account.email }}</strong>
+                <small>{{ account.name || "未填写备注" }}</small>
+              </div>
+            </el-option>
+          </el-select>
+        </div>
         <el-button
           :icon="Download"
           :disabled="selectedAliases.length === 0"
@@ -35,6 +64,13 @@
       </template>
     </SectionHeader>
 
+    <RequestAlert
+      v-if="accountsLoadError"
+      :error="accountsLoadError"
+      closable
+      @close="accountsLoadError = null"
+    />
+
     <div v-if="loading && aliases.length === 0" class="data-panel loading-panel">
       <el-skeleton :rows="6" animated />
     </div>
@@ -46,8 +82,12 @@
 
     <EmptyState
       v-else-if="aliases.length === 0"
-      title="还没有隐私邮箱"
-      description="进入某个主号详情页添加地址。"
+      :title="selectedAccountId ? '该主号暂无隐私邮箱' : '还没有隐私邮箱'"
+      :description="
+        selectedAccountId
+          ? '请选择其他主号，或进入该主号详情页添加地址。'
+          : '进入某个主号详情页添加地址。'
+      "
     >
       <el-button type="primary" :icon="Setting" @click="openAccounts">
         查看主号
@@ -209,12 +249,15 @@ import { ElMessage } from "element-plus";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
-import { getAliases } from "../api/admin.js";
+import { getAccounts, getAliases } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncStatus from "../components/SyncStatus.vue";
-import { createActionLock } from "../utils/asyncState.js";
+import {
+  createActionLock,
+  createLatestRequestGate,
+} from "../utils/asyncState.js";
 import { buildAliasExportText } from "../utils/aliasExport.js";
 import {
   buildRecentMailDirectLink,
@@ -226,13 +269,18 @@ import { createLiveRefresh } from "../utils/liveRefresh.js";
 
 const router = useRouter();
 const aliases = ref([]);
+const accounts = ref([]);
+const selectedAccountId = ref("");
 const aliasTable = ref(null);
 const selectedAliasIds = ref([]);
 const loading = ref(false);
 const loadError = ref(null);
+const accountsLoading = ref(false);
+const accountsLoadError = ref(null);
 const copyLoading = reactive({});
 const copyLock = createActionLock();
-let refreshInFlight = false;
+const aliasLoadGate = createLatestRequestGate();
+const accountsLoadGate = createLatestRequestGate();
 let viewActive = true;
 
 const selectedAliases = computed(() => {
@@ -244,31 +292,83 @@ function keyPrefix(alias) {
   return alias.apiKeyPrefix ? `${alias.apiKeyPrefix}…` : "-";
 }
 
+async function loadAccounts({ silent = false } = {}) {
+  const ticket = accountsLoadGate.begin("accounts");
+  if (!silent) {
+    accountsLoading.value = true;
+    accountsLoadError.value = null;
+  }
+  try {
+    const nextAccounts = await getAccounts();
+    if (!accountsLoadGate.isCurrent(ticket)) return;
+    accounts.value = nextAccounts;
+    accountsLoadError.value = null;
+
+    if (
+      selectedAccountId.value &&
+      !nextAccounts.some(
+        (account) => String(account.id) === String(selectedAccountId.value),
+      )
+    ) {
+      selectedAccountId.value = "";
+      clearAliasSelection();
+      void loadAliases({ silent });
+    }
+  } catch (error) {
+    if (accountsLoadGate.isCurrent(ticket) && !silent) {
+      accountsLoadError.value = error;
+    }
+  } finally {
+    if (accountsLoadGate.isCurrent(ticket)) {
+      accountsLoading.value = false;
+    }
+  }
+}
+
 async function loadAliases({ silent = false } = {}) {
-  if (refreshInFlight) return;
-  refreshInFlight = true;
+  const accountId = selectedAccountId.value;
+  const ticket = aliasLoadGate.begin(accountId);
   if (!silent) {
     loading.value = true;
     loadError.value = null;
   }
   try {
-    const nextAliases = await getAliases();
-    if (!viewActive) return;
+    const nextAliases = await getAliases(accountId);
+    if (!aliasLoadGate.isCurrent(ticket, selectedAccountId.value)) return;
     aliases.value = nextAliases;
+    const availableAliasIds = new Set(nextAliases.map((alias) => alias.id));
+    selectedAliasIds.value = selectedAliasIds.value.filter((id) =>
+      availableAliasIds.has(id),
+    );
     loadError.value = null;
   } catch (error) {
-    if (viewActive && !silent) {
+    if (aliasLoadGate.isCurrent(ticket, selectedAccountId.value) && !silent) {
       loadError.value = error;
     }
   } finally {
-    refreshInFlight = false;
-    if (!silent) {
+    if (aliasLoadGate.isCurrent(ticket, selectedAccountId.value)) {
       loading.value = false;
     }
   }
 }
 
-const liveRefresh = createLiveRefresh(() => loadAliases({ silent: true }));
+function clearAliasSelection() {
+  selectedAliasIds.value = [];
+  aliasTable.value?.clearSelection();
+}
+
+function handleAccountFilterChange(value) {
+  selectedAccountId.value = value == null ? "" : value;
+  clearAliasSelection();
+  loadAliases();
+}
+
+const liveRefresh = createLiveRefresh(() => {
+  return Promise.all([
+    loadAliases({ silent: true }),
+    loadAccounts({ silent: true }),
+  ]);
+});
 
 function handleSelectionChange(selection) {
   selectedAliasIds.value = selection.map((alias) => alias.id);
@@ -369,17 +469,38 @@ function openAccount(id) {
 }
 
 onMounted(() => {
+  loadAccounts();
   loadAliases();
   liveRefresh.start({ immediate: false });
 });
 
 onBeforeUnmount(() => {
   viewActive = false;
+  aliasLoadGate.deactivate();
+  accountsLoadGate.deactivate();
   liveRefresh.stop();
 });
 </script>
 
 <style scoped>
+.alias-filter {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.alias-filter__label {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.alias-filter__select {
+  width: min(280px, 30vw);
+}
+
 .account-link {
   max-width: 100%;
   justify-content: flex-start;
@@ -409,5 +530,17 @@ onBeforeUnmount(() => {
 .mobile-alias-selection__checkbox {
   flex: 0 0 auto;
   margin-top: 1px;
+}
+
+@media (max-width: 720px) {
+  .alias-filter {
+    width: 100%;
+  }
+
+  .alias-filter__select {
+    min-width: 0;
+    flex: 1 1 auto;
+    width: auto;
+  }
 }
 </style>

@@ -28,6 +28,14 @@ func TestMigrateV2ToV3(t *testing.T) {
 		_ = current.Close()
 		t.Fatalf("remove v3 table from fixture: %v", err)
 	}
+	if _, err := current.DB().ExecContext(ctx, `DROP TABLE pending_alias_api_keys`); err != nil {
+		_ = current.Close()
+		t.Fatalf("remove v5 pending key table from fixture: %v", err)
+	}
+	if _, err := current.DB().ExecContext(ctx, `DROP TABLE alias_creation_schedules`); err != nil {
+		_ = current.Close()
+		t.Fatalf("remove v5 schedule table from fixture: %v", err)
+	}
 	if _, err := current.DB().ExecContext(ctx, `PRAGMA user_version = 2`); err != nil {
 		_ = current.Close()
 		t.Fatalf("mark fixture as v2: %v", err)
@@ -50,8 +58,8 @@ func TestMigrateV2ToV3(t *testing.T) {
 	if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 4 {
-		t.Fatalf("schema version = %d, want 4", version)
+	if version != 5 {
+		t.Fatalf("schema version = %d, want 5", version)
 	}
 	retained, err := migrated.GetAccount(ctx, account.ID)
 	if err != nil {

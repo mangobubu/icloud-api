@@ -17,7 +17,9 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"icloud-api/internal/apple"
+	"icloud-api/internal/autocreate"
 	"icloud-api/internal/config"
+	"icloud-api/internal/domain"
 	"icloud-api/internal/hmesync"
 	"icloud-api/internal/httpserver"
 	mailfetch "icloud-api/internal/mail"
@@ -99,10 +101,29 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("初始化隐私邮箱同步服务: %w", err)
 	}
+	autoManager, err := autocreate.New(
+		db,
+		func(ctx context.Context, accountID int64) (domain.Alias, error) {
+			alias, createErr := hmeService.CreateAutoAlias(ctx, accountID)
+			if errors.Is(createErr, store.ErrAliasLimit) {
+				return domain.Alias{}, fmt.Errorf("%w: %v", autocreate.ErrCapacityReached, createErr)
+			}
+			return alias, createErr
+		},
+		logger,
+	)
+	if err != nil {
+		return fmt.Errorf("初始化隐私邮箱自动创建服务: %w", err)
+	}
 	syncDone := make(chan struct{})
 	go func() {
 		defer close(syncDone)
 		manager.Run(appContext)
+	}()
+	autoCreateDone := make(chan struct{})
+	go func() {
+		defer close(autoCreateDone)
+		autoManager.Run(appContext)
 	}()
 
 	web, err := httpserver.New(db, cipher, cfg, logger, func(accountID int64) error {
@@ -114,6 +135,7 @@ func run() error {
 	}
 	web.SetAccountLocker(manager.WithAccountLock)
 	web.SetHMESyncService(hmeService)
+	web.SetAliasAutoCreationService(autoManager)
 	router, err := web.Router()
 	if err != nil {
 		return err
@@ -152,6 +174,11 @@ func run() error {
 	case <-syncDone:
 	case <-shutdownContext.Done():
 		return fmt.Errorf("等待同步任务结束: %w", shutdownContext.Err())
+	}
+	select {
+	case <-autoCreateDone:
+	case <-shutdownContext.Done():
+		return fmt.Errorf("等待自动创建任务结束: %w", shutdownContext.Err())
 	}
 	logger.Info("服务已关闭")
 	return nil

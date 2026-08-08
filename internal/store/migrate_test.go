@@ -105,8 +105,8 @@ func TestMigrateV1ToV3(t *testing.T) {
 	if err := db.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatalf("read migrated schema version: %v", err)
 	}
-	if schemaVersion != 4 {
-		t.Fatalf("schema version = %d, want 4", schemaVersion)
+	if schemaVersion != 5 {
+		t.Fatalf("schema version = %d, want 5", schemaVersion)
 	}
 
 	var adminPasswordVersion, sessionPasswordVersion int64

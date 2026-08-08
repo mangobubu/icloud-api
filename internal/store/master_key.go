@@ -27,6 +27,10 @@ type MasterKeyCipherValidator interface {
 	DecryptAppleSession(string) (string, error)
 }
 
+type pendingAliasKeyCipherValidator interface {
+	DecryptPendingAliasAPIKey(string) (string, error)
+}
+
 // VerifyStoredMasterKey checks an existing database binding without creating
 // one. The bool is false only when this database has not yet stored a master
 // key fingerprint.
@@ -220,6 +224,8 @@ func validateStoredCiphertexts(ctx context.Context, tx *sql.Tx, validator Master
 		SELECT 'imap', id, password_ciphertext FROM accounts
 		UNION ALL
 		SELECT 'apple', account_id, session_ciphertext FROM apple_web_sessions
+		UNION ALL
+		SELECT 'pending_alias', alias_id, api_key_ciphertext FROM pending_alias_api_keys
 		ORDER BY 1, 2
 	`)
 	if err != nil {
@@ -244,6 +250,12 @@ func validateStoredCiphertexts(ctx context.Context, tx *sql.Tx, validator Master
 			_, decryptErr = validator.Decrypt(ciphertext)
 		case "apple":
 			_, decryptErr = validator.DecryptAppleSession(ciphertext)
+		case "pending_alias":
+			pendingValidator, ok := validator.(pendingAliasKeyCipherValidator)
+			if !ok {
+				return fmt.Errorf("validate stored pending alias ciphertext for alias %d before binding master key: validator does not support pending alias keys", accountID)
+			}
+			_, decryptErr = pendingValidator.DecryptPendingAliasAPIKey(ciphertext)
 		default:
 			return fmt.Errorf("unknown encrypted data kind %q", kind)
 		}

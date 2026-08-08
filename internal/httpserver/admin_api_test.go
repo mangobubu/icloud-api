@@ -477,6 +477,66 @@ func assertAdminDirectLinkPath(t *testing.T, alias adminAPIAliasDTO, apiKeyHash 
 	return nil
 }
 
+func TestAdminAPIListAliasesFiltersByPrimaryAccount(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, _, _ := env.createSession(t, "alias-filter-admin", "alias filter password")
+	first := adminAPITestCreateAccount(t, env, "first-filter@icloud.com")
+	second := adminAPITestCreateAccount(t, env, "second-filter@icloud.com")
+
+	for index, item := range []struct {
+		account domain.Account
+		address string
+	}{
+		{account: first, address: "first-filter-alias@icloud.com"},
+		{account: second, address: "second-filter-alias@icloud.com"},
+	} {
+		if _, err := env.store.CreateAlias(context.Background(), domain.Alias{
+			AccountID:    item.account.ID,
+			Address:      item.address,
+			APIKeyHash:   secure.HashToken(fmt.Sprintf("alias-filter-key-%d", index)),
+			APIKeyPrefix: fmt.Sprintf("filter-%d", index),
+			Enabled:      true,
+		}); err != nil {
+			t.Fatalf("create filtered alias %q: %v", item.address, err)
+		}
+	}
+
+	response := env.request(
+		t,
+		http.MethodGet,
+		"/admin/api/v1/aliases?account_id="+strconvFormatInt(first.ID),
+		nil,
+		"",
+		[]*http.Cookie{sessionCookie},
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("filtered aliases status = %d; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data []adminAPIAliasDTO `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode filtered aliases: %v; body=%s", err, response.Body.String())
+	}
+	if len(payload.Data) != 1 || payload.Data[0].AccountID != first.ID || payload.Data[0].Address != "first-filter-alias@icloud.com" {
+		t.Fatalf("filtered aliases = %#v, want only first account", payload.Data)
+	}
+
+	invalid := env.request(
+		t,
+		http.MethodGet,
+		"/admin/api/v1/aliases?account_id=not-an-id",
+		nil,
+		"",
+		[]*http.Cookie{sessionCookie},
+		"",
+	)
+	if invalid.Code != http.StatusBadRequest || adminAPITestErrorCode(t, invalid) != "VALIDATION_FAILED" {
+		t.Fatalf("invalid account filter status = %d; body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
 func TestAdminAPIStrictJSONAndPasswordRevocation(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	const oldPassword = "old password for API tests"

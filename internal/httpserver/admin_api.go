@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"icloud-api/internal/domain"
+	"icloud-api/internal/hmesync"
 	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
 	"icloud-api/internal/syncer"
@@ -54,6 +55,9 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.POST("/accounts/:id/apple-auth", s.adminAPIStartAppleAuth)
 	protected.POST("/accounts/:id/apple-auth/verify", s.adminAPIVerifyAppleAuth)
 	protected.DELETE("/accounts/:id/apple-auth", s.adminAPIClearAppleAuth)
+	protected.PUT("/accounts/:id/aliases/auto-create", s.adminAPISetAliasAutoCreation)
+	protected.GET("/accounts/:id/aliases/auto-create/keys", s.adminAPIGetAliasAutoCreationKeys)
+	protected.DELETE("/accounts/:id/aliases/auto-create/keys", s.adminAPIAcknowledgeAliasAutoCreationKeys)
 	protected.POST("/accounts/:id/aliases", s.adminAPICreateAlias)
 	protected.POST("/accounts/:id/aliases/sync", s.adminAPISyncAppleAliases)
 
@@ -125,8 +129,36 @@ type adminAPIAccountDetailDTO struct {
 	Account      adminAPIAccountDTO       `json:"account"`
 	Aliases      []adminAPIAliasDTO       `json:"aliases"`
 	AppleSession *adminAPIAppleSessionDTO `json:"apple_session"`
+	AutoCreation *adminAPIAutoCreationDTO `json:"auto_creation"`
 	SyncPending  bool                     `json:"sync_pending,omitempty"`
 }
+
+type adminAPIAutoCreationDTO struct {
+	Enabled          bool     `json:"enabled"`
+	Status           string   `json:"status"`
+	PlannedAt        *string  `json:"planned_at"`
+	PlannedTimes     []string `json:"planned_times"`
+	NextRunAt        *string  `json:"next_run_at"`
+	LastAttemptedAt  *string  `json:"last_attempted_at"`
+	LastCreatedAt    *string  `json:"last_created_at"`
+	LastAliasAddress string   `json:"last_alias_address"`
+	LastError        string   `json:"last_error"`
+	PendingKeyCount  int      `json:"pending_key_count"`
+	PendingKeyTotal  int      `json:"pending_auto_created_key_count"`
+}
+
+type adminAPIAutoCreationRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
+type adminAPIAutoCreationKeysRequest struct {
+	AliasIDs []int64 `json:"alias_ids"`
+}
+
+var (
+	errAutoCreationUnavailable     = errors.New("automatic alias creation service is unavailable")
+	errAutoCreationAccountDisabled = errors.New("primary account is disabled")
+)
 
 type adminAPIOneTimeKeyDTO struct {
 	Alias  adminAPIAliasDTO `json:"alias"`
@@ -249,6 +281,44 @@ func adminAPIOptionalTime(value *time.Time) *string {
 	}
 	formatted := value.UTC().Format(time.RFC3339)
 	return &formatted
+}
+
+func adminAPIAutoCreationFromSchedule(schedule domain.AliasCreationSchedule, pendingCount int, appleStatus string) *adminAPIAutoCreationDTO {
+	plannedTimes := make([]string, 0, len(schedule.PlannedAt))
+	for _, planned := range schedule.PlannedAt {
+		plannedTimes = append(plannedTimes, adminAPITime(planned))
+	}
+	var plannedAt *string
+	if len(plannedTimes) > 0 {
+		first := plannedTimes[0]
+		plannedAt = &first
+	}
+	status := "disabled"
+	if schedule.Enabled {
+		switch {
+		case schedule.LastError != "":
+			status = "error"
+		case appleStatus == hmesync.StatusLoginRequired || appleStatus == hmesync.StatusExpired:
+			status = "login_required"
+		case schedule.NextRunAt == nil:
+			status = "paused"
+		default:
+			status = "scheduled"
+		}
+	}
+	return &adminAPIAutoCreationDTO{
+		Enabled:          schedule.Enabled,
+		Status:           status,
+		PlannedAt:        plannedAt,
+		PlannedTimes:     plannedTimes,
+		NextRunAt:        adminAPIOptionalTime(schedule.NextRunAt),
+		LastAttemptedAt:  adminAPIOptionalTime(schedule.LastAttemptedAt),
+		LastCreatedAt:    adminAPIOptionalTime(schedule.LastCreatedAt),
+		LastAliasAddress: schedule.LastAliasAddress,
+		LastError:        schedule.LastError,
+		PendingKeyCount:  pendingCount,
+		PendingKeyTotal:  pendingCount,
+	}
 }
 
 func adminAPIAccountsFromDomain(accounts []domain.Account) []adminAPIAccountDTO {
@@ -726,11 +796,39 @@ func (s *Server) adminAPIAccountDetail(ctx context.Context, id int64) (adminAPIA
 	if err != nil {
 		return adminAPIAccountDetailDTO{}, err
 	}
+	autoCreation, err := s.adminAPIAutoCreation(ctx, id, appleSessionStatus(appleSession))
+	if err != nil {
+		return adminAPIAccountDetailDTO{}, err
+	}
 	return adminAPIAccountDetailDTO{
 		Account:      adminAPIAccountFromDomain(account),
 		Aliases:      aliasDTOs,
 		AppleSession: appleSession,
+		AutoCreation: autoCreation,
 	}, nil
+}
+
+func appleSessionStatus(session *adminAPIAppleSessionDTO) string {
+	if session == nil {
+		return ""
+	}
+	return session.Status
+}
+
+func (s *Server) adminAPIAutoCreation(ctx context.Context, accountID int64, appleStatus string) (*adminAPIAutoCreationDTO, error) {
+	schedule := domain.AliasCreationSchedule{AccountID: accountID}
+	if s.autoCreate != nil {
+		loaded, err := s.autoCreate.GetSchedule(ctx, accountID)
+		if err != nil {
+			return nil, err
+		}
+		schedule = loaded
+	}
+	pending, err := s.store.CountPendingAliasAPIKeysByAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	return adminAPIAutoCreationFromSchedule(schedule, pending, appleStatus), nil
 }
 
 func (s *Server) adminAPICreateAlias(c *gin.Context) {
@@ -795,6 +893,158 @@ func (s *Server) adminAPICreateAlias(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.Header("Location", fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID))
 	writeAdminAPIData(c, http.StatusCreated, adminAPIOneTimeKeyDTO{Alias: aliasDTO, APIKey: rawKey})
+}
+
+func (s *Server) adminAPISetAliasAutoCreation(c *gin.Context) {
+	accountID, ok := adminAPIParseID(c)
+	if !ok {
+		return
+	}
+	if s.autoCreate == nil {
+		writeAdminAPIError(c, http.StatusServiceUnavailable, "AUTO_CREATION_UNAVAILABLE", "自动创建服务暂不可用")
+		return
+	}
+	var input adminAPIAutoCreationRequest
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	if input.Enabled == nil {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "请明确指定是否开启自动创建")
+		return
+	}
+	var (
+		schedule    domain.AliasCreationSchedule
+		appleStatus string
+		pending     int
+	)
+	err := s.withAccountLock(c.Request.Context(), accountID, func() error {
+		account, err := s.store.GetAccount(c.Request.Context(), accountID)
+		if err != nil {
+			return err
+		}
+		if *input.Enabled {
+			if !account.Enabled {
+				return errAutoCreationAccountDisabled
+			}
+			if s.hmeSync == nil {
+				return errAutoCreationUnavailable
+			}
+			info, err := s.hmeSync.GetSession(c.Request.Context(), accountID)
+			if err != nil {
+				return err
+			}
+			appleStatus = info.Status
+			if info.Status != hmesync.StatusAuthenticated {
+				if info.Status == hmesync.StatusExpired {
+					return hmesync.ErrSessionExpired
+				}
+				return hmesync.ErrLoginRequired
+			}
+		}
+		var setErr error
+		schedule, setErr = s.autoCreate.SetEnabled(c.Request.Context(), accountID, *input.Enabled)
+		if setErr != nil {
+			return setErr
+		}
+		pending, setErr = s.store.CountPendingAliasAPIKeysByAccount(c.Request.Context(), accountID)
+		return setErr
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, errAutoCreationUnavailable):
+			writeAdminAPIError(c, http.StatusServiceUnavailable, "AUTO_CREATION_UNAVAILABLE", "自动创建服务暂不可用")
+		case errors.Is(err, errAutoCreationAccountDisabled):
+			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_DISABLED", "主号已停用，不能开启自动创建")
+		case errors.Is(err, store.ErrAccountDisabled):
+			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_DISABLED", "主号已停用，不能开启自动创建")
+		case errors.Is(err, store.ErrNotFound):
+			writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "主号不存在")
+		case errors.Is(err, hmesync.ErrLoginRequired), errors.Is(err, hmesync.ErrSessionExpired):
+			s.adminAPIFinishAppleFailure(c, mustSession(c), accountID, "alias_auto_create_enable", classifyAdminAPIAppleError(err))
+		default:
+			s.writeAdminAPIInternalError(c, err)
+		}
+		return
+	}
+	dto := adminAPIAutoCreationFromSchedule(schedule, pending, appleStatus)
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "alias_auto_create_set", "account", strconv.FormatInt(accountID, 10), "success", strconv.FormatBool(*input.Enabled))
+	writeAdminAPIData(c, http.StatusOK, dto)
+}
+
+func (s *Server) adminAPIGetAliasAutoCreationKeys(c *gin.Context) {
+	accountID, ok := adminAPIParseID(c)
+	if !ok || !s.adminAPIAppleAccountExists(c, accountID) {
+		return
+	}
+	pending, err := s.store.ListPendingAliasAPIKeysByAccount(c.Request.Context(), accountID)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	created := make([]adminAPIAppleCreatedAliasDTO, 0, len(pending))
+	for _, item := range pending {
+		rawKey, decryptErr := s.cipher.DecryptPendingAliasAPIKey(item.APIKeyCiphertext)
+		if decryptErr != nil {
+			s.writeAdminAPIInternalError(c, decryptErr)
+			return
+		}
+		aliasDTO, aliasErr := s.adminAPIAliasFromDomain(item.Alias)
+		if aliasErr != nil {
+			s.writeAdminAPIInternalError(c, aliasErr)
+			return
+		}
+		directLink := ""
+		if aliasDTO.DirectLinkPath != "" {
+			directLink = aliasDTO.DirectLinkPath
+		}
+		created = append(created, adminAPIAppleCreatedAliasDTO{
+			Alias:             aliasDTO,
+			APIKey:            rawKey,
+			MailAPIDirectLink: directLink,
+		})
+		rawKey = ""
+	}
+	c.Header("Cache-Control", "no-store")
+	c.Header("Pragma", "no-cache")
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "alias_auto_create_keys_read", "account", strconv.FormatInt(accountID, 10), "success", strconv.Itoa(len(created)))
+	writeAdminAPIData(c, http.StatusOK, gin.H{"created": created})
+}
+
+func (s *Server) adminAPIAcknowledgeAliasAutoCreationKeys(c *gin.Context) {
+	accountID, ok := adminAPIParseID(c)
+	if !ok || !s.adminAPIAppleAccountExists(c, accountID) {
+		return
+	}
+	var input adminAPIAutoCreationKeysRequest
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	if len(input.AliasIDs) == 0 || len(input.AliasIDs) > domain.MaxEnabledAliasesPerAccount {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "请提供要确认保存的隐私邮箱 ID")
+		return
+	}
+	seen := make(map[int64]struct{}, len(input.AliasIDs))
+	ids := make([]int64, 0, len(input.AliasIDs))
+	for _, id := range input.AliasIDs {
+		if id < 1 {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "隐私邮箱 ID 必须是正整数")
+			return
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if err := s.store.DeletePendingAliasAPIKeys(c.Request.Context(), accountID, ids); err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "alias_auto_create_keys_ack", "account", strconv.FormatInt(accountID, 10), "success", strconv.Itoa(len(ids)))
+	c.Status(http.StatusNoContent)
 }
 
 func (s *Server) adminAPIListAliases(c *gin.Context) {

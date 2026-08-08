@@ -87,6 +87,38 @@ func TestAppleSessionCipherUsesDedicatedContext(t *testing.T) {
 	}
 }
 
+func TestPendingAliasAPIKeyCipherUsesDedicatedContext(t *testing.T) {
+	box, err := NewCipher(bytes.Repeat([]byte{0x29}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawKey := "icm_background-created-secret"
+	encrypted, err := box.EncryptPendingAliasAPIKey(rawKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(encrypted, "ak1.") || strings.Contains(encrypted, rawKey) {
+		t.Fatalf("pending API key ciphertext has an invalid envelope: %q", encrypted)
+	}
+	got, err := box.DecryptPendingAliasAPIKey(encrypted)
+	if err != nil || got != rawKey {
+		t.Fatalf("decrypt pending API key = %q, %v", got, err)
+	}
+	if _, err := box.Decrypt(encrypted); err == nil {
+		t.Fatal("pending API key ciphertext was accepted as an IMAP credential")
+	}
+	if _, err := box.DecryptAppleSession(encrypted); err == nil {
+		t.Fatal("pending API key ciphertext was accepted as an Apple session")
+	}
+	sessionCiphertext, err := box.EncryptAppleSession(`{"session":"secret"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := box.DecryptPendingAliasAPIKey(sessionCiphertext); err == nil {
+		t.Fatal("Apple session ciphertext was accepted as a pending API key")
+	}
+}
+
 func TestAPIKeyUsesHighEntropyAndStableHash(t *testing.T) {
 	raw, hash, prefix, err := NewAPIKey()
 	if err != nil {

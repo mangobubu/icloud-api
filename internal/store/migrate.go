@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 // Migrate applies schema changes transactionally. Repeated calls are safe.
 func (s *Store) Migrate(ctx context.Context) error {
@@ -35,22 +35,28 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = schemaV4
-		migrationName = "schema v4"
+		statements = schemaV5
+		migrationName = "schema v5"
 	case 1:
 		statements = append([]string{}, migrateV1ToV2...)
 		statements = append(statements, migrateV2ToV3...)
 		statements = append(statements, migrateV3ToV4...)
-		migrationName = "migration v1 to v4"
+		statements = append(statements, migrateV4ToV5...)
+		migrationName = "migration v1 to v5"
 	case 2:
 		statements = append([]string{}, migrateV2ToV3...)
 		statements = append(statements, migrateV3ToV4...)
-		migrationName = "migration v2 to v4"
+		statements = append(statements, migrateV4ToV5...)
+		migrationName = "migration v2 to v5"
 	case 3:
-		statements = migrateV3ToV4
-		migrationName = "migration v3 to v4"
+		statements = append([]string{}, migrateV3ToV4...)
+		statements = append(statements, migrateV4ToV5...)
+		migrationName = "migration v3 to v5"
+	case 4:
+		statements = migrateV4ToV5
+		migrationName = "migration v4 to v5"
 	case schemaVersion:
-		migrationName = "schema v4 convergence"
+		migrationName = "schema v5 convergence"
 	}
 	for _, statement := range statements {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
@@ -63,7 +69,7 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 		}
 	}
 	if current != schemaVersion {
-		if _, err := s.txExecContext(ctx, tx, "PRAGMA user_version = 4"); err != nil {
+		if _, err := s.txExecContext(ctx, tx, "PRAGMA user_version = 5"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}
@@ -103,13 +109,17 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = postgresSchemaV4
-		migrationName = "postgres schema v4"
+		statements = postgresSchemaV5
+		migrationName = "postgres schema v5"
 	case 3:
-		statements = postgresMigrateV3ToV4
-		migrationName = "postgres migration v3 to v4"
+		statements = append([]string{}, postgresMigrateV3ToV4...)
+		statements = append(statements, postgresMigrateV4ToV5...)
+		migrationName = "postgres migration v3 to v5"
+	case 4:
+		statements = postgresMigrateV4ToV5
+		migrationName = "postgres migration v4 to v5"
 	case schemaVersion:
-		migrationName = "postgres schema convergence"
+		migrationName = "postgres schema v5 convergence"
 	default:
 		return fmt.Errorf("postgres schema version %d has no migration path to version %d", current, schemaVersion)
 	}
@@ -248,9 +258,34 @@ var migrateV3ToV4 = []string{
 
 var schemaV4 = append(append([]string{}, schemaV3...), migrateV3ToV4...)
 
+var migrateV4ToV5 = []string{
+	`CREATE TABLE alias_creation_schedules (
+		account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+		planned_at_json TEXT NOT NULL DEFAULT '[]',
+		next_run_at INTEGER,
+		last_attempted_at INTEGER,
+		last_created_at INTEGER,
+		last_alias_address TEXT NOT NULL DEFAULT '',
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX alias_creation_schedules_due_idx
+		ON alias_creation_schedules(enabled, next_run_at, account_id)`,
+	`CREATE TABLE pending_alias_api_keys (
+		alias_id INTEGER PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		api_key_ciphertext TEXT NOT NULL CHECK(length(trim(api_key_ciphertext)) > 0),
+		created_at INTEGER NOT NULL
+	)`,
+}
+
+var schemaV5 = append(append([]string{}, schemaV4...), migrateV4ToV5...)
+
 var sqliteSchemaConvergence = []string{
 	`CREATE INDEX IF NOT EXISTS aliases_account_address_idx ON aliases(account_id, address, id)`,
 	`CREATE INDEX IF NOT EXISTS aliases_enabled_account_address_idx ON aliases(account_id, enabled, address, id)`,
+	`CREATE INDEX IF NOT EXISTS alias_creation_schedules_due_idx ON alias_creation_schedules(enabled, next_run_at, account_id)`,
 }
 
 var migrateV1ToV2 = []string{
@@ -418,6 +453,30 @@ var postgresSchemaV4 = []string{
 	)`,
 }
 
+var postgresMigrateV4ToV5 = []string{
+	`CREATE TABLE alias_creation_schedules (
+		account_id BIGINT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		enabled BOOLEAN NOT NULL DEFAULT FALSE,
+		planned_at_json TEXT NOT NULL DEFAULT '[]',
+		next_run_at BIGINT,
+		last_attempted_at BIGINT,
+		last_created_at BIGINT,
+		last_alias_address TEXT NOT NULL DEFAULT '',
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at BIGINT NOT NULL,
+		updated_at BIGINT NOT NULL
+	)`,
+	`CREATE INDEX alias_creation_schedules_due_idx
+		ON alias_creation_schedules(enabled, next_run_at, account_id)`,
+	`CREATE TABLE pending_alias_api_keys (
+		alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		api_key_ciphertext TEXT NOT NULL CHECK(length(trim(api_key_ciphertext)) > 0),
+		created_at BIGINT NOT NULL
+	)`,
+}
+
+var postgresSchemaV5 = append(append([]string{}, postgresSchemaV4...), postgresMigrateV4ToV5...)
+
 var postgresMigrateV3ToV4 = []string{
 	`CREATE INDEX IF NOT EXISTS accounts_enabled_email_idx ON accounts(email, id) WHERE enabled`,
 	`CREATE INDEX IF NOT EXISTS aliases_account_address_idx ON aliases(account_id, address, id)`,
@@ -439,4 +498,5 @@ var postgresSchemaConvergence = []string{
 	`CREATE INDEX IF NOT EXISTS accounts_enabled_email_idx ON accounts(email, id) WHERE enabled`,
 	`CREATE INDEX IF NOT EXISTS aliases_account_address_idx ON aliases(account_id, address, id)`,
 	`CREATE INDEX IF NOT EXISTS aliases_enabled_account_address_idx ON aliases(account_id, address, id) WHERE enabled`,
+	`CREATE INDEX IF NOT EXISTS alias_creation_schedules_due_idx ON alias_creation_schedules(enabled, next_run_at, account_id)`,
 }

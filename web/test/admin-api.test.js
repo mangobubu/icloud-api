@@ -2,9 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  clearAliasAutoCreationKeys,
   deleteAppleSession,
+  getAliasAutoCreationKeys,
   getAccount,
+  getAliases,
   loginAppleSession,
+  normalizeAutoCreation,
+  setAliasAutoCreation,
   syncAccount,
   syncAccountAliases,
   verifyAppleSession,
@@ -46,6 +51,199 @@ test("account detail includes the normalized Apple session", async () => {
     authenticatedAt: "2026-08-07T08:00:00Z",
     expiresAt: null,
   });
+});
+
+test("account detail normalizes automatic alias creation state", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse({
+      account: { id: 12, email: "owner@icloud.com" },
+      aliases: [],
+      apple_session: null,
+      auto_creation: {
+        enabled: true,
+        status: "scheduled",
+        next_run_at: "2026-08-08T09:00:00Z",
+        planned_at: "2026-08-08T09:00:00Z",
+        last_attempted_at: "2026-08-08T08:00:00Z",
+        last_created_at: "2026-08-08T07:00:00Z",
+        last_alias_address: "new@icloud.com",
+        last_error: "",
+        pending_key_count: 5,
+      },
+    });
+
+  const detail = await getAccount(12);
+
+  assert.deepEqual(detail.autoCreation, {
+    enabled: true,
+    status: "scheduled",
+    nextRunAt: "2026-08-08T09:00:00Z",
+    plannedAt: "2026-08-08T09:00:00Z",
+    lastAttemptedAt: "2026-08-08T08:00:00Z",
+    lastCreatedAt: "2026-08-08T07:00:00Z",
+    lastAliasAddress: "new@icloud.com",
+    lastError: "",
+    pendingKeyCount: 5,
+  });
+
+  assert.deepEqual(
+    normalizeAutoCreation({
+      Enabled: true,
+      Status: "ready",
+      NextRunAt: "2026-08-08T10:00:00Z",
+      PlannedAt: "2026-08-08T10:00:00Z",
+      LastAttemptedAt: "2026-08-08T09:00:00Z",
+      LastCreatedAt: "2026-08-08T08:00:00Z",
+      LastAliasAddress: "pascal@icloud.com",
+      LastError: "temporary failure",
+      PendingKeyCount: -2,
+    }),
+    {
+      enabled: true,
+      status: "ready",
+      nextRunAt: "2026-08-08T10:00:00Z",
+      plannedAt: "2026-08-08T10:00:00Z",
+      lastAttemptedAt: "2026-08-08T09:00:00Z",
+      lastCreatedAt: "2026-08-08T08:00:00Z",
+      lastAliasAddress: "pascal@icloud.com",
+      lastError: "temporary failure",
+      pendingKeyCount: 0,
+    },
+  );
+});
+
+test("automatic alias creation toggle uses an encoded account URL and CSRF", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      auto_creation: {
+        enabled: true,
+        status: "scheduled",
+        pending_key_count: 0,
+      },
+    });
+  };
+
+  const result = await setAliasAutoCreation("account/12", true, "csrf-token");
+
+  assert.equal(
+    request.url,
+    "/admin/api/v1/accounts/account%2F12/aliases/auto-create",
+  );
+  assert.equal(request.options.method, "PUT");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.deepEqual(JSON.parse(request.options.body), { enabled: true });
+  assert.deepEqual(result, {
+    enabled: true,
+    status: "scheduled",
+    nextRunAt: null,
+    plannedAt: null,
+    lastAttemptedAt: null,
+    lastCreatedAt: null,
+    lastAliasAddress: "",
+    lastError: "",
+    pendingKeyCount: 0,
+  });
+});
+
+test("automatic alias creation key retrieval normalizes created entries", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      created: [
+        {
+          alias: {
+            id: 91,
+            account_id: 12,
+            account_email: "owner@icloud.com",
+            address: "queued@icloud.com",
+            api_key_prefix: "icm_queued",
+            direct_link_path: "/api/v1/mail/recent?api_key=derived",
+            enabled: true,
+          },
+          api_key: "icm_one-time-secret",
+          mail_api_direct_link: "/api/v1/mail/recent?api_key=derived",
+        },
+      ],
+    });
+  };
+
+  const result = await getAliasAutoCreationKeys("account/12");
+
+  assert.equal(
+    request.url,
+    "/admin/api/v1/accounts/account%2F12/aliases/auto-create/keys",
+  );
+  assert.equal(request.options.method, "GET");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), null);
+  assert.deepEqual(result.created[0], {
+    alias: {
+      id: 91,
+      accountId: 12,
+      accountEmail: "owner@icloud.com",
+      address: "queued@icloud.com",
+      label: "",
+      apiKeyPrefix: "icm_queued",
+      directLinkPath: "/api/v1/mail/recent?api_key=derived",
+      enabled: true,
+      lastSyncStatus: "pending",
+      lastSyncError: "",
+      lastSyncedAt: null,
+      lastAccessedAt: null,
+      latestReceivedAt: null,
+    },
+    apiKey: "icm_one-time-secret",
+    mailApiDirectLink: "/api/v1/mail/recent?api_key=derived",
+  });
+});
+
+test("automatic alias creation key acknowledgement sends DELETE with IDs and CSRF", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return new Response(null, { status: 204 });
+  };
+
+  const result = await clearAliasAutoCreationKeys(
+    "account/12",
+    [91, 92],
+    "csrf-token",
+  );
+
+  assert.equal(result, null);
+  assert.equal(
+    request.url,
+    "/admin/api/v1/accounts/account%2F12/aliases/auto-create/keys",
+  );
+  assert.equal(request.options.method, "DELETE");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.deepEqual(JSON.parse(request.options.body), { alias_ids: [91, 92] });
+});
+
+test("alias directory forwards the optional primary-account filter", async () => {
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return jsonResponse([
+      {
+        id: 8,
+        account_id: 12,
+        account_email: "owner@icloud.com",
+        address: "private@icloud.com",
+        enabled: true,
+      },
+    ]);
+  };
+
+  const filtered = await getAliases(12);
+  const all = await getAliases();
+
+  assert.equal(requests[0].url, "/admin/api/v1/aliases?account_id=12");
+  assert.equal(requests[1].url, "/admin/api/v1/aliases");
+  assert.equal(filtered[0].accountId, 12);
+  assert.equal(all[0].address, "private@icloud.com");
 });
 
 test("pending mail sync accepts HTTP 202 and exposes continuation state", async () => {

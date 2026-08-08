@@ -232,6 +232,13 @@ func (m *Manager) WithAccountLock(ctx context.Context, accountID int64, operatio
 	return operation()
 }
 
+// AcquireAccountLock exposes the keyed account boundary to operations that
+// must keep configuration changes from racing an irreversible remote request.
+// Callers must invoke the returned release function exactly once.
+func (m *Manager) AcquireAccountLock(ctx context.Context, accountID int64) (func(), error) {
+	return m.acquireAccount(ctx, accountID)
+}
+
 type failureRecorder struct {
 	manager   *Manager
 	parent    context.Context
