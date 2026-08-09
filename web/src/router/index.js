@@ -65,6 +65,15 @@ const routes = [
         meta: { title: "操作记录", subtitle: "追踪后台登录与配置变更" },
       },
       {
+        path: "logs",
+        name: "logs",
+        component: () => import("../views/LogsView.vue"),
+        meta: {
+          title: "全部日志",
+          subtitle: "查看服务运行、同步与后台请求日志",
+        },
+      },
+      {
         path: "security",
         name: "security",
         component: () => import("../views/SecurityView.vue"),

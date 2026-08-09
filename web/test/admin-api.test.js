@@ -3,10 +3,13 @@ import test from "node:test";
 
 import {
   clearAliasAutoCreationKeys,
+  deleteAlias,
   deleteAppleSession,
   getAliasAutoCreationKeys,
   getAccount,
+  getAccounts,
   getAliases,
+  getRuntimeLogs,
   loginAppleSession,
   normalizeAutoCreation,
   setAliasAutoCreation,
@@ -21,6 +24,127 @@ function jsonResponse(data, status = 200) {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+test("account list normalizes sync progress and detailed error logs", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse([
+      {
+        id: 12,
+        email: "owner@icloud.com",
+        last_sync_error: "同步失败",
+        last_sync_error_log: "fetch IMAP mailbox increment: connection closed",
+        sync_progress: {
+          active: true,
+          source: "automatic",
+          stage: "fetching",
+          percentage: 0,
+          started_at: "2026-08-09T08:00:00Z",
+          updated_at: "2026-08-09T08:00:01Z",
+        },
+      },
+      { id: 13, email: "missing@icloud.com" },
+      { id: 14, email: "idle@icloud.com", sync_progress: null },
+    ]);
+
+  const accounts = await getAccounts();
+
+  assert.deepEqual(accounts[0].syncProgress, {
+    active: true,
+    source: "automatic",
+    stage: "fetching",
+    percentage: 0,
+    startedAt: "2026-08-09T08:00:00Z",
+    updatedAt: "2026-08-09T08:00:01Z",
+  });
+  assert.equal(
+    accounts[0].lastSyncErrorLog,
+    "fetch IMAP mailbox increment: connection closed",
+  );
+  assert.equal(accounts[1].syncProgress, null);
+  assert.equal(accounts[1].lastSyncErrorLog, "");
+  assert.equal(accounts[2].syncProgress, null);
+});
+
+test("account detail accepts camelCase progress and falls back to the sync error", async () => {
+  globalThis.fetch = async () =>
+    jsonResponse({
+      account: {
+        id: 12,
+        email: "owner@icloud.com",
+        lastSyncError: "连接被远端关闭",
+        syncProgress: {
+          active: true,
+          source: "manual",
+          stage: "saving",
+          percentage: 125,
+          startedAt: "2026-08-09T08:00:00Z",
+          updatedAt: "2026-08-09T08:00:02Z",
+        },
+      },
+      aliases: [],
+    });
+
+  const detail = await getAccount(12);
+
+  assert.deepEqual(detail.account.syncProgress, {
+    active: true,
+    source: "manual",
+    stage: "saving",
+    percentage: 100,
+    startedAt: "2026-08-09T08:00:00Z",
+    updatedAt: "2026-08-09T08:00:02Z",
+  });
+  assert.equal(detail.account.lastSyncErrorLog, "连接被远端关闭");
+});
+
+test("mail sync accepts PascalCase progress and normalizes percentage bounds", async () => {
+  const progressCases = [
+    {
+      Percentage: -20,
+      expectedPercentage: 0,
+    },
+    {
+      Percentage: "unknown",
+      expectedPercentage: null,
+    },
+  ];
+  const responseQueue = [...progressCases];
+  globalThis.fetch = async () => {
+    const { expectedPercentage: _expectedPercentage, ...progress } =
+      responseQueue.shift();
+    return jsonResponse(
+      {
+        account: {
+          ID: 12,
+          Email: "owner@icloud.com",
+          LastSyncError: "同步失败",
+          LastSyncErrorLog: "完整错误日志",
+          SyncProgress: {
+            Active: true,
+            Source: "manual",
+            Stage: "connecting",
+            StartedAt: "2026-08-09T08:00:00Z",
+            UpdatedAt: "2026-08-09T08:00:03Z",
+            ...progress,
+          },
+        },
+        aliases: [],
+        SyncPending: true,
+      },
+      202,
+    );
+  };
+
+  for (const progressCase of progressCases) {
+    const detail = await syncAccount(12, "csrf-token");
+    assert.equal(
+      detail.account.syncProgress.percentage,
+      progressCase.expectedPercentage,
+    );
+    assert.equal(detail.account.lastSyncErrorLog, "完整错误日志");
+    assert.equal(detail.syncPending, true);
+  }
+});
 
 test("account detail includes the normalized Apple session", async () => {
   globalThis.fetch = async () =>
@@ -190,6 +314,7 @@ test("automatic alias creation key retrieval normalizes created entries", async 
       enabled: true,
       lastSyncStatus: "pending",
       lastSyncError: "",
+      lastSyncErrorLog: "",
       lastSyncedAt: null,
       lastAccessedAt: null,
       latestReceivedAt: null,
@@ -222,6 +347,22 @@ test("automatic alias creation key acknowledgement sends DELETE with IDs and CSR
   assert.deepEqual(JSON.parse(request.options.body), { alias_ids: [91, 92] });
 });
 
+test("alias deletion sends an authenticated DELETE without a request body", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return new Response(null, { status: 204 });
+  };
+
+  const result = await deleteAlias("alias/91", "csrf-token");
+
+  assert.equal(result, null);
+  assert.equal(request.url, "/admin/api/v1/aliases/alias%2F91");
+  assert.equal(request.options.method, "DELETE");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.equal(request.options.body, undefined);
+});
+
 test("alias directory forwards the optional primary-account filter", async () => {
   const requests = [];
   globalThis.fetch = async (url, options) => {
@@ -233,6 +374,16 @@ test("alias directory forwards the optional primary-account filter", async () =>
         account_email: "owner@icloud.com",
         address: "private@icloud.com",
         enabled: true,
+        last_sync_error: "连接失败",
+        last_sync_error_log: "fetch IMAP mailbox increment: connection closed",
+      },
+      {
+        id: 9,
+        account_id: 12,
+        account_email: "owner@icloud.com",
+        address: "fallback@icloud.com",
+        enabled: true,
+        last_sync_error: "仅有错误摘要",
       },
     ]);
   };
@@ -243,6 +394,11 @@ test("alias directory forwards the optional primary-account filter", async () =>
   assert.equal(requests[0].url, "/admin/api/v1/aliases?account_id=12");
   assert.equal(requests[1].url, "/admin/api/v1/aliases");
   assert.equal(filtered[0].accountId, 12);
+  assert.equal(
+    filtered[0].lastSyncErrorLog,
+    "fetch IMAP mailbox increment: connection closed",
+  );
+  assert.equal(filtered[1].lastSyncErrorLog, "仅有错误摘要");
   assert.equal(all[0].address, "private@icloud.com");
 });
 
@@ -423,6 +579,7 @@ test("alias directory sync normalizes its summary and one-time keys", async () =
       enabled: true,
       lastSyncStatus: "pending",
       lastSyncError: "",
+      lastSyncErrorLog: "",
       lastSyncedAt: null,
       lastAccessedAt: null,
       latestReceivedAt: null,
@@ -430,4 +587,52 @@ test("alias directory sync normalizes its summary and one-time keys", async () =
     apiKey: "icm_one-time-secret",
     mailApiDirectLink: "/api/v1/mail/recent/?api_key=derived",
   });
+});
+
+test("runtime logs use filter and cursor parameters and normalize the response", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      items: [
+        {
+          id: 81,
+          created_at: "2026-08-09T08:00:00Z",
+          level: "ERROR",
+          message: "主号同步失败",
+          source: "syncer.manager",
+          account_id: 12,
+          request_id: "req-log-1",
+          attributes: { error: "connection closed" },
+        },
+      ],
+      has_more: true,
+      next_before_id: 81,
+    });
+  };
+
+  const result = await getRuntimeLogs({
+    level: "error",
+    query: "同步失败",
+    accountId: 12,
+    limit: 50,
+    beforeId: 90,
+  });
+  const url = new URL(request.url, "https://admin.invalid");
+
+  assert.equal(url.pathname, "/admin/api/v1/logs");
+  assert.deepEqual(Object.fromEntries(url.searchParams), {
+    level: "error",
+    query: "同步失败",
+    account_id: "12",
+    limit: "50",
+    before_id: "90",
+  });
+  assert.equal(request.options.method, "GET");
+  assert.equal(result.items[0].time, "2026-08-09T08:00:00Z");
+  assert.equal(result.items[0].level, "error");
+  assert.equal(result.items[0].accountId, 12);
+  assert.equal(result.items[0].requestId, "req-log-1");
+  assert.equal(result.hasMore, true);
+  assert.equal(result.nextBeforeId, 81);
 });

@@ -44,7 +44,7 @@
               <td data-label="操作" class="actions"><div class="button-row">
                 <form method="post" action="/admin/aliases/{{.ID}}/rotate"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small" type="submit" data-confirm="轮换后旧 Key 会立即失效。继续吗？">轮换 Key</button></form>
                 <form method="post" action="/admin/aliases/{{.ID}}/toggle"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>
-                <form method="post" action="/admin/aliases/{{.ID}}/delete"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small button-danger" type="submit" data-confirm="删除后该地址的 API Key 和最新邮件都会清除。继续吗？">删除</button></form>
+                <form method="post" action="/admin/aliases/{{.ID}}/delete"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small button-danger" type="submit" data-confirm="删除后，该隐私邮箱将从 iCloud 永久删除，同时清除本地 API Key、邮件快照及关联记录，且无法恢复。继续吗？">永久删除</button></form>
               </div></td>
               {{end}}
             </tr>{{end}}</tbody>

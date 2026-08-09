@@ -345,18 +345,33 @@ func (s *Server) deleteAlias(c *gin.Context) {
 		s.renderNotFoundOrError(c, err)
 		return
 	}
-	if err := s.withAccountLock(c.Request.Context(), alias.AccountID, func() error {
-		return s.store.DeleteAlias(c.Request.Context(), id)
-	}); err != nil {
+	if adminAPIAliasConfirmationPending(alias) {
+		s.renderAliasConfirmationPending(c, alias.AccountID)
+		return
+	}
+	adminSession := mustSession(c)
+	if s.hmeSync == nil {
+		apiErr := adminAPIAppleAliasDeleteFailure(adminAPIAppleServiceUnavailable())
+		s.auditAppleAliasDeleteFailure(c, adminSession, id, apiErr)
+		s.renderAccountPage(c, alias.AccountID, apiErr.Status, apiErr.Message, "error", "")
+		return
+	}
+	if err := s.hmeSync.DeleteAlias(c.Request.Context(), id); err != nil {
 		if errors.Is(err, store.ErrAliasConfirmationPending) {
 			s.renderAliasConfirmationPending(c, alias.AccountID)
 			return
 		}
-		s.renderPageError(c, err)
+		apiErr := classifyAdminAPIAppleError(err)
+		if errors.Is(err, store.ErrNotFound) && apiErr.Status == http.StatusNotFound {
+			s.renderNotFoundOrError(c, err)
+			return
+		}
+		apiErr = adminAPIAppleAliasDeleteFailure(apiErr)
+		s.auditAppleAliasDeleteFailure(c, adminSession, id, apiErr)
+		s.renderAccountPage(c, alias.AccountID, apiErr.Status, apiErr.Message, "error", "")
 		return
 	}
-	session := mustSession(c)
-	s.audit(c, &session.AdminID, session.Username, "delete", "alias", strconv.FormatInt(id, 10), "success", "")
+	s.audit(c, &adminSession.AdminID, adminSession.Username, "delete", "alias", strconv.FormatInt(id, 10), "success", "")
 	c.Redirect(http.StatusSeeOther, fmt.Sprintf("/admin/accounts/%d?notice=alias_deleted", alias.AccountID))
 }
 

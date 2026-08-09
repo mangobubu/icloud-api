@@ -30,7 +30,9 @@ tags:
   - name: Admin Accounts
     description: 管理端主号与 IMAP 邮件同步
   - name: Admin Apple
-    description: 管理端 Apple 受信任会话与完整隐私邮箱目录同步
+    description: 管理端 Apple 受信任会话、完整隐私邮箱目录同步与远端永久删除
+  - name: Admin Logs
+    description: 管理端当前进程应用日志
   - name: Health
     description: 服务健康检查
 
@@ -518,10 +520,18 @@ paths:
                     enabled: true
                     last_sync_status: pending
                     last_sync_error: ""
+                    last_sync_error_log: ""
                     last_synced_at: "2026-08-08T12:30:00Z"
                     created_at: "2026-08-07T12:00:00Z"
                     updated_at: "2026-08-08T12:30:00Z"
                     alias_count: 1
+                    sync_progress:
+                      active: true
+                      source: manual
+                      stage: queued
+                      percentage: 0
+                      started_at: "2026-08-08T12:31:00Z"
+                      updated_at: "2026-08-08T12:31:00Z"
                   aliases:
                     - id: 44
                       account_id: 12
@@ -533,6 +543,7 @@ paths:
                       enabled: true
                       last_sync_status: pending
                       last_sync_error: ""
+                      last_sync_error_log: ""
                       last_synced_at: "2026-08-08T12:30:00Z"
                       last_accessed_at: null
                       latest_received_at: "2026-08-08T12:29:00Z"
@@ -977,6 +988,156 @@ paths:
         "504":
           $ref: "#/components/responses/AdminAppleTimeout"
 
+  /admin/api/v1/aliases/{id}:
+    delete:
+      tags:
+        - Admin Apple
+      operationId: deleteAdminAppleAlias
+      summary: 从 Apple 和本地永久删除隐私邮箱
+      description: |
+        使用所属主号已保存的受信任 Apple Web 会话读取完整 Hide My Email 目录，并按本地地址
+        定位远端条目。远端条目仍启用时，服务先调用 Apple `/v1/hme/deactivate` 停止转发，
+        再调用 `/v1/hme/delete` 永久删除；已经停用的条目直接永久删除。
+
+        Apple 完整目录中已经没有该地址时按幂等成功处理。远端变更返回错误或结果不明确时，
+        服务只通过 `/v2/hme/list` 重新读取权威目录进行对账；确认地址已经不存在后，才删除本地
+        隐私邮箱及其 API Key、邮件快照和关联记录。任何错误响应都会保留本地隐私邮箱记录，
+        调用方可使用同一 ID 安全重试。若远端删除已经完成，但 Apple 会话状态保存或本地清理失败，
+        本接口返回 500；重试时会通过“远端目录已缺失”的幂等分支完成本地清理。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAliasID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      responses:
+        "204":
+          description: Apple 端永久删除已经确认或远端本就不存在；本地隐私邮箱及关联记录已清除
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+        "400":
+          description: id 不是正整数
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+              example:
+                error:
+                  code: VALIDATION_FAILED
+                  message: id 参数无效
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAliasNotFound"
+        "409":
+          $ref: "#/components/responses/AdminAliasDeleteConflict"
+        "429":
+          $ref: "#/components/responses/AdminAppleRateLimited"
+        "500":
+          $ref: "#/components/responses/AdminAliasDeleteInternalError"
+        "502":
+          $ref: "#/components/responses/AdminAppleBadGateway"
+        "503":
+          $ref: "#/components/responses/AdminAppleUnavailable"
+        "504":
+          $ref: "#/components/responses/AdminAppleTimeout"
+
+  /admin/api/v1/logs:
+    get:
+      tags:
+        - Admin Logs
+      operationId: listAdminApplicationLogs
+      summary: 查询当前进程应用日志
+      description: |
+        返回当前应用进程内存中保留的最近最多 2000 条日志，按 `id` 从新到旧排列。
+        可按级别、关键词和主号筛选，并使用排他的 `before_id` 游标向更早的记录翻页。
+        日志不会跨进程重启保留；敏感字段会在进入日志缓冲区前脱敏。
+      security:
+        - adminSession: []
+      parameters:
+        - name: level
+          in: query
+          required: false
+          description: 日志级别；省略时返回全部级别。
+          schema:
+            type: string
+            enum:
+              - debug
+              - info
+              - warn
+              - error
+        - name: query
+          in: query
+          required: false
+          description: 用于匹配日志内容的关键词；前后空白会被忽略。
+          schema:
+            type: string
+            maxLength: 200
+        - name: account_id
+          in: query
+          required: false
+          description: 只返回带有指定主号 ID 的日志。
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: limit
+          in: query
+          required: false
+          description: 本页最多返回的日志数。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 100
+        - name: before_id
+          in: query
+          required: false
+          description: 排他游标，只返回 ID 小于该值的日志。
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: 当前筛选条件下的一页应用日志
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminApplicationLogListResponse"
+        "400":
+          description: level、query、account_id、limit 或 before_id 参数无效
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+              example:
+                error:
+                  code: VALIDATION_FAILED
+                  message: level 参数无效
+                  request_id: 6oe7j0x3x3pJv9Dv
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+
   /healthz:
     get:
       tags:
@@ -1075,6 +1236,15 @@ components:
         type: integer
         format: int64
         minimum: 1
+    AdminAliasID:
+      name: id
+      in: path
+      required: true
+      description: 本地隐私邮箱 ID。
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
     AdminCSRFToken:
       name: X-CSRF-Token
       in: header
@@ -1104,6 +1274,94 @@ components:
       example: no-store, private
 
   responses:
+    AdminAliasNotFound:
+      description: 指定的本地隐私邮箱不存在
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          example:
+            error:
+              code: NOT_FOUND
+              message: 隐私邮箱不存在
+              request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminAliasDeleteConflict:
+      description: |
+        尚未连接 Apple 账户、Apple 会话已过期、Apple 账户需要先完成条款或其他操作、
+        Apple 登录账户或转发邮箱与主号不匹配、操作期间主号身份发生变化，或该隐私邮箱
+        仍在等待 Apple 目录确认。远端和本地删除均未确认完成，本地记录保留。
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          examples:
+            appleLoginRequired:
+              value:
+                error:
+                  code: APPLE_LOGIN_REQUIRED
+                  message: 请先连接 Apple 账户
+                  request_id: 6oe7j0x3x3pJv9Dv
+            appleSessionExpired:
+              value:
+                error:
+                  code: APPLE_SESSION_EXPIRED
+                  message: Apple 会话已过期，请重新登录
+                  request_id: 6oe7j0x3x3pJv9Dv
+            appleAccountActionRequired:
+              value:
+                error:
+                  code: APPLE_ACCOUNT_ACTION_REQUIRED
+                  message: Apple 账户需要完成条款确认或其他账户操作，请前往 Apple 官网处理后重试
+                  request_id: 6oe7j0x3x3pJv9Dv
+            appleAccountMismatch:
+              value:
+                error:
+                  code: APPLE_ACCOUNT_MISMATCH
+                  message: Apple 登录账户或转发邮箱与该主号不匹配
+                  request_id: 6oe7j0x3x3pJv9Dv
+            accountChanged:
+              value:
+                error:
+                  code: ACCOUNT_CHANGED
+                  message: 主号信息已发生变化，请重新操作
+                  request_id: 6oe7j0x3x3pJv9Dv
+            aliasConfirmationPending:
+              value:
+                error:
+                  code: ALIAS_CONFIRMATION_PENDING
+                  message: 该隐私邮箱正在等待 Apple 目录确认，暂时不能修改或删除
+                  request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminAliasDeleteInternalError:
+      description: |
+        Apple 会话状态保存或本地清理失败，本地隐私邮箱记录保留。Apple 端永久删除可能已经完成；
+        使用同一隐私邮箱 ID 重试是安全的，服务会重新读取 Apple 完整目录并完成剩余的本地清理。
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          example:
+            error:
+              code: INTERNAL_ERROR
+              message: 请求处理失败，请稍后重试
+              request_id: 6oe7j0x3x3pJv9Dv
+
     AdminAppleBadRequest:
       description: JSON 格式错误、含有未知字段，或 Apple 登录/验证码字段校验失败
       headers:
@@ -1389,7 +1647,7 @@ components:
               request_id: 6oe7j0x3x3pJv9Dv
 
     AdminAppleUnavailable:
-      description: Apple 目录同步服务尚未就绪
+      description: Apple 隐私邮箱服务尚未初始化；本次操作未完成，本地记录保持不变
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestID"
@@ -1401,7 +1659,7 @@ components:
             $ref: "#/components/schemas/AdminAppleErrorResponse"
           example:
             error:
-              code: APPLE_UPSTREAM_ERROR
+              code: INTERNAL_ERROR
               message: Apple 同步服务暂时不可用，请稍后再试
               request_id: 6oe7j0x3x3pJv9Dv
 
@@ -1883,6 +2141,77 @@ components:
               items:
                 $ref: "#/components/schemas/AdminAppleCreatedAlias"
 
+    AdminApplicationLogListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminApplicationLogPage"
+
+    AdminApplicationLogPage:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+        - has_more
+        - next_before_id
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminApplicationLog"
+        has_more:
+          type: boolean
+          description: 是否还有符合当前筛选条件的更早日志。
+        next_before_id:
+          type: integer
+          minimum: 0
+          description: 下一页请求使用的 before_id；没有下一页时为 0。
+
+    AdminApplicationLog:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - created_at
+        - level
+        - message
+        - source
+        - attributes
+      properties:
+        id:
+          type: integer
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        level:
+          type: string
+          enum:
+            - debug
+            - info
+            - warn
+            - error
+        message:
+          type: string
+        source:
+          type: string
+        attributes:
+          type: object
+          description: 已脱敏的结构化日志属性。
+          additionalProperties:
+            type: string
+        account_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: 日志可归属到主号时返回。
+        request_id:
+          type: string
+          description: 日志可关联到 HTTP 请求时返回。
+
     AdminAccount:
       type: object
       additionalProperties: false
@@ -1896,6 +2225,7 @@ components:
         - enabled
         - last_sync_status
         - last_sync_error
+        - last_sync_error_log
         - last_synced_at
         - created_at
         - updated_at
@@ -1924,6 +2254,10 @@ components:
           type: string
         last_sync_error:
           type: string
+          description: 最近同步错误的简短摘要；最近一次同步没有错误时为空字符串。
+        last_sync_error_log:
+          type: string
+          description: 最近同步错误的完整日志；最近一次同步没有错误时为空字符串。
         last_synced_at:
           type:
             - string
@@ -1938,6 +2272,51 @@ components:
         alias_count:
           type: integer
           minimum: 0
+        sync_progress:
+          $ref: "#/components/schemas/AdminSyncProgress"
+
+    AdminSyncProgress:
+      type: object
+      additionalProperties: false
+      required:
+        - active
+        - source
+        - stage
+        - percentage
+        - started_at
+        - updated_at
+      properties:
+        active:
+          type: boolean
+          const: true
+          description: 该对象出现时恒为 true；同步结束后整个 sync_progress 字段省略。
+        source:
+          type: string
+          enum:
+            - manual
+            - automatic
+          description: 本次同步由管理员手动发起，或由定时任务自动发起。
+        stage:
+          type: string
+          enum:
+            - queued
+            - waiting
+            - connecting
+            - authenticating
+            - scanning
+            - reading
+            - validating
+            - saving
+        percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+        started_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
 
     AdminAlias:
       type: object
@@ -1953,6 +2332,7 @@ components:
         - enabled
         - last_sync_status
         - last_sync_error
+        - last_sync_error_log
         - last_synced_at
         - last_accessed_at
         - latest_received_at
@@ -1989,6 +2369,10 @@ components:
           type: string
         last_sync_error:
           type: string
+          description: 最近同步错误的简短摘要；最近一次同步没有错误时为空字符串。
+        last_sync_error_log:
+          type: string
+          description: 最近同步错误的完整日志；最近一次同步没有错误时为空字符串。
         last_synced_at:
           type:
             - string
@@ -2141,6 +2525,7 @@ components:
             - APPLE_CREDENTIALS_INVALID
             - APPLE_VERIFICATION_INVALID
             - APPLE_FLOW_EXPIRED
+            - APPLE_ACCOUNT_ACTION_REQUIRED
             - APPLE_RATE_LIMITED
             - APPLE_UPSTREAM_ERROR
             - AUTO_CREATION_UNAVAILABLE
@@ -2148,6 +2533,7 @@ components:
             - APPLE_ACCOUNT_MISMATCH
             - ACCOUNT_CHANGED
             - ALIAS_OWNERSHIP_CONFLICT
+            - ALIAS_CONFIRMATION_PENDING
             - SYNC_FAILED
             - INTERNAL_ERROR
           description: |

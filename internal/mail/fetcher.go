@@ -171,6 +171,7 @@ func (f *Fetcher) fetchIncrementalAttempt(
 	if err != nil {
 		return failure, err
 	}
+	domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseConnecting, 5)
 	session, err := settings.dial(ctx, address, host, settings.timeout)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -195,12 +196,14 @@ func (f *Fetcher) fetchIncrementalAttempt(
 		_ = session.Terminate()
 	}()
 
+	domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseAuthenticating, 10)
 	if err := session.Login(username, password); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return failure, ctxErr
 		}
 		return failure, fmt.Errorf("login IMAP account: %w", err)
 	}
+	domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseScanning, 15)
 	mailbox, err := session.Select("INBOX", true)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -240,13 +243,15 @@ func (f *Fetcher) fetchIncrementalAttempt(
 			LastUID:     upperUID,
 			UpdatedAt:   syncedAt,
 		},
-		Reset: reset,
+		Reset:     reset,
+		TargetUID: upperUID,
 	}
 	if !reset {
 		result.State.LastUID = previous.LastUID
 	}
 	preserveExistingSnapshots := !reset || previous == nil || previous.UIDValidity == uidValidity
 	publish := func() (domain.MailboxSyncResult, error) {
+		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseValidating, 25)
 		if err := validatePublishUIDs(
 			ctx,
 			session,
@@ -265,6 +270,7 @@ func (f *Fetcher) fetchIncrementalAttempt(
 	aliasIDs := flattenedAliasIDs(aliasAddresses)
 	if len(aliasIDs) == 0 {
 		result.State.LastUID = upperUID
+		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseReading, 20)
 		return publish()
 	}
 
@@ -329,6 +335,7 @@ func (f *Fetcher) fetchIncrementalAttempt(
 		}
 		return failure, fmt.Errorf("discover candidate message UIDs: %w", err)
 	}
+	domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseReading, 20)
 	for _, uid := range candidateUIDs {
 		if uid == 0 || uid > upperUID {
 			return failure, fmt.Errorf("discover candidate message UIDs: UID %d is outside mailbox upper UID %d", uid, upperUID)

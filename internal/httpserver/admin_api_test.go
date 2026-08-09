@@ -188,6 +188,50 @@ func TestAdminAPIAliasDTOWithholdsPendingConfirmationDirectLink(t *testing.T) {
 	}
 }
 
+func TestAdminAPIAccountDTOIncludesLiveSyncProgress(t *testing.T) {
+	startedAt := time.Date(2026, 8, 9, 10, 11, 12, 0, time.UTC)
+	updatedAt := startedAt.Add(3 * time.Second)
+	server := &Server{}
+	server.SetSyncProgressProvider(func(accountID int64) (domain.MailboxSyncProgress, bool) {
+		if accountID != 17 {
+			return domain.MailboxSyncProgress{}, false
+		}
+		return domain.MailboxSyncProgress{
+			AccountID: accountID,
+			Trigger:   domain.MailboxSyncTriggerAutomatic,
+			Phase:     domain.MailboxSyncPhaseReading,
+			Percent:   64,
+			StartedAt: startedAt,
+			UpdatedAt: updatedAt,
+		}, true
+	})
+
+	dto := server.adminAPIAccountFromDomain(domain.Account{ID: 17})
+	if dto.SyncProgress == nil {
+		t.Fatal("active account sync progress was omitted")
+	}
+	if !dto.SyncProgress.Active || dto.SyncProgress.Source != "automatic" ||
+		dto.SyncProgress.Stage != "reading" || dto.SyncProgress.Percentage != 64 ||
+		dto.SyncProgress.StartedAt != startedAt.Format(time.RFC3339) ||
+		dto.SyncProgress.UpdatedAt != updatedAt.Format(time.RFC3339) {
+		t.Fatalf("sync progress DTO = %#v", dto.SyncProgress)
+	}
+	if inactive := server.adminAPIAccountFromDomain(domain.Account{ID: 18}); inactive.SyncProgress != nil {
+		t.Fatalf("inactive account progress = %#v, want nil", inactive.SyncProgress)
+	}
+}
+
+func TestAdminAPISyncErrorKeepsSummaryAndFullLog(t *testing.T) {
+	fullLog := strings.Repeat("详细错误", 100)
+	dto := adminAPIAccountFromDomain(domain.Account{LastSyncError: fullLog})
+	if got := len([]rune(dto.LastSyncError)); got != 240 {
+		t.Fatalf("sync error summary rune count = %d, want 240", got)
+	}
+	if dto.LastSyncErrorLog != fullLog {
+		t.Fatalf("full sync error log length = %d, want %d", len([]rune(dto.LastSyncErrorLog)), len([]rune(fullLog)))
+	}
+}
+
 func TestAdminAPISyncAccountReturnsAcceptedForPendingBatch(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	sessionCookie, csrf, _ := env.createSession(t, "sync-pending-admin", "sync pending password")
@@ -428,6 +472,11 @@ func TestAdminAPIAuthFlowUsesJSONWithoutRedirects(t *testing.T) {
 
 func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T) {
 	env := newAdminAPITestEnv(t)
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		deleteAlias: func(ctx context.Context, aliasID int64) error {
+			return env.store.DeleteAlias(ctx, aliasID)
+		},
+	})
 	sessionCookie, csrf, _ := env.createSession(t, "resource-admin", "unused-resource-password")
 	const appPassword = "api-test-imap-app-password"
 	createAccount := env.request(t, http.MethodPost, "/admin/api/v1/accounts", adminAPITestJSON(t, gin.H{
@@ -555,6 +604,12 @@ func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T
 
 func TestAdminAPIPendingAliasMutationsReturnConflict(t *testing.T) {
 	env := newAdminAPITestEnv(t)
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		deleteAlias: func(context.Context, int64) error {
+			t.Fatal("pending alias reached Apple deletion")
+			return nil
+		},
+	})
 	sessionCookie, csrf, _ := env.createSession(t, "pending-alias-admin", "unused-password")
 	account := adminAPITestCreateAccount(t, env, "pending-alias@icloud.com")
 	pending, _, err := env.store.CreateAliasWithPendingAPIKey(

@@ -387,6 +387,59 @@ func (c *Client) ListAliases(ctx context.Context, session Session) (list ListRes
 	return list, result, nil
 }
 
+// DeactivateAlias stops delivery to one Hide My Email address. Apple requires
+// the opaque anonymous ID returned by ListAliases rather than the address.
+func (c *Client) DeactivateAlias(ctx context.Context, session Session, anonymousID string) (Session, error) {
+	return c.mutateAlias(ctx, session, anonymousID, "/v1/hme/deactivate", "deactivate Hide My Email alias")
+}
+
+// DeleteAlias permanently removes one deactivated Hide My Email address.
+// Callers are responsible for deactivating active aliases first.
+func (c *Client) DeleteAlias(ctx context.Context, session Session, anonymousID string) (Session, error) {
+	return c.mutateAlias(ctx, session, anonymousID, "/v1/hme/delete", "delete Hide My Email alias")
+}
+
+func (c *Client) mutateAlias(
+	ctx context.Context,
+	session Session,
+	anonymousID string,
+	endpoint string,
+	operation string,
+) (result Session, err error) {
+	result = session
+	if !validHMEAnonymousID(anonymousID) {
+		return result, operationError(operation, ErrInvalidConfig, 0,
+			errors.New("invalid Hide My Email anonymous ID"))
+	}
+	op, err := c.newOperation(&result)
+	if err != nil {
+		return result, err
+	}
+	defer op.persist(&result)
+	if result.PremiumMailSettingsURL == "" || result.DSID == "" {
+		return result, operationError(operation, ErrInvalidSession, 0, nil)
+	}
+	requestURL, err := c.premiumMailSettingsRequestURL(result, endpoint)
+	if err != nil {
+		return result, fmt.Errorf("%w: invalid premium mail service URL", ErrInvalidSession)
+	}
+	response, err := op.request(
+		ctx,
+		operation,
+		http.MethodPost,
+		requestURL,
+		map[string]string{"anonymousId": anonymousID},
+		op.serviceHeaders(),
+	)
+	if err != nil {
+		return result, nonRetryableAppleError(err)
+	}
+	if err := decodeHMEMutation(operation, response); err != nil {
+		return result, nonRetryableAppleError(err)
+	}
+	return result, nil
+}
+
 // CreateAlias generates and reserves one new Hide My Email address. The
 // reserve request is a remote side effect, so errors after it starts are
 // deliberately marked non-retryable even when Apple returns a transient HTTP
@@ -536,6 +589,32 @@ func decodeHMEResult(operation string, response responseData) (json.RawMessage, 
 		return nil, operationError("decode "+operation, ErrInvalidResponse, response.status, errors.New("result is required"))
 	}
 	return envelope.Result, nil
+}
+
+func decodeHMEMutation(operation string, response responseData) error {
+	if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == 450 {
+		return responseError(operation, ErrInvalidSession, response)
+	}
+	if response.status == http.StatusPreconditionFailed {
+		return responseError(operation, ErrTermsRequired, response)
+	}
+	if response.status < 200 || response.status >= 300 {
+		return responseError(operation, ErrService, response)
+	}
+	var envelope struct {
+		Success *bool `json:"success"`
+	}
+	if err := json.Unmarshal(response.body, &envelope); err != nil {
+		return operationError("decode "+operation, ErrInvalidResponse, response.status, err)
+	}
+	if envelope.Success == nil {
+		return operationError("decode "+operation, ErrInvalidResponse, response.status,
+			errors.New("success must be a boolean"))
+	}
+	if !*envelope.Success {
+		return responseError(operation, ErrService, response)
+	}
+	return nil
 }
 
 func decodeGeneratedHME(result json.RawMessage) (string, error) {
@@ -1340,6 +1419,21 @@ func validBuildIdentifier(value string) bool {
 	}
 	for _, character := range value {
 		if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_') {
+			return false
+		}
+	}
+	return true
+}
+
+func validHMEAnonymousID(value string) bool {
+	if len(value) < 1 || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			character == '-' || character == '_') {
 			return false
 		}
 	}

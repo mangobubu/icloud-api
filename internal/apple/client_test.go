@@ -437,6 +437,299 @@ func TestCreateAliasGeneratesThenReserves(t *testing.T) {
 	}
 }
 
+func TestAliasMutationsPostAnonymousIDAndPersistSession(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		mutate  func(context.Context, Session, string) (Session, error)
+		cookie  string
+		session string
+		token   string
+		scnt    string
+	}{
+		{
+			name:    "deactivate",
+			path:    "/v1/hme/deactivate",
+			cookie:  "deactivated",
+			session: "deactivate-session",
+			token:   "deactivate-token",
+			scnt:    "deactivate-scnt",
+		},
+		{
+			name:    "delete",
+			path:    "/v1/hme/delete",
+			cookie:  "deleted",
+			session: "delete-session",
+			token:   "delete-token",
+			scnt:    "delete-scnt",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			client, err := NewClient(Config{
+				ClientBuildNumber:     "build-test",
+				ClientMasteringNumber: "mastering-test",
+				Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					requests++
+					if request.Method != http.MethodPost || request.URL.Path != test.path ||
+						request.URL.Host != "p01-maildomainws.icloud.com" {
+						return nil, fmt.Errorf("unexpected mutation request %s %s", request.Method, request.URL.String())
+					}
+					query := request.URL.Query()
+					if query.Get("clientBuildNumber") != "build-test" ||
+						query.Get("clientMasteringNumber") != "mastering-test" ||
+						query.Get("clientId") != "client-id" || query.Get("dsid") != "42" {
+						return nil, fmt.Errorf("unexpected mutation query: %s", request.URL.RawQuery)
+					}
+					if request.Header.Get("Accept") != "application/json" ||
+						request.Header.Get("Content-Type") != "application/json" ||
+						request.Header.Get("Origin") != "https://www.icloud.com" ||
+						request.Header.Get("Referer") != "https://www.icloud.com/" {
+						return nil, fmt.Errorf("unexpected mutation headers: %#v", request.Header)
+					}
+					if !strings.Contains(request.Header.Get("Cookie"), "existing=session") {
+						return nil, errors.New("persisted mutation cookie was not restored")
+					}
+					body, err := io.ReadAll(request.Body)
+					if err != nil {
+						return nil, err
+					}
+					var payload map[string]string
+					if err := json.Unmarshal(body, &payload); err != nil || len(payload) != 1 ||
+						payload["anonymousId"] != "remote-id_1" {
+						return nil, fmt.Errorf("mutation payload = %s", body)
+					}
+					headers := make(http.Header)
+					headers.Set("X-Apple-ID-Session-Id", test.session)
+					headers.Set("X-Apple-Session-Token", test.token)
+					headers.Set("scnt", test.scnt)
+					headers.Add("Set-Cookie", test.cookie+"=complete; Path=/; Secure; HttpOnly")
+					return testResponse(request, http.StatusOK, `{"success":true}`, headers), nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.path == "/v1/hme/deactivate" {
+				test.mutate = client.DeactivateAlias
+			} else {
+				test.mutate = client.DeleteAlias
+			}
+			updated, err := test.mutate(context.Background(), Session{
+				Region:                 RegionGlobal,
+				DSID:                   "42",
+				ClientID:               "client-id",
+				PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+				Cookies: []PersistentCookie{{
+					Name: "existing", Value: "session", Domain: "p01-maildomainws.icloud.com",
+					Path: "/", HostOnly: true, Secure: true,
+				}},
+			}, "remote-id_1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if requests != 1 || updated.SessionID != test.session ||
+				updated.SessionToken != test.token || updated.SCNT != test.scnt {
+				t.Fatalf("requests=%d updated session=%#v", requests, updated)
+			}
+			foundCookie := false
+			for _, cookie := range updated.Cookies {
+				if cookie.Name == test.cookie && cookie.Value == "complete" {
+					foundCookie = true
+				}
+			}
+			if !foundCookie {
+				t.Fatalf("updated cookies = %#v", updated.Cookies)
+			}
+		})
+	}
+}
+
+func TestAliasMutationsRejectInvalidAnonymousIDsWithoutRequest(t *testing.T) {
+	requests := 0
+	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		return testResponse(request, http.StatusOK, `{"success":true}`, nil), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := []struct {
+		name   string
+		mutate func(context.Context, Session, string) (Session, error)
+	}{
+		{name: "deactivate", mutate: client.DeactivateAlias},
+		{name: "delete", mutate: client.DeleteAlias},
+	}
+	invalidIDs := []string{
+		"",
+		" ",
+		" leading",
+		"trailing ",
+		"path/segment",
+		"dot.segment",
+		"non-ascii-\u00e9",
+		strings.Repeat("a", 129),
+	}
+	for _, mutation := range mutations {
+		for _, anonymousID := range invalidIDs {
+			t.Run(mutation.name+"/"+fmt.Sprintf("%q", anonymousID), func(t *testing.T) {
+				_, err := mutation.mutate(context.Background(), Session{
+					Region:                 RegionGlobal,
+					DSID:                   "42",
+					ClientID:               "client-id",
+					PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+				}, anonymousID)
+				if !errors.Is(err, ErrInvalidConfig) {
+					t.Fatalf("error = %v, want ErrInvalidConfig", err)
+				}
+			})
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("invalid anonymous IDs made %d requests", requests)
+	}
+}
+
+func TestAliasMutationErrorsAreNotRetryableOrRetried(t *testing.T) {
+	transportFailure := errors.New("connection reset after mutation write")
+	tests := []struct {
+		name        string
+		respond     func(*http.Request) (*http.Response, error)
+		wantKind    error
+		wantStatus  int
+		serviceCode string
+	}{
+		{
+			name: "transport failure",
+			respond: func(*http.Request) (*http.Response, error) {
+				return nil, transportFailure
+			},
+			wantKind: ErrService,
+		},
+		{
+			name: "session expired",
+			respond: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusUnauthorized, `{"errorCode":"SESSION_EXPIRED"}`, nil), nil
+			},
+			wantKind: ErrInvalidSession, wantStatus: http.StatusUnauthorized, serviceCode: "SESSION_EXPIRED",
+		},
+		{
+			name: "account action required",
+			respond: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusPreconditionFailed, `{"errorCode":"TERMS_REQUIRED"}`, nil), nil
+			},
+			wantKind: ErrTermsRequired, wantStatus: http.StatusPreconditionFailed, serviceCode: "TERMS_REQUIRED",
+		},
+		{
+			name: "server failure",
+			respond: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusServiceUnavailable, `{"serverErrorCode":"TEMPORARY"}`, nil), nil
+			},
+			wantKind: ErrService, wantStatus: http.StatusServiceUnavailable, serviceCode: "TEMPORARY",
+		},
+		{
+			name: "success false",
+			respond: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusOK, `{"success":false,"error":{"errorCode":"REJECTED"}}`, nil), nil
+			},
+			wantKind: ErrService, wantStatus: http.StatusOK, serviceCode: "REJECTED",
+		},
+		{
+			name: "missing success",
+			respond: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusOK, `{"result":null}`, nil), nil
+			},
+			wantKind: ErrInvalidResponse, wantStatus: http.StatusOK,
+		},
+		{
+			name: "wrong success type",
+			respond: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusOK, `{"success":"true"}`, nil), nil
+			},
+			wantKind: ErrInvalidResponse, wantStatus: http.StatusOK,
+		},
+		{
+			name: "empty success response",
+			respond: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusNoContent, "", nil), nil
+			},
+			wantKind: ErrInvalidResponse, wantStatus: http.StatusNoContent,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				requests++
+				return test.respond(request)
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.DeleteAlias(context.Background(), Session{
+				Region:                 RegionGlobal,
+				DSID:                   "42",
+				ClientID:               "client-id",
+				PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+			}, "remote-id")
+			if !errors.Is(err, test.wantKind) {
+				t.Fatalf("error = %v, want %v", err, test.wantKind)
+			}
+			var typed *Error
+			if !errors.As(err, &typed) || typed.StatusCode != test.wantStatus ||
+				typed.ServiceCode != test.serviceCode || typed.Retryable {
+				t.Fatalf("typed error = %#v", typed)
+			}
+			if requests != 1 {
+				t.Fatalf("mutation requests = %d, want 1", requests)
+			}
+		})
+	}
+}
+
+func TestAliasMutationFailurePersistsRotatedSession(t *testing.T) {
+	requests := 0
+	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		headers := make(http.Header)
+		headers.Set("X-Apple-ID-Session-Id", "rotated-session")
+		headers.Set("X-Apple-Session-Token", "rotated-token")
+		headers.Add("Set-Cookie", "rotated=mutation; Path=/; Secure; HttpOnly")
+		return testResponse(request, http.StatusServiceUnavailable,
+			`{"success":false,"error":{"errorCode":"TEMPORARY"}}`, headers), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := client.DeactivateAlias(context.Background(), Session{
+		Region:                 RegionGlobal,
+		DSID:                   "42",
+		ClientID:               "client-id",
+		PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+	}, "remote-id")
+	if !errors.Is(err, ErrService) || requests != 1 {
+		t.Fatalf("error=%v requests=%d", err, requests)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) || typed.Retryable {
+		t.Fatalf("mutation error = %#v, want non-retryable", typed)
+	}
+	if updated.SessionID != "rotated-session" || updated.SessionToken != "rotated-token" {
+		t.Fatalf("updated session = %#v", updated)
+	}
+	foundCookie := false
+	for _, cookie := range updated.Cookies {
+		if cookie.Name == "rotated" && cookie.Value == "mutation" {
+			foundCookie = true
+		}
+	}
+	if !foundCookie {
+		t.Fatalf("updated cookies = %#v", updated.Cookies)
+	}
+}
+
 func TestCreateAliasRejectsInvalidResponses(t *testing.T) {
 	validGenerate := `{"success":true,"result":{"hme":"candidate@icloud.com"}}`
 	validReserve := `{"success":true,"result":{"hme":{"hme":"candidate@icloud.com"}}}`

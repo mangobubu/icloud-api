@@ -12,6 +12,8 @@ test("admin navigation selects the section for the current route", () => {
     ["/admin/accounts/42/edit", "accounts"],
     ["/admin/aliases", "aliases"],
     ["/admin/audit", "audit"],
+    ["/admin/logs", "logs"],
+    ["/admin/logs/archive", "logs"],
     ["/admin/security", "security"],
   ];
 
@@ -22,6 +24,7 @@ test("admin navigation selects the section for the current route", () => {
 
 test("admin navigation only matches complete path segments", () => {
   assert.equal(getActiveAdminSection("/admin/aliases-archive"), "");
+  assert.equal(getActiveAdminSection("/admin/logs-archive"), "");
   assert.equal(getActiveAdminSection("/admin/accounting"), "");
   assert.equal(getActiveAdminSection("/admin/login"), "");
 });

@@ -205,3 +205,17 @@ test("account detail exposes automatic alias creation and safe key handling", as
   assert.match(navigationGuard, /pendingAutoKeysLoading\.value/);
   assert.match(navigationGuard, /pendingAutoKeysClearing\.value/);
 });
+
+test("alias deletion is presented as an irreversible iCloud operation", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const remove = functionBody(source, "async function removeAlias");
+
+  assert.match(source, /从 iCloud 永久删除隐私邮箱/);
+  assert.match(remove, /将从 iCloud 永久删除/);
+  assert.match(remove, /且无法恢复/);
+  assert.match(remove, /await deleteAlias\(alias\.id/);
+  assert.match(remove, /aliases\.value = aliases\.value\.filter/);
+  assert.match(remove, /isAppleSessionInvalid\(error\)/);
+  assert.match(remove, /openAppleLogin\(\{ error \}\)/);
+  assert.match(remove, /本地记录已保留/);
+});

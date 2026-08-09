@@ -52,6 +52,7 @@ import {
   Menu,
   Message,
   SwitchButton,
+  Tickets,
 } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
 import { computed, defineComponent, h, ref, watch } from "vue";
@@ -74,6 +75,7 @@ const menuItems = [
   { to: "/admin/", label: "主号管理", icon: Connection, section: "accounts" },
   { to: "/admin/aliases", label: "隐私邮箱", icon: Message, section: "aliases" },
   { to: "/admin/audit", label: "操作记录", icon: Document, section: "audit" },
+  { to: "/admin/logs", label: "全部日志", icon: Tickets, section: "logs" },
   { to: "/admin/security", label: "安全设置", icon: Lock, section: "security" },
 ];
 

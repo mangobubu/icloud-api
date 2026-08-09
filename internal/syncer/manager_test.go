@@ -488,6 +488,71 @@ func TestQueueAccountSyncContinuesPendingBatches(t *testing.T) {
 	}
 }
 
+func TestQueuedManualSyncProgressSpansPendingBatches(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseSecond) })
+	var manager *Manager
+	var callsMu sync.Mutex
+	calls := 0
+	firstProgress := make(chan domain.MailboxSyncProgress, 1)
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseConnecting, 5)
+		if call == 1 {
+			progress, _ := manager.AccountProgress(account.ID)
+			firstProgress <- progress
+			return domain.MailboxSyncResult{
+				State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1, LastUID: 25},
+				HasMore:   true,
+				TargetUID: 100,
+			}, nil
+		}
+		close(secondStarted)
+		<-releaseSecond
+		return domain.MailboxSyncResult{
+			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1, LastUID: 100},
+			TargetUID: 100,
+		}, nil
+	})
+	manager = New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
+
+	if err := manager.QueueAccountSync(context.Background(), account.ID); !errors.Is(err, ErrSyncQueued) {
+		t.Fatalf("queue result = %v, want ErrSyncQueued", err)
+	}
+	first := <-firstProgress
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second manual batch did not start")
+	}
+	second, ok := manager.AccountProgress(account.ID)
+	if !ok {
+		t.Fatal("manual continuation omitted active progress")
+	}
+	if first.Trigger != domain.MailboxSyncTriggerManual || second.Trigger != domain.MailboxSyncTriggerManual {
+		t.Fatalf("manual progress triggers = %q/%q", first.Trigger, second.Trigger)
+	}
+	if !second.StartedAt.Equal(first.StartedAt) {
+		t.Fatalf("manual continuation restarted progress: first=%v second=%v", first.StartedAt, second.StartedAt)
+	}
+	if second.Percent < first.Percent || second.Percent < 25 || second.Phase != domain.MailboxSyncPhaseConnecting {
+		t.Fatalf("manual continuation progress = %#v after %#v", second, first)
+	}
+	releaseOnce.Do(func() { close(releaseSecond) })
+	manager.BeginShutdown()
+	manager.waitForManualJobs()
+	if progress, ok := manager.AccountProgress(account.ID); ok {
+		t.Fatalf("completed manual progress was retained: %#v", progress)
+	}
+}
+
 func TestSyncAccountFailureUsesOneBulkRecord(t *testing.T) {
 	accountVersion := time.Date(2026, 8, 8, 9, 30, 0, 456, time.UTC)
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted", UpdatedAt: accountVersion}
@@ -820,13 +885,13 @@ func TestFailureRecorderRetriesWithOneThreeSecondFallback(t *testing.T) {
 	}
 }
 
-func TestFailureRecorderTruncatesUnicodeWithoutBreakingUTF8(t *testing.T) {
+func TestFailureRecorderKeepsDetailedUnicodeErrorWithinBound(t *testing.T) {
 	repo := newFakeRepo()
 	manager := New(repo, cipherFunc(fixedCipher), nil, discardLogger(), time.Minute, 1)
 	recorder := newFailureRecorder(manager, context.Background(), 1, time.Unix(0, 1).UTC())
 	defer recorder.close()
 
-	recorder.record(errors.New(strings.Repeat("错", 300)))
+	recorder.record(errors.New(strings.Repeat("错", maxPersistedSyncErrorRunes+100)))
 	failures := repo.failureCalls()
 	if len(failures) != 1 {
 		t.Fatalf("失败记录次数 = %d, want 1", len(failures))
@@ -834,8 +899,8 @@ func TestFailureRecorderTruncatesUnicodeWithoutBreakingUTF8(t *testing.T) {
 	if !utf8.ValidString(failures[0].message) {
 		t.Fatalf("截断后的错误文本不是有效 UTF-8: %q", failures[0].message)
 	}
-	if got := utf8.RuneCountInString(failures[0].message); got != 240 {
-		t.Fatalf("截断后字符数 = %d, want 240", got)
+	if got := utf8.RuneCountInString(failures[0].message); got != maxPersistedSyncErrorRunes {
+		t.Fatalf("截断后字符数 = %d, want %d", got, maxPersistedSyncErrorRunes)
 	}
 }
 
@@ -1223,6 +1288,77 @@ func TestRunDrainsPendingBatchesBeforeWaiting(t *testing.T) {
 	callsMu.Unlock()
 	if gotCalls != 3 {
 		t.Fatalf("batch calls = %d, want 3", gotCalls)
+	}
+}
+
+func TestRunAutomaticProgressSpansPendingBatches(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseSecond) })
+	var manager *Manager
+	var callsMu sync.Mutex
+	calls := 0
+	firstProgress := make(chan domain.MailboxSyncProgress, 1)
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseScanning, 15)
+		if call == 1 {
+			progress, _ := manager.AccountProgress(account.ID)
+			firstProgress <- progress
+			return domain.MailboxSyncResult{
+				State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 2, LastUID: 40},
+				HasMore:   true,
+				TargetUID: 100,
+			}, nil
+		}
+		close(secondStarted)
+		<-releaseSecond
+		return domain.MailboxSyncResult{
+			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 2, LastUID: 100},
+			TargetUID: 100,
+		}, nil
+	})
+	manager = New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 1)
+	manager.waitInterval = func(context.Context, time.Duration) bool { return false }
+	done := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(done)
+	}()
+
+	first := <-firstProgress
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second automatic batch did not start")
+	}
+	second, ok := manager.AccountProgress(account.ID)
+	if !ok {
+		t.Fatal("automatic continuation omitted active progress")
+	}
+	if first.Trigger != domain.MailboxSyncTriggerAutomatic || second.Trigger != domain.MailboxSyncTriggerAutomatic {
+		t.Fatalf("automatic progress triggers = %q/%q", first.Trigger, second.Trigger)
+	}
+	if !second.StartedAt.Equal(first.StartedAt) {
+		t.Fatalf("automatic continuation restarted progress: first=%v second=%v", first.StartedAt, second.StartedAt)
+	}
+	if second.Percent < first.Percent || second.Percent < 25 || second.Phase != domain.MailboxSyncPhaseScanning {
+		t.Fatalf("automatic continuation progress = %#v after %#v", second, first)
+	}
+	releaseOnce.Do(func() { close(releaseSecond) })
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("automatic sync did not finish")
+	}
+	if progress, ok := manager.AccountProgress(account.ID); ok {
+		t.Fatalf("completed automatic progress was retained: %#v", progress)
 	}
 }
 

@@ -68,6 +68,7 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.DELETE("/aliases/:id", s.adminAPIDeleteAlias)
 
 	protected.GET("/audit", s.adminAPIListAuditLogs)
+	protected.GET("/logs", s.adminAPIListApplicationLogs)
 }
 
 type adminAPIAdminDTO struct {
@@ -81,19 +82,30 @@ type adminAPISessionDTO struct {
 }
 
 type adminAPIAccountDTO struct {
-	ID             int64   `json:"id"`
-	Name           string  `json:"name"`
-	Email          string  `json:"email"`
-	IMAPHost       string  `json:"imap_host"`
-	IMAPPort       int     `json:"imap_port"`
-	IMAPUsername   string  `json:"imap_username"`
-	Enabled        bool    `json:"enabled"`
-	LastSyncStatus string  `json:"last_sync_status"`
-	LastSyncError  string  `json:"last_sync_error"`
-	LastSyncedAt   *string `json:"last_synced_at"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	AliasCount     int     `json:"alias_count"`
+	ID               int64                    `json:"id"`
+	Name             string                   `json:"name"`
+	Email            string                   `json:"email"`
+	IMAPHost         string                   `json:"imap_host"`
+	IMAPPort         int                      `json:"imap_port"`
+	IMAPUsername     string                   `json:"imap_username"`
+	Enabled          bool                     `json:"enabled"`
+	LastSyncStatus   string                   `json:"last_sync_status"`
+	LastSyncError    string                   `json:"last_sync_error"`
+	LastSyncErrorLog string                   `json:"last_sync_error_log"`
+	LastSyncedAt     *string                  `json:"last_synced_at"`
+	CreatedAt        string                   `json:"created_at"`
+	UpdatedAt        string                   `json:"updated_at"`
+	AliasCount       int                      `json:"alias_count"`
+	SyncProgress     *adminAPISyncProgressDTO `json:"sync_progress,omitempty"`
+}
+
+type adminAPISyncProgressDTO struct {
+	Active     bool   `json:"active"`
+	Source     string `json:"source"`
+	Stage      string `json:"stage"`
+	Percentage int    `json:"percentage"`
+	StartedAt  string `json:"started_at"`
+	UpdatedAt  string `json:"updated_at"`
 }
 
 type adminAPIAliasDTO struct {
@@ -107,6 +119,7 @@ type adminAPIAliasDTO struct {
 	Enabled          bool    `json:"enabled"`
 	LastSyncStatus   string  `json:"last_sync_status"`
 	LastSyncError    string  `json:"last_sync_error"`
+	LastSyncErrorLog string  `json:"last_sync_error_log"`
 	LastSyncedAt     *string `json:"last_synced_at"`
 	LastAccessedAt   *string `json:"last_accessed_at"`
 	LatestReceivedAt *string `json:"latest_received_at"`
@@ -210,20 +223,41 @@ func adminAPISessionFromDomain(session domain.Session) adminAPISessionDTO {
 
 func adminAPIAccountFromDomain(account domain.Account) adminAPIAccountDTO {
 	return adminAPIAccountDTO{
-		ID:             account.ID,
-		Name:           account.Name,
-		Email:          account.Email,
-		IMAPHost:       account.IMAPHost,
-		IMAPPort:       account.IMAPPort,
-		IMAPUsername:   account.IMAPUsername,
-		Enabled:        account.Enabled,
-		LastSyncStatus: account.LastSyncStatus,
-		LastSyncError:  account.LastSyncError,
-		LastSyncedAt:   adminAPIOptionalTime(account.LastSyncedAt),
-		CreatedAt:      adminAPITime(account.CreatedAt),
-		UpdatedAt:      adminAPITime(account.UpdatedAt),
-		AliasCount:     account.AliasCount,
+		ID:               account.ID,
+		Name:             account.Name,
+		Email:            account.Email,
+		IMAPHost:         account.IMAPHost,
+		IMAPPort:         account.IMAPPort,
+		IMAPUsername:     account.IMAPUsername,
+		Enabled:          account.Enabled,
+		LastSyncStatus:   account.LastSyncStatus,
+		LastSyncError:    adminAPISyncErrorSummary(account.LastSyncError),
+		LastSyncErrorLog: account.LastSyncError,
+		LastSyncedAt:     adminAPIOptionalTime(account.LastSyncedAt),
+		CreatedAt:        adminAPITime(account.CreatedAt),
+		UpdatedAt:        adminAPITime(account.UpdatedAt),
+		AliasCount:       account.AliasCount,
 	}
+}
+
+func (s *Server) adminAPIAccountFromDomain(account domain.Account) adminAPIAccountDTO {
+	dto := adminAPIAccountFromDomain(account)
+	if s.syncProgress == nil {
+		return dto
+	}
+	progress, active := s.syncProgress(account.ID)
+	if !active {
+		return dto
+	}
+	dto.SyncProgress = &adminAPISyncProgressDTO{
+		Active:     true,
+		Source:     string(progress.Trigger),
+		Stage:      string(progress.Phase),
+		Percentage: progress.Percent,
+		StartedAt:  adminAPITime(progress.StartedAt),
+		UpdatedAt:  adminAPITime(progress.UpdatedAt),
+	}
+	return dto
 }
 
 func (s *Server) adminAPIAliasFromDomain(alias domain.Alias) (adminAPIAliasDTO, error) {
@@ -249,13 +283,23 @@ func (s *Server) adminAPIAliasFromDomain(alias domain.Alias) (adminAPIAliasDTO, 
 		DirectLinkPath:   directLinkPath,
 		Enabled:          alias.Enabled,
 		LastSyncStatus:   alias.LastSyncStatus,
-		LastSyncError:    alias.LastSyncError,
+		LastSyncError:    adminAPISyncErrorSummary(alias.LastSyncError),
+		LastSyncErrorLog: alias.LastSyncError,
 		LastSyncedAt:     adminAPIOptionalTime(alias.LastSyncedAt),
 		LastAccessedAt:   adminAPIOptionalTime(alias.LastAccessedAt),
 		LatestReceivedAt: adminAPIOptionalTime(alias.LatestReceivedAt),
 		CreatedAt:        adminAPITime(alias.CreatedAt),
 		UpdatedAt:        adminAPITime(alias.UpdatedAt),
 	}, nil
+}
+
+func adminAPISyncErrorSummary(message string) string {
+	const maxRunes = 240
+	runes := []rune(strings.TrimSpace(message))
+	if len(runes) > maxRunes {
+		runes = runes[:maxRunes]
+	}
+	return string(runes)
 }
 
 func adminAPIAliasConfirmationPending(alias domain.Alias) bool {
@@ -328,10 +372,10 @@ func adminAPIAutoCreationFromSchedule(schedule domain.AliasCreationSchedule, pen
 	}
 }
 
-func adminAPIAccountsFromDomain(accounts []domain.Account) []adminAPIAccountDTO {
+func (s *Server) adminAPIAccountsFromDomain(accounts []domain.Account) []adminAPIAccountDTO {
 	result := make([]adminAPIAccountDTO, 0, len(accounts))
 	for _, account := range accounts {
-		result = append(result, adminAPIAccountFromDomain(account))
+		result = append(result, s.adminAPIAccountFromDomain(account))
 	}
 	return result
 }
@@ -598,7 +642,7 @@ func (s *Server) adminAPIListAccounts(c *gin.Context) {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	writeAdminAPIData(c, http.StatusOK, adminAPIAccountsFromDomain(accounts))
+	writeAdminAPIData(c, http.StatusOK, s.adminAPIAccountsFromDomain(accounts))
 }
 
 func (s *Server) adminAPICreateAccount(c *gin.Context) {
@@ -813,7 +857,7 @@ func (s *Server) adminAPIAccountDetail(ctx context.Context, id int64) (adminAPIA
 		return adminAPIAccountDetailDTO{}, err
 	}
 	return adminAPIAccountDetailDTO{
-		Account:      adminAPIAccountFromDomain(account),
+		Account:      s.adminAPIAccountFromDomain(account),
 		Aliases:      aliasDTOs,
 		AppleSession: appleSession,
 		AutoCreation: autoCreation,
@@ -1198,20 +1242,29 @@ func (s *Server) adminAPIDeleteAlias(c *gin.Context) {
 		s.writeAdminAPIStoreReadError(c, err)
 		return
 	}
-	if err := s.withAccountLock(c.Request.Context(), alias.AccountID, func() error {
-		return s.store.DeleteAlias(c.Request.Context(), id)
-	}); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
-		} else if errors.Is(err, store.ErrAliasConfirmationPending) {
+	if adminAPIAliasConfirmationPending(alias) {
+		writeAdminAPIAliasConfirmationPending(c)
+		return
+	}
+	adminSession := mustSession(c)
+	if s.hmeSync == nil {
+		s.adminAPIFinishAppleAliasDeleteFailure(c, adminSession, id, adminAPIAppleServiceUnavailable())
+		return
+	}
+	if err := s.hmeSync.DeleteAlias(c.Request.Context(), id); err != nil {
+		if errors.Is(err, store.ErrAliasConfirmationPending) {
 			writeAdminAPIAliasConfirmationPending(c)
 		} else {
-			s.writeAdminAPIInternalError(c, err)
+			apiErr := classifyAdminAPIAppleError(err)
+			if errors.Is(err, store.ErrNotFound) && apiErr.Status == http.StatusNotFound {
+				writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
+			} else {
+				s.adminAPIFinishAppleAliasDeleteFailure(c, adminSession, id, apiErr)
+			}
 		}
 		return
 	}
-	session := mustSession(c)
-	s.audit(c, &session.AdminID, session.Username, "delete", "alias", strconv.FormatInt(id, 10), "success", "")
+	s.audit(c, &adminSession.AdminID, adminSession.Username, "delete", "alias", strconv.FormatInt(id, 10), "success", "")
 	c.Status(http.StatusNoContent)
 }
 

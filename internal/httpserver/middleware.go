@@ -81,6 +81,11 @@ func (s *Server) requestContext() gin.HandlerFunc {
 		c.Header("X-Request-ID", requestID)
 		started := time.Now()
 		c.Next()
+		if c.Request.Method == http.MethodGet &&
+			c.Request.URL.Path == adminAPIApplicationLogsPath &&
+			c.Writer.Status() >= http.StatusOK && c.Writer.Status() < http.StatusMultipleChoices {
+			return
+		}
 		s.logger.Info("HTTP 请求", "method", c.Request.Method, "path", c.Request.URL.Path, "status", c.Writer.Status(), "duration_ms", time.Since(started).Milliseconds(), "request_id", requestID)
 	}
 }
@@ -332,7 +337,7 @@ func notice(code string) (string, string) {
 		"sync_pending":     {"同步已在后台处理。", "warning"},
 		"sync_error":       {"同步失败，请检查连接状态。", "error"},
 		"alias_updated":    {"隐私邮箱状态已更新。", "success"},
-		"alias_deleted":    {"隐私邮箱已删除。", "success"},
+		"alias_deleted":    {"隐私邮箱已从 iCloud 和本地永久删除。", "success"},
 	}
 	if message, ok := messages[code]; ok {
 		return message[0], message[1]

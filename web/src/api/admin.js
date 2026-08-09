@@ -1,4 +1,8 @@
 import { apiRequest } from "./client.js";
+import {
+  buildRuntimeLogQuery,
+  normalizeRuntimeLogPage,
+} from "../utils/runtimeLogs.js";
 
 function firstDefined(object, ...keys) {
   for (const key of keys) {
@@ -22,6 +26,16 @@ function listFrom(data, ...keys) {
 }
 
 export function normalizeAccount(raw = {}) {
+  const lastSyncError =
+    firstDefined(raw, "last_sync_error", "lastSyncError", "LastSyncError") ||
+    "";
+  const lastSyncErrorLog = firstDefined(
+    raw,
+    "last_sync_error_log",
+    "lastSyncErrorLog",
+    "LastSyncErrorLog",
+  );
+
   return {
     id: firstDefined(raw, "id", "ID"),
     name: firstDefined(raw, "name", "Name") || "",
@@ -37,18 +51,60 @@ export function normalizeAccount(raw = {}) {
     lastSyncStatus:
       firstDefined(raw, "last_sync_status", "lastSyncStatus", "LastSyncStatus") ||
       "pending",
-    lastSyncError:
-      firstDefined(raw, "last_sync_error", "lastSyncError", "LastSyncError") ||
-      "",
+    lastSyncError,
+    lastSyncErrorLog:
+      lastSyncErrorLog === undefined ? lastSyncError : lastSyncErrorLog || "",
     lastSyncedAt:
       firstDefined(raw, "last_synced_at", "lastSyncedAt", "LastSyncedAt") ||
       null,
+    syncProgress: normalizeSyncProgress(
+      firstDefined(raw, "sync_progress", "syncProgress", "SyncProgress"),
+    ),
     aliasCount:
       Number(firstDefined(raw, "alias_count", "aliasCount", "AliasCount")) || 0,
   };
 }
 
+function normalizeSyncProgress(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+
+  const percentageRaw = firstDefined(raw, "percentage", "Percentage");
+  const percentageValue =
+    typeof percentageRaw === "string" ? percentageRaw.trim() : percentageRaw;
+  const percentageNumber =
+    percentageValue === undefined ||
+    percentageValue === null ||
+    percentageValue === ""
+      ? Number.NaN
+      : Number(percentageValue);
+
+  return {
+    active: Boolean(firstDefined(raw, "active", "Active")),
+    source: firstDefined(raw, "source", "Source") || "",
+    stage: firstDefined(raw, "stage", "Stage") || "",
+    percentage: Number.isFinite(percentageNumber)
+      ? Math.min(100, Math.max(0, percentageNumber))
+      : null,
+    startedAt:
+      firstDefined(raw, "started_at", "startedAt", "StartedAt") || null,
+    updatedAt:
+      firstDefined(raw, "updated_at", "updatedAt", "UpdatedAt") || null,
+  };
+}
+
 export function normalizeAlias(raw = {}) {
+  const lastSyncError =
+    firstDefined(raw, "last_sync_error", "lastSyncError", "LastSyncError") ||
+    "";
+  const lastSyncErrorLog = firstDefined(
+    raw,
+    "last_sync_error_log",
+    "lastSyncErrorLog",
+    "LastSyncErrorLog",
+  );
+
   return {
     id: firstDefined(raw, "id", "ID"),
     accountId: firstDefined(raw, "account_id", "accountId", "AccountID"),
@@ -69,9 +125,9 @@ export function normalizeAlias(raw = {}) {
     lastSyncStatus:
       firstDefined(raw, "last_sync_status", "lastSyncStatus", "LastSyncStatus") ||
       "pending",
-    lastSyncError:
-      firstDefined(raw, "last_sync_error", "lastSyncError", "LastSyncError") ||
-      "",
+    lastSyncError,
+    lastSyncErrorLog:
+      lastSyncErrorLog === undefined ? lastSyncError : lastSyncErrorLog || "",
     lastSyncedAt:
       firstDefined(raw, "last_synced_at", "lastSyncedAt", "LastSyncedAt") ||
       null,
@@ -533,4 +589,10 @@ export async function getAuditLogs() {
   return listFrom(data, "audit", "audit_logs", "logs", "items").map(
     normalizeAuditLog,
   );
+}
+
+export async function getRuntimeLogs(options = {}) {
+  const query = buildRuntimeLogQuery(options);
+  const data = await apiRequest(`/logs${query ? `?${query}` : ""}`);
+  return normalizeRuntimeLogPage(data || {});
 }

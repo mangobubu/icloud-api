@@ -39,6 +39,13 @@ type AutoCreateRepository interface {
 	ConfirmPendingAutoAlias(context.Context, domain.AppleWebSession, int64) (domain.Alias, domain.AppleWebSession, error)
 }
 
+// AliasDeletionRepository is the additional persistence surface used by
+// synchronized Apple and local alias deletion.
+type AliasDeletionRepository interface {
+	GetAlias(context.Context, int64) (domain.Alias, error)
+	DeleteAlias(context.Context, int64) error
+}
+
 type SessionCipher interface {
 	EncryptAppleSession(string) (string, error)
 	DecryptAppleSession(string) (string, error)
@@ -57,6 +64,13 @@ type AppleClient interface {
 
 type AutoAliasClient interface {
 	CreateAlias(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error)
+}
+
+// AliasDeletionClient exposes Apple's two-step permanent deletion flow.
+// Active aliases must be deactivated before they can be deleted.
+type AliasDeletionClient interface {
+	DeactivateAlias(context.Context, apple.Session, string) (apple.Session, error)
+	DeleteAlias(context.Context, apple.Session, string) (apple.Session, error)
 }
 
 // AccountLocker is shared with IMAP synchronization. Interactive Apple flows

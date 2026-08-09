@@ -24,6 +24,7 @@ type HMESyncService interface {
 	GetSession(context.Context, int64) (hmesync.SessionInfo, error)
 	ClearAuth(context.Context, int64) error
 	SyncAliases(context.Context, int64) (hmesync.SyncResult, error)
+	DeleteAlias(context.Context, int64) error
 }
 
 type adminAPIAppleAuthRequest struct {
@@ -491,4 +492,38 @@ func (s *Server) adminAPIFinishAppleFailure(
 	)
 	s.audit(c, &adminSession.AdminID, adminSession.Username, action, "account", strconv.FormatInt(accountID, 10), "failed", apiErr.Code)
 	writeAdminAPIError(c, apiErr.Status, apiErr.Code, apiErr.Message)
+}
+
+func (s *Server) auditAppleAliasDeleteFailure(
+	c *gin.Context,
+	adminSession domain.Session,
+	aliasID int64,
+	apiErr adminAPIAppleError,
+) {
+	s.logger.Warn("Apple alias deletion failed",
+		"action", "delete",
+		"code", apiErr.Code,
+		"request_id", requestID(c),
+	)
+	s.audit(c, &adminSession.AdminID, adminSession.Username, "delete", "alias", strconv.FormatInt(aliasID, 10), "failed", apiErr.Code)
+}
+
+func (s *Server) adminAPIFinishAppleAliasDeleteFailure(
+	c *gin.Context,
+	adminSession domain.Session,
+	aliasID int64,
+	apiErr adminAPIAppleError,
+) {
+	apiErr = adminAPIAppleAliasDeleteFailure(apiErr)
+	s.auditAppleAliasDeleteFailure(c, adminSession, aliasID, apiErr)
+	writeAdminAPIError(c, apiErr.Status, apiErr.Code, apiErr.Message)
+}
+
+func adminAPIAppleAliasDeleteFailure(apiErr adminAPIAppleError) adminAPIAppleError {
+	message := strings.TrimRight(strings.TrimSpace(apiErr.Message), "。")
+	if !strings.Contains(message, "本地记录已保留") {
+		message += "；本地记录已保留，可稍后重试"
+	}
+	apiErr.Message = message
+	return apiErr
 }

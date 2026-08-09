@@ -1039,6 +1039,496 @@ func TestSyncOwnershipConflictIsTypedAndDoesNotReturnKeys(t *testing.T) {
 	}
 }
 
+func TestDeleteAliasSynchronizesAppleBeforeLocalDeletion(t *testing.T) {
+	tests := []struct {
+		name             string
+		remotePresent    bool
+		remoteActive     bool
+		wantEvents       string
+		wantSession      string
+		wantDeactivate   int32
+		wantRemoteDelete int32
+	}{
+		{
+			name:             "active alias is deactivated then permanently deleted",
+			remotePresent:    true,
+			remoteActive:     true,
+			wantEvents:       "validate,list,deactivate,delete,local",
+			wantSession:      "deleted-session",
+			wantDeactivate:   1,
+			wantRemoteDelete: 1,
+		},
+		{
+			name:             "inactive alias skips deactivation",
+			remotePresent:    true,
+			wantEvents:       "validate,list,delete,local",
+			wantSession:      "deleted-session",
+			wantRemoteDelete: 1,
+		},
+		{
+			name:        "remote absence is idempotent success",
+			wantEvents:  "validate,list,local",
+			wantSession: "listed-session",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+			repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+			repo.addAlias(domain.Alias{
+				ID: 41, AccountID: 3, AccountEmail: "primary@icloud.com",
+				Address: "alias@icloud.com", Enabled: true,
+			})
+			locker := &fakeLocker{}
+			var events []string
+			client := &fakeAppleClient{
+				validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+					assertNetworkInsideAccountLock(t, locker)
+					events = append(events, "validate")
+					if session.SessionToken != "initial-session" {
+						t.Fatalf("validation session token = %q", session.SessionToken)
+					}
+					session.SessionToken = "validated-session"
+					return session, nil
+				},
+				list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+					assertNetworkInsideAccountLock(t, locker)
+					events = append(events, "list")
+					if session.SessionToken != "validated-session" {
+						t.Fatalf("list session token = %q", session.SessionToken)
+					}
+					session.SessionToken = "listed-session"
+					result := aliasDeletionDirectory()
+					if test.remotePresent {
+						result.Aliases = []apple.Alias{{
+							AnonymousID: "remote-id", HME: "ALIAS@icloud.com",
+							ForwardToEmail: "PRIMARY@icloud.com", IsActive: test.remoteActive,
+						}}
+					}
+					return result, session, nil
+				},
+				deactivate: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+					assertNetworkInsideAccountLock(t, locker)
+					events = append(events, "deactivate")
+					if anonymousID != "remote-id" || session.SessionToken != "listed-session" {
+						t.Fatalf("deactivate input: id=%q session=%#v", anonymousID, session)
+					}
+					session.SessionToken = "deactivated-session"
+					return session, nil
+				},
+				deleteRemote: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+					assertNetworkInsideAccountLock(t, locker)
+					events = append(events, "delete")
+					wantToken := "listed-session"
+					if test.remoteActive {
+						wantToken = "deactivated-session"
+					}
+					if anonymousID != "remote-id" || session.SessionToken != wantToken {
+						t.Fatalf("delete input: id=%q session=%#v want_token=%q", anonymousID, session, wantToken)
+					}
+					session.SessionToken = "deleted-session"
+					return session, nil
+				},
+			}
+			repo.deleteAliasFn = func(_ context.Context, id int64) error {
+				events = append(events, "local")
+				if id != 41 || locker.held.Load() == 0 {
+					t.Fatalf("local deletion was not published under the account lock: id=%d held=%d", id, locker.held.Load())
+				}
+				return nil
+			}
+			service := newTestService(t, repo, client, locker, func() time.Time { return now })
+			storeSession(t, service, repo, 3, apple.Session{
+				AppleID: "owner@example.com", Region: apple.RegionGlobal, SessionToken: "initial-session",
+			})
+
+			if err := service.DeleteAlias(ctx, 41); err != nil {
+				t.Fatalf("delete alias: %v", err)
+			}
+			if got := strings.Join(events, ","); got != test.wantEvents {
+				t.Fatalf("operation order = %q, want %q", got, test.wantEvents)
+			}
+			if repo.hasAlias(41) || repo.aliasDeletes.Load() != 1 {
+				t.Fatalf("local alias state: exists=%v deletes=%d", repo.hasAlias(41), repo.aliasDeletes.Load())
+			}
+			if client.deactivateCalls.Load() != test.wantDeactivate || client.deleteCalls.Load() != test.wantRemoteDelete {
+				t.Fatalf("remote calls: deactivate=%d delete=%d", client.deactivateCalls.Load(), client.deleteCalls.Load())
+			}
+			assertStoredAppleSessionToken(t, service, repo, 3, test.wantSession)
+		})
+	}
+}
+
+func TestDeleteAliasRejectsPendingConfirmationBeforeApple(t *testing.T) {
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.addAlias(domain.Alias{
+		ID: 41, AccountID: 3, Address: "alias@icloud.com", Enabled: false,
+		LastSyncError: "  " + domain.AppleAliasConfirmationPending + "  ",
+	})
+	client := &fakeAppleClient{validate: func(context.Context, apple.Session) (apple.Session, error) {
+		t.Fatal("pending alias reached Apple validation")
+		return apple.Session{}, nil
+	}}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+
+	err := service.DeleteAlias(context.Background(), 41)
+	if !errors.Is(err, ErrAliasConfirmationPending) ||
+		!errors.Is(err, store.ErrAliasConfirmationPending) ||
+		Code(err) != CodeAliasConfirmationPending {
+		t.Fatalf("pending alias deletion error = %v code=%q", err, Code(err))
+	}
+	if !repo.hasAlias(41) || repo.aliasDeletes.Load() != 0 ||
+		client.deactivateCalls.Load() != 0 || client.deleteCalls.Load() != 0 {
+		t.Fatal("pending alias deletion changed local or remote state")
+	}
+}
+
+func TestDeleteAliasReconcilesAmbiguousDeactivateOutcome(t *testing.T) {
+	tests := []struct {
+		name              string
+		reconciledPresent bool
+		reconciledActive  bool
+		wantError         bool
+		wantLocalAlias    bool
+		wantRemoteDelete  int32
+		wantSession       string
+	}{
+		{
+			name:        "alias disappeared",
+			wantSession: "reconciled-session",
+		},
+		{
+			name:              "alias became inactive",
+			reconciledPresent: true,
+			wantRemoteDelete:  1,
+			wantSession:       "deleted-session",
+		},
+		{
+			name:              "alias remained active",
+			reconciledPresent: true,
+			reconciledActive:  true,
+			wantError:         true,
+			wantLocalAlias:    true,
+			wantSession:       "reconciled-session",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+			repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+			repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "alias@icloud.com", Enabled: true})
+			var listCalls atomic.Int32
+			client := &fakeAppleClient{
+				validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+					session.SessionToken = "validated-session"
+					return session, nil
+				},
+				list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+					call := listCalls.Add(1)
+					result := aliasDeletionDirectory()
+					switch call {
+					case 1:
+						if session.SessionToken != "validated-session" {
+							t.Fatalf("initial list session token = %q", session.SessionToken)
+						}
+						result.Aliases = []apple.Alias{{
+							AnonymousID: "initial-id", HME: "alias@icloud.com",
+							ForwardToEmail: "primary@icloud.com", IsActive: true,
+						}}
+						session.SessionToken = "listed-session"
+					case 2:
+						if session.SessionToken != "ambiguous-deactivate-session" {
+							t.Fatalf("reconciliation session token = %q", session.SessionToken)
+						}
+						if test.reconciledPresent {
+							result.Aliases = []apple.Alias{{
+								AnonymousID: "reconciled-id", HME: "alias@icloud.com",
+								ForwardToEmail: "primary@icloud.com", IsActive: test.reconciledActive,
+							}}
+						}
+						session.SessionToken = "reconciled-session"
+					default:
+						t.Fatalf("unexpected list call %d", call)
+					}
+					return result, session, nil
+				},
+				deactivate: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+					if anonymousID != "initial-id" || session.SessionToken != "listed-session" {
+						t.Fatalf("deactivate input: id=%q session=%#v", anonymousID, session)
+					}
+					session.SessionToken = "ambiguous-deactivate-session"
+					return session, ambiguousAliasMutationError("deactivate")
+				},
+				deleteRemote: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+					if anonymousID != "reconciled-id" || session.SessionToken != "reconciled-session" {
+						t.Fatalf("delete after reconcile: id=%q session=%#v", anonymousID, session)
+					}
+					session.SessionToken = "deleted-session"
+					return session, nil
+				},
+			}
+			service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+			storeSession(t, service, repo, 3, apple.Session{
+				AppleID: "owner@example.com", Region: apple.RegionGlobal, SessionToken: "initial-session",
+			})
+
+			err := service.DeleteAlias(ctx, 41)
+			if test.wantError {
+				if !errors.Is(err, ErrUpstream) || Code(err) != CodeUpstreamError {
+					t.Fatalf("ambiguous deactivate error = %v code=%q", err, Code(err))
+				}
+			} else if err != nil {
+				t.Fatalf("delete after ambiguous deactivate: %v", err)
+			}
+			if got := repo.hasAlias(41); got != test.wantLocalAlias {
+				t.Fatalf("local alias exists = %v, want %v", got, test.wantLocalAlias)
+			}
+			if listCalls.Load() != 2 || client.deactivateCalls.Load() != 1 || client.deleteCalls.Load() != test.wantRemoteDelete {
+				t.Fatalf("calls: list=%d deactivate=%d delete=%d",
+					listCalls.Load(), client.deactivateCalls.Load(), client.deleteCalls.Load())
+			}
+			assertStoredAppleSessionToken(t, service, repo, 3, test.wantSession)
+		})
+	}
+}
+
+func TestDeleteAliasReconcilesAmbiguousPermanentDeleteOutcome(t *testing.T) {
+	tests := []struct {
+		name           string
+		stillPresent   bool
+		active         bool
+		wantError      bool
+		wantLocalAlias bool
+	}{
+		{name: "alias disappeared"},
+		{name: "inactive alias remained", stillPresent: true, wantError: true, wantLocalAlias: true},
+		{name: "active alias remained", stillPresent: true, active: true, wantError: true, wantLocalAlias: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+			repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+			repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "alias@icloud.com", Enabled: true})
+			var listCalls atomic.Int32
+			client := &fakeAppleClient{
+				validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+					session.SessionToken = "validated-session"
+					return session, nil
+				},
+				list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+					call := listCalls.Add(1)
+					result := aliasDeletionDirectory()
+					switch call {
+					case 1:
+						result.Aliases = []apple.Alias{{
+							AnonymousID: "remote-id", HME: "alias@icloud.com",
+							ForwardToEmail: "primary@icloud.com", IsActive: false,
+						}}
+						session.SessionToken = "listed-session"
+					case 2:
+						if session.SessionToken != "ambiguous-delete-session" {
+							t.Fatalf("delete reconciliation session token = %q", session.SessionToken)
+						}
+						if test.stillPresent {
+							result.Aliases = []apple.Alias{{
+								AnonymousID: "remote-id", HME: "alias@icloud.com",
+								ForwardToEmail: "primary@icloud.com", IsActive: test.active,
+							}}
+						}
+						session.SessionToken = "reconciled-session"
+					default:
+						t.Fatalf("unexpected list call %d", call)
+					}
+					return result, session, nil
+				},
+				deleteRemote: func(_ context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+					if anonymousID != "remote-id" || session.SessionToken != "listed-session" {
+						t.Fatalf("delete input: id=%q session=%#v", anonymousID, session)
+					}
+					session.SessionToken = "ambiguous-delete-session"
+					return session, ambiguousAliasMutationError("delete")
+				},
+			}
+			service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+			storeSession(t, service, repo, 3, apple.Session{
+				AppleID: "owner@example.com", Region: apple.RegionGlobal, SessionToken: "initial-session",
+			})
+
+			err := service.DeleteAlias(ctx, 41)
+			if test.wantError {
+				if !errors.Is(err, ErrUpstream) || Code(err) != CodeUpstreamError {
+					t.Fatalf("ambiguous permanent delete error = %v code=%q", err, Code(err))
+				}
+			} else if err != nil {
+				t.Fatalf("delete after reconciliation: %v", err)
+			}
+			if got := repo.hasAlias(41); got != test.wantLocalAlias {
+				t.Fatalf("local alias exists = %v, want %v", got, test.wantLocalAlias)
+			}
+			if listCalls.Load() != 2 || client.deactivateCalls.Load() != 0 || client.deleteCalls.Load() != 1 {
+				t.Fatalf("calls: list=%d deactivate=%d delete=%d",
+					listCalls.Load(), client.deactivateCalls.Load(), client.deleteCalls.Load())
+			}
+			assertStoredAppleSessionToken(t, service, repo, 3, "reconciled-session")
+		})
+	}
+}
+
+func TestDeleteAliasRejectsTargetForwardedToAnotherMailbox(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "alias@icloud.com", Enabled: true})
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{
+				SelectedForwardTo: "primary@icloud.com",
+				ForwardToEmails:   []string{"primary@icloud.com", "other@example.com"},
+				Aliases: []apple.Alias{
+					{AnonymousID: "target-id", HME: "alias@icloud.com", ForwardToEmail: "other@example.com", IsActive: true},
+					{AnonymousID: "owned-id", HME: "owned@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true},
+				},
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	err := service.DeleteAlias(ctx, 41)
+	if !errors.Is(err, ErrAccountMismatch) || Code(err) != CodeAccountMismatch {
+		t.Fatalf("forwarding mismatch error = %v code=%q", err, Code(err))
+	}
+	if !repo.hasAlias(41) || repo.aliasDeletes.Load() != 0 ||
+		client.deactivateCalls.Load() != 0 || client.deleteCalls.Load() != 0 {
+		t.Fatalf("forwarding mismatch caused deletion: exists=%v local=%d deactivate=%d delete=%d",
+			repo.hasAlias(41), repo.aliasDeletes.Load(), client.deactivateCalls.Load(), client.deleteCalls.Load())
+	}
+}
+
+func TestDeleteAliasRequiresUsableAppleSession(t *testing.T) {
+	t.Run("login required", func(t *testing.T) {
+		now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+		repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+		repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "alias@icloud.com", Enabled: true})
+		client := &fakeAppleClient{validate: func(context.Context, apple.Session) (apple.Session, error) {
+			t.Fatal("missing session reached Apple validation")
+			return apple.Session{}, nil
+		}}
+		service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+
+		err := service.DeleteAlias(context.Background(), 41)
+		if !errors.Is(err, ErrLoginRequired) || Code(err) != CodeLoginRequired {
+			t.Fatalf("missing session error = %v code=%q", err, Code(err))
+		}
+		if !repo.hasAlias(41) || repo.aliasDeletes.Load() != 0 {
+			t.Fatal("missing Apple login deleted the local alias")
+		}
+	})
+
+	t.Run("expired session is removed", func(t *testing.T) {
+		now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+		repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+		repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "alias@icloud.com", Enabled: true})
+		client := &fakeAppleClient{validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			session.SessionToken = "expired-rotated-session"
+			return session, apple.ErrInvalidSession
+		}}
+		service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+		storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+		err := service.DeleteAlias(context.Background(), 41)
+		if !errors.Is(err, ErrSessionExpired) || Code(err) != CodeSessionExpired {
+			t.Fatalf("expired session error = %v code=%q", err, Code(err))
+		}
+		if !repo.hasAlias(41) || repo.aliasDeletes.Load() != 0 || repo.sessionCount() != 0 {
+			t.Fatalf("expired session cleanup: alias_exists=%v local_deletes=%d sessions=%d",
+				repo.hasAlias(41), repo.aliasDeletes.Load(), repo.sessionCount())
+		}
+	})
+}
+
+func TestDeleteAliasSerializesOperationsForTheSameAccount(t *testing.T) {
+	now := time.Date(2026, 8, 9, 10, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.addAlias(domain.Alias{ID: 41, AccountID: 3, Address: "one@icloud.com", Enabled: true})
+	repo.addAlias(domain.Alias{ID: 42, AccountID: 3, Address: "two@icloud.com", Enabled: true})
+	secondRead := make(chan struct{})
+	var secondReadOnce sync.Once
+	repo.getAliasFn = func(_ context.Context, id int64) error {
+		if id == 42 {
+			secondReadOnce.Do(func() { close(secondRead) })
+		}
+		return nil
+	}
+	firstListed := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var validateCalls atomic.Int32
+	var listCalls atomic.Int32
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			validateCalls.Add(1)
+			return session, nil
+		},
+		list: func(ctx context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			if listCalls.Add(1) == 1 {
+				close(firstListed)
+				select {
+				case <-releaseFirst:
+				case <-ctx.Done():
+					return apple.ListResult{}, session, ctx.Err()
+				}
+			}
+			return aliasDeletionDirectory(), session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	firstContext, cancelFirst := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelFirst()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- service.DeleteAlias(firstContext, 41) }()
+	select {
+	case <-firstListed:
+	case <-firstContext.Done():
+		t.Fatalf("first deletion did not reach Apple list: %v", firstContext.Err())
+	}
+
+	secondContext, cancelSecond := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- service.DeleteAlias(secondContext, 42) }()
+	select {
+	case <-secondRead:
+	case <-firstContext.Done():
+		t.Fatalf("second deletion did not reach the operation lock: %v", firstContext.Err())
+	}
+	cancelSecond()
+	if err := <-secondDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("blocked deletion error = %v, want context.Canceled", err)
+	}
+	if validateCalls.Load() != 1 || listCalls.Load() != 1 || !repo.hasAlias(42) {
+		t.Fatalf("same-account operation overlapped: validates=%d lists=%d second_exists=%v",
+			validateCalls.Load(), listCalls.Load(), repo.hasAlias(42))
+	}
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first deletion: %v", err)
+	}
+	if repo.hasAlias(41) {
+		t.Fatal("first deletion did not remove its local alias")
+	}
+}
+
 func TestFilterAliasesRejectsDuplicateAddress(t *testing.T) {
 	_, _, err := filterAliases(apple.ListResult{
 		ForwardToEmails: []string{"primary@icloud.com"},
@@ -1053,14 +1543,18 @@ func TestFilterAliasesRejectsDuplicateAddress(t *testing.T) {
 }
 
 type fakeAppleClient struct {
-	signIn   func(context.Context, string, string, apple.Region, *apple.Session) (apple.Session, bool, error)
-	verify   func(context.Context, apple.Session, string) (apple.Session, error)
-	validate func(context.Context, apple.Session) (apple.Session, error)
-	list     func(context.Context, apple.Session) (apple.ListResult, apple.Session, error)
-	create   func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error)
+	signIn       func(context.Context, string, string, apple.Region, *apple.Session) (apple.Session, bool, error)
+	verify       func(context.Context, apple.Session, string) (apple.Session, error)
+	validate     func(context.Context, apple.Session) (apple.Session, error)
+	list         func(context.Context, apple.Session) (apple.ListResult, apple.Session, error)
+	create       func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error)
+	deactivate   func(context.Context, apple.Session, string) (apple.Session, error)
+	deleteRemote func(context.Context, apple.Session, string) (apple.Session, error)
 
-	verifyCalls atomic.Int32
-	createCalls atomic.Int32
+	verifyCalls     atomic.Int32
+	createCalls     atomic.Int32
+	deactivateCalls atomic.Int32
+	deleteCalls     atomic.Int32
 }
 
 func (c *fakeAppleClient) SignIn(ctx context.Context, appleID, password string, region apple.Region, previous *apple.Session) (apple.Session, bool, error) {
@@ -1100,6 +1594,22 @@ func (c *fakeAppleClient) CreateAlias(ctx context.Context, session apple.Session
 	return c.create(ctx, session, label, note)
 }
 
+func (c *fakeAppleClient) DeactivateAlias(ctx context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+	c.deactivateCalls.Add(1)
+	if c.deactivate == nil {
+		panic("unexpected DeactivateAlias")
+	}
+	return c.deactivate(ctx, session, anonymousID)
+}
+
+func (c *fakeAppleClient) DeleteAlias(ctx context.Context, session apple.Session, anonymousID string) (apple.Session, error) {
+	c.deleteCalls.Add(1)
+	if c.deleteRemote == nil {
+		panic("unexpected DeleteAlias")
+	}
+	return c.deleteRemote(ctx, session, anonymousID)
+}
+
 type fakeLocker struct {
 	held atomic.Int32
 }
@@ -1114,6 +1624,13 @@ func assertNetworkOutsideAccountLock(t *testing.T, locker *fakeLocker) {
 	t.Helper()
 	if locker.held.Load() != 0 {
 		t.Fatal("Apple network request ran while the account lock was held")
+	}
+}
+
+func assertNetworkInsideAccountLock(t *testing.T, locker *fakeLocker) {
+	t.Helper()
+	if locker.held.Load() == 0 {
+		t.Fatal("Apple deletion request ran outside the account lock")
 	}
 }
 
@@ -1149,20 +1666,26 @@ type fakeRepository struct {
 	mu               sync.Mutex
 	account          domain.Account
 	sessions         map[int64]domain.AppleWebSession
+	aliases          map[int64]domain.Alias
 	pending          *domain.PendingAliasAPIKey
 	now              time.Time
 	deleteSessionErr error
+	deleteAliasErr   error
+	getAliasFn       func(context.Context, int64) error
+	deleteAliasFn    func(context.Context, int64) error
 	importFn         func(context.Context, int64, []domain.AliasImportCandidate) (domain.AliasImportResult, error)
 	upserts          atomic.Int32
 	imports          atomic.Int32
 	creates          atomic.Int32
 	confirms         atomic.Int32
+	aliasDeletes     atomic.Int32
 }
 
 func newFakeRepository(account domain.Account, now time.Time) *fakeRepository {
 	return &fakeRepository{
 		account:  account,
 		sessions: make(map[int64]domain.AppleWebSession),
+		aliases:  make(map[int64]domain.Alias),
 		now:      now,
 	}
 }
@@ -1210,6 +1733,40 @@ func (r *fakeRepository) DeleteAppleWebSession(_ context.Context, accountID int6
 		return sql.ErrNoRows
 	}
 	delete(r.sessions, accountID)
+	return nil
+}
+
+func (r *fakeRepository) GetAlias(ctx context.Context, id int64) (domain.Alias, error) {
+	if r.getAliasFn != nil {
+		if err := r.getAliasFn(ctx, id); err != nil {
+			return domain.Alias{}, err
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	alias, ok := r.aliases[id]
+	if !ok {
+		return domain.Alias{}, store.ErrNotFound
+	}
+	return alias, nil
+}
+
+func (r *fakeRepository) DeleteAlias(ctx context.Context, id int64) error {
+	if r.deleteAliasFn != nil {
+		if err := r.deleteAliasFn(ctx, id); err != nil {
+			return err
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.deleteAliasErr != nil {
+		return r.deleteAliasErr
+	}
+	if _, ok := r.aliases[id]; !ok {
+		return store.ErrNotFound
+	}
+	delete(r.aliases, id)
+	r.aliasDeletes.Add(1)
 	return nil
 }
 
@@ -1295,6 +1852,19 @@ func (r *fakeRepository) setIMAPUsername(username string) {
 	r.account.IMAPUsername = username
 }
 
+func (r *fakeRepository) addAlias(alias domain.Alias) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.aliases[alias.ID] = alias
+}
+
+func (r *fakeRepository) hasAlias(id int64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.aliases[id]
+	return ok
+}
+
 func (r *fakeRepository) sessionCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1346,5 +1916,39 @@ func storeSession(t *testing.T, service *Service, repo *fakeRepository, accountI
 	})
 	if err != nil {
 		t.Fatalf("store session: %v", err)
+	}
+}
+
+func aliasDeletionDirectory() apple.ListResult {
+	return apple.ListResult{
+		SelectedForwardTo: "primary@icloud.com",
+		ForwardToEmails:   []string{"primary@icloud.com"},
+	}
+}
+
+func ambiguousAliasMutationError(operation string) error {
+	return &apple.Error{
+		Op:         operation + " Hide My Email alias",
+		Kind:       apple.ErrService,
+		StatusCode: 503,
+		Retryable:  false,
+		Err:        errors.New("response lost after request started"),
+	}
+}
+
+func assertStoredAppleSessionToken(
+	t *testing.T,
+	service *Service,
+	repo *fakeRepository,
+	accountID int64,
+	want string,
+) {
+	t.Helper()
+	stored, err := service.decryptSession(repo.mustSession(t, accountID))
+	if err != nil {
+		t.Fatalf("decrypt stored Apple session: %v", err)
+	}
+	if stored.SessionToken != want {
+		t.Fatalf("stored Apple session token = %q, want %q", stored.SessionToken, want)
 	}
 }

@@ -276,11 +276,11 @@
           <template #actions>
             <el-button
               :icon="Refresh"
-              :loading="syncLoading"
-              :disabled="!account.enabled"
+              :loading="syncLoading || syncActive"
+              :disabled="!account.enabled || syncActive"
               @click="syncNow"
             >
-              同步邮件
+              {{ syncActive ? "同步处理中" : "同步邮件" }}
             </el-button>
             <el-button :icon="EditPen" @click="editAccount">编辑</el-button>
           </template>
@@ -307,7 +307,13 @@
 
         <div v-if="account.lastSyncError" class="inline-error" role="status">
           <strong>最近错误</strong>
-          <span>{{ account.lastSyncError }}</span>
+          <div class="inline-error__content">
+            <span>{{ account.lastSyncError }}</span>
+            <SyncErrorLogDialog
+              :log="account.lastSyncErrorLog || account.lastSyncError"
+              :account-id="account.id"
+            />
+          </div>
         </div>
       </section>
 
@@ -517,7 +523,7 @@
                       @click="rotateKey(row)"
                     />
                   </el-tooltip>
-                  <el-tooltip content="删除隐私邮箱" placement="top">
+                  <el-tooltip content="从 iCloud 永久删除隐私邮箱" placement="top">
                     <el-button
                       type="danger"
                       plain
@@ -525,7 +531,7 @@
                       circle
                       :loading="Boolean(deleteLoading[row.id])"
                       :disabled="Boolean(copyLoading[row.id] || toggleLoading[row.id] || rotateLoading[row.id])"
-                      :aria-label="`删除隐私邮箱 ${row.address}`"
+                      :aria-label="`从 iCloud 永久删除隐私邮箱 ${row.address}`"
                       @click="removeAlias(row)"
                     />
                   </el-tooltip>
@@ -603,7 +609,7 @@
                 :disabled="Boolean(copyLoading[alias.id] || toggleLoading[alias.id] || rotateLoading[alias.id])"
                 @click="removeAlias(alias)"
               >
-                删除
+                永久删除
               </el-button>
             </footer>
           </article>
@@ -732,6 +738,7 @@ import EmptyState from "../components/EmptyState.vue";
 import OneTimeSecret from "../components/OneTimeSecret.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
+import SyncErrorLogDialog from "../components/SyncErrorLogDialog.vue";
 import SyncStatus from "../components/SyncStatus.vue";
 import { useAuth } from "../stores/auth.js";
 import { setPageHeader } from "../stores/page.js";
@@ -800,6 +807,8 @@ const secretNavigationLock = createActionLock();
 let viewActive = true;
 let resumeAliasSyncAfterAuth = false;
 let resumeAutoCreationAfterAuth = false;
+
+const syncActive = computed(() => Boolean(account.value?.syncProgress?.active));
 
 const aliasForm = reactive({ address: "", label: "" });
 const appleLoginForm = reactive({ appleId: "", password: "", region: "global" });
@@ -1169,7 +1178,7 @@ async function revealKey(value, directLinkPath, accountId) {
 }
 
 async function syncNow() {
-  if (syncLoading.value) return;
+  if (syncLoading.value || syncActive.value) return;
   beginDetailMutation();
   const accountId = account.value.id;
   syncLoading.value = true;
@@ -1920,11 +1929,11 @@ async function removeAlias(alias) {
   deleteLoading[alias.id] = true;
   try {
     await ElMessageBox.confirm(
-      "删除后该地址的 API Key 和最新邮件都会清除。继续吗？",
-      `删除 ${alias.address}`,
+      "删除后，该隐私邮箱将从 iCloud 永久删除，同时清除本地 API Key、邮件快照及关联记录，且无法恢复。继续吗？",
+      `从 iCloud 永久删除 ${alias.address}`,
       {
         type: "warning",
-        confirmButtonText: "删除",
+        confirmButtonText: "永久删除",
         cancelButtonText: "取消",
         confirmButtonClass: "el-button--danger",
         autofocus: false,
@@ -1935,11 +1944,21 @@ async function removeAlias(alias) {
     if (!isCurrentAccount(accountId)) return;
     aliases.value = aliases.value.filter((item) => item.id !== alias.id);
     account.value = { ...account.value, aliasCount: aliases.value.length };
-    successMessage("隐私邮箱已删除。");
+    successMessage("隐私邮箱已从 iCloud 和本地永久删除。");
   } catch (error) {
     if (confirmationCancelled(error)) return;
     if (!isCurrentAccount(accountId)) return;
-    showRequestError(error, "隐私邮箱删除失败，请稍后重试。");
+    if (isAppleSessionInvalid(error)) {
+      if (appleSession.value) {
+        appleSession.value = { ...appleSession.value, status: "expired" };
+      }
+      openAppleLogin({ error });
+      return;
+    }
+    showRequestError(
+      error,
+      "隐私邮箱删除未完成，本地记录已保留，请稍后重试。",
+    );
   } finally {
     delete deleteLoading[alias.id];
     aliasActionLock.release(alias.id);

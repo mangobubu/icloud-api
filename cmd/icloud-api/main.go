@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"icloud-api/internal/apple"
+	"icloud-api/internal/applog"
 	"icloud-api/internal/autocreate"
 	"icloud-api/internal/config"
 	"icloud-api/internal/domain"
@@ -55,7 +56,11 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("读取配置: %w", err)
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	applicationLogs := applog.New(2000)
+	logger := slog.New(applog.Tee(
+		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
+		applicationLogs,
+	))
 
 	db, cipher, keyCreated, err := openInitializedStore(context.Background(), cfg)
 	if err != nil {
@@ -137,6 +142,8 @@ func run() error {
 		return fmt.Errorf("初始化 HTTP 服务: %w", err)
 	}
 	web.SetAccountLocker(manager.WithAccountLock)
+	web.SetApplicationLogSource(applicationLogs)
+	web.SetSyncProgressProvider(manager.AccountProgress)
 	web.SetHMESyncService(hmeService)
 	web.SetAliasAutoCreationService(autoManager)
 	web.SetSeenNotifier(seenWorker.Notify)

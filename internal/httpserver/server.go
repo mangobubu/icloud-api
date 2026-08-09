@@ -28,8 +28,10 @@ type Server struct {
 	cipher               *secure.Cipher
 	cfg                  config.Config
 	logger               *slog.Logger
+	applicationLogs      ApplicationLogSource
 	now                  func() time.Time
 	sync                 func(int64) error
+	syncProgress         func(int64) (domain.MailboxSyncProgress, bool)
 	hmeSync              HMESyncService
 	autoCreate           AliasAutoCreationService
 	lockAccount          func(context.Context, int64, func() error) error
@@ -85,6 +87,13 @@ func (s *Server) SetAccountLocker(locker func(context.Context, int64, func() err
 // request queues a message for marking as read.
 func (s *Server) SetSeenNotifier(notify func()) {
 	s.seenNotify = notify
+}
+
+// SetSyncProgressProvider exposes the sync manager's in-memory activity to
+// administrator API reads. Progress is intentionally runtime state; durable
+// success and failure remain on the account record.
+func (s *Server) SetSyncProgressProvider(provider func(int64) (domain.MailboxSyncProgress, bool)) {
+	s.syncProgress = provider
 }
 
 func (s *Server) withAccountLock(ctx context.Context, accountID int64, operation func() error) error {

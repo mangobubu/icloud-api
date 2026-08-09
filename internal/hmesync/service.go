@@ -24,6 +24,7 @@ const (
 	autoCreateLabel             = "自动创建"
 	autoCreateNote              = "icloud-api 自动创建"
 	autoCreatePersistTimeout    = 5 * time.Second
+	aliasDeletePersistTimeout   = 5 * time.Second
 )
 
 var defaultAutoCreateConfirmationDelays = [...]time.Duration{
@@ -387,6 +388,304 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		Created: created,
 		Session: sessionInfoFromRecord(saved, updated, StatusAuthenticated),
 	}, nil
+}
+
+// DeleteAlias permanently removes an Apple Hide My Email address before
+// deleting its local record. Ambiguous remote results are reconciled only by
+// reading Apple's authoritative directory.
+func (s *Service) DeleteAlias(ctx context.Context, aliasID int64) error {
+	if aliasID < 1 {
+		return errors.New("alias ID must be positive")
+	}
+	deleteRepo, ok := s.repo.(AliasDeletionRepository)
+	if !ok {
+		return errors.New("alias deletion persistence is unavailable")
+	}
+	deleteClient, ok := s.client.(AliasDeletionClient)
+	if !ok {
+		return errors.New("Apple alias deletion client is unavailable")
+	}
+	initial, err := deleteRepo.GetAlias(ctx, aliasID)
+	if err != nil {
+		return err
+	}
+	if initial.AccountID < 1 {
+		return errors.New("alias account ID must be positive")
+	}
+
+	releaseOperation, err := s.acquireOperation(ctx, initial.AccountID)
+	if err != nil {
+		return err
+	}
+	defer releaseOperation()
+
+	operation := func() error {
+		return s.deleteAliasLocked(ctx, deleteRepo, deleteClient, initial.AccountID, aliasID)
+	}
+	if acquirer, ok := s.locker.(AccountLockAcquirer); ok {
+		releaseAccount, err := acquirer.AcquireAccountLock(ctx, initial.AccountID)
+		if err != nil {
+			return err
+		}
+		defer releaseAccount()
+		return operation()
+	}
+	return s.locker.WithAccountLock(ctx, initial.AccountID, operation)
+}
+
+func (s *Service) deleteAliasLocked(
+	ctx context.Context,
+	deleteRepo AliasDeletionRepository,
+	deleteClient AliasDeletionClient,
+	accountID, aliasID int64,
+) error {
+	alias, err := deleteRepo.GetAlias(ctx, aliasID)
+	if err != nil {
+		return err
+	}
+	if alias.AccountID != accountID {
+		return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+	}
+	if !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending {
+		return wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, store.ErrAliasConfirmationPending)
+	}
+	account, err := s.repo.GetAccount(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	record, session, err := s.loadSession(ctx, accountID)
+	if err != nil {
+		if errors.Is(err, ErrSessionExpired) {
+			return s.expireAliasDeletionSession(ctx, accountID, err)
+		}
+		return err
+	}
+
+	validated, err := s.client.Validate(ctx, session)
+	if err != nil {
+		mapped := mapAppleError(err, false)
+		if errors.Is(mapped, ErrSessionExpired) {
+			return s.expireAliasDeletionSession(ctx, accountID, mapped)
+		}
+		return mapped
+	}
+	validated, err = s.prepareAliasDeletionSession(record, validated, session)
+	if err != nil {
+		return err
+	}
+
+	directory, listedSession, err := s.client.ListAliases(ctx, validated)
+	if err != nil {
+		mapped := mapAppleError(err, false)
+		if errors.Is(mapped, ErrSessionExpired) {
+			return s.expireAliasDeletionSession(ctx, accountID, mapped)
+		}
+		listedSession, sessionErr := s.prepareAliasDeletionSession(record, listedSession, validated)
+		if sessionErr != nil {
+			return errors.Join(sessionErr, mapped)
+		}
+		if sessionErr = s.checkpointAliasDeletionSession(ctx, accountID, listedSession); sessionErr != nil {
+			return errors.Join(mapped, sessionErr)
+		}
+		return mapped
+	}
+	listedSession, err = s.prepareAliasDeletionSession(record, listedSession, validated)
+	if err != nil {
+		return err
+	}
+	if err := s.checkpointAliasDeletionSession(ctx, accountID, listedSession); err != nil {
+		return err
+	}
+	filtered, _, err := filterAliases(directory, account.Email)
+	if err != nil {
+		return err
+	}
+	remote, found, err := findAppleAliasForDeletion(directory.Aliases, filtered, alias.Address)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return s.deleteLocalAliasAfterApple(ctx, deleteRepo, aliasID)
+	}
+	remoteID := strings.TrimSpace(remote.AnonymousID)
+	if remoteID == "" {
+		return wrapError(CodeUpstreamError, ErrUpstream, errors.New("Apple alias omitted its remote ID"))
+	}
+
+	currentSession := listedSession
+	if remote.IsActive {
+		returned, remoteErr := deleteClient.DeactivateAlias(ctx, currentSession, remoteID)
+		if remoteErr != nil {
+			mapped := mapAppleError(remoteErr, false)
+			if errors.Is(mapped, ErrSessionExpired) {
+				return s.expireAliasDeletionSession(ctx, accountID, mapped)
+			}
+			returned, sessionErr := s.prepareAliasDeletionSession(record, returned, currentSession)
+			if sessionErr != nil {
+				return errors.Join(sessionErr, mapped)
+			}
+			if sessionErr = s.checkpointAliasDeletionSession(ctx, accountID, returned); sessionErr != nil {
+				return errors.Join(mapped, sessionErr)
+			}
+			reconciled, stillPresent, reconciledSession, reconcileErr := s.reconcileAliasDeletion(
+				ctx, account, record, returned, alias.Address,
+			)
+			if reconcileErr != nil {
+				return errors.Join(reconcileErr, mapped)
+			}
+			if !stillPresent {
+				return s.deleteLocalAliasAfterApple(ctx, deleteRepo, aliasID)
+			}
+			if reconciled.IsActive {
+				return mapped
+			}
+			remoteID = strings.TrimSpace(reconciled.AnonymousID)
+			if remoteID == "" {
+				return errors.Join(mapped, wrapError(CodeUpstreamError, ErrUpstream,
+					errors.New("Apple alias omitted its remote ID")))
+			}
+			currentSession = reconciledSession
+		} else {
+			returned, err = s.prepareAliasDeletionSession(record, returned, currentSession)
+			if err != nil {
+				return err
+			}
+			if err := s.checkpointAliasDeletionSession(ctx, accountID, returned); err != nil {
+				return err
+			}
+			currentSession = returned
+		}
+	}
+
+	returned, remoteErr := deleteClient.DeleteAlias(ctx, currentSession, remoteID)
+	if remoteErr != nil {
+		mapped := mapAppleError(remoteErr, false)
+		if errors.Is(mapped, ErrSessionExpired) {
+			return s.expireAliasDeletionSession(ctx, accountID, mapped)
+		}
+		returned, sessionErr := s.prepareAliasDeletionSession(record, returned, currentSession)
+		if sessionErr != nil {
+			return errors.Join(sessionErr, mapped)
+		}
+		if sessionErr = s.checkpointAliasDeletionSession(ctx, accountID, returned); sessionErr != nil {
+			return errors.Join(mapped, sessionErr)
+		}
+		_, stillPresent, _, reconcileErr := s.reconcileAliasDeletion(ctx, account, record, returned, alias.Address)
+		if reconcileErr != nil {
+			return errors.Join(reconcileErr, mapped)
+		}
+		if stillPresent {
+			return mapped
+		}
+		return s.deleteLocalAliasAfterApple(ctx, deleteRepo, aliasID)
+	}
+	returned, err = s.prepareAliasDeletionSession(record, returned, currentSession)
+	if err != nil {
+		return err
+	}
+	if err := s.checkpointAliasDeletionSession(ctx, accountID, returned); err != nil {
+		return err
+	}
+	return s.deleteLocalAliasAfterApple(ctx, deleteRepo, aliasID)
+}
+
+func (s *Service) prepareAliasDeletionSession(
+	record domain.AppleWebSession,
+	returned, fallback apple.Session,
+) (apple.Session, error) {
+	if !hasAppleSessionState(returned) {
+		returned = fallback
+	}
+	if strings.TrimSpace(returned.AppleID) != "" &&
+		!strings.EqualFold(strings.TrimSpace(returned.AppleID), strings.TrimSpace(record.AppleID)) {
+		return apple.Session{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	normalizeSession(&returned, record.AppleID, fallback.Region, s.now())
+	region, err := normalizeRegion(returned.Region)
+	if err != nil {
+		return apple.Session{}, err
+	}
+	returned.Region = region
+	return returned, nil
+}
+
+func (s *Service) checkpointAliasDeletionSession(ctx context.Context, accountID int64, session apple.Session) error {
+	persistContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), aliasDeletePersistTimeout)
+	defer cancel()
+	_, err := s.saveSession(persistContext, accountID, session)
+	return err
+}
+
+func (s *Service) expireAliasDeletionSession(ctx context.Context, accountID int64, sessionErr error) error {
+	persistContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), aliasDeletePersistTimeout)
+	defer cancel()
+	err := s.repo.DeleteAppleWebSession(persistContext, accountID)
+	if errors.Is(err, store.ErrNotFound) {
+		err = nil
+	}
+	if err == nil {
+		return sessionErr
+	}
+	return wrapError(CodeSessionExpired, ErrSessionExpired, errors.Join(
+		sessionErr,
+		fmt.Errorf("delete expired Apple session: %w", err),
+	))
+}
+
+func (s *Service) reconcileAliasDeletion(
+	ctx context.Context,
+	account domain.Account,
+	record domain.AppleWebSession,
+	session apple.Session,
+	address string,
+) (apple.Alias, bool, apple.Session, error) {
+	reconcileContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), aliasDeletePersistTimeout)
+	defer cancel()
+	directory, returned, err := s.client.ListAliases(reconcileContext, session)
+	if err != nil {
+		mapped := mapAppleError(err, false)
+		if errors.Is(mapped, ErrSessionExpired) {
+			return apple.Alias{}, false, session, s.expireAliasDeletionSession(reconcileContext, account.ID, mapped)
+		}
+		returned, sessionErr := s.prepareAliasDeletionSession(record, returned, session)
+		if sessionErr != nil {
+			return apple.Alias{}, false, session, errors.Join(mapped, sessionErr)
+		}
+		if _, sessionErr = s.saveSession(reconcileContext, account.ID, returned); sessionErr != nil {
+			return apple.Alias{}, false, returned, errors.Join(mapped, sessionErr)
+		}
+		return apple.Alias{}, false, returned, mapped
+	}
+	returned, err = s.prepareAliasDeletionSession(record, returned, session)
+	if err != nil {
+		return apple.Alias{}, false, session, err
+	}
+	if _, err := s.saveSession(reconcileContext, account.ID, returned); err != nil {
+		return apple.Alias{}, false, returned, err
+	}
+	filtered, _, err := filterAliases(directory, account.Email)
+	if err != nil {
+		return apple.Alias{}, false, returned, err
+	}
+	remote, found, err := findAppleAliasForDeletion(directory.Aliases, filtered, address)
+	return remote, found, returned, err
+}
+
+func (s *Service) deleteLocalAliasAfterApple(ctx context.Context, repo AliasDeletionRepository, aliasID int64) error {
+	persistContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), aliasDeletePersistTimeout)
+	defer cancel()
+	return repo.DeleteAlias(persistContext, aliasID)
+}
+
+func findAppleAliasForDeletion(all, owned []apple.Alias, address string) (apple.Alias, bool, error) {
+	remote, found := findAppleAlias(owned, address)
+	if found {
+		return remote, true, nil
+	}
+	if _, exists := findAppleAlias(all, address); exists {
+		return apple.Alias{}, false, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	return apple.Alias{}, false, nil
 }
 
 // CreateAutoAlias reserves exactly one Hide My Email address and publishes it

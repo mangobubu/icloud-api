@@ -513,6 +513,37 @@ func testFetcher(session imapSession, now time.Time) *Fetcher {
 	return fetcher
 }
 
+func TestFetchIncrementalReportsProgressStagesAndTargetUID(t *testing.T) {
+	session := &fakeIMAPSession{uidValidity: 77, uidNext: 5}
+	var updates []domain.MailboxSyncProgressUpdate
+	ctx := domain.WithMailboxSyncProgressReporter(
+		context.Background(),
+		func(update domain.MailboxSyncProgressUpdate) {
+			updates = append(updates, update)
+		},
+	)
+
+	result, err := testFetcher(session, time.Now()).FetchIncremental(
+		ctx, testAccount(), "password", nil, nil, nil,
+	)
+	if err != nil {
+		t.Fatalf("fetch empty mailbox: %v", err)
+	}
+	if result.TargetUID != 4 || result.State.LastUID != 4 {
+		t.Fatalf("mailbox progress target/state = %d/%d, want 4/4", result.TargetUID, result.State.LastUID)
+	}
+	want := []domain.MailboxSyncProgressUpdate{
+		{Phase: domain.MailboxSyncPhaseConnecting, Percent: 5},
+		{Phase: domain.MailboxSyncPhaseAuthenticating, Percent: 10},
+		{Phase: domain.MailboxSyncPhaseScanning, Percent: 15},
+		{Phase: domain.MailboxSyncPhaseReading, Percent: 20},
+		{Phase: domain.MailboxSyncPhaseValidating, Percent: 25},
+	}
+	if !reflect.DeepEqual(updates, want) {
+		t.Fatalf("progress updates = %#v, want %#v", updates, want)
+	}
+}
+
 func TestNewFetcherUsesSeparateCandidateDefaults(t *testing.T) {
 	fetcher := NewFetcher()
 	if fetcher.MaxCandidates != 1024 || fetcher.MaxIncrementalCandidates != 256 {

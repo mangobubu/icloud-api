@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ type fakeHMESyncService struct {
 	getSession  func(context.Context, int64) (hmesync.SessionInfo, error)
 	clearAuth   func(context.Context, int64) error
 	syncAliases func(context.Context, int64) (hmesync.SyncResult, error)
+	deleteAlias func(context.Context, int64) error
 }
 
 func (f *fakeHMESyncService) StartAuth(
@@ -68,6 +70,13 @@ func (f *fakeHMESyncService) SyncAliases(ctx context.Context, accountID int64) (
 		return hmesync.SyncResult{}, errors.New("unexpected SyncAliases call")
 	}
 	return f.syncAliases(ctx, accountID)
+}
+
+func (f *fakeHMESyncService) DeleteAlias(ctx context.Context, aliasID int64) error {
+	if f.deleteAlias == nil {
+		return errors.New("unexpected DeleteAlias call")
+	}
+	return f.deleteAlias(ctx, aliasID)
 }
 
 func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
@@ -253,6 +262,195 @@ func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
 		if !strings.Contains(auditText, action) {
 			t.Fatalf("audit log omitted action %q: %s", action, auditText)
 		}
+	}
+}
+
+func TestAdminAPIDeleteAliasUsesAppleServiceAndAuditsSuccess(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-delete-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "delete-success@icloud.com")
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "delete-success-alias@icloud.com")
+
+	deleteCalls := 0
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		deleteAlias: func(ctx context.Context, aliasID int64) error {
+			deleteCalls++
+			if aliasID != alias.ID {
+				t.Fatalf("delete alias ID = %d, want %d", aliasID, alias.ID)
+			}
+			return env.store.DeleteAlias(ctx, aliasID)
+		},
+	})
+
+	path := fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID)
+	response := env.request(t, http.MethodDelete, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+		t.Fatalf("delete alias response = %d; body=%s", response.Code, response.Body.String())
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("Apple delete calls = %d, want 1", deleteCalls)
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted alias lookup error = %v, want not found", err)
+	}
+	assertAdminAliasDeleteAudit(t, env.store, alias.ID, "success", "")
+}
+
+func TestAdminAPIDeleteAliasAppleFailuresKeepLocalRecord(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "login required wrapping missing session",
+			err:        fmt.Errorf("load Apple session: %w: %w", hmesync.ErrLoginRequired, store.ErrNotFound),
+			wantStatus: http.StatusConflict,
+			wantCode:   hmesync.CodeLoginRequired,
+		},
+		{name: "session expired", err: hmesync.ErrSessionExpired, wantStatus: http.StatusConflict, wantCode: hmesync.CodeSessionExpired},
+		{name: "rate limited", err: hmesync.ErrRateLimited, wantStatus: http.StatusTooManyRequests, wantCode: hmesync.CodeRateLimited},
+		{name: "upstream", err: hmesync.ErrUpstream, wantStatus: http.StatusBadGateway, wantCode: hmesync.CodeUpstreamError},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newAdminAPITestEnv(t)
+			sessionCookie, csrf, _ := env.createSession(t, "apple-delete-failure-"+strings.ReplaceAll(test.name, " ", "-"), "unused-password")
+			account := adminAPITestCreateAccount(t, env, strings.ReplaceAll(test.name, " ", "-")+"@icloud.com")
+			alias := adminAPITestCreateDeleteAlias(t, env, account.ID, strings.ReplaceAll(test.name, " ", "-")+"-alias@icloud.com")
+			deleteCalls := 0
+			env.server.SetHMESyncService(&fakeHMESyncService{
+				deleteAlias: func(_ context.Context, aliasID int64) error {
+					deleteCalls++
+					if aliasID != alias.ID {
+						t.Fatalf("delete alias ID = %d, want %d", aliasID, alias.ID)
+					}
+					return test.err
+				},
+			})
+
+			path := fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID)
+			response := env.request(t, http.MethodDelete, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+			if response.Code != test.wantStatus || adminAPITestErrorCode(t, response) != test.wantCode {
+				t.Fatalf("delete alias response = %d; body=%s; want %d %s", response.Code, response.Body.String(), test.wantStatus, test.wantCode)
+			}
+			if !strings.Contains(response.Body.String(), "本地记录已保留") {
+				t.Fatalf("delete failure omitted local-retention notice: %s", response.Body.String())
+			}
+			if deleteCalls != 1 {
+				t.Fatalf("Apple delete calls = %d, want 1", deleteCalls)
+			}
+			if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+				t.Fatalf("failed Apple delete removed local alias: %v", err)
+			}
+			assertAdminAliasDeleteAudit(t, env.store, alias.ID, "failed", test.wantCode)
+		})
+	}
+}
+
+func TestAdminAPIDeleteAliasWithoutAppleServiceKeepsLocalRecord(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-delete-unavailable", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "delete-unavailable@icloud.com")
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "delete-unavailable-alias@icloud.com")
+
+	path := fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID)
+	response := env.request(t, http.MethodDelete, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusServiceUnavailable || adminAPITestErrorCode(t, response) != "INTERNAL_ERROR" {
+		t.Fatalf("delete alias without Apple service = %d; body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "本地记录已保留") {
+		t.Fatalf("unavailable delete service omitted local-retention notice: %s", response.Body.String())
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+		t.Fatalf("missing Apple service removed local alias: %v", err)
+	}
+	assertAdminAliasDeleteAudit(t, env.store, alias.ID, "failed", "INTERNAL_ERROR")
+}
+
+func TestAdminAPIDeleteMissingAliasReturnsNotFoundBeforeAppleService(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-delete-missing", "unused-password")
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/999999", nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusNotFound || adminAPITestErrorCode(t, response) != "NOT_FOUND" {
+		t.Fatalf("delete missing alias = %d; body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestLegacyAdminDeleteAliasUsesAppleServiceAndRedirects(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	fixture := env.createMailboxFixture(t)
+	cookie := env.createAdminSession(t)
+	deleteCalls := 0
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		deleteAlias: func(ctx context.Context, aliasID int64) error {
+			deleteCalls++
+			if aliasID != fixture.aliasA.ID {
+				t.Fatalf("delete alias ID = %d, want %d", aliasID, fixture.aliasA.ID)
+			}
+			return env.store.DeleteAlias(ctx, aliasID)
+		},
+	})
+
+	target := fmt.Sprintf("/admin/aliases/%d/delete", fixture.aliasA.ID)
+	response := env.request(t, http.MethodPost, target, url.Values{"csrf_token": {testSessionCSRF}}, []*http.Cookie{cookie})
+	wantLocation := fmt.Sprintf("/admin/accounts/%d?notice=alias_deleted", fixture.accountA.ID)
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != wantLocation {
+		t.Fatalf("legacy delete = %d Location=%q; body=%s", response.Code, response.Header().Get("Location"), response.Body.String())
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("Apple delete calls = %d, want 1", deleteCalls)
+	}
+	if _, err := env.store.GetAlias(context.Background(), fixture.aliasA.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("legacy deleted alias lookup error = %v, want not found", err)
+	}
+	assertAdminAliasDeleteAudit(t, env.store, fixture.aliasA.ID, "success", "")
+}
+
+func TestLegacyAdminDeleteAliasClassifiesFailuresAndKeepsLocalRecord(t *testing.T) {
+	tests := []struct {
+		name       string
+		serviceErr error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "service unavailable", wantStatus: http.StatusServiceUnavailable, wantCode: "INTERNAL_ERROR"},
+		{
+			name:       "login required wrapping missing session",
+			serviceErr: fmt.Errorf("load Apple session: %w: %w", hmesync.ErrLoginRequired, store.ErrNotFound),
+			wantStatus: http.StatusConflict,
+			wantCode:   hmesync.CodeLoginRequired,
+		},
+		{name: "rate limited", serviceErr: hmesync.ErrRateLimited, wantStatus: http.StatusTooManyRequests, wantCode: hmesync.CodeRateLimited},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newHTTPTestEnv(t)
+			fixture := env.createMailboxFixture(t)
+			cookie := env.createAdminSession(t)
+			if test.serviceErr != nil {
+				env.server.SetHMESyncService(&fakeHMESyncService{
+					deleteAlias: func(context.Context, int64) error { return test.serviceErr },
+				})
+			}
+
+			target := fmt.Sprintf("/admin/aliases/%d/delete", fixture.aliasA.ID)
+			response := env.request(t, http.MethodPost, target, url.Values{"csrf_token": {testSessionCSRF}}, []*http.Cookie{cookie})
+			if response.Code != test.wantStatus {
+				t.Fatalf("legacy delete failure = %d; body=%s; want %d", response.Code, response.Body.String(), test.wantStatus)
+			}
+			if !strings.Contains(response.Body.String(), "本地记录已保留") {
+				t.Fatalf("legacy delete failure omitted local-retention notice: %s", response.Body.String())
+			}
+			if _, err := env.store.GetAlias(context.Background(), fixture.aliasA.ID); err != nil {
+				t.Fatalf("legacy failed delete removed local alias: %v", err)
+			}
+			assertAdminAliasDeleteAudit(t, env.store, fixture.aliasA.ID, "failed", test.wantCode)
+		})
 	}
 }
 
@@ -557,4 +755,38 @@ func adminAPITestCreateAccount(t *testing.T, env *adminAPITestEnv, email string)
 		t.Fatalf("create Apple API test account: %v", err)
 	}
 	return account
+}
+
+func adminAPITestCreateDeleteAlias(t *testing.T, env *adminAPITestEnv, accountID int64, address string) domain.Alias {
+	t.Helper()
+	alias, err := env.store.CreateAlias(context.Background(), domain.Alias{
+		AccountID:    accountID,
+		Address:      address,
+		Label:        "Delete test alias",
+		APIKeyHash:   secure.HashToken("delete-test-key-" + address),
+		APIKeyPrefix: "delete-test",
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("create delete test alias: %v", err)
+	}
+	return alias
+}
+
+func assertAdminAliasDeleteAudit(t *testing.T, db *store.Store, aliasID int64, result, detail string) {
+	t.Helper()
+	audits, err := db.ListAuditLogs(context.Background(), 100, 0)
+	if err != nil {
+		t.Fatalf("list alias delete audits: %v", err)
+	}
+	resourceID := strconvFormatInt(aliasID)
+	for _, audit := range audits {
+		if audit.Action == "delete" && audit.ResourceType == "alias" && audit.ResourceID == resourceID {
+			if audit.Result != result || audit.Detail != detail {
+				t.Fatalf("alias delete audit = %#v, want result=%q detail=%q", audit, result, detail)
+			}
+			return
+		}
+	}
+	t.Fatalf("alias delete audit for alias %d was not recorded", aliasID)
 }

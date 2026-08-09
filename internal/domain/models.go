@@ -208,6 +208,9 @@ type MailboxSyncResult struct {
 	Reset    bool
 	// HasMore means later unread UIDs remain beyond State.LastUID.
 	HasMore bool
+	// TargetUID is the selected mailbox upper bound observed for this batch.
+	// It is transient progress metadata and is not persisted with the cursor.
+	TargetUID uint32
 }
 
 type MailboxBinding struct {
