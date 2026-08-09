@@ -231,6 +231,73 @@ func TestAdminAPISyncAccountReturnsAcceptedForPendingBatch(t *testing.T) {
 	}
 }
 
+func TestAdminAPISyncAccountReturnsAcceptedWhenQueued(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "sync-queued-admin", "sync queued password")
+	account := adminAPITestCreateAccount(t, env, "sync-queued@icloud.com")
+	syncCalls := 0
+	env.server.sync = func(accountID int64) error {
+		syncCalls++
+		if accountID != account.ID {
+			t.Fatalf("sync account ID = %d, want %d", accountID, account.ID)
+		}
+		return syncer.ErrSyncQueued
+	}
+
+	response := env.request(
+		t,
+		http.MethodPost,
+		fmt.Sprintf("/admin/api/v1/accounts/%d/sync", account.ID),
+		nil,
+		"",
+		[]*http.Cookie{sessionCookie},
+		csrf,
+	)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("queued sync status = %d, want 202; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data adminAPIAccountDetailDTO `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode queued sync response: %v; body=%s", err, response.Body.String())
+	}
+	if syncCalls != 1 || !payload.Data.SyncPending || payload.Data.Account.ID != account.ID {
+		t.Fatalf("queued sync payload/calls = %#v / %d", payload.Data, syncCalls)
+	}
+}
+
+func TestAdminAPISyncAccountRejectsDisabledAccount(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "sync-disabled-admin", "sync disabled password")
+	account := adminAPITestCreateAccount(t, env, "sync-disabled@icloud.com")
+	account.Enabled = false
+	if _, err := env.store.UpdateAccount(context.Background(), account); err != nil {
+		t.Fatal(err)
+	}
+	syncCalls := 0
+	env.server.sync = func(int64) error {
+		syncCalls++
+		return syncer.ErrSyncQueued
+	}
+
+	response := env.request(
+		t,
+		http.MethodPost,
+		fmt.Sprintf("/admin/api/v1/accounts/%d/sync", account.ID),
+		nil,
+		"",
+		[]*http.Cookie{sessionCookie},
+		csrf,
+	)
+	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "ACCOUNT_DISABLED" {
+		t.Fatalf("disabled sync response = %d/%s; body=%s", response.Code, adminAPITestErrorCode(t, response), response.Body.String())
+	}
+	if syncCalls != 0 {
+		t.Fatalf("disabled sync calls = %d, want 0", syncCalls)
+	}
+}
+
 func TestAdminAPISyncAccountReturnsOKWhenCaughtUp(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	sessionCookie, csrf, _ := env.createSession(t, "sync-complete-admin", "sync complete password")

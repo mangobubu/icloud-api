@@ -30,13 +30,16 @@ const (
 	defaultMaxMessageBytes          = 10 << 20
 	defaultMaxBodyBytes             = 1 << 20
 	defaultMaxFetchResultBytes      = 64 << 20
-	// Content FETCHes use the ordinary incremental window as their UID ceiling.
-	// Header commands may use fewer UIDs to retain the configured per-message
-	// header limit within the aggregate literal budget.
+	// Header commands retain the configured per-message limit within the
+	// aggregate literal budget. Body commands stay deliberately small because
+	// go-imap applies one absolute deadline to transfer and parse the whole batch.
 	candidateHeaderFetchBatch   = defaultMaxIncrementalCandidates
-	messageFetchBatch           = defaultMaxIncrementalCandidates
+	messageFetchBatch           = 8
 	maxContentFetchLiteralBytes = 12 << 20
 	maxSequenceFetchMessages    = defaultMaxCandidates + 1
+	compatibilityHeaderBatch    = 64
+	compatibilityMessageBatch   = 4
+	imapReconnectDelay          = 100 * time.Millisecond
 )
 
 var (
@@ -117,6 +120,34 @@ func (f *Fetcher) FetchIncremental(
 	snapshotPositions map[int64]domain.MailboxSnapshotPosition,
 ) (domain.MailboxSyncResult, error) {
 	settings := f.settings()
+	result, err := f.fetchIncrementalAttempt(
+		ctx, account, password, aliases, previous, snapshotPositions, settings,
+	)
+	if err == nil || ctx.Err() != nil || !isRetryableIMAPDisconnect(err) {
+		return result, err
+	}
+	if !waitForIMAPReconnect(ctx, imapReconnectDelay) {
+		return result, ctx.Err()
+	}
+
+	// Retry this read-only operation on a new connection with the conservative
+	// batch sizes used before large mailbox batching was introduced.
+	settings.headerFetchBatch = min(settings.headerFetchBatch, compatibilityHeaderBatch)
+	settings.messageFetchBatch = min(settings.messageFetchBatch, compatibilityMessageBatch)
+	return f.fetchIncrementalAttempt(
+		ctx, account, password, aliases, previous, snapshotPositions, settings,
+	)
+}
+
+func (f *Fetcher) fetchIncrementalAttempt(
+	ctx context.Context,
+	account domain.Account,
+	password string,
+	aliases []domain.Alias,
+	previous *domain.IMAPSyncState,
+	snapshotPositions map[int64]domain.MailboxSnapshotPosition,
+	settings fetchSettings,
+) (domain.MailboxSyncResult, error) {
 	failure := domain.MailboxSyncResult{}
 	if previous != nil {
 		failure.State = *previous
@@ -313,6 +344,7 @@ func (f *Fetcher) FetchIncremental(
 			account.Email,
 			settings.maxHeaderBytes,
 			settings.allowWeakRecipientHeaders,
+			settings.headerFetchBatch,
 		)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
@@ -365,6 +397,7 @@ func (f *Fetcher) FetchIncremental(
 		mimeLimits,
 		uidToAliases,
 		resultDynamicBudget,
+		settings.messageFetchBatch,
 	)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -404,6 +437,49 @@ func (f *Fetcher) FetchIncremental(
 	return publish()
 }
 
+func isRetryableIMAPDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
+		return true
+	}
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		message := strings.ToLower(strings.TrimSpace(cause.Error()))
+		switch message {
+		case "imap: connection closed", "imap: connection closed during command execution":
+			return true
+		}
+		if strings.Contains(message, "connection reset") ||
+			strings.Contains(message, "broken pipe") ||
+			strings.Contains(message, "forcibly closed") ||
+			strings.Contains(message, "connection was aborted") ||
+			strings.Contains(message, "wsasend") ||
+			strings.Contains(message, "wsarecv") {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForIMAPReconnect(ctx context.Context, delay time.Duration) bool {
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // fetchCandidateWinners scans candidate headers newest-first in shared batches.
 // A successful UID FETCH may omit expunged UID gaps. Individual malformed or
 // ambiguous messages are skipped because they cannot be routed safely; command
@@ -416,8 +492,9 @@ func fetchCandidateWinners(
 	accountEmail string,
 	maxHeaderBytes int,
 	allowWeak bool,
+	batchSizeOverride ...int,
 ) (map[int64]uint32, error) {
-	headerBytes, headerFetchBatch := boundedHeaderFetchLimits(maxHeaderBytes)
+	headerBytes, headerFetchBatch := boundedHeaderFetchLimits(maxHeaderBytes, batchSizeOverride...)
 	winners := make(map[int64]uint32)
 	for start := 0; start < len(candidateUIDs); start += headerFetchBatch {
 		if err := ctx.Err(); err != nil {
@@ -520,6 +597,8 @@ type fetchSettings struct {
 	maxParsedMessageBytes     int
 	maxFetchResultBytes       int
 	allowWeakRecipientHeaders bool
+	headerFetchBatch          int
+	messageFetchBatch         int
 	dial                      dialSessionFunc
 	now                       func() time.Time
 }
@@ -534,6 +613,8 @@ func (f *Fetcher) settings() fetchSettings {
 		maxMessageBytes:          defaultMaxMessageBytes,
 		maxBodyBytes:             defaultMaxBodyBytes,
 		maxFetchResultBytes:      defaultMaxFetchResultBytes,
+		headerFetchBatch:         candidateHeaderFetchBatch,
+		messageFetchBatch:        messageFetchBatch,
 		dial:                     dialIMAPTLS,
 		now:                      time.Now,
 	}
@@ -1221,6 +1302,7 @@ func fetchMessages(
 	limits mimeLimits,
 	aliasesByUID map[uint32][]int64,
 	remainingResultBytes int64,
+	batchSizeOverride ...int,
 ) (map[uint32]fetchedMessage, error) {
 	if remainingResultBytes < 0 {
 		remainingResultBytes = 0
@@ -1232,9 +1314,13 @@ func fetchMessages(
 		limits.maxResultBytes,
 		remainingResultBytes,
 	)
+	batchSize := messageFetchBatch
+	if len(batchSizeOverride) > 0 && batchSizeOverride[0] > 0 {
+		batchSize = min(batchSize, batchSizeOverride[0])
+	}
 	result := make(map[uint32]fetchedMessage, len(uids))
-	for start := 0; start < len(uids); start += messageFetchBatch {
-		end := min(start+messageFetchBatch, len(uids))
+	for start := 0; start < len(uids); start += batchSize {
+		end := min(start+batchSize, len(uids))
 		batchMessageBytes := boundedContentLiteralBytes(messageBytes, end-start)
 		section := &imap.BodySectionName{Peek: true, Partial: []int{0, batchMessageBytes + 1}}
 		batchUIDs := make(map[uint32]struct{}, end-start)
@@ -1319,12 +1405,16 @@ func fetchMessages(
 // boundedHeaderFetchLimits keeps the per-message header allowance intact and
 // reduces UID cardinality instead. Only a configured single-header allowance
 // larger than the aggregate command budget is reduced.
-func boundedHeaderFetchLimits(maxHeaderBytes int) (headerBytes, batchSize int) {
+func boundedHeaderFetchLimits(maxHeaderBytes int, batchSizeOverride ...int) (headerBytes, batchSize int) {
 	if maxHeaderBytes < 0 {
 		maxHeaderBytes = 0
 	}
 	headerBytes = min(maxHeaderBytes, maxContentFetchLiteralBytes-1)
-	batchSize = min(candidateHeaderFetchBatch, maxContentFetchLiteralBytes/(headerBytes+1))
+	batchLimit := candidateHeaderFetchBatch
+	if len(batchSizeOverride) > 0 && batchSizeOverride[0] > 0 {
+		batchLimit = min(batchLimit, batchSizeOverride[0])
+	}
+	batchSize = min(batchLimit, maxContentFetchLiteralBytes/(headerBytes+1))
 	if batchSize < 1 {
 		batchSize = 1
 	}

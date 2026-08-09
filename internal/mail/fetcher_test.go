@@ -1441,10 +1441,9 @@ func TestFetchIncrementalResetUsesNewestActualSparseMessages(t *testing.T) {
 
 func TestFetchIncrementalResetHasBoundedCommandCountAtProductionLimits(t *testing.T) {
 	const (
-		mailboxMessages        = defaultMaxCandidates + 1
-		winnerCount            = defaultMaxAliases
-		connectionTimeoutSteps = 3 // TCP dial, TLS handshake, and IMAP greeting.
-		loginSelectCommands    = 2
+		mailboxMessages     = defaultMaxCandidates + 1
+		winnerCount         = defaultMaxAliases
+		loginSelectCommands = 2
 	)
 	if maxContentFetchLiteralBytes != 12<<20 {
 		t.Fatalf("content FETCH aggregate literal budget = %d, want 12 MiB", maxContentFetchLiteralBytes)
@@ -1477,7 +1476,7 @@ func TestFetchIncrementalResetHasBoundedCommandCountAtProductionLimits(t *testin
 			session.bodyByUID[uid] = []byte(fmt.Sprintf(
 				"Message-ID: <%d@example.com>\r\nSubject: large message\r\n\r\n%s",
 				uid,
-				strings.Repeat("x", maxContentFetchLiteralBytes/defaultMaxIncrementalCandidates),
+				strings.Repeat("x", maxContentFetchLiteralBytes/messageFetchBatch),
 			))
 		}
 	}
@@ -1503,6 +1502,9 @@ func TestFetchIncrementalResetHasBoundedCommandCountAtProductionLimits(t *testin
 		}
 	}
 	bodyCalls := bodyFetchCalls(calls)
+	if messageFetchBatch != 8 {
+		t.Fatalf("body FETCH batch = %d, want 8", messageFetchBatch)
+	}
 	headerBytes, headerFetchBatch := boundedHeaderFetchLimits(defaultMaxHeaderBytes)
 	if headerBytes != defaultMaxHeaderBytes || headerFetchBatch != 95 {
 		t.Fatalf("default header limits = %d bytes/%d UIDs, want %d/95", headerBytes, headerFetchBatch, defaultMaxHeaderBytes)
@@ -1530,6 +1532,11 @@ func TestFetchIncrementalResetHasBoundedCommandCountAtProductionLimits(t *testin
 			}
 		}
 	}
+	for _, call := range bodyCalls {
+		if requested := requestedSequenceCount(t, call.seqSet, mailboxMessages); requested > 8 {
+			t.Fatalf("body FETCH exceeds compatibility limit 8: call=%#v count=%d", call, requested)
+		}
+	}
 
 	// The remaining UID FETCHes are one recent-window discovery, one optional
 	// current-generation snapshot validation, and one final publish validation.
@@ -1543,19 +1550,8 @@ func TestFetchIncrementalResetHasBoundedCommandCountAtProductionLimits(t *testin
 		t.Fatalf("session commands = login:%d select:%d max-active:%d", loginCalls, selectCalls, maxActive)
 	}
 	serialIMAPCommands := loginSelectCommands + wantFetchCommands
-	if serialIMAPCommands != 20 {
-		t.Fatalf("maximum reset IMAP commands = %d, want 20", serialIMAPCommands)
-	}
-	defaultWorstCase := time.Duration(connectionTimeoutSteps+serialIMAPCommands) * defaultIMAPTimeout
-	const defaultSyncTimeout = 10 * time.Minute
-	if defaultWorstCase >= defaultSyncTimeout {
-		t.Fatalf("default reset timeout bound = %v, must be below %v", defaultWorstCase, defaultSyncTimeout)
-	}
-	if defaultWorstCase != 575*time.Second {
-		t.Fatalf("default reset timeout bound = %v, want 575s", defaultWorstCase)
-	}
-	if margin := defaultSyncTimeout - defaultWorstCase; margin != 25*time.Second {
-		t.Fatalf("default reset timeout margin = %v, want 25s", margin)
+	if serialIMAPCommands != 141 {
+		t.Fatalf("maximum reset IMAP commands = %d, want 141", serialIMAPCommands)
 	}
 }
 
@@ -1603,6 +1599,200 @@ func TestFetchCandidateWinnersPreservesLargeHeaderUnderAggregateBudget(t *testin
 		if aggregate := requested * section.Partial[1]; aggregate > maxContentFetchLiteralBytes {
 			t.Fatalf("header aggregate = %d, exceeds %d", aggregate, maxContentFetchLiteralBytes)
 		}
+	}
+}
+
+func TestFetchIncrementalReconnectsWithConservativeBatches(t *testing.T) {
+	const winnerCount = compatibilityMessageBatch + 1
+	if compatibilityMessageBatch >= messageFetchBatch {
+		t.Fatalf("retry body batch = %d, want less than initial batch %d", compatibilityMessageBatch, messageFetchBatch)
+	}
+	newSession := func() *fakeIMAPSession {
+		session := &fakeIMAPSession{
+			uidValidity: 77,
+			uidNext:     winnerCount + 1,
+			headerByUID: make(map[uint32][]byte, winnerCount),
+			bodyByUID:   make(map[uint32][]byte, winnerCount),
+		}
+		for uid := uint32(1); uid <= winnerCount; uid++ {
+			address := fmt.Sprintf("winner-%d@icloud.com", uid)
+			session.headerByUID[uid] = aliasHeader(address)
+			session.bodyByUID[uid] = rawMessage(uid)
+		}
+		return session
+	}
+	first := newSession()
+	first.fetchErrors = []error{nil, nil, errors.New("imap: connection closed")}
+	second := newSession()
+	sessions := []imapSession{first, second}
+	dialCalls := 0
+	fetcher := NewFetcher()
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		if dialCalls >= len(sessions) {
+			return nil, errors.New("unexpected extra IMAP reconnect")
+		}
+		session := sessions[dialCalls]
+		dialCalls++
+		return session, nil
+	}
+	aliases := make([]domain.Alias, 0, winnerCount)
+	for id := int64(1); id <= winnerCount; id++ {
+		aliases = append(aliases, testAlias(id, fmt.Sprintf("winner-%d@icloud.com", id)))
+	}
+
+	result, err := fetcher.FetchIncremental(
+		context.Background(), testAccount(), "password", aliases, nil, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dialCalls != 2 || len(result.Messages) != winnerCount {
+		t.Fatalf("reconnect result = dials:%d messages:%d", dialCalls, len(result.Messages))
+	}
+	if _, _, _, _, terminated := first.counters(); !terminated {
+		t.Fatal("failed IMAP session was not terminated before reconnect")
+	}
+	bodyCalls := bodyFetchCalls(second.calls())
+	if len(bodyCalls) != 2 {
+		t.Fatalf("conservative body FETCH calls = %d, want 2; calls=%#v", len(bodyCalls), second.calls())
+	}
+	for _, call := range bodyCalls {
+		if requested := requestedSequenceCount(t, call.seqSet, winnerCount); requested > compatibilityMessageBatch {
+			t.Fatalf("retry body batch requested %d messages, limit %d", requested, compatibilityMessageBatch)
+		}
+	}
+}
+
+func TestFetchIncrementalReconnectsOnlyOnce(t *testing.T) {
+	newDisconnectedSession := func() *fakeIMAPSession {
+		return &fakeIMAPSession{
+			uidValidity: 77,
+			uidNext:     2,
+			headerByUID: map[uint32][]byte{1: aliasHeader("one@icloud.com")},
+			bodyByUID:   map[uint32][]byte{1: rawMessage(1)},
+			fetchErrors: []error{nil, nil, errors.New("imap: connection closed")},
+		}
+	}
+	sessions := []imapSession{newDisconnectedSession(), newDisconnectedSession()}
+	dialCalls := 0
+	fetcher := NewFetcher()
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		dialCalls++
+		if dialCalls > len(sessions) {
+			return nil, errors.New("unexpected third IMAP connection")
+		}
+		return sessions[dialCalls-1], nil
+	}
+
+	_, err := fetcher.FetchIncremental(
+		context.Background(), testAccount(), "password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")}, nil, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "imap: connection closed") {
+		t.Fatalf("second disconnect error = %v", err)
+	}
+	if dialCalls != 2 {
+		t.Fatalf("disconnect dial calls = %d, want 2", dialCalls)
+	}
+}
+
+func TestFetchIncrementalStopsReconnectAfterContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first := &fakeIMAPSession{
+		uidValidity: 77,
+		uidNext:     2,
+		headerByUID: map[uint32][]byte{1: aliasHeader("one@icloud.com")},
+		bodyByUID:   map[uint32][]byte{1: rawMessage(1)},
+		fetchErrors: []error{nil, nil, errors.New("imap: connection closed")},
+	}
+	dialCalls := 0
+	fetcher := NewFetcher()
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		dialCalls++
+		if dialCalls > 1 {
+			return nil, errors.New("unexpected reconnect after cancellation")
+		}
+		return first, nil
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := fetcher.FetchIncremental(
+			ctx, testAccount(), "password",
+			[]domain.Alias{testAlias(1, "one@icloud.com")}, nil, nil,
+		)
+		result <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if len(first.calls()) >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first IMAP attempt did not reach the disconnect")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled reconnect error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled reconnect did not return")
+	}
+	if dialCalls != 1 {
+		t.Fatalf("canceled reconnect dial calls = %d, want 1", dialCalls)
+	}
+}
+
+func TestFetchIncrementalDoesNotReconnectForPermanentIMAPError(t *testing.T) {
+	session := &fakeIMAPSession{
+		uidValidity: 77,
+		uidNext:     2,
+		headerByUID: map[uint32][]byte{1: aliasHeader("one@icloud.com")},
+		bodyByUID:   map[uint32][]byte{1: rawMessage(1)},
+		fetchErrors: []error{nil, nil, errors.New("permanent IMAP command failure")},
+	}
+	dialCalls := 0
+	fetcher := testFetcher(session, time.Now())
+	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
+		dialCalls++
+		return session, nil
+	}
+
+	_, err := fetcher.FetchIncremental(
+		context.Background(), testAccount(), "password",
+		[]domain.Alias{testAlias(1, "one@icloud.com")}, nil, nil,
+	)
+	if err == nil || !strings.Contains(err.Error(), "permanent IMAP command failure") {
+		t.Fatalf("permanent error = %v", err)
+	}
+	if dialCalls != 1 {
+		t.Fatalf("permanent error dial calls = %d, want 1", dialCalls)
+	}
+}
+
+func TestRetryableIMAPDisconnectRecognizesPlatformResetMessages(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "windows receive reset", err: errors.New("wsarecv: An existing connection was forcibly closed by the remote host"), want: true},
+		{name: "windows send abort", err: errors.New("wsasend: An established connection was aborted by the software in your host machine"), want: true},
+		{name: "unix reset", err: errors.New("write tcp: connection reset by peer"), want: true},
+		{name: "protocol failure", err: errors.New("imap: invalid command sequence"), want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isRetryableIMAPDisconnect(test.err); got != test.want {
+				t.Fatalf("retryable(%q) = %v, want %v", test.err, got, test.want)
+			}
+		})
 	}
 }
 

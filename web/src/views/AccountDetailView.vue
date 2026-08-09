@@ -277,6 +277,7 @@
             <el-button
               :icon="Refresh"
               :loading="syncLoading"
+              :disabled="!account.enabled"
               @click="syncNow"
             >
               同步邮件
@@ -1181,7 +1182,7 @@ async function syncNow() {
       autoCreation.value = detail.autoCreation;
     }
     if (detail.syncPending) {
-      ElMessage({ type: "warning", message: "已提交一批，仍在追平。" });
+      ElMessage({ type: "warning", message: "同步已在后台处理。" });
     } else {
       successMessage("同步已完成。");
     }

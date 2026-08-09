@@ -752,8 +752,13 @@ func (s *Server) adminAPISyncAccount(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if _, err := s.store.GetAccount(c.Request.Context(), id); err != nil {
+	account, err := s.store.GetAccount(c.Request.Context(), id)
+	if err != nil {
 		s.writeAdminAPIStoreReadError(c, err)
+		return
+	}
+	if !account.Enabled {
+		writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_DISABLED", "主号已停用，请先启用主号后再同步邮件")
 		return
 	}
 	result := "success"
@@ -763,7 +768,7 @@ func (s *Server) adminAPISyncAccount(c *gin.Context) {
 	} else {
 		syncErr = s.sync(id)
 	}
-	pending := errors.Is(syncErr, syncer.ErrSyncPending)
+	pending := errors.Is(syncErr, syncer.ErrSyncPending) || errors.Is(syncErr, syncer.ErrSyncQueued)
 	if syncErr != nil && !pending {
 		result = "failed"
 	}

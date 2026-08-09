@@ -59,3 +59,25 @@ test("expired sessions invoke the global unauthorized handler", async () => {
   assert.equal(invalidations, 1);
   setUnauthorizedHandler(null);
 });
+
+test("HTML gateway timeouts are normalized without exposing the proxy page", async () => {
+  const proxyPage =
+    "<!doctype html><html><body><h1>504 Gateway Time-out</h1></body></html>";
+  globalThis.fetch = async () =>
+    new Response(proxyPage, {
+      status: 504,
+      headers: { "Content-Type": "text/html" },
+    });
+
+  await assert.rejects(
+    apiRequest("/accounts/12/sync", { method: "POST" }),
+    (error) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 504);
+      assert.equal(error.code, "GATEWAY_TIMEOUT");
+      assert.equal(error.message, "网关等待服务响应超时，请稍后重试。");
+      assert.equal(error.message.includes("<html>"), false);
+      return true;
+    },
+  );
+});

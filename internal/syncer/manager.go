@@ -37,6 +37,10 @@ type MailFetcher interface {
 // failed mailbox sync.
 var ErrSyncPending = errors.New("mailbox sync batch committed; more messages remain")
 
+// ErrSyncQueued means a manual sync is running in the background, or an
+// equivalent request for the same account is already queued.
+var ErrSyncQueued = errors.New("mailbox sync queued")
+
 type accountLock struct {
 	token chan struct{}
 	refs  int
@@ -56,6 +60,11 @@ type Manager struct {
 	locksMu  sync.Mutex
 	locks    map[int64]*accountLock
 	stopping atomic.Bool
+
+	manualMu         sync.Mutex
+	manualJobs       map[int64]struct{}
+	manualDone       chan struct{}
+	manualDoneClosed bool
 }
 
 func New(repo Repository, cipher CredentialCipher, fetcher MailFetcher, logger *slog.Logger, interval time.Duration, concurrency int) *Manager {
@@ -70,6 +79,8 @@ func New(repo Repository, cipher CredentialCipher, fetcher MailFetcher, logger *
 		withTimeout:  context.WithTimeout,
 		waitInterval: waitForInterval,
 		locks:        make(map[int64]*accountLock),
+		manualJobs:   make(map[int64]struct{}),
+		manualDone:   make(chan struct{}),
 	}
 }
 
@@ -82,10 +93,14 @@ func (m *Manager) SetSyncTimeout(timeout time.Duration) {
 // BeginShutdown prevents cancellation caused by process shutdown from being
 // persisted as an account synchronization failure.
 func (m *Manager) BeginShutdown() {
+	m.manualMu.Lock()
 	m.stopping.Store(true)
+	m.closeManualDoneLocked()
+	m.manualMu.Unlock()
 }
 
 func (m *Manager) Run(ctx context.Context) {
+	defer m.waitForManualJobs()
 	var continuations accountIDSet
 	for {
 		continuations = m.syncAllRound(ctx, continuations)
@@ -225,6 +240,88 @@ func (m *Manager) SyncAccountWithTimeout(ctx context.Context, accountID int64) e
 	})
 }
 
+// QueueAccountSync starts a deduplicated manual sync outside the HTTP request
+// lifetime. Pending batches continue until the account catches up or the
+// worker context ends.
+func (m *Manager) QueueAccountSync(ctx context.Context, accountID int64) error {
+	if ctx == nil {
+		return errors.New("manual sync context must not be nil")
+	}
+	if accountID < 1 {
+		return errors.New("manual sync account ID must be positive")
+	}
+
+	m.manualMu.Lock()
+	if m.stopping.Load() {
+		m.manualMu.Unlock()
+		return context.Canceled
+	}
+	if _, exists := m.manualJobs[accountID]; exists {
+		m.manualMu.Unlock()
+		return ErrSyncQueued
+	}
+	if err := ctx.Err(); err != nil {
+		m.manualMu.Unlock()
+		return err
+	}
+	m.manualJobs[accountID] = struct{}{}
+	m.manualMu.Unlock()
+
+	go m.runQueuedAccountSync(ctx, accountID)
+	return ErrSyncQueued
+}
+
+func (m *Manager) runQueuedAccountSync(ctx context.Context, accountID int64) {
+	defer m.finishManualJob(accountID)
+	for {
+		syncErr := m.syncQueuedAccount(ctx, accountID)
+		if errors.Is(syncErr, ErrSyncPending) {
+			continue
+		}
+		if syncErr != nil && !errors.Is(syncErr, context.Canceled) {
+			m.logger.Warn("queued account sync failed", "account_id", accountID, "error", syncErr)
+		}
+		return
+	}
+}
+
+// syncQueuedAccount waits for the account and global IMAP slot until the
+// worker context is canceled. Once both resources are held, mailbox work gets
+// its own bounded timeout so a slow server cannot block shutdown forever.
+func (m *Manager) syncQueuedAccount(ctx context.Context, accountID int64) error {
+	return m.WithAccountIMAPSlot(ctx, accountID, func() error {
+		syncCtx, cancelSync := m.withTimeout(ctx, m.syncTimeout)
+		defer cancelSync()
+		return m.syncAccountLocked(syncCtx, accountID)
+	})
+}
+
+func (m *Manager) finishManualJob(accountID int64) {
+	m.manualMu.Lock()
+	delete(m.manualJobs, accountID)
+	m.closeManualDoneLocked()
+	m.manualMu.Unlock()
+}
+
+func (m *Manager) closeManualDoneLocked() {
+	if !m.stopping.Load() || len(m.manualJobs) != 0 || m.manualDoneClosed {
+		return
+	}
+	close(m.manualDone)
+	m.manualDoneClosed = true
+}
+
+func (m *Manager) waitForManualJobs() {
+	m.manualMu.Lock()
+	if !m.stopping.Load() {
+		m.manualMu.Unlock()
+		return
+	}
+	done := m.manualDone
+	m.manualMu.Unlock()
+	<-done
+}
+
 func (m *Manager) SyncAccount(ctx context.Context, accountID int64) error {
 	return m.WithAccountIMAPSlot(ctx, accountID, func() error {
 		return m.syncAccountLocked(ctx, accountID)
@@ -265,7 +362,7 @@ func (m *Manager) syncAccountLocked(ctx context.Context, accountID int64) (syncE
 		return err
 	}
 	if !account.Enabled {
-		return errors.New("主号已停用")
+		return store.ErrAccountDisabled
 	}
 	failures := newFailureRecorder(m, ctx, accountID, account.UpdatedAt)
 	defer failures.close()

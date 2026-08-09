@@ -146,15 +146,22 @@ func (s *Server) syncAccount(c *gin.Context) {
 	if !ok {
 		return
 	}
+	account, err := s.store.GetAccount(c.Request.Context(), id)
+	if err != nil {
+		s.renderNotFoundOrError(c, err)
+		return
+	}
 	result := "success"
 	noticeCode := "sync_ok"
 	var syncErr error
-	if s.sync == nil {
+	if !account.Enabled {
+		syncErr = store.ErrAccountDisabled
+	} else if s.sync == nil {
 		syncErr = errors.New("sync service is unavailable")
 	} else {
 		syncErr = s.sync(id)
 	}
-	if errors.Is(syncErr, syncer.ErrSyncPending) {
+	if errors.Is(syncErr, syncer.ErrSyncPending) || errors.Is(syncErr, syncer.ErrSyncQueued) {
 		noticeCode = "sync_pending"
 	} else if syncErr != nil {
 		result, noticeCode = "failed", "sync_error"

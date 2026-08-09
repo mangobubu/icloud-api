@@ -130,7 +130,7 @@ func run() error {
 	seenWorker.SetOperationTimeout(seenOperationTimeout(cfg.IMAPTimeout))
 
 	web, err := httpserver.New(db, cipher, cfg, logger, func(accountID int64) error {
-		return manager.SyncAccountWithTimeout(requestContext, accountID)
+		return manager.QueueAccountSync(workerContext, accountID)
 	})
 	cfg.OAuthToken = ""
 	if err != nil {

@@ -318,6 +318,176 @@ func TestSyncAccountReturnsPendingAfterCommittingOneBoundedBatch(t *testing.T) {
 	}
 }
 
+func TestQueueAccountSyncReturnsImmediatelyAndDeduplicates(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	fetchCalls := 0
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetchCalls++
+		if fetchCalls == 1 {
+			close(started)
+		}
+		<-release
+		return domain.MailboxSyncResult{
+			Messages: map[int64]domain.LatestMessage{},
+			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
+
+	queueResult := make(chan error, 1)
+	go func() {
+		queueResult <- manager.QueueAccountSync(context.Background(), account.ID)
+	}()
+	select {
+	case err := <-queueResult:
+		if !errors.Is(err, ErrSyncQueued) {
+			t.Fatalf("first queue result = %v, want ErrSyncQueued", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queue call blocked on mailbox synchronization")
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("queued sync did not start")
+	}
+	if err := manager.QueueAccountSync(context.Background(), account.ID); !errors.Is(err, ErrSyncQueued) {
+		t.Fatalf("duplicate queue result = %v, want ErrSyncQueued", err)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	manager.BeginShutdown()
+	manager.waitForManualJobs()
+	if fetchCalls != 1 {
+		t.Fatalf("deduplicated fetch calls = %d, want 1", fetchCalls)
+	}
+	if applies := repo.applyCalls(); len(applies) != 1 {
+		t.Fatalf("deduplicated apply calls = %d, want 1", len(applies))
+	}
+	if err := manager.QueueAccountSync(context.Background(), account.ID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("queue during shutdown = %v, want context canceled", err)
+	}
+}
+
+func TestQueueAccountSyncShutdownWaitsForWorker(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		close(started)
+		<-release
+		return domain.MailboxSyncResult{
+			Messages: map[int64]domain.LatestMessage{},
+			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
+
+	if err := manager.QueueAccountSync(context.Background(), account.ID); !errors.Is(err, ErrSyncQueued) {
+		t.Fatalf("queue result = %v, want ErrSyncQueued", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("queued sync did not start")
+	}
+	manager.BeginShutdown()
+	waitDone := make(chan struct{})
+	go func() {
+		manager.waitForManualJobs()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		t.Fatal("shutdown wait returned before the queued sync released its resources")
+	case <-time.After(25 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown wait did not return after the queued sync finished")
+	}
+}
+
+func TestQueueAccountSyncWaitsForResourcesWithoutDropping(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	started := make(chan struct{})
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		close(started)
+		return domain.MailboxSyncResult{
+			Messages: map[int64]domain.LatestMessage{},
+			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
+	manager.SetSyncTimeout(20 * time.Millisecond)
+	releaseBusy, err := manager.acquireAccount(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var releaseBusyOnce sync.Once
+	releaseBusyLock := func() { releaseBusyOnce.Do(releaseBusy) }
+	defer releaseBusyLock()
+
+	if err := manager.QueueAccountSync(context.Background(), account.ID); !errors.Is(err, ErrSyncQueued) {
+		t.Fatalf("queue result = %v, want ErrSyncQueued", err)
+	}
+	select {
+	case <-started:
+		t.Fatal("queued sync bypassed the busy account lock")
+	case <-time.After(60 * time.Millisecond):
+	}
+	releaseBusyLock()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("queued sync was dropped after waiting for the account lock")
+	}
+	manager.BeginShutdown()
+	manager.waitForManualJobs()
+	if calls := len(repo.applyCalls()); calls != 1 {
+		t.Fatalf("queued sync apply calls = %d, want 1", calls)
+	}
+}
+
+func TestQueueAccountSyncContinuesPendingBatches(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	fetchCalls := 0
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetchCalls++
+		return domain.MailboxSyncResult{
+			Messages: map[int64]domain.LatestMessage{},
+			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1, LastUID: uint32(fetchCalls)},
+			HasMore:  fetchCalls == 1,
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
+
+	if err := manager.QueueAccountSync(context.Background(), account.ID); !errors.Is(err, ErrSyncQueued) {
+		t.Fatalf("queue result = %v, want ErrSyncQueued", err)
+	}
+	manager.BeginShutdown()
+	manager.waitForManualJobs()
+	if fetchCalls != 2 {
+		t.Fatalf("pending continuation fetch calls = %d, want 2", fetchCalls)
+	}
+	if applies := repo.applyCalls(); len(applies) != 2 || !applies[0].result.HasMore || applies[1].result.HasMore {
+		t.Fatalf("pending continuation applies = %#v", applies)
+	}
+}
+
 func TestSyncAccountFailureUsesOneBulkRecord(t *testing.T) {
 	accountVersion := time.Date(2026, 8, 8, 9, 30, 0, 456, time.UTC)
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted", UpdatedAt: accountVersion}
@@ -1419,7 +1589,7 @@ func TestSyncDisabledAccount(t *testing.T) {
 	manager := New(repo, cipherFunc(fixedCipher), nil, discardLogger(), time.Minute, 1)
 
 	err := manager.SyncAccount(context.Background(), account.ID)
-	if err == nil || err.Error() != "主号已停用" {
+	if !errors.Is(err, store.ErrAccountDisabled) {
 		t.Fatalf("停用主号错误 = %v", err)
 	}
 }

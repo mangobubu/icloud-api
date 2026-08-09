@@ -472,13 +472,12 @@ paths:
         检查窗口。后续邮件头和正文始终只处理其中最早的最多 256 封未读邮件，成功提交游标后
         再继续下一批。
 
-        服务先等待取得该主号的账号同步锁和全局 IMAP 连接额度，随后才开始计算整轮同步预算。
+        请求会把主号加入去重的后台同步队列并立即返回 202；同一主号已有手动任务时重复请求会合并。
+        后台任务先等待取得该主号的账号同步锁和全局 IMAP 连接额度，随后才开始计算整轮同步预算。
         `ICLOUD_API_SYNC_TIMEOUT` 默认 `10m`，这 10 分钟全部用于实际数据库读取、IMAP 收取和事务提交；
-        排队等待不占用该预算。每条 IMAP 网络命令仍分别受默认 `25s` 的 `ICLOUD_API_IMAP_TIMEOUT` 限制。
-
-        若执行后已经追平，返回 200，响应中省略
-        `sync_pending`；若本批已成功提交但仍有积压，返回 202，并明确返回
-        `sync_pending: true`。后续轮询或再次调用本接口会继续处理剩余批次。
+        排队等待不占用该预算。每条正文 FETCH 最多处理 8 封邮件；只读同步遇到连接关闭时会新建连接重试一次。
+        每条 IMAP 网络命令仍分别受默认 `25s` 的 `ICLOUD_API_IMAP_TIMEOUT` 限制。积压批次会在后台连续处理，
+        客户端可通过主号详情接口轮询最终状态。
       security:
         - adminSession: []
       parameters:
@@ -497,7 +496,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminAccountDetailResponse"
         "202":
-          description: 当前有界批次已成功提交，但仍有邮件积压等待后续批次
+          description: 手动邮件同步已进入后台队列，或同一主号已有任务正在处理
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -575,6 +574,8 @@ paths:
           $ref: "#/components/responses/AdminCSRFForbidden"
         "404":
           $ref: "#/components/responses/AdminAccountNotFound"
+        "409":
+          $ref: "#/components/responses/AdminAccountDisabled"
         "500":
           $ref: "#/components/responses/AdminInternalError"
         "502":
@@ -1187,6 +1188,23 @@ components:
               message: 主号不存在
               request_id: 6oe7j0x3x3pJv9Dv
 
+    AdminAccountDisabled:
+      description: 主号已停用，必须先启用后才能同步邮件
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          example:
+            error:
+              code: ACCOUNT_DISABLED
+              message: 主号已停用，请先启用主号后再同步邮件
+              request_id: 6oe7j0x3x3pJv9Dv
+
     AdminAppleConflict:
       description: |
         尚未连接 Apple 账户、Apple 会话已经过期、转发邮箱与主号不匹配、操作期间主号身份变化，
@@ -1745,8 +1763,8 @@ components:
         sync_pending:
           type: boolean
           description: |
-            仅在手动邮件同步返回 202 时出现且恒为 true，表示当前有界批次已提交，
-            但主号仍有邮件积压等待后续批次；同步已追平时该字段省略。
+            仅在手动邮件同步返回 202 时出现且恒为 true，表示请求已进入后台队列，
+            或同一主号已有同步任务正在处理。
 
     AdminAliasAutoCreationRequest:
       type: object

@@ -28,7 +28,29 @@ async function parsePayload(response) {
   }
 
   const text = await response.text();
+  if (
+    contentType.includes("text/html") ||
+    /^\s*<(?:!doctype\s+html|html)(?:\s|>)/i.test(text)
+  ) {
+    return null;
+  }
   return text ? { error: { message: text } } : null;
+}
+
+function fallbackHTTPError(status) {
+  if (status === 504) {
+    return {
+      code: "GATEWAY_TIMEOUT",
+      message: "网关等待服务响应超时，请稍后重试。",
+    };
+  }
+  if (status >= 500) {
+    return {
+      code: "SERVICE_UNAVAILABLE",
+      message: "服务暂时不可用，请稍后重试。",
+    };
+  }
+  return {};
 }
 
 export async function apiRequest(path, options = {}) {
@@ -82,10 +104,11 @@ export async function apiRequest(path, options = {}) {
 
   if (!response.ok) {
     const envelope = payload?.error || {};
+    const fallback = fallbackHTTPError(response.status);
     const error = new ApiError({
       status: response.status,
-      code: envelope.code,
-      message: envelope.message,
+      code: envelope.code || fallback.code,
+      message: envelope.message || fallback.message,
       requestId:
         envelope.request_id || response.headers.get("X-Request-ID") || "",
       fields: envelope.fields,
