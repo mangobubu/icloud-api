@@ -197,16 +197,17 @@ type MailboxSnapshotPosition struct {
 	UID         uint32
 }
 
-// MailboxSyncResult contains only changed alias snapshots during an
-// incremental run. Reset establishes a bounded baseline for an initial,
-// invalidated-cursor, or new-generation scan. A bounded reset only includes
-// aliases it found. SnapshotEmpty means the local snapshot was authoritatively
-// invalidated and no replacement was found in the bounded reconciliation window.
+// MailboxSyncResult contains only changed alias snapshots during a sync batch.
+// Reset starts an unread-only baseline for an initial, invalidated-cursor, or
+// new-generation scan and may still have continuation batches. SnapshotEmpty
+// means the local snapshot was authoritatively invalidated.
 type MailboxSyncResult struct {
 	Messages map[int64]LatestMessage
 	State    IMAPSyncState
 	Reset    bool
-	// HasMore means later unread UIDs remain beyond State.LastUID.
+	// HasMore means mailbox UIDs beyond State.LastUID still need inspection. It
+	// can be true even when all remaining messages are already read, and for the
+	// first Reset batch; later batches continue as ordinary increments.
 	HasMore bool
 	// TargetUID is the selected mailbox upper bound observed for this batch.
 	// It is transient progress metadata and is not persisted with the cursor.

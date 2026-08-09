@@ -18,7 +18,6 @@ type Repository interface {
 	ListEnabledAccounts(context.Context) ([]domain.Account, error)
 	GetAccount(context.Context, int64) (domain.Account, error)
 	ListEnabledAliasesByAccount(context.Context, int64) ([]domain.Alias, error)
-	ListMailboxSnapshotPositions(context.Context, int64) (map[int64]domain.MailboxSnapshotPosition, error)
 	GetIMAPSyncState(context.Context, int64) (domain.IMAPSyncState, error)
 	ApplyMailboxSync(context.Context, int64, time.Time, []domain.Alias, domain.MailboxSyncResult, time.Time) error
 	RecordMailboxSyncFailure(context.Context, int64, time.Time, string, time.Time) error
@@ -572,10 +571,6 @@ func (m *Manager) syncAccountLocked(
 	if err != nil {
 		return err
 	}
-	snapshotPositions, err := m.repo.ListMailboxSnapshotPositions(ctx, accountID)
-	if err != nil {
-		return fmt.Errorf("read mailbox snapshot positions: %w", err)
-	}
 	state, err := m.repo.GetIMAPSyncState(ctx, accountID)
 	var previousState *domain.IMAPSyncState
 	switch {
@@ -594,7 +589,7 @@ func (m *Manager) syncAccountLocked(
 	fetchCtx := domain.WithMailboxSyncProgressReporter(ctx, func(update domain.MailboxSyncProgressUpdate) {
 		m.reportProgress(accountID, trigger, update)
 	})
-	result, err := m.fetcher.FetchIncremental(fetchCtx, account, password, enabled, previousState, snapshotPositions)
+	result, err := m.fetcher.FetchIncremental(fetchCtx, account, password, enabled, previousState, nil)
 	password = ""
 	if err != nil {
 		return fmt.Errorf("fetch IMAP mailbox increment: %w", err)

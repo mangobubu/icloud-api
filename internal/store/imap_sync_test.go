@@ -193,52 +193,98 @@ func TestApplyMailboxSyncKeepsPendingWhileIncrementalBatchesRemain(t *testing.T)
 	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusOK, "", finalAt)
 }
 
-func TestApplyMailboxSyncPublishesExpungeFallbackAndDeletion(t *testing.T) {
+func TestApplyMailboxSyncCommitsResetBatchThenContinuesIncrementally(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db := openTestStore(t)
-	account := createAccount(t, ctx, db, "Expunge", "expunge-sync@icloud.com")
-	alias := createAlias(t, ctx, db, account.ID, "expunge-alias@icloud.com", []byte("expunge-hash"))
+	account := createAccount(t, ctx, db, "Reset batches", "reset-batches@icloud.com")
+	firstAlias := createAlias(t, ctx, db, account.ID, "reset-batches-first@icloud.com", []byte("reset-batches-first-hash"))
+	secondAlias := createAlias(t, ctx, db, account.ID, "reset-batches-second@icloud.com", []byte("reset-batches-second-hash"))
 	base := time.Date(2026, 8, 7, 10, 45, 0, 0, time.UTC)
-	latest := mailboxSyncTestMessage(alias.ID, 77, 30, "expunged latest", base)
-	latest.SnapshotState = domain.SnapshotFound
-	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{alias.ID: latest},
+	first := mailboxSyncTestMessage(firstAlias.ID, 77, 4, "reset first batch", base)
+	first.SnapshotState = domain.SnapshotFound
+	aliases := []domain.Alias{firstAlias, secondAlias}
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{firstAlias.ID: first},
 		State: domain.IMAPSyncState{
-			AccountID: account.ID, UIDValidity: 77, LastUID: 30, UpdatedAt: base,
+			AccountID: account.ID, UIDValidity: 77, LastUID: 5, UpdatedAt: base,
 		},
-		Reset: true,
+		Reset: true, HasMore: true,
 	}, base); err != nil {
-		t.Fatalf("apply expunge baseline: %v", err)
+		t.Fatalf("apply first reset batch: %v", err)
+	}
+	assertLatestSubject(t, ctx, db, firstAlias.ID, "reset first batch", 77, 4)
+	if _, err := db.GetLatestMessage(ctx, secondAlias.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("second alias snapshot after first reset batch error = %v, want ErrNotFound", err)
+	}
+	state, err := db.GetIMAPSyncState(ctx, account.ID)
+	if err != nil || state.UIDValidity != 77 || state.LastUID != 5 || !state.UpdatedAt.Equal(base) {
+		t.Fatalf("first reset batch cursor = %#v, error = %v", state, err)
+	}
+	for _, aliasID := range []int64{firstAlias.ID, secondAlias.ID} {
+		assertAliasSyncState(t, ctx, db, aliasID, domain.SyncStatusPending, "", base)
+	}
+	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusPending, "", base)
+
+	finalAt := base.Add(time.Minute)
+	second := mailboxSyncTestMessage(secondAlias.ID, 77, 9, "incremental final batch", finalAt)
+	second.SnapshotState = domain.SnapshotFound
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{secondAlias.ID: second},
+		State: domain.IMAPSyncState{
+			AccountID: account.ID, UIDValidity: 77, LastUID: 10, UpdatedAt: finalAt,
+		},
+	}, finalAt); err != nil {
+		t.Fatalf("apply final incremental batch: %v", err)
+	}
+	assertLatestSubject(t, ctx, db, firstAlias.ID, "reset first batch", 77, 4)
+	assertLatestSubject(t, ctx, db, secondAlias.ID, "incremental final batch", 77, 9)
+	state, err = db.GetIMAPSyncState(ctx, account.ID)
+	if err != nil || state.UIDValidity != 77 || state.LastUID != 10 || !state.UpdatedAt.Equal(finalAt) {
+		t.Fatalf("final incremental batch cursor = %#v, error = %v", state, err)
+	}
+	for _, aliasID := range []int64{firstAlias.ID, secondAlias.ID} {
+		assertAliasSyncState(t, ctx, db, aliasID, domain.SyncStatusOK, "", finalAt)
+	}
+	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusOK, "", finalAt)
+}
+
+func TestApplyMailboxSyncKeepsSnapshotUIDMonotonicWithinGeneration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Monotonic", "monotonic-sync@icloud.com")
+	alias := createAlias(t, ctx, db, account.ID, "monotonic-alias@icloud.com", []byte("monotonic-hash"))
+	base := time.Date(2026, 8, 7, 10, 50, 0, 0, time.UTC)
+	mustUpsert(t, ctx, db, mailboxSyncTestMessage(alias.ID, 77, 100, "existing UID 100", base))
+
+	apply := func(uid uint32, subject string, reset, hasMore bool, at time.Time) {
+		t.Helper()
+		message := mailboxSyncTestMessage(alias.ID, 77, uid, subject, at)
+		message.SnapshotState = domain.SnapshotFound
+		if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
+			Messages: map[int64]domain.LatestMessage{alias.ID: message},
+			State: domain.IMAPSyncState{
+				AccountID: account.ID, UIDValidity: 77, LastUID: uid, UpdatedAt: at,
+			},
+			Reset: reset, HasMore: hasMore,
+		}, at); err != nil {
+			t.Fatalf("apply UID %d mailbox batch: %v", uid, err)
+		}
 	}
 
-	fallbackAt := base.Add(time.Minute)
-	fallback := mailboxSyncTestMessage(alias.ID, 77, 20, "fallback", fallbackAt)
-	fallback.SnapshotState = domain.SnapshotFound
-	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{alias.ID: fallback},
-		State: domain.IMAPSyncState{
-			AccountID: account.ID, UIDValidity: 77, LastUID: 30, UpdatedAt: fallbackAt,
-		},
-	}, fallbackAt); err != nil {
-		t.Fatalf("apply expunge fallback: %v", err)
-	}
-	assertLatestSubject(t, ctx, db, alias.ID, "fallback", 77, 20)
+	apply(80, "older reset winner", true, true, base.Add(time.Minute))
+	assertLatestSubject(t, ctx, db, alias.ID, "existing UID 100", 77, 100)
+	assertAliasSyncState(t, ctx, db, alias.ID, domain.SyncStatusPending, "", base.Add(time.Minute))
+	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusPending, "", base.Add(time.Minute))
 
-	emptyAt := base.Add(2 * time.Minute)
-	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{
-			alias.ID: {AliasID: alias.ID, UIDValidity: 77, SnapshotState: domain.SnapshotEmpty},
-		},
-		State: domain.IMAPSyncState{
-			AccountID: account.ID, UIDValidity: 77, LastUID: 30, UpdatedAt: emptyAt,
-		},
-	}, emptyAt); err != nil {
-		t.Fatalf("apply expunge deletion: %v", err)
-	}
-	if _, err := db.GetLatestMessage(ctx, alias.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("snapshot after expunge deletion error = %v, want ErrNotFound", err)
-	}
+	apply(90, "older incremental winner", false, true, base.Add(2*time.Minute))
+	assertLatestSubject(t, ctx, db, alias.ID, "existing UID 100", 77, 100)
+
+	apply(110, "newer incremental winner", false, false, base.Add(3*time.Minute))
+	assertLatestSubject(t, ctx, db, alias.ID, "newer incremental winner", 77, 110)
+	assertAliasSyncState(t, ctx, db, alias.ID, domain.SyncStatusOK, "", base.Add(3*time.Minute))
+	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusOK, "", base.Add(3*time.Minute))
 }
 
 func TestApplyMailboxSyncResetReplacesWholeAccountGeneration(t *testing.T) {
@@ -247,7 +293,7 @@ func TestApplyMailboxSyncResetReplacesWholeAccountGeneration(t *testing.T) {
 	db := openTestStore(t)
 	account := createAccount(t, ctx, db, "Reset", "reset-sync@icloud.com")
 	winner := createAlias(t, ctx, db, account.ID, "reset-winner@icloud.com", []byte("reset-winner-hash"))
-	empty := createAlias(t, ctx, db, account.ID, "reset-empty@icloud.com", []byte("reset-empty-hash"))
+	replacedLater := createAlias(t, ctx, db, account.ID, "reset-later@icloud.com", []byte("reset-later-hash"))
 	disabled := createAlias(t, ctx, db, account.ID, "reset-disabled@icloud.com", []byte("reset-disabled-hash"))
 	if err := db.SetAliasEnabled(ctx, disabled.ID, false); err != nil {
 		t.Fatalf("disable reset fixture: %v", err)
@@ -256,30 +302,73 @@ func TestApplyMailboxSyncResetReplacesWholeAccountGeneration(t *testing.T) {
 	otherAlias := createAlias(t, ctx, db, otherAccount.ID, "other-reset-alias@icloud.com", []byte("other-reset-hash"))
 
 	base := time.Date(2026, 8, 7, 11, 0, 0, 0, time.UTC)
-	for index, aliasID := range []int64{winner.ID, empty.ID, disabled.ID, otherAlias.ID} {
-		mustUpsert(t, ctx, db, mailboxSyncTestMessage(aliasID, 91, uint32(index+1), "old generation", base))
+	oldWinner := mailboxSyncTestMessage(winner.ID, 91, 10, "old winner", base)
+	oldWinner.SnapshotState = domain.SnapshotFound
+	oldLater := mailboxSyncTestMessage(replacedLater.ID, 91, 11, "old later", base)
+	oldLater.SnapshotState = domain.SnapshotFound
+	aliases := []domain.Alias{winner, replacedLater}
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{
+			winner.ID:        oldWinner,
+			replacedLater.ID: oldLater,
+		},
+		State: domain.IMAPSyncState{
+			AccountID: account.ID, UIDValidity: 91, LastUID: 11, UpdatedAt: base,
+		},
+		Reset: true,
+	}, base); err != nil {
+		t.Fatalf("apply old generation baseline: %v", err)
 	}
-	newWinner := mailboxSyncTestMessage(winner.ID, 7, 2, "new generation", base.Add(time.Hour))
+	mustUpsert(t, ctx, db, mailboxSyncTestMessage(disabled.ID, 91, 12, "old disabled", base))
+	mustUpsert(t, ctx, db, mailboxSyncTestMessage(otherAlias.ID, 91, 13, "other account", base))
+
+	partialAt := base.Add(time.Hour)
+	newWinner := mailboxSyncTestMessage(winner.ID, 7, 2, "new generation first batch", partialAt)
 	newWinner.SnapshotState = domain.SnapshotFound
 	result := domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{
-			winner.ID: newWinner,
-			empty.ID:  {AliasID: empty.ID, SnapshotState: domain.SnapshotEmpty},
+		Messages: map[int64]domain.LatestMessage{winner.ID: newWinner},
+		State: domain.IMAPSyncState{
+			AccountID: account.ID, UIDValidity: 7, LastUID: 3, UpdatedAt: partialAt,
 		},
-		State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 7, LastUID: 3},
-		Reset: true,
+		Reset: true, HasMore: true,
 	}
-	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{winner, empty}, result, base.Add(2*time.Hour)); err != nil {
-		t.Fatalf("apply reset mailbox sync: %v", err)
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, result, partialAt); err != nil {
+		t.Fatalf("apply first new-generation batch: %v", err)
 	}
 
-	assertLatestSubject(t, ctx, db, winner.ID, "new generation", 7, 2)
-	for _, aliasID := range []int64{empty.ID, disabled.ID} {
+	assertLatestSubject(t, ctx, db, winner.ID, "new generation first batch", 7, 2)
+	for _, aliasID := range []int64{replacedLater.ID, disabled.ID} {
 		if _, err := db.GetLatestMessage(ctx, aliasID); !errors.Is(err, store.ErrNotFound) {
-			t.Fatalf("reset alias %d lookup error = %v, want ErrNotFound", aliasID, err)
+			t.Fatalf("old-generation alias %d lookup error = %v, want ErrNotFound", aliasID, err)
 		}
 	}
-	assertLatestSubject(t, ctx, db, otherAlias.ID, "old generation", 91, 4)
+	assertLatestSubject(t, ctx, db, otherAlias.ID, "other account", 91, 13)
+	state, err := db.GetIMAPSyncState(ctx, account.ID)
+	if err != nil || state.UIDValidity != 7 || state.LastUID != 3 || !state.UpdatedAt.Equal(partialAt) {
+		t.Fatalf("first new-generation cursor = %#v, error = %v", state, err)
+	}
+	for _, aliasID := range []int64{winner.ID, replacedLater.ID} {
+		assertAliasSyncState(t, ctx, db, aliasID, domain.SyncStatusPending, "", partialAt)
+	}
+	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusPending, "", partialAt)
+
+	finalAt := partialAt.Add(time.Minute)
+	newLater := mailboxSyncTestMessage(replacedLater.ID, 7, 5, "new generation final batch", finalAt)
+	newLater.SnapshotState = domain.SnapshotFound
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{replacedLater.ID: newLater},
+		State: domain.IMAPSyncState{
+			AccountID: account.ID, UIDValidity: 7, LastUID: 5, UpdatedAt: finalAt,
+		},
+	}, finalAt); err != nil {
+		t.Fatalf("apply final new-generation batch: %v", err)
+	}
+	assertLatestSubject(t, ctx, db, winner.ID, "new generation first batch", 7, 2)
+	assertLatestSubject(t, ctx, db, replacedLater.ID, "new generation final batch", 7, 5)
+	for _, aliasID := range []int64{winner.ID, replacedLater.ID} {
+		assertAliasSyncState(t, ctx, db, aliasID, domain.SyncStatusOK, "", finalAt)
+	}
+	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusOK, "", finalAt)
 }
 
 func TestApplyMailboxSyncSameGenerationResetPreservesOmittedSnapshot(t *testing.T) {
@@ -304,10 +393,11 @@ func TestApplyMailboxSyncSameGenerationResetPreservesOmittedSnapshot(t *testing.
 		State: domain.IMAPSyncState{
 			AccountID: account.ID, UIDValidity: 50, LastUID: 100, UpdatedAt: at.Add(time.Minute),
 		},
-		Reset: true,
+		Reset: true, HasMore: true,
 	}
 	aliases := []domain.Alias{preserved, confirmedEmpty, oldGeneration}
-	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, result, at.Add(time.Minute)); err != nil {
+	partialAt := at.Add(time.Minute)
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, result, partialAt); err != nil {
 		t.Fatalf("apply same-generation bounded reset: %v", err)
 	}
 
@@ -321,6 +411,30 @@ func TestApplyMailboxSyncSameGenerationResetPreservesOmittedSnapshot(t *testing.
 	if err != nil || state.UIDValidity != 50 || state.LastUID != 100 {
 		t.Fatalf("same-generation reset cursor = %#v, error = %v", state, err)
 	}
+	for _, aliasID := range []int64{preserved.ID, confirmedEmpty.ID, oldGeneration.ID} {
+		assertAliasSyncState(t, ctx, db, aliasID, domain.SyncStatusPending, "", partialAt)
+	}
+	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusPending, "", partialAt)
+
+	finalAt := at.Add(2 * time.Minute)
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{},
+		State: domain.IMAPSyncState{
+			AccountID: account.ID, UIDValidity: 50, LastUID: 110, UpdatedAt: finalAt,
+		},
+	}, finalAt); err != nil {
+		t.Fatalf("apply same-generation final batch: %v", err)
+	}
+	assertLatestSubject(t, ctx, db, preserved.ID, "outside reset window", 50, 5)
+	for _, aliasID := range []int64{confirmedEmpty.ID, oldGeneration.ID} {
+		if _, err := db.GetLatestMessage(ctx, aliasID); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("alias %d after final batch error = %v, want ErrNotFound", aliasID, err)
+		}
+	}
+	for _, aliasID := range []int64{preserved.ID, confirmedEmpty.ID, oldGeneration.ID} {
+		assertAliasSyncState(t, ctx, db, aliasID, domain.SyncStatusOK, "", finalAt)
+	}
+	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusOK, "", finalAt)
 }
 
 func TestListMailboxSnapshotPositionsReturnsEnabledAliasesOnly(t *testing.T) {
@@ -600,52 +714,6 @@ func TestApplyMailboxSyncDropsOlderResetAfterNewGenerationCommit(t *testing.T) {
 	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusOK, "", base.Add(time.Minute))
 }
 
-func TestApplyMailboxSyncDropsOlderSameCursorSnapshotAfterFallback(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	db := openTestStore(t)
-	account := createAccount(t, ctx, db, "Fallback CAS", "fallback-cas@icloud.com")
-	alias := createAlias(t, ctx, db, account.ID, "fallback-cas-alias@icloud.com", []byte("fallback-cas-hash"))
-	base := time.Date(2026, 8, 8, 10, 30, 0, 0, time.UTC)
-	latest := mailboxSyncTestMessage(alias.ID, 77, 30, "original latest", base)
-	latest.SnapshotState = domain.SnapshotFound
-	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{alias.ID: latest},
-		State: domain.IMAPSyncState{
-			AccountID: account.ID, UIDValidity: 77, LastUID: 30, UpdatedAt: base,
-		},
-		Reset: true,
-	}, base); err != nil {
-		t.Fatalf("seed fallback snapshot: %v", err)
-	}
-
-	sharedVersion := currentAccountVersion(t, ctx, db, account.ID)
-	fallbackAt := base.Add(time.Minute)
-	fallback := mailboxSyncTestMessage(alias.ID, 77, 20, "confirmed fallback", fallbackAt)
-	fallback.SnapshotState = domain.SnapshotFound
-	if err := db.ApplyMailboxSync(ctx, account.ID, sharedVersion, []domain.Alias{alias}, domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{alias.ID: fallback},
-		State: domain.IMAPSyncState{
-			AccountID: account.ID, UIDValidity: 77, LastUID: 30, UpdatedAt: fallbackAt,
-		},
-	}, fallbackAt); err != nil {
-		t.Fatalf("commit expunge fallback: %v", err)
-	}
-
-	staleAt := base.Add(2 * time.Minute)
-	stale := mailboxSyncTestMessage(alias.ID, 77, 30, "stale pre-expunge result", staleAt)
-	stale.SnapshotState = domain.SnapshotFound
-	if err := db.ApplyMailboxSync(ctx, account.ID, sharedVersion, []domain.Alias{alias}, domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{alias.ID: stale},
-		State: domain.IMAPSyncState{
-			AccountID: account.ID, UIDValidity: 77, LastUID: 30, UpdatedAt: staleAt,
-		},
-	}, staleAt); err != nil {
-		t.Fatalf("drop stale same-cursor result: %v", err)
-	}
-	assertLatestSubject(t, ctx, db, alias.ID, "confirmed fallback", 77, 20)
-}
-
 func TestMailboxSyncCASPreservesPendingAfterCredentialChange(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -771,24 +839,32 @@ func TestMailboxSyncCASPreservesManualAliasReset(t *testing.T) {
 	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusOK, "", base)
 }
 
-func TestApplyMailboxSyncRollsBackSnapshotWhenCursorWriteFails(t *testing.T) {
+func TestApplyMailboxSyncRollsBackNewGenerationResetBatchWhenCursorWriteFails(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db := openTestStore(t)
 	account := createAccount(t, ctx, db, "Atomic", "atomic-sync@icloud.com")
-	alias := createAlias(t, ctx, db, account.ID, "atomic-alias@icloud.com", []byte("atomic-sync-hash"))
+	firstAlias := createAlias(t, ctx, db, account.ID, "atomic-first@icloud.com", []byte("atomic-first-hash"))
+	secondAlias := createAlias(t, ctx, db, account.ID, "atomic-second@icloud.com", []byte("atomic-second-hash"))
 	firstAt := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
-	first := mailboxSyncTestMessage(alias.ID, 55, 4, "committed", firstAt)
+	first := mailboxSyncTestMessage(firstAlias.ID, 55, 4, "committed first", firstAt)
 	first.SnapshotState = domain.SnapshotFound
-	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{alias.ID: first},
+	second := mailboxSyncTestMessage(secondAlias.ID, 55, 5, "committed second", firstAt)
+	second.SnapshotState = domain.SnapshotFound
+	aliases := []domain.Alias{firstAlias, secondAlias}
+	if err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{
+			firstAlias.ID:  first,
+			secondAlias.ID: second,
+		},
 		State: domain.IMAPSyncState{
-			AccountID: account.ID, UIDValidity: 55, LastUID: 4, UpdatedAt: firstAt,
+			AccountID: account.ID, UIDValidity: 55, LastUID: 5, UpdatedAt: firstAt,
 		},
 		Reset: true,
 	}, firstAt); err != nil {
 		t.Fatalf("apply baseline mailbox sync: %v", err)
 	}
+	versionBefore := currentAccountVersion(t, ctx, db, account.ID)
 
 	if _, err := db.DB().ExecContext(ctx, `
 		CREATE TRIGGER reject_imap_cursor_update
@@ -798,28 +874,36 @@ func TestApplyMailboxSyncRollsBackSnapshotWhenCursorWriteFails(t *testing.T) {
 		END`); err != nil {
 		t.Fatalf("create cursor failure trigger: %v", err)
 	}
-	secondAt := firstAt.Add(time.Hour)
-	second := mailboxSyncTestMessage(alias.ID, 55, 9, "must roll back", secondAt)
-	second.SnapshotState = domain.SnapshotFound
-	err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, []domain.Alias{alias}, domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{alias.ID: second},
+	resetAt := firstAt.Add(time.Hour)
+	newGeneration := mailboxSyncTestMessage(firstAlias.ID, 66, 2, "must roll back", resetAt)
+	newGeneration.SnapshotState = domain.SnapshotFound
+	err := applyMailboxSyncForCurrentAccount(t, ctx, db, account.ID, aliases, domain.MailboxSyncResult{
+		Messages: map[int64]domain.LatestMessage{firstAlias.ID: newGeneration},
 		State: domain.IMAPSyncState{
-			AccountID: account.ID, UIDValidity: 55, LastUID: 9, UpdatedAt: secondAt,
+			AccountID: account.ID, UIDValidity: 66, LastUID: 3, UpdatedAt: resetAt,
 		},
-	}, secondAt)
+		Reset: true, HasMore: true,
+	}, resetAt)
 	if err == nil || !strings.Contains(err.Error(), "upsert IMAP sync state") {
 		t.Fatalf("cursor failure error = %v", err)
 	}
 
-	assertLatestSubject(t, ctx, db, alias.ID, "committed", 55, 4)
+	assertLatestSubject(t, ctx, db, firstAlias.ID, "committed first", 55, 4)
+	assertLatestSubject(t, ctx, db, secondAlias.ID, "committed second", 55, 5)
 	state, stateErr := db.GetIMAPSyncState(ctx, account.ID)
 	if stateErr != nil {
 		t.Fatalf("get state after rollback: %v", stateErr)
 	}
-	if state.LastUID != 4 || !state.UpdatedAt.Equal(firstAt) {
+	if state.UIDValidity != 55 || state.LastUID != 5 || !state.UpdatedAt.Equal(firstAt) {
 		t.Fatalf("cursor changed despite rollback: %#v", state)
 	}
-	assertAliasSyncState(t, ctx, db, alias.ID, domain.SyncStatusOK, "", firstAt)
+	versionAfter := currentAccountVersion(t, ctx, db, account.ID)
+	if !versionAfter.Equal(versionBefore) {
+		t.Fatalf("account version after rollback = %v, want %v", versionAfter, versionBefore)
+	}
+	for _, aliasID := range []int64{firstAlias.ID, secondAlias.ID} {
+		assertAliasSyncState(t, ctx, db, aliasID, domain.SyncStatusOK, "", firstAt)
+	}
 	assertAccountSyncState(t, ctx, db, account.ID, domain.SyncStatusOK, "", firstAt)
 }
 
@@ -860,13 +944,6 @@ func TestApplyMailboxSyncValidatesAccountAndAliasSet(t *testing.T) {
 					AliasID: alias.ID, SnapshotState: domain.SnapshotUnknown,
 				}},
 				State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
-			},
-		},
-		{
-			name: "reset has more batches", aliases: []domain.Alias{alias},
-			result: domain.MailboxSyncResult{
-				State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
-				Reset: true, HasMore: true,
 			},
 		},
 	}

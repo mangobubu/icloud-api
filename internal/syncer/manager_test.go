@@ -37,7 +37,6 @@ type fakeRepo struct {
 
 	accounts   []domain.Account
 	aliases    map[int64][]domain.Alias
-	positions  map[int64]map[int64]domain.MailboxSnapshotPosition
 	states     map[int64]domain.IMAPSyncState
 	stateErrs  map[int64]error
 	getErrs    map[int64]error
@@ -53,7 +52,6 @@ func newFakeRepo(accounts ...domain.Account) *fakeRepo {
 	return &fakeRepo{
 		accounts:  accounts,
 		aliases:   make(map[int64][]domain.Alias),
-		positions: make(map[int64]map[int64]domain.MailboxSnapshotPosition),
 		states:    make(map[int64]domain.IMAPSyncState),
 		stateErrs: make(map[int64]error),
 		getErrs:   make(map[int64]error),
@@ -91,16 +89,6 @@ func (f *fakeRepo) ListEnabledAliasesByAccount(_ context.Context, accountID int6
 		}
 	}
 	return enabled, nil
-}
-
-func (f *fakeRepo) ListMailboxSnapshotPositions(_ context.Context, accountID int64) (map[int64]domain.MailboxSnapshotPosition, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	result := make(map[int64]domain.MailboxSnapshotPosition, len(f.positions[accountID]))
-	for aliasID, position := range f.positions[accountID] {
-		result[aliasID] = position
-	}
-	return result, nil
 }
 
 func (f *fakeRepo) GetIMAPSyncState(_ context.Context, accountID int64) (domain.IMAPSyncState, error) {
@@ -185,10 +173,6 @@ func TestSyncAccountPassesCursorAndAppliesOnce(t *testing.T) {
 	}
 	wantState := domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 7, LastUID: 41}
 	repo.states[account.ID] = wantState
-	wantPositions := map[int64]domain.MailboxSnapshotPosition{
-		10: {AliasID: 10, UIDValidity: 7, UID: 40},
-	}
-	repo.positions[account.ID] = wantPositions
 	wantResult := domain.MailboxSyncResult{
 		Messages: map[int64]domain.LatestMessage{
 			10: {AliasID: 10, UIDValidity: 7, UID: 42, SnapshotState: domain.SnapshotFound},
@@ -207,8 +191,8 @@ func TestSyncAccountPassesCursorAndAppliesOnce(t *testing.T) {
 		if state == nil || !reflect.DeepEqual(*state, wantState) {
 			t.Fatalf("增量游标 = %#v, want %#v", state, wantState)
 		}
-		if !reflect.DeepEqual(positions, wantPositions) {
-			t.Fatalf("mailbox snapshot positions = %#v, want %#v", positions, wantPositions)
+		if positions != nil {
+			t.Fatalf("mailbox snapshot positions = %#v, want nil", positions)
 		}
 		return wantResult, nil
 	})

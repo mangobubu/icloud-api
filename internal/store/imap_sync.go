@@ -382,10 +382,6 @@ func validateMailboxSync(
 	if result.State.UIDValidity == 0 {
 		return nil, fmt.Errorf("apply mailbox sync: state UIDVALIDITY must be positive")
 	}
-	if result.Reset && result.HasMore {
-		return nil, fmt.Errorf("apply mailbox sync: reset result cannot have more incremental batches")
-	}
-
 	enabled := make(map[int64]struct{}, len(enabledAliases))
 	for _, alias := range enabledAliases {
 		if alias.ID < 1 {
@@ -485,7 +481,10 @@ func (s *Store) upsertMailboxSnapshot(ctx context.Context, tx *sql.Tx, message d
 			html_body = excluded.html_body,
 			attachments_json = excluded.attachments_json,
 			body_truncated = excluded.body_truncated,
-			synced_at = excluded.synced_at`,
+			synced_at = excluded.synced_at
+		WHERE excluded.uid_validity != latest_messages.uid_validity
+		   OR (excluded.uid_validity = latest_messages.uid_validity
+		       AND excluded.uid >= latest_messages.uid)`,
 		message.AliasID, int64(message.UIDValidity), int64(message.UID), message.MessageID,
 		timestamp(message.InternalDate), nullableTimestamp(message.HeaderDate),
 		fromJSON, toJSON, ccJSON, message.Subject, message.TextBody, message.HTMLBody,
