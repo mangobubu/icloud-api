@@ -49,10 +49,27 @@ type accountLock struct {
 
 type activeMailboxSync struct {
 	progress    domain.MailboxSyncProgress
+	runID       string
+	batch       int
+	batchStart  time.Time
 	uidValidity uint32
 	initialUID  uint32
 	targetUID   uint32
 	cursorSet   bool
+}
+
+type syncFlowSeed struct {
+	runID     string
+	startedAt time.Time
+}
+
+type syncFlowSnapshot struct {
+	runID        string
+	batch        int
+	stage        domain.MailboxSyncPhase
+	percent      int
+	startedAt    time.Time
+	batchStarted time.Time
 }
 
 type Manager struct {
@@ -71,15 +88,19 @@ type Manager struct {
 	stopping atomic.Bool
 
 	manualMu         sync.Mutex
-	manualJobs       map[int64]struct{}
+	manualJobs       map[int64]syncFlowSeed
 	manualDone       chan struct{}
 	manualDoneClosed bool
 
 	progressMu sync.RWMutex
 	progress   map[int64]activeMailboxSync
+	runSeq     atomic.Uint64
 }
 
 func New(repo Repository, cipher CredentialCipher, fetcher MailFetcher, logger *slog.Logger, interval time.Duration, concurrency int) *Manager {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Manager{
 		repo:         repo,
 		cipher:       cipher,
@@ -91,7 +112,7 @@ func New(repo Repository, cipher CredentialCipher, fetcher MailFetcher, logger *
 		withTimeout:  context.WithTimeout,
 		waitInterval: waitForInterval,
 		locks:        make(map[int64]*accountLock),
-		manualJobs:   make(map[int64]struct{}),
+		manualJobs:   make(map[int64]syncFlowSeed),
 		manualDone:   make(chan struct{}),
 		progress:     make(map[int64]activeMailboxSync),
 	}
@@ -155,19 +176,49 @@ func waitForInterval(ctx context.Context, interval time.Duration) bool {
 	}
 }
 
-func (m *Manager) ensureProgress(accountID int64, trigger domain.MailboxSyncTrigger, phase domain.MailboxSyncPhase, percent int) {
+func (m *Manager) newSyncFlowSeed() syncFlowSeed {
+	now := time.Now().UTC()
+	sequence := m.runSeq.Add(1)
+	return syncFlowSeed{
+		runID:     fmt.Sprintf("sync-%016x-%08x", uint64(now.UnixNano()), sequence),
+		startedAt: now,
+	}
+}
+
+func (m *Manager) ensureProgress(
+	accountID int64,
+	trigger domain.MailboxSyncTrigger,
+	phase domain.MailboxSyncPhase,
+	percent int,
+	seed syncFlowSeed,
+) syncFlowSnapshot {
 	now := time.Now().UTC()
 	m.progressMu.Lock()
-	defer m.progressMu.Unlock()
 	active, ok := m.progress[accountID]
 	if ok && active.progress.Trigger != trigger {
-		return
+		m.progressMu.Unlock()
+		return syncFlowSnapshot{
+			runID:     seed.runID,
+			batch:     1,
+			stage:     phase,
+			percent:   normalizedActivePercent(percent),
+			startedAt: seed.startedAt,
+		}
 	}
 	if !ok {
-		active.progress = domain.MailboxSyncProgress{
-			AccountID: accountID,
-			Trigger:   trigger,
-			StartedAt: now,
+		if seed.runID == "" {
+			seed = m.newSyncFlowSeed()
+		}
+		if seed.startedAt.IsZero() {
+			seed.startedAt = now
+		}
+		active = activeMailboxSync{
+			runID: seed.runID,
+			progress: domain.MailboxSyncProgress{
+				AccountID: accountID,
+				Trigger:   trigger,
+				StartedAt: seed.startedAt,
+			},
 		}
 	}
 	active.progress.Phase = phase
@@ -176,33 +227,52 @@ func (m *Manager) ensureProgress(accountID int64, trigger domain.MailboxSyncTrig
 	}
 	active.progress.UpdatedAt = now
 	m.progress[accountID] = active
+	snapshot := syncFlowSnapshotFromActive(active, true)
+	m.progressMu.Unlock()
+	return snapshot
 }
 
-func (m *Manager) beginProgress(accountID int64, trigger domain.MailboxSyncTrigger, phase domain.MailboxSyncPhase, percent int) {
+func (m *Manager) beginProgress(
+	accountID int64,
+	trigger domain.MailboxSyncTrigger,
+	phase domain.MailboxSyncPhase,
+	percent int,
+	seed syncFlowSeed,
+) syncFlowSnapshot {
 	now := time.Now().UTC()
 	m.progressMu.Lock()
-	defer m.progressMu.Unlock()
 	active, ok := m.progress[accountID]
 	if !ok || active.progress.Trigger != trigger {
+		if seed.runID == "" {
+			seed = m.newSyncFlowSeed()
+		}
+		if seed.startedAt.IsZero() {
+			seed.startedAt = now
+		}
 		active = activeMailboxSync{progress: domain.MailboxSyncProgress{
 			AccountID: accountID,
 			Trigger:   trigger,
-			StartedAt: now,
-		}}
+			StartedAt: seed.startedAt,
+		}, runID: seed.runID}
 	}
+	active.batch++
+	active.batchStart = now
 	active.progress.Phase = phase
 	if percent > active.progress.Percent {
 		active.progress.Percent = normalizedActivePercent(percent)
 	}
 	active.progress.UpdatedAt = now
 	m.progress[accountID] = active
+	snapshot := syncFlowSnapshotFromActive(active, false)
+	m.progressMu.Unlock()
+	return snapshot
 }
 
 func (m *Manager) reportProgress(accountID int64, trigger domain.MailboxSyncTrigger, update domain.MailboxSyncProgressUpdate) {
 	m.progressMu.Lock()
-	defer m.progressMu.Unlock()
 	active, ok := m.progress[accountID]
 	if !ok || active.progress.Trigger != trigger {
+		m.progressMu.Unlock()
 		return
 	}
 	active.progress.Phase = update.Phase
@@ -211,6 +281,17 @@ func (m *Manager) reportProgress(accountID int64, trigger domain.MailboxSyncTrig
 	}
 	active.progress.UpdatedAt = time.Now().UTC()
 	m.progress[accountID] = active
+	snapshot := syncFlowSnapshotFromActive(active, false)
+	m.progressMu.Unlock()
+	m.logSyncFlow(
+		context.Background(),
+		slog.LevelDebug,
+		syncStageMessage(update.Phase),
+		accountID,
+		trigger,
+		"stage_started",
+		snapshot,
+	)
 }
 
 func (m *Manager) reportCursorProgress(
@@ -218,13 +299,13 @@ func (m *Manager) reportCursorProgress(
 	trigger domain.MailboxSyncTrigger,
 	previous *domain.IMAPSyncState,
 	result domain.MailboxSyncResult,
-) {
+) (syncFlowSnapshot, bool) {
 	now := time.Now().UTC()
 	m.progressMu.Lock()
-	defer m.progressMu.Unlock()
 	active, ok := m.progress[accountID]
 	if !ok || active.progress.Trigger != trigger {
-		return
+		m.progressMu.Unlock()
+		return syncFlowSnapshot{}, false
 	}
 	if !active.cursorSet || active.uidValidity != result.State.UIDValidity {
 		active.uidValidity = result.State.UIDValidity
@@ -257,6 +338,38 @@ func (m *Manager) reportCursorProgress(
 	active.progress.Phase = domain.MailboxSyncPhaseSaving
 	active.progress.UpdatedAt = now
 	m.progress[accountID] = active
+	snapshot := syncFlowSnapshotFromActive(active, false)
+	m.progressMu.Unlock()
+	return snapshot, true
+}
+
+func syncFlowSnapshotFromActive(active activeMailboxSync, nextBatch bool) syncFlowSnapshot {
+	batch := active.batch
+	batchStarted := active.batchStart
+	if nextBatch {
+		batch++
+		batchStarted = time.Time{}
+	} else if batch < 1 {
+		batch = 1
+	}
+	return syncFlowSnapshot{
+		runID:        active.runID,
+		batch:        batch,
+		stage:        active.progress.Phase,
+		percent:      active.progress.Percent,
+		startedAt:    active.progress.StartedAt,
+		batchStarted: batchStarted,
+	}
+}
+
+func (m *Manager) currentSyncFlow(accountID int64, trigger domain.MailboxSyncTrigger) (syncFlowSnapshot, bool) {
+	m.progressMu.RLock()
+	active, ok := m.progress[accountID]
+	m.progressMu.RUnlock()
+	if !ok || active.progress.Trigger != trigger {
+		return syncFlowSnapshot{}, false
+	}
+	return syncFlowSnapshotFromActive(active, false), true
 }
 
 func (m *Manager) finishProgress(accountID int64, trigger domain.MailboxSyncTrigger) {
@@ -304,6 +417,16 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 	if err != nil {
 		m.logger.Error("读取待同步主号失败", "error", err)
 		for accountID := range continuations {
+			if flow, ok := m.currentSyncFlow(accountID, domain.MailboxSyncTriggerAutomatic); ok {
+				m.logSyncFailure(
+					ctx,
+					accountID,
+					domain.MailboxSyncTriggerAutomatic,
+					flow,
+					"list_enabled_accounts",
+					err,
+				)
+			}
 			m.finishProgress(accountID, domain.MailboxSyncTriggerAutomatic)
 		}
 		return pending
@@ -315,6 +438,17 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 		}
 		for accountID := range continuations {
 			if _, ok := enabled[accountID]; !ok {
+				if flow, active := m.currentSyncFlow(accountID, domain.MailboxSyncTriggerAutomatic); active {
+					m.logSyncCancellation(
+						ctx,
+						accountID,
+						domain.MailboxSyncTriggerAutomatic,
+						flow,
+						flow.stage,
+						"account_no_longer_enabled",
+						"账号已停用或已从自动同步列表移除",
+					)
+				}
 				m.finishProgress(accountID, domain.MailboxSyncTriggerAutomatic)
 			}
 		}
@@ -342,9 +476,29 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 		go func() {
 			defer wg.Done()
 
+			seed := m.newSyncFlowSeed()
+			if active, ok := m.currentSyncFlow(account.ID, domain.MailboxSyncTriggerAutomatic); ok {
+				seed = syncFlowSeed{runID: active.runID, startedAt: active.startedAt}
+			}
 			var release func()
 			if continuing {
-				m.ensureProgress(account.ID, domain.MailboxSyncTriggerAutomatic, domain.MailboxSyncPhaseWaiting, 2)
+				waiting := m.ensureProgress(
+					account.ID,
+					domain.MailboxSyncTriggerAutomatic,
+					domain.MailboxSyncPhaseWaiting,
+					2,
+					seed,
+				)
+				m.logSyncFlow(
+					ctx,
+					slog.LevelDebug,
+					"邮件同步正在等待账号锁",
+					account.ID,
+					domain.MailboxSyncTriggerAutomatic,
+					"waiting",
+					waiting,
+					slog.String("wait_for", "account_lock"),
+				)
 				lockCtx, cancelLock := m.withTimeout(ctx, m.syncTimeout)
 				var err error
 				release, err = m.acquireAccount(lockCtx, account.ID)
@@ -356,6 +510,14 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 					if release != nil {
 						release()
 					}
+					m.logSyncFailure(
+						ctx,
+						account.ID,
+						domain.MailboxSyncTriggerAutomatic,
+						waiting,
+						"wait_account_lock",
+						err,
+					)
 					m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
 					return
 				}
@@ -367,40 +529,70 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 				}
 			}
 			defer release()
-			m.beginProgress(account.ID, domain.MailboxSyncTriggerAutomatic, domain.MailboxSyncPhaseWaiting, 2)
+			waiting := m.ensureProgress(
+				account.ID,
+				domain.MailboxSyncTriggerAutomatic,
+				domain.MailboxSyncPhaseWaiting,
+				2,
+				seed,
+			)
+			m.logSyncFlow(
+				ctx,
+				slog.LevelDebug,
+				"邮件同步正在等待全局连接名额",
+				account.ID,
+				domain.MailboxSyncTriggerAutomatic,
+				"waiting",
+				waiting,
+				slog.String("wait_for", "global_imap_slot"),
+			)
 
 			waitCtx, cancelWait := m.withTimeout(ctx, m.syncTimeout)
 			defer cancelWait()
 			releaseSlot, err := m.acquireSyncSlot(waitCtx)
 			if err != nil {
+				m.logSyncFailure(
+					ctx,
+					account.ID,
+					domain.MailboxSyncTriggerAutomatic,
+					waiting,
+					"wait_global_imap_slot",
+					err,
+				)
 				m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
 				markResult(account.ID, err)
-				if !errors.Is(err, context.Canceled) {
-					m.logger.Warn("主号同步失败", "account_id", account.ID, "error", err)
-				}
 				return
 			}
 			defer releaseSlot()
 			if err := waitCtx.Err(); err != nil {
+				m.logSyncFailure(
+					ctx,
+					account.ID,
+					domain.MailboxSyncTriggerAutomatic,
+					waiting,
+					"wait_global_imap_slot",
+					err,
+				)
 				m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
 				markResult(account.ID, err)
-				if !errors.Is(err, context.Canceled) {
-					m.logger.Warn("主号同步失败", "account_id", account.ID, "error", err)
-				}
 				return
 			}
 			cancelWait()
 
+			flow := m.beginProgress(
+				account.ID,
+				domain.MailboxSyncTriggerAutomatic,
+				domain.MailboxSyncPhasePreparing,
+				3,
+				seed,
+			)
+			m.logSyncBatchStarted(ctx, account.ID, domain.MailboxSyncTriggerAutomatic, flow)
 			syncCtx, cancelSync := m.withTimeout(ctx, m.syncTimeout)
 			defer cancelSync()
-			syncErr := m.syncAccountLocked(syncCtx, account.ID, domain.MailboxSyncTriggerAutomatic)
+			syncErr := m.syncAccountLocked(syncCtx, account.ID, domain.MailboxSyncTriggerAutomatic, flow)
 			markResult(account.ID, syncErr)
 			if !errors.Is(syncErr, ErrSyncPending) {
 				m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
-			}
-			if syncErr != nil &&
-				!errors.Is(syncErr, context.Canceled) && !errors.Is(syncErr, ErrSyncPending) {
-				m.logger.Warn("主号同步失败", "account_id", account.ID, "error", syncErr)
 			}
 		}()
 	}
@@ -411,17 +603,47 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 // SyncAccountWithTimeout bounds queueing and mailbox work separately so a busy
 // account or IMAP slot does not consume the mailbox operation's full budget.
 func (m *Manager) SyncAccountWithTimeout(ctx context.Context, accountID int64) error {
-	m.ensureProgress(accountID, domain.MailboxSyncTriggerManual, domain.MailboxSyncPhaseWaiting, 2)
+	seed := m.newSyncFlowSeed()
+	waiting := m.ensureProgress(
+		accountID,
+		domain.MailboxSyncTriggerManual,
+		domain.MailboxSyncPhaseWaiting,
+		2,
+		seed,
+	)
+	m.logSyncFlow(
+		ctx,
+		slog.LevelDebug,
+		"邮件同步正在等待执行资源",
+		accountID,
+		domain.MailboxSyncTriggerManual,
+		"waiting",
+		waiting,
+		slog.String("wait_for", "account_lock_and_global_imap_slot"),
+	)
 	defer m.finishProgress(accountID, domain.MailboxSyncTriggerManual)
 	waitCtx, cancelWait := m.withTimeout(ctx, m.syncTimeout)
 	defer cancelWait()
-	return m.WithAccountIMAPSlot(waitCtx, accountID, func() error {
+	started := false
+	err := m.WithAccountIMAPSlot(waitCtx, accountID, func() error {
 		cancelWait()
-		m.beginProgress(accountID, domain.MailboxSyncTriggerManual, domain.MailboxSyncPhaseWaiting, 2)
+		flow := m.beginProgress(
+			accountID,
+			domain.MailboxSyncTriggerManual,
+			domain.MailboxSyncPhasePreparing,
+			3,
+			seed,
+		)
+		started = true
+		m.logSyncBatchStarted(ctx, accountID, domain.MailboxSyncTriggerManual, flow)
 		syncCtx, cancelSync := m.withTimeout(ctx, m.syncTimeout)
 		defer cancelSync()
-		return m.syncAccountLocked(syncCtx, accountID, domain.MailboxSyncTriggerManual)
+		return m.syncAccountLocked(syncCtx, accountID, domain.MailboxSyncTriggerManual, flow)
 	})
+	if err != nil && !started {
+		m.logSyncFailure(ctx, accountID, domain.MailboxSyncTriggerManual, waiting, "wait_sync_resources", err)
+	}
+	return err
 }
 
 // QueueAccountSync starts a deduplicated manual sync outside the HTTP request
@@ -448,24 +670,37 @@ func (m *Manager) QueueAccountSync(ctx context.Context, accountID int64) error {
 		m.manualMu.Unlock()
 		return err
 	}
-	m.manualJobs[accountID] = struct{}{}
+	seed := m.newSyncFlowSeed()
+	m.manualJobs[accountID] = seed
 	m.manualMu.Unlock()
-	m.ensureProgress(accountID, domain.MailboxSyncTriggerManual, domain.MailboxSyncPhaseQueued, 0)
+	queued := m.ensureProgress(
+		accountID,
+		domain.MailboxSyncTriggerManual,
+		domain.MailboxSyncPhaseQueued,
+		0,
+		seed,
+	)
+	m.logSyncFlow(
+		ctx,
+		slog.LevelInfo,
+		"邮件同步已排队",
+		accountID,
+		domain.MailboxSyncTriggerManual,
+		"run_queued",
+		queued,
+	)
 
-	go m.runQueuedAccountSync(ctx, accountID)
+	go m.runQueuedAccountSync(ctx, accountID, seed)
 	return ErrSyncQueued
 }
 
-func (m *Manager) runQueuedAccountSync(ctx context.Context, accountID int64) {
+func (m *Manager) runQueuedAccountSync(ctx context.Context, accountID int64, seed syncFlowSeed) {
 	defer m.finishManualJob(accountID)
 	defer m.finishProgress(accountID, domain.MailboxSyncTriggerManual)
 	for {
-		syncErr := m.syncQueuedAccount(ctx, accountID)
+		syncErr := m.syncQueuedAccount(ctx, accountID, seed)
 		if errors.Is(syncErr, ErrSyncPending) {
 			continue
-		}
-		if syncErr != nil && !errors.Is(syncErr, context.Canceled) {
-			m.logger.Warn("queued account sync failed", "account_id", accountID, "error", syncErr)
 		}
 		return
 	}
@@ -474,14 +709,43 @@ func (m *Manager) runQueuedAccountSync(ctx context.Context, accountID int64) {
 // syncQueuedAccount waits for the account and global IMAP slot until the
 // worker context is canceled. Once both resources are held, mailbox work gets
 // its own bounded timeout so a slow server cannot block shutdown forever.
-func (m *Manager) syncQueuedAccount(ctx context.Context, accountID int64) error {
-	m.ensureProgress(accountID, domain.MailboxSyncTriggerManual, domain.MailboxSyncPhaseWaiting, 2)
-	return m.WithAccountIMAPSlot(ctx, accountID, func() error {
-		m.beginProgress(accountID, domain.MailboxSyncTriggerManual, domain.MailboxSyncPhaseWaiting, 2)
+func (m *Manager) syncQueuedAccount(ctx context.Context, accountID int64, seed syncFlowSeed) error {
+	waiting := m.ensureProgress(
+		accountID,
+		domain.MailboxSyncTriggerManual,
+		domain.MailboxSyncPhaseWaiting,
+		2,
+		seed,
+	)
+	m.logSyncFlow(
+		ctx,
+		slog.LevelDebug,
+		"邮件同步正在等待执行资源",
+		accountID,
+		domain.MailboxSyncTriggerManual,
+		"waiting",
+		waiting,
+		slog.String("wait_for", "account_lock_and_global_imap_slot"),
+	)
+	started := false
+	err := m.WithAccountIMAPSlot(ctx, accountID, func() error {
+		flow := m.beginProgress(
+			accountID,
+			domain.MailboxSyncTriggerManual,
+			domain.MailboxSyncPhasePreparing,
+			3,
+			seed,
+		)
+		started = true
+		m.logSyncBatchStarted(ctx, accountID, domain.MailboxSyncTriggerManual, flow)
 		syncCtx, cancelSync := m.withTimeout(ctx, m.syncTimeout)
 		defer cancelSync()
-		return m.syncAccountLocked(syncCtx, accountID, domain.MailboxSyncTriggerManual)
+		return m.syncAccountLocked(syncCtx, accountID, domain.MailboxSyncTriggerManual, flow)
 	})
+	if err != nil && !started {
+		m.logSyncFailure(ctx, accountID, domain.MailboxSyncTriggerManual, waiting, "wait_sync_resources", err)
+	}
+	return err
 }
 
 func (m *Manager) finishManualJob(accountID int64) {
@@ -511,12 +775,42 @@ func (m *Manager) waitForManualJobs() {
 }
 
 func (m *Manager) SyncAccount(ctx context.Context, accountID int64) error {
-	m.ensureProgress(accountID, domain.MailboxSyncTriggerManual, domain.MailboxSyncPhaseWaiting, 2)
+	seed := m.newSyncFlowSeed()
+	waiting := m.ensureProgress(
+		accountID,
+		domain.MailboxSyncTriggerManual,
+		domain.MailboxSyncPhaseWaiting,
+		2,
+		seed,
+	)
+	m.logSyncFlow(
+		ctx,
+		slog.LevelDebug,
+		"邮件同步正在等待执行资源",
+		accountID,
+		domain.MailboxSyncTriggerManual,
+		"waiting",
+		waiting,
+		slog.String("wait_for", "account_lock_and_global_imap_slot"),
+	)
 	defer m.finishProgress(accountID, domain.MailboxSyncTriggerManual)
-	return m.WithAccountIMAPSlot(ctx, accountID, func() error {
-		m.beginProgress(accountID, domain.MailboxSyncTriggerManual, domain.MailboxSyncPhaseWaiting, 2)
-		return m.syncAccountLocked(ctx, accountID, domain.MailboxSyncTriggerManual)
+	started := false
+	err := m.WithAccountIMAPSlot(ctx, accountID, func() error {
+		flow := m.beginProgress(
+			accountID,
+			domain.MailboxSyncTriggerManual,
+			domain.MailboxSyncPhasePreparing,
+			3,
+			seed,
+		)
+		started = true
+		m.logSyncBatchStarted(ctx, accountID, domain.MailboxSyncTriggerManual, flow)
+		return m.syncAccountLocked(ctx, accountID, domain.MailboxSyncTriggerManual, flow)
 	})
+	if err != nil && !started {
+		m.logSyncFailure(ctx, accountID, domain.MailboxSyncTriggerManual, waiting, "wait_sync_resources", err)
+	}
+	return err
 }
 
 // WithAccountIMAPSlot serializes work for one account and includes it in the
@@ -547,18 +841,36 @@ func (m *Manager) syncAccountLocked(
 	ctx context.Context,
 	accountID int64,
 	trigger domain.MailboxSyncTrigger,
+	flow syncFlowSnapshot,
 ) (syncErr error) {
+	failedOperation := "check_context"
+	sensitiveValues := make([]string, 0, 4)
+	defer func() {
+		m.logSyncFailure(ctx, accountID, trigger, flow, failedOperation, syncErr, sensitiveValues...)
+	}()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
+	failedOperation = "load_account"
 	account, err := m.repo.GetAccount(ctx, accountID)
 	if err != nil {
 		return err
 	}
+	sensitiveValues = append(sensitiveValues, account.Email, account.PasswordCiphertext)
+	failedOperation = "validate_account_enabled"
 	if !account.Enabled {
 		return store.ErrAccountDisabled
 	}
+	m.logSyncFlow(
+		ctx,
+		slog.LevelDebug,
+		"已读取邮件同步账号配置",
+		accountID,
+		trigger,
+		"account_loaded",
+		flow,
+	)
 	failures := newFailureRecorder(m, ctx, accountID, account.UpdatedAt)
 	defer failures.close()
 	defer func() {
@@ -567,10 +879,15 @@ func (m *Manager) syncAccountLocked(
 		}
 	}()
 
+	failedOperation = "load_enabled_aliases"
 	enabled, err := m.repo.ListEnabledAliasesByAccount(ctx, accountID)
 	if err != nil {
 		return err
 	}
+	for _, alias := range enabled {
+		sensitiveValues = append(sensitiveValues, alias.Address)
+	}
+	failedOperation = "load_incremental_cursor"
 	state, err := m.repo.GetIMAPSyncState(ctx, accountID)
 	var previousState *domain.IMAPSyncState
 	switch {
@@ -581,31 +898,118 @@ func (m *Manager) syncAccountLocked(
 	default:
 		return fmt.Errorf("读取 IMAP 增量游标: %w", err)
 	}
+	preparedAttrs := []slog.Attr{
+		slog.Int("enabled_alias_count", len(enabled)),
+		slog.Bool("has_previous_cursor", previousState != nil),
+	}
+	if previousState != nil {
+		preparedAttrs = append(
+			preparedAttrs,
+			slog.Uint64("uid_validity", uint64(previousState.UIDValidity)),
+			slog.Uint64("cursor_uid", uint64(previousState.LastUID)),
+		)
+	}
+	m.logSyncFlow(
+		ctx,
+		slog.LevelDebug,
+		"邮件同步范围准备完成",
+		accountID,
+		trigger,
+		"prepared",
+		flow,
+		preparedAttrs...,
+	)
 
+	failedOperation = "decrypt_credentials"
 	password, err := m.cipher.Decrypt(account.PasswordCiphertext)
 	if err != nil {
 		return fmt.Errorf("解密 IMAP 凭据: %w", err)
 	}
+	sensitiveValues = append(sensitiveValues, password)
 	fetchCtx := domain.WithMailboxSyncProgressReporter(ctx, func(update domain.MailboxSyncProgressUpdate) {
 		m.reportProgress(accountID, trigger, update)
 	})
+	failedOperation = "fetch_incremental"
 	result, err := m.fetcher.FetchIncremental(fetchCtx, account, password, enabled, previousState, nil)
 	password = ""
 	if err != nil {
 		return fmt.Errorf("fetch IMAP mailbox increment: %w", err)
 	}
-	m.reportCursorProgress(accountID, trigger, previousState, result)
+	saving, ok := m.reportCursorProgress(accountID, trigger, previousState, result)
+	if !ok {
+		saving = flow
+		saving.stage = domain.MailboxSyncPhaseSaving
+	}
+	m.logSyncFlow(
+		ctx,
+		slog.LevelDebug,
+		"正在保存同步结果",
+		accountID,
+		trigger,
+		"stage_started",
+		saving,
+		slog.Int("result_count", len(result.Messages)),
+		slog.Uint64("cursor_uid", uint64(result.State.LastUID)),
+		slog.Uint64("target_uid", uint64(result.TargetUID)),
+		slog.Bool("has_more", result.HasMore),
+		slog.Bool("cursor_reset", result.Reset),
+	)
+	failedOperation = "save_result"
 	now := time.Now().UTC()
 	if err := m.repo.ApplyMailboxSync(ctx, accountID, account.UpdatedAt, enabled, result, now); err != nil {
 		return fmt.Errorf("批量保存 IMAP 同步结果: %w", err)
 	}
+	m.logSyncFlow(
+		ctx,
+		slog.LevelDebug,
+		"邮件同步批次已保存",
+		accountID,
+		trigger,
+		"batch_saved",
+		saving,
+		slog.Int("result_count", len(result.Messages)),
+		slog.Uint64("cursor_uid", uint64(result.State.LastUID)),
+		slog.Uint64("target_uid", uint64(result.TargetUID)),
+		slog.Bool("has_more", result.HasMore),
+	)
 	if result.HasMore {
+		m.logSyncFlow(
+			ctx,
+			slog.LevelInfo,
+			"邮件同步批次完成，仍有邮件等待后续批次",
+			accountID,
+			trigger,
+			"batch_completed",
+			saving,
+			slog.Int("next_batch", saving.batch+1),
+			slog.Uint64("cursor_uid", uint64(result.State.LastUID)),
+			slog.Uint64("target_uid", uint64(result.TargetUID)),
+		)
 		return ErrSyncPending
 	}
+	failedOperation = "complete_run"
 	m.reportProgress(accountID, trigger, domain.MailboxSyncProgressUpdate{
 		Phase:   domain.MailboxSyncPhaseSaving,
 		Percent: 100,
 	})
+	completed, ok := m.currentSyncFlow(accountID, trigger)
+	if !ok {
+		completed = saving
+		completed.percent = 100
+	}
+	completed.stage = domain.MailboxSyncPhase("completed")
+	m.logSyncFlow(
+		ctx,
+		slog.LevelInfo,
+		"邮件同步完成",
+		accountID,
+		trigger,
+		"run_completed",
+		completed,
+		slog.Int("result_count", len(result.Messages)),
+		slog.Uint64("cursor_uid", uint64(result.State.LastUID)),
+		slog.Uint64("target_uid", uint64(result.TargetUID)),
+	)
 	return nil
 }
 

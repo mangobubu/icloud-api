@@ -1,6 +1,8 @@
 import { apiRequest } from "./client.js";
 import {
   buildRuntimeLogQuery,
+  chronologicalRuntimeLogs,
+  mergeRuntimeLogs,
   normalizeRuntimeLogPage,
 } from "../utils/runtimeLogs.js";
 
@@ -593,6 +595,36 @@ export async function getAuditLogs() {
 
 export async function getRuntimeLogs(options = {}) {
   const query = buildRuntimeLogQuery(options);
-  const data = await apiRequest(`/logs${query ? `?${query}` : ""}`);
+  const data = await apiRequest(`/logs${query ? `?${query}` : ""}`, {
+    signal: options.signal,
+  });
   return normalizeRuntimeLogPage(data || {});
+}
+
+export async function getRuntimeLogRun(syncRunId, options = {}) {
+  const normalizedRunId = String(syncRunId ?? "").trim();
+  if (!normalizedRunId) return [];
+
+  const maximum = 2000;
+  const seenCursors = new Set();
+  let beforeId = "";
+  let items = [];
+
+  while (items.length < maximum) {
+    const page = await getRuntimeLogs({
+      accountId: options.accountId,
+      beforeId,
+      limit: 200,
+      signal: options.signal,
+      syncRunId: normalizedRunId,
+    });
+    items = mergeRuntimeLogs(items, page.items).slice(0, maximum);
+
+    const nextCursor = String(page.nextBeforeId ?? "").trim();
+    if (!page.hasMore || !nextCursor || seenCursors.has(nextCursor)) break;
+    seenCursors.add(nextCursor);
+    beforeId = nextCursor;
+  }
+
+  return chronologicalRuntimeLogs(items);
 }

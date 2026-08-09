@@ -232,6 +232,11 @@
     <RuntimeLogDetailDialog
       v-model="detailVisible"
       :log="selectedLog"
+      :flow-logs="detailFlowLogs"
+      :flow-loading="detailFlowLoading"
+      :flow-error="detailFlowError"
+      :account-label="accountLabel(selectedLog?.accountId)"
+      @retry-flow="loadSelectedLogFlow"
     />
   </section>
 </template>
@@ -253,7 +258,11 @@ import {
 } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
-import { getAccounts, getRuntimeLogs } from "../api/admin.js";
+import {
+  getAccounts,
+  getRuntimeLogRun,
+  getRuntimeLogs,
+} from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import RuntimeLogDetailDialog from "../components/RuntimeLogDetailDialog.vue";
@@ -307,10 +316,15 @@ const nextBeforeId = ref(null);
 const autoRefreshEnabled = ref(true);
 const detailVisible = ref(false);
 const selectedLog = ref(null);
+const detailFlowLogs = ref([]);
+const detailFlowLoading = ref(false);
+const detailFlowError = ref(null);
 const logRequestGate = createLatestRequestGate();
+const detailRequestGate = createLatestRequestGate();
 let latestRequest = null;
 let latestRequestKey = "";
 let loadMoreGeneration = 0;
+let detailFlowAbortController = null;
 let viewActive = true;
 
 const currentFilterKey = computed(() =>
@@ -479,9 +493,52 @@ function resetFilters() {
   reloadForFilters();
 }
 
+async function loadSelectedLogFlow() {
+  const log = selectedLog.value;
+  const syncRunId = String(log?.syncRunId || "").trim();
+  if (!syncRunId || !detailVisible.value) return;
+
+  detailFlowAbortController?.abort();
+  detailFlowAbortController = new AbortController();
+  const ticket = detailRequestGate.begin(syncRunId);
+  detailFlowLoading.value = true;
+  detailFlowError.value = null;
+
+  try {
+    const nextLogs = await getRuntimeLogRun(syncRunId, {
+      accountId: log.accountId,
+      signal: detailFlowAbortController.signal,
+    });
+    if (
+      detailRequestGate.isCurrent(ticket, selectedLog.value?.syncRunId) &&
+      detailVisible.value
+    ) {
+      detailFlowLogs.value = nextLogs;
+    }
+  } catch (error) {
+    if (
+      error?.name !== "AbortError" &&
+      detailRequestGate.isCurrent(ticket, selectedLog.value?.syncRunId) &&
+      detailVisible.value
+    ) {
+      detailFlowError.value = error;
+    }
+  } finally {
+    if (detailRequestGate.isCurrent(ticket, selectedLog.value?.syncRunId)) {
+      detailFlowLoading.value = false;
+    }
+  }
+}
+
 function openLogDetail(log) {
+  detailFlowAbortController?.abort();
+  detailRequestGate.invalidate();
   selectedLog.value = log;
+  detailFlowLogs.value = [];
+  detailFlowError.value = null;
+  detailFlowLoading.value = Boolean(log?.syncRunId);
   detailVisible.value = true;
+  if (log?.syncRunId) void loadSelectedLogFlow();
 }
 
 const liveRefresh = createLiveRefresh(() => loadLatestLogs({ silent: true }));
@@ -496,6 +553,14 @@ watch(autoRefreshEnabled, (enabled) => {
   } else {
     liveRefresh.stop();
   }
+});
+
+watch(detailVisible, (visible) => {
+  if (visible) return;
+  detailFlowAbortController?.abort();
+  detailFlowAbortController = null;
+  detailRequestGate.invalidate();
+  detailFlowLoading.value = false;
 });
 
 watch(
@@ -528,6 +593,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   viewActive = false;
   logRequestGate.deactivate();
+  detailFlowAbortController?.abort();
+  detailRequestGate.deactivate();
   liveRefresh.stop();
 });
 </script>

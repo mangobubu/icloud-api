@@ -43,6 +43,11 @@ test("all logs view supports filters, cursor paging, live refresh, and responsiv
   assert.match(source, /class="data-panel desktop-data-table"/);
   assert.match(source, /class="mobile-record-list"/);
   assert.match(source, /<RuntimeLogDetailDialog/);
+  assert.match(source, /getRuntimeLogRun\(syncRunId,\s*\{/);
+  assert.match(source, /detailFlowAbortController\?\.abort\(\)/);
+  assert.match(source, /:flow-loading="detailFlowLoading"/);
+  assert.match(source, /:flow-error="detailFlowError"/);
+  assert.match(source, /@retry-flow="loadSelectedLogFlow"/);
   assert.match(source, /@media \(max-width: 720px\)/);
 });
 
@@ -69,17 +74,32 @@ test("reenabling live refresh cancels an in-flight historical page before loadin
   }
 });
 
-test("runtime log details are escaped, copyable, and mobile safe", async () => {
+test("runtime log details show a loadable, copyable, responsive sync timeline", async () => {
   const source = await readFile(detailPath, "utf8");
 
   assert.match(source, /<pre>\{\{ log\.message \|\| "-" \}\}<\/pre>/);
   assert.match(source, /<pre>\{\{ attributesText \}\}<\/pre>/);
   assert.doesNotMatch(source, /v-html|innerHTML/);
+  assert.match(source, /v-if="flowLoading"[\s\S]{0,300}<el-skeleton/);
+  assert.match(source, /v-if="flowError"[\s\S]{0,300}<RequestAlert/);
+  assert.match(source, /重新加载完整流程/);
+  assert.match(source, /content="刷新同步流程"[\s\S]{0,180}@click="emit\('retry-flow'\)"/);
+  assert.match(source, /v-for="entry in orderedFlowLogs"/);
+  assert.match(source, /失败于 \{\{ runtimeLogSyncStageLabel\(entry\.failedStage\) \}\}/);
+  assert.match(source, /<strong>错误详情<\/strong>[\s\S]{0,100}entry\.errorDetail/);
+  assert.match(source, /操作位置：[\s\S]{0,100}entry\.failedOperation/);
+  assert.match(source, /当前仅展示日志缓冲区内保留的部分流程/);
+  assert.match(source, /\["started", "run_started", "run_queued"\]/);
+  assert.match(source, /v-else-if="flowIsRunning"/);
+  assert.match(source, /该次同步尚未结束/);
   assert.match(source, /await copyText\(fullLogText\.value\)/);
   assert.match(source, /完整日志已复制/);
+  assert.match(source, /完整同步流程已复制/);
+  assert.match(source, /function flowLogText\(\)/);
   assert.match(source, /role="status"[\s\S]{0,100}aria-live="polite"/);
   assert.doesNotMatch(source, /runtime-log-detail__announcement/);
-  assert.match(source, /width="min\(760px, calc\(100vw - 28px\)\)"/);
+  assert.match(source, /width="min\(900px, calc\(100vw - 28px\)\)"/);
   assert.match(source, /overflow-wrap:\s*anywhere/);
+  assert.match(source, /max-height:\s*52dvh/);
   assert.match(source, /@media \(max-width: 600px\)/);
 });

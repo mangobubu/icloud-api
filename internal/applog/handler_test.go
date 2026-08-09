@@ -91,6 +91,20 @@ func TestListFiltersAndCursorPagination(t *testing.T) {
 	}
 }
 
+func TestListFiltersSyncRunIDExactly(t *testing.T) {
+	handler := New(10)
+	logger := slog.New(handler)
+	logger.Info("exact", "sync_run_id", "sync-run-1")
+	logger.Info("different", "sync_run_id", "sync-run-10")
+	logger.Info("grouped", slog.Group("sync", "sync_run_id", "sync-run-1"))
+	logger.Info("missing")
+
+	page := handler.List(Filter{SyncRunID: "sync-run-1", Limit: 10})
+	if len(page.Items) != 2 || page.Items[0].Message != "grouped" || page.Items[1].Message != "exact" {
+		t.Fatalf("exact sync run page = %#v", page)
+	}
+}
+
 func TestWithAttrsAndGroupsPreserveBindingOrder(t *testing.T) {
 	handler := New(10)
 	derived := handler.

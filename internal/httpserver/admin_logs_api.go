@@ -16,6 +16,7 @@ const (
 	adminAPIDefaultLogLimit     = 100
 	adminAPIMaxLogLimit         = 200
 	adminAPIMaxLogQueryRunes    = 200
+	adminAPIMaxSyncRunIDRunes   = 128
 )
 
 // ApplicationLogSource supplies the bounded in-memory application log history.
@@ -39,6 +40,7 @@ type adminAPIApplicationLogDTO struct {
 	Source     string            `json:"source"`
 	AccountID  *int64            `json:"account_id,omitempty"`
 	RequestID  string            `json:"request_id,omitempty"`
+	SyncRunID  string            `json:"sync_run_id,omitempty"`
 	Attributes map[string]string `json:"attributes"`
 }
 
@@ -86,6 +88,10 @@ func adminAPIApplicationLogFilter(c *gin.Context) (applog.Filter, bool) {
 	if !ok {
 		return applog.Filter{}, false
 	}
+	syncRunID, ok := adminAPIOptionalSyncRunID(c)
+	if !ok {
+		return applog.Filter{}, false
+	}
 	beforeID, ok := adminAPIOptionalUint64(c, "before_id")
 	if !ok {
 		return applog.Filter{}, false
@@ -99,9 +105,31 @@ func adminAPIApplicationLogFilter(c *gin.Context) (applog.Filter, bool) {
 		Level:     level,
 		Query:     query,
 		AccountID: accountID,
+		SyncRunID: syncRunID,
 		BeforeID:  beforeID,
 		Limit:     limit,
 	}, true
+}
+
+func adminAPIOptionalSyncRunID(c *gin.Context) (string, bool) {
+	raw, present := c.GetQuery("sync_run_id")
+	if !present {
+		return "", true
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" || len([]rune(value)) > adminAPIMaxSyncRunIDRunes {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "sync_run_id 参数无效")
+		return "", false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' || char == ':' {
+			continue
+		}
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "sync_run_id 参数无效")
+		return "", false
+	}
+	return value, true
 }
 
 func adminAPIOptionalPositiveInt64(c *gin.Context, name string) (*int64, bool) {
@@ -151,6 +179,7 @@ func adminAPIApplicationLogFromEntry(entry applog.Entry) adminAPIApplicationLogD
 		Source:     entry.Source,
 		AccountID:  accountID,
 		RequestID:  adminAPIApplicationLogAttribute(entry.Fields, "request_id"),
+		SyncRunID:  adminAPIApplicationLogAttribute(entry.Fields, "sync_run_id"),
 		Attributes: attributes,
 	}
 }

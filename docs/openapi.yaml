@@ -1063,9 +1063,14 @@ paths:
       operationId: listAdminApplicationLogs
       summary: 查询当前进程应用日志
       description: |
-        返回当前应用进程内存中保留的最近最多 2000 条日志，按 `id` 从新到旧排列。
-        可按级别、关键词和主号筛选，并使用排他的 `before_id` 游标向更早的记录翻页。
-        日志不会跨进程重启保留；敏感字段会在进入日志缓冲区前脱敏。
+        返回当前应用进程环形缓冲区中保留的最近最多 2000 条日志，按 `id` 从新到旧排列。
+        环形缓冲区还受总字节数限制，较大的记录可能使更早日志在达到 2000 条前被覆盖。
+        可按级别、关键词、主号和 `sync_run_id` 筛选，并使用排他的 `before_id` 游标向更早的记录翻页。
+
+        邮件同步流程为每次逻辑同步分配一个 `sync_run_id`；同一次追平任务的多个批次继续使用同一值。
+        使用 `sync_run_id` 会按结构化字段完整值精确匹配，前端据此读取当前环形窗口内同一轮同步的
+        全部分页，再按时间从早到晚组成详情时间线。日志不会跨进程重启保留，较早流程事件也可能已被覆盖；
+        因此时间线可能只包含部分流程，不属于持久审计记录。敏感字段会在进入日志缓冲区前脱敏。
       security:
         - adminSession: []
       parameters:
@@ -1095,6 +1100,19 @@ paths:
             type: integer
             format: int64
             minimum: 1
+        - name: sync_run_id
+          in: query
+          required: false
+          description: |
+            邮件同步运行标识的精确筛选值。参数出现时会忽略前后空白，之后必须包含 1 至 128 个字符，
+            且只能使用 ASCII 字母、数字、连字符、下划线、句点和冒号。服务生成的值通常采用
+            `sync-<16位十六进制时间>-<至少8位十六进制序号>` 格式。
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: "^[A-Za-z0-9_.:-]+$"
+          example: sync-1875f21a4c8b0000-00000001
         - name: limit
           in: query
           required: false
@@ -1124,7 +1142,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminApplicationLogListResponse"
         "400":
-          description: level、query、account_id、limit 或 before_id 参数无效
+          description: level、query、account_id、sync_run_id、limit 或 before_id 参数无效
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -2203,10 +2221,7 @@ components:
         source:
           type: string
         attributes:
-          type: object
-          description: 已脱敏的结构化日志属性。
-          additionalProperties:
-            type: string
+          $ref: "#/components/schemas/AdminApplicationLogAttributes"
         account_id:
           type: integer
           format: int64
@@ -2215,6 +2230,97 @@ components:
         request_id:
           type: string
           description: 日志可关联到 HTTP 请求时返回。
+        sync_run_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+          description: |
+            日志属于邮件同步流程时返回；非同步日志省略。该值也保留在 attributes 中，
+            同一次逻辑同步的多个追平批次共用同一值。
+
+    AdminApplicationLogAttributes:
+      type: object
+      description: |
+        已脱敏的结构化日志属性，所有值均编码为字符串。普通日志可以包含其他字符串属性；
+        邮件同步流程使用下列标准字段构建详情时间线。
+      properties:
+        account_id:
+          type: string
+          pattern: "^[1-9][0-9]*$"
+        request_id:
+          type: string
+        sync_run_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+          description: 一次逻辑邮件同步的聚合标识。
+        trigger:
+          type: string
+          enum:
+            - manual
+            - automatic
+        sync_batch:
+          type: string
+          pattern: "^[1-9][0-9]*$"
+          description: 当前追平批次，从 1 开始。
+        sync_stage:
+          type: string
+          enum:
+            - queued
+            - waiting
+            - preparing
+            - connecting
+            - authenticating
+            - scanning
+            - reading
+            - validating
+            - saving
+            - completed
+            - failed
+            - cancelled
+        sync_percent:
+          type: string
+          pattern: "^(100|[1-9]?[0-9])$"
+          description: 当前进度百分比，范围 0 至 100。
+        sync_event:
+          type: string
+          enum:
+            - run_queued
+            - waiting
+            - run_started
+            - batch_started
+            - account_loaded
+            - prepared
+            - stage_started
+            - batch_saved
+            - batch_completed
+            - run_completed
+            - run_failed
+            - run_cancelled
+        elapsed_ms:
+          type: string
+          pattern: "^[0-9]+$"
+          description: 从本次逻辑同步开始到当前事件的毫秒数。
+        batch_elapsed_ms:
+          type: string
+          pattern: "^[0-9]+$"
+          description: 从当前批次开始到当前事件的毫秒数；批次尚未开始时省略。
+        failed_stage:
+          type: string
+          description: 失败或取消前正在执行的同步阶段，仅终止事件使用。
+        failed_operation:
+          type: string
+          description: 失败或取消时对应的内部操作位置，仅终止事件使用。
+        error_context:
+          type: string
+          description: 已移除当前主号凭据和邮箱地址等敏感值的详细错误上下文，仅终止事件使用。
+        error:
+          type: string
+          description: 已脱敏的详细错误文本，仅终止事件使用。
+      additionalProperties:
+        type: string
 
     AdminAccount:
       type: object
@@ -2305,6 +2411,7 @@ components:
           enum:
             - queued
             - waiting
+            - preparing
             - connecting
             - authenticating
             - scanning

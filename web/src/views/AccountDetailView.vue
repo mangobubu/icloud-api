@@ -422,6 +422,12 @@
 
           <dl class="auto-creation-metrics">
             <div>
+              <dt>当前隐私邮箱</dt>
+              <dd aria-live="polite" aria-atomic="true">
+                {{ account.aliasCount }}
+              </dd>
+            </div>
+            <div>
               <dt>下次执行</dt>
               <dd>{{ formatTime(autoCreation.nextRunAt, { seconds: true }) }}</dd>
             </div>
@@ -1096,6 +1102,34 @@ function keyPrefix(alias) {
   return alias.apiKeyPrefix ? `${alias.apiKeyPrefix}…` : "-";
 }
 
+function syncAccountAliasCount() {
+  if (!account.value) return;
+  const count = Array.isArray(aliases.value) ? aliases.value.length : 0;
+  if (account.value.aliasCount === count) return;
+  account.value = { ...account.value, aliasCount: count };
+}
+
+function aliasAddressOrder(left, right) {
+  return (
+    left.address.localeCompare(right.address) ||
+    Number(left.id || 0) - Number(right.id || 0)
+  );
+}
+
+function mergeAliases(items) {
+  const aliasesByID = new Map(
+    aliases.value
+      .filter((item) => item?.id !== undefined && item?.id !== null)
+      .map((item) => [Number(item.id), item]),
+  );
+  for (const item of Array.isArray(items) ? items : []) {
+    if (item?.id === undefined || item?.id === null) continue;
+    aliasesByID.set(Number(item.id), item);
+  }
+  aliases.value = [...aliasesByID.values()].sort(aliasAddressOrder);
+  syncAccountAliasCount();
+}
+
 function replaceAlias(updated) {
   aliases.value = aliases.value.map((item) =>
     item.id === updated.id ? updated : item,
@@ -1141,6 +1175,7 @@ async function loadDetail({ silent = false } = {}) {
     if (!detailGate.isCurrent(ticket, detailRouteKey())) return;
     account.value = detail.account;
     aliases.value = detail.aliases;
+    syncAccountAliasCount();
     appleSession.value = detail.appleSession;
     autoCreation.value = detail.autoCreation || null;
     loadError.value = null;
@@ -1187,6 +1222,7 @@ async function syncNow() {
     if (!isCurrentAccount(accountId)) return;
     account.value = detail.account;
     aliases.value = detail.aliases;
+    syncAccountAliasCount();
     if (detail.autoCreation) {
       autoCreation.value = detail.autoCreation;
     }
@@ -1445,6 +1481,7 @@ async function openPendingAutoCreationKeys() {
   const accountId = account.value.id;
   beginDetailMutation();
   pendingAutoKeysLoading.value = true;
+  let refreshAfterRequest = false;
   try {
     const result = await getAliasAutoCreationKeys(accountId);
     if (!isCurrentAccount(accountId)) return;
@@ -1456,7 +1493,13 @@ async function openPendingAutoCreationKeys() {
         apiKey: item.apiKey,
         mailApiDirectLink: batchDirectLink(item),
       }));
+    mergeAliases(
+      (result?.created || [])
+        .map((item) => item.alias)
+        .filter((item) => item?.id),
+    );
     if (!created.length) {
+      refreshAfterRequest = true;
       if (autoCreation.value) {
         autoCreation.value = {
           ...autoCreation.value,
@@ -1480,6 +1523,9 @@ async function openPendingAutoCreationKeys() {
   } finally {
     pendingAutoKeysLoading.value = false;
     pendingAutoKeysLock.release();
+    if (refreshAfterRequest && isCurrentAccount(accountId)) {
+      void loadDetail({ silent: true });
+    }
   }
 }
 
@@ -1509,6 +1555,7 @@ async function acknowledgeAndCloseBatchSecrets() {
   beginDetailMutation();
   pendingAutoKeysClearing.value = true;
   let acknowledgedCount = 0;
+  let refreshAfterClose = false;
   try {
     for (const aliasIDBatch of aliasIDBatches) {
       await clearAliasAutoCreationKeys(
@@ -1535,6 +1582,7 @@ async function acknowledgeAndCloseBatchSecrets() {
       }
     }
     clearBatchSecrets();
+    refreshAfterClose = true;
     successMessage("本次自动创建的 API Key 已确认保存。");
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;
@@ -1547,6 +1595,9 @@ async function acknowledgeAndCloseBatchSecrets() {
   } finally {
     pendingAutoKeysClearing.value = false;
     pendingAutoKeysLock.release();
+    if (refreshAfterClose && isCurrentAccount(accountId)) {
+      void loadDetail({ silent: true });
+    }
   }
 }
 
@@ -1596,6 +1647,7 @@ async function performAliasesSync() {
     if (!isCurrentAccount(accountId)) return;
     account.value = result.account;
     aliases.value = result.aliases;
+    syncAccountAliasCount();
     appleSession.value = result.appleSession || appleSession.value;
     if (result.autoCreation) {
       autoCreation.value = result.autoCreation;
@@ -1733,7 +1785,11 @@ function clearBatchSecrets() {
 }
 
 function dismissBatchSecrets() {
+  const refreshAfterClose = batchSecretsSource.value === "auto";
   clearBatchSecrets();
+  if (refreshAfterClose && account.value) {
+    void loadDetail({ silent: true });
+  }
 }
 
 function closeBatchSecrets() {
@@ -1791,7 +1847,7 @@ async function addAlias() {
       (left, right) =>
         left.address.localeCompare(right.address) || left.id - right.id,
     );
-    account.value = { ...account.value, aliasCount: aliases.value.length };
+    syncAccountAliasCount();
     Object.assign(aliasForm, { address: "", label: "" });
     aliasFormRef.value?.resetFields();
     if (!(await revealKey(result.apiKey, result.alias.directLinkPath, accountId))) {
@@ -1943,7 +1999,7 @@ async function removeAlias(alias) {
     await deleteAlias(alias.id, auth.state.csrfToken);
     if (!isCurrentAccount(accountId)) return;
     aliases.value = aliases.value.filter((item) => item.id !== alias.id);
-    account.value = { ...account.value, aliasCount: aliases.value.length };
+    syncAccountAliasCount();
     successMessage("隐私邮箱已从 iCloud 和本地永久删除。");
   } catch (error) {
     if (confirmationCancelled(error)) return;

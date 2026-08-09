@@ -6,6 +6,7 @@ const SOURCE_LABELS = Object.freeze({
 const STAGE_LABELS = Object.freeze({
   queued: "等待开始",
   waiting: "等待同步资源",
+  preparing: "正在准备同步数据",
   connecting: "正在连接邮箱",
   authenticating: "正在验证邮箱账户",
   scanning: "正在扫描邮件",

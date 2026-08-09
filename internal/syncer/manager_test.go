@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"icloud-api/internal/applog"
 	"icloud-api/internal/domain"
 	"icloud-api/internal/store"
 )
@@ -161,6 +163,376 @@ func fixedCipher(_ string) (string, error) { return "app-password", nil }
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func chronologicalLogEntries(entries []applog.Entry) []applog.Entry {
+	result := make([]applog.Entry, len(entries))
+	for index := range entries {
+		result[len(entries)-1-index] = entries[index]
+	}
+	return result
+}
+
+func TestQueuedSyncLogsDetailedFlowAcrossPendingBatches(t *testing.T) {
+	account := domain.Account{
+		ID:                 41,
+		Email:              "account@icloud.com",
+		Enabled:            true,
+		PasswordCiphertext: "encrypted",
+	}
+	repo := newFakeRepo(account)
+	repo.aliases[account.ID] = []domain.Alias{{
+		ID:        401,
+		AccountID: account.ID,
+		Address:   "alias@icloud.com",
+		Enabled:   true,
+	}}
+	call := 0
+	fetcher := fetcherFunc(func(
+		ctx context.Context,
+		_ domain.Account,
+		_ string,
+		_ []domain.Alias,
+		_ *domain.IMAPSyncState,
+		_ map[int64]domain.MailboxSnapshotPosition,
+	) (domain.MailboxSyncResult, error) {
+		call++
+		for _, update := range []domain.MailboxSyncProgressUpdate{
+			{Phase: domain.MailboxSyncPhaseConnecting, Percent: 5},
+			{Phase: domain.MailboxSyncPhaseAuthenticating, Percent: 10},
+			{Phase: domain.MailboxSyncPhaseScanning, Percent: 15},
+			{Phase: domain.MailboxSyncPhaseReading, Percent: 20},
+			{Phase: domain.MailboxSyncPhaseValidating, Percent: 25},
+		} {
+			domain.ReportMailboxSyncProgress(ctx, update.Phase, update.Percent)
+		}
+		lastUID := uint32(call * 50)
+		return domain.MailboxSyncResult{
+			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 7, LastUID: lastUID},
+			TargetUID: 100,
+			HasMore:   call == 1,
+		}, nil
+	})
+	logs := applog.New(200)
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Minute, 1)
+
+	if err := manager.QueueAccountSync(context.Background(), account.ID); !errors.Is(err, ErrSyncQueued) {
+		t.Fatalf("queue sync = %v, want ErrSyncQueued", err)
+	}
+	manager.BeginShutdown()
+	manager.waitForManualJobs()
+	if call != 2 {
+		t.Fatalf("fetch calls = %d, want 2", call)
+	}
+
+	page := logs.List(applog.Filter{AccountID: &account.ID, Limit: 200})
+	entries := chronologicalLogEntries(page.Items)
+	if len(entries) == 0 {
+		t.Fatal("sync flow emitted no logs")
+	}
+	var runID string
+	eventCounts := make(map[string]int)
+	stages := make(map[string]bool)
+	sawSecondBatchWaiting := false
+	sawSecondBatchStart := false
+	for _, entry := range entries {
+		entryRunID := entry.Fields["sync_run_id"]
+		if entryRunID == "" {
+			t.Fatalf("flow log missing sync_run_id: %#v", entry)
+		}
+		if runID == "" {
+			runID = entryRunID
+		} else if entryRunID != runID {
+			t.Fatalf("pending batches used different run IDs: %q and %q", runID, entryRunID)
+		}
+		if entry.Fields["elapsed_ms"] == "" || entry.Fields["sync_batch"] == "" || entry.Fields["sync_percent"] == "" {
+			t.Fatalf("flow log missing progress fields: %#v", entry.Fields)
+		}
+		eventCounts[entry.Fields["sync_event"]]++
+		stages[entry.Fields["sync_stage"]] = true
+		if entry.Fields["sync_event"] == "waiting" && entry.Fields["sync_batch"] == "2" {
+			sawSecondBatchWaiting = true
+			if _, ok := entry.Fields["batch_elapsed_ms"]; ok {
+				t.Fatalf("next batch wait reused previous batch timer: %#v", entry.Fields)
+			}
+		}
+		if entry.Fields["sync_event"] == "batch_started" && entry.Fields["sync_batch"] == "2" {
+			sawSecondBatchStart = true
+			if _, ok := entry.Fields["batch_elapsed_ms"]; !ok {
+				t.Fatalf("second batch start missing batch timer: %#v", entry.Fields)
+			}
+		}
+	}
+	if !strings.HasPrefix(runID, "sync-") || len(runID) > 128 {
+		t.Fatalf("sync run ID = %q", runID)
+	}
+	for _, stage := range []domain.MailboxSyncPhase{
+		domain.MailboxSyncPhaseQueued,
+		domain.MailboxSyncPhaseWaiting,
+		domain.MailboxSyncPhasePreparing,
+		domain.MailboxSyncPhaseConnecting,
+		domain.MailboxSyncPhaseAuthenticating,
+		domain.MailboxSyncPhaseScanning,
+		domain.MailboxSyncPhaseReading,
+		domain.MailboxSyncPhaseValidating,
+		domain.MailboxSyncPhaseSaving,
+	} {
+		if !stages[string(stage)] {
+			t.Fatalf("sync stage %q missing from logs: %#v", stage, stages)
+		}
+	}
+	if eventCounts["run_started"] != 1 || eventCounts["batch_started"] != 1 ||
+		eventCounts["batch_completed"] != 1 || eventCounts["run_completed"] != 1 ||
+		eventCounts["run_failed"] != 0 || !sawSecondBatchWaiting || !sawSecondBatchStart {
+		t.Fatalf("sync lifecycle events = %#v", eventCounts)
+	}
+	last := entries[len(entries)-1]
+	if last.Fields["sync_event"] != "run_completed" || last.Fields["sync_stage"] != "completed" ||
+		last.Fields["sync_batch"] != "2" || last.Fields["sync_percent"] != "100" {
+		t.Fatalf("terminal flow log = %#v", last)
+	}
+}
+
+func TestAutomaticSyncLogsOneRunAcrossPendingBatches(t *testing.T) {
+	account := domain.Account{ID: 43, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	call := 0
+	fetcher := fetcherFunc(func(
+		ctx context.Context,
+		_ domain.Account,
+		_ string,
+		_ []domain.Alias,
+		_ *domain.IMAPSyncState,
+		_ map[int64]domain.MailboxSnapshotPosition,
+	) (domain.MailboxSyncResult, error) {
+		call++
+		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseConnecting, 5)
+		lastUID := uint32(call * 50)
+		return domain.MailboxSyncResult{
+			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 9, LastUID: lastUID},
+			TargetUID: 100,
+			HasMore:   call == 1,
+		}, nil
+	})
+	logs := applog.New(100)
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Hour, 1)
+
+	pending := manager.syncAllRound(context.Background(), nil)
+	if _, ok := pending[account.ID]; !ok {
+		t.Fatalf("first automatic round pending = %#v", pending)
+	}
+	pending = manager.syncAllRound(context.Background(), pending)
+	if len(pending) != 0 || call != 2 {
+		t.Fatalf("second automatic round pending=%#v calls=%d", pending, call)
+	}
+
+	entries := chronologicalLogEntries(logs.List(applog.Filter{AccountID: &account.ID, Limit: 100}).Items)
+	var runID string
+	eventCounts := make(map[string]int)
+	for _, entry := range entries {
+		if entry.Fields["trigger"] != string(domain.MailboxSyncTriggerAutomatic) {
+			t.Fatalf("automatic flow trigger = %#v", entry.Fields)
+		}
+		if runID == "" {
+			runID = entry.Fields["sync_run_id"]
+		} else if entry.Fields["sync_run_id"] != runID {
+			t.Fatalf("automatic batches used different run IDs: %q and %q", runID, entry.Fields["sync_run_id"])
+		}
+		eventCounts[entry.Fields["sync_event"]]++
+	}
+	if runID == "" || eventCounts["run_started"] != 1 || eventCounts["batch_started"] != 1 ||
+		eventCounts["batch_completed"] != 1 || eventCounts["run_completed"] != 1 {
+		t.Fatalf("automatic lifecycle run=%q events=%#v", runID, eventCounts)
+	}
+}
+
+func TestAutomaticContinuationWaitFailureKeepsRunID(t *testing.T) {
+	account := domain.Account{ID: 44, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	fetcher := fetcherFunc(func(
+		context.Context,
+		domain.Account,
+		string,
+		[]domain.Alias,
+		*domain.IMAPSyncState,
+		map[int64]domain.MailboxSnapshotPosition,
+	) (domain.MailboxSyncResult, error) {
+		return domain.MailboxSyncResult{
+			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 11, LastUID: 50},
+			TargetUID: 100,
+			HasMore:   true,
+		}, nil
+	})
+	logs := applog.New(100)
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Hour, 1)
+	pending := manager.syncAllRound(context.Background(), nil)
+	if _, ok := pending[account.ID]; !ok {
+		t.Fatalf("first automatic round pending = %#v", pending)
+	}
+	firstEntries := logs.List(applog.Filter{AccountID: &account.ID, Limit: 100}).Items
+	var runID string
+	for _, entry := range firstEntries {
+		if entry.Fields["sync_event"] == "run_started" {
+			runID = entry.Fields["sync_run_id"]
+			break
+		}
+	}
+	if runID == "" {
+		t.Fatalf("first automatic run ID missing: %#v", firstEntries)
+	}
+
+	release, err := manager.acquireAccount(context.Background(), account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.SetSyncTimeout(10 * time.Millisecond)
+	manager.syncAllRound(context.Background(), pending)
+	release()
+
+	entries := logs.List(applog.Filter{AccountID: &account.ID, SyncRunID: runID, Limit: 100}).Items
+	var failed *applog.Entry
+	for index := range entries {
+		if entries[index].Fields["sync_event"] == "run_failed" {
+			failed = &entries[index]
+			break
+		}
+	}
+	if failed == nil {
+		t.Fatalf("automatic wait failure missing for run %q: %#v", runID, entries)
+	}
+	if failed.Fields["sync_run_id"] != runID || failed.Fields["failed_stage"] != "waiting" ||
+		failed.Fields["failed_operation"] != "wait_account_lock" || failed.Fields["sync_batch"] != "2" {
+		t.Fatalf("automatic wait failure = %#v", failed.Fields)
+	}
+}
+
+func TestAutomaticContinuationDisabledAccountLogsCancellation(t *testing.T) {
+	account := domain.Account{ID: 45, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	fetcher := fetcherFunc(func(
+		context.Context,
+		domain.Account,
+		string,
+		[]domain.Alias,
+		*domain.IMAPSyncState,
+		map[int64]domain.MailboxSnapshotPosition,
+	) (domain.MailboxSyncResult, error) {
+		return domain.MailboxSyncResult{
+			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 13, LastUID: 50},
+			TargetUID: 100,
+			HasMore:   true,
+		}, nil
+	})
+	logs := applog.New(100)
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Hour, 1)
+	pending := manager.syncAllRound(context.Background(), nil)
+	if _, ok := pending[account.ID]; !ok {
+		t.Fatalf("first automatic round pending = %#v", pending)
+	}
+	active, ok := manager.currentSyncFlow(account.ID, domain.MailboxSyncTriggerAutomatic)
+	if !ok || active.runID == "" {
+		t.Fatalf("automatic continuation flow = %#v, active=%v", active, ok)
+	}
+
+	repo.mu.Lock()
+	repo.accounts = nil
+	repo.mu.Unlock()
+	if next := manager.syncAllRound(context.Background(), pending); len(next) != 0 {
+		t.Fatalf("disabled account remained pending: %#v", next)
+	}
+	if _, ok := manager.currentSyncFlow(account.ID, domain.MailboxSyncTriggerAutomatic); ok {
+		t.Fatal("disabled account progress was retained")
+	}
+
+	entries := logs.List(applog.Filter{AccountID: &account.ID, SyncRunID: active.runID, Limit: 100}).Items
+	var cancelled *applog.Entry
+	for index := range entries {
+		if entries[index].Fields["sync_event"] == "run_cancelled" {
+			cancelled = &entries[index]
+			break
+		}
+	}
+	if cancelled == nil {
+		t.Fatalf("disabled automatic continuation missing terminal event: %#v", entries)
+	}
+	if cancelled.Fields["sync_run_id"] != active.runID || cancelled.Fields["sync_stage"] != "cancelled" ||
+		cancelled.Fields["failed_operation"] != "account_no_longer_enabled" ||
+		cancelled.Fields["error_context"] != "账号已停用或已从自动同步列表移除" {
+		t.Fatalf("disabled automatic continuation cancellation = %#v", cancelled.Fields)
+	}
+}
+
+func TestSyncFailureLogIdentifiesStageAndRedactsSecrets(t *testing.T) {
+	const (
+		accountEmail = "private-account@icloud.com"
+		aliasAddress = "private-alias@icloud.com"
+		password     = "private-app-password"
+		ciphertext   = "private-ciphertext"
+	)
+	account := domain.Account{
+		ID:                 42,
+		Email:              accountEmail,
+		Enabled:            true,
+		PasswordCiphertext: ciphertext,
+	}
+	repo := newFakeRepo(account)
+	repo.aliases[account.ID] = []domain.Alias{{ID: 402, AccountID: account.ID, Address: aliasAddress, Enabled: true}}
+	fetcher := fetcherFunc(func(
+		ctx context.Context,
+		_ domain.Account,
+		_ string,
+		_ []domain.Alias,
+		_ *domain.IMAPSyncState,
+		_ map[int64]domain.MailboxSnapshotPosition,
+	) (domain.MailboxSyncResult, error) {
+		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseAuthenticating, 10)
+		return domain.MailboxSyncResult{}, fmt.Errorf(
+			"login failed for %s alias %s password %s ciphertext %s",
+			accountEmail,
+			aliasAddress,
+			password,
+			ciphertext,
+		)
+	})
+	logs := applog.New(100)
+	manager := New(
+		repo,
+		cipherFunc(func(string) (string, error) { return password, nil }),
+		fetcher,
+		slog.New(logs),
+		time.Minute,
+		1,
+	)
+
+	err := manager.SyncAccount(context.Background(), account.ID)
+	if err == nil {
+		t.Fatal("sync failure was omitted")
+	}
+	entries := logs.List(applog.Filter{AccountID: &account.ID, Limit: 100}).Items
+	var failed *applog.Entry
+	for index := range entries {
+		if entries[index].Fields["sync_event"] == "run_failed" {
+			failed = &entries[index]
+			break
+		}
+	}
+	if failed == nil {
+		t.Fatalf("run_failed log missing: %#v", entries)
+	}
+	fields := failed.Fields
+	if fields["sync_stage"] != "failed" || fields["failed_stage"] != string(domain.MailboxSyncPhaseAuthenticating) ||
+		fields["failed_operation"] != "fetch_incremental" {
+		t.Fatalf("failure location fields = %#v", fields)
+	}
+	if fields["error_context"] == "" || fields["error_context"] != fields["error"] ||
+		!strings.Contains(fields["error_context"], syncLogRedactedValue) {
+		t.Fatalf("failure detail fields = %#v", fields)
+	}
+	for _, secret := range []string{accountEmail, aliasAddress, password, ciphertext} {
+		if strings.Contains(fields["error_context"], secret) {
+			t.Fatalf("failure log leaked %q: %#v", secret, fields)
+		}
+	}
 }
 
 func TestSyncAccountPassesCursorAndAppliesOnce(t *testing.T) {

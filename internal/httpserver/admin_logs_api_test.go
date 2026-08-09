@@ -38,9 +38,10 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 				Message: "同步主号失败",
 				Source:  "manager.go:371",
 				Fields: map[string]string{
-					"account_id": "42",
-					"request_id": "request-123",
-					"error":      "IMAP connection closed",
+					"account_id":  "42",
+					"request_id":  "request-123",
+					"sync_run_id": "sync-run-123",
+					"error":       "IMAP connection closed",
 				},
 			},
 		},
@@ -52,7 +53,7 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 	response := env.request(
 		t,
 		http.MethodGet,
-		"/admin/api/v1/logs?level=ERROR&query=%20imap%20&keyword=ignored&account_id=42&before_id=100&limit=20",
+		"/admin/api/v1/logs?level=ERROR&query=%20imap%20&keyword=ignored&account_id=42&sync_run_id=sync-run-123&before_id=100&limit=20",
 		nil,
 		"",
 		[]*http.Cookie{sessionCookie},
@@ -69,6 +70,9 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 	}
 	if source.filter.AccountID == nil || *source.filter.AccountID != 42 {
 		t.Fatalf("application log account filter = %#v, want 42", source.filter.AccountID)
+	}
+	if source.filter.SyncRunID != "sync-run-123" {
+		t.Fatalf("application log sync run filter = %q", source.filter.SyncRunID)
 	}
 
 	var payload struct {
@@ -88,8 +92,8 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 	if item.ID != 99 || item.CreatedAt != loggedAt.Format(time.RFC3339Nano) || item.Level != "error" || item.Message != "同步主号失败" || item.Source != "manager.go:371" {
 		t.Fatalf("application log item = %#v", item)
 	}
-	if item.AccountID == nil || *item.AccountID != 42 || item.RequestID != "request-123" {
-		t.Fatalf("promoted application log attributes = account:%#v request:%q", item.AccountID, item.RequestID)
+	if item.AccountID == nil || *item.AccountID != 42 || item.RequestID != "request-123" || item.SyncRunID != "sync-run-123" {
+		t.Fatalf("promoted application log attributes = account:%#v request:%q run:%q", item.AccountID, item.RequestID, item.SyncRunID)
 	}
 	if want := source.page.Items[0].Fields; !reflect.DeepEqual(item.Attributes, want) {
 		t.Fatalf("application log attributes = %#v, want %#v", item.Attributes, want)
@@ -146,6 +150,10 @@ func TestAdminAPIApplicationLogsRejectInvalidFilters(t *testing.T) {
 		"before_id=not-an-id",
 		"limit=0",
 		"limit=201",
+		"sync_run_id=",
+		"sync_run_id=%20",
+		"sync_run_id=bad%20run",
+		"sync_run_id=" + strings.Repeat("a", adminAPIMaxSyncRunIDRunes+1),
 	} {
 		response := env.request(t, http.MethodGet, "/admin/api/v1/logs?"+query, nil, "", []*http.Cookie{sessionCookie}, "")
 		if response.Code != http.StatusBadRequest || adminAPITestErrorCode(t, response) != "VALIDATION_FAILED" {
@@ -182,21 +190,24 @@ func TestAdminAPIApplicationLogsValidateUnicodeQueryLength(t *testing.T) {
 func TestAdminAPIApplicationLogPromotesGroupedIdentifiers(t *testing.T) {
 	item := adminAPIApplicationLogFromEntry(applog.Entry{Fields: map[string]string{
 		"sync.account_id":   "42",
+		"sync.sync_run_id":  "sync-grouped",
 		"http.request_id":   "grouped-request",
 		"worker.request_id": "later-request",
 	}})
-	if item.AccountID == nil || *item.AccountID != 42 || item.RequestID != "grouped-request" {
-		t.Fatalf("grouped identifiers = account:%#v request:%q", item.AccountID, item.RequestID)
+	if item.AccountID == nil || *item.AccountID != 42 || item.RequestID != "grouped-request" || item.SyncRunID != "sync-grouped" {
+		t.Fatalf("grouped identifiers = account:%#v request:%q run:%q", item.AccountID, item.RequestID, item.SyncRunID)
 	}
 
 	item = adminAPIApplicationLogFromEntry(applog.Entry{Fields: map[string]string{
-		"account_id":      "7",
-		"sync.account_id": "42",
-		"request_id":      "exact-request",
-		"http.request_id": "grouped-request",
+		"account_id":       "7",
+		"sync.account_id":  "42",
+		"request_id":       "exact-request",
+		"http.request_id":  "grouped-request",
+		"sync_run_id":      "sync-exact",
+		"sync.sync_run_id": "sync-grouped",
 	}})
-	if item.AccountID == nil || *item.AccountID != 7 || item.RequestID != "exact-request" {
-		t.Fatalf("exact identifiers did not take precedence = account:%#v request:%q", item.AccountID, item.RequestID)
+	if item.AccountID == nil || *item.AccountID != 7 || item.RequestID != "exact-request" || item.SyncRunID != "sync-exact" {
+		t.Fatalf("exact identifiers did not take precedence = account:%#v request:%q run:%q", item.AccountID, item.RequestID, item.SyncRunID)
 	}
 }
 

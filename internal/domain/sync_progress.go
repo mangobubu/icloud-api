@@ -17,6 +17,7 @@ type MailboxSyncPhase string
 const (
 	MailboxSyncPhaseQueued         MailboxSyncPhase = "queued"
 	MailboxSyncPhaseWaiting        MailboxSyncPhase = "waiting"
+	MailboxSyncPhasePreparing      MailboxSyncPhase = "preparing"
 	MailboxSyncPhaseConnecting     MailboxSyncPhase = "connecting"
 	MailboxSyncPhaseAuthenticating MailboxSyncPhase = "authenticating"
 	MailboxSyncPhaseScanning       MailboxSyncPhase = "scanning"

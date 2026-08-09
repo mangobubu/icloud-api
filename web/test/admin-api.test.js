@@ -9,6 +9,7 @@ import {
   getAccount,
   getAccounts,
   getAliases,
+  getRuntimeLogRun,
   getRuntimeLogs,
   loginAppleSession,
   normalizeAutoCreation,
@@ -635,4 +636,57 @@ test("runtime logs use filter and cursor parameters and normalize the response",
   assert.equal(result.items[0].requestId, "req-log-1");
   assert.equal(result.hasMore, true);
   assert.equal(result.nextBeforeId, 81);
+});
+
+test("sync run logs follow every cursor without inheriting list filters", async () => {
+  const requests = [];
+  const pages = [
+    {
+      items: [
+        { id: 6, created_at: "2026-08-09T08:00:06Z", attributes: { sync_run_id: "run-42", sync_event: "run_failed" } },
+        { id: 5, created_at: "2026-08-09T08:00:05Z", attributes: { sync_run_id: "run-42", sync_event: "progress" } },
+      ],
+      has_more: true,
+      next_before_id: 5,
+    },
+    {
+      items: [
+        { id: 4, created_at: "2026-08-09T08:00:04Z", attributes: { sync_run_id: "run-42", sync_event: "progress" } },
+        { id: 3, created_at: "2026-08-09T08:00:03Z", attributes: { sync_run_id: "run-42", sync_event: "progress" } },
+      ],
+      has_more: true,
+      next_before_id: 3,
+    },
+    {
+      items: [
+        { id: 2, created_at: "2026-08-09T08:00:02Z", attributes: { sync_run_id: "run-42", sync_event: "progress" } },
+        { id: 1, created_at: "2026-08-09T08:00:01Z", attributes: { sync_run_id: "run-42", sync_event: "run_started" } },
+      ],
+      has_more: false,
+      next_before_id: 0,
+    },
+  ];
+
+  globalThis.fetch = async (url) => {
+    requests.push(new URL(url, "https://admin.invalid"));
+    return jsonResponse(pages.shift());
+  };
+
+  const result = await getRuntimeLogRun(" run-42 ", { accountId: 12 });
+
+  assert.deepEqual(result.map((item) => item.id), [1, 2, 3, 4, 5, 6]);
+  assert.equal(result[0].syncEvent, "run_started");
+  assert.equal(result.at(-1).syncEvent, "run_failed");
+  assert.equal(requests.length, 3);
+  assert.deepEqual(Object.fromEntries(requests[0].searchParams), {
+    account_id: "12",
+    sync_run_id: "run-42",
+    limit: "200",
+  });
+  assert.equal(requests[1].searchParams.get("before_id"), "5");
+  assert.equal(requests[2].searchParams.get("before_id"), "3");
+  for (const request of requests) {
+    assert.equal(request.searchParams.has("level"), false);
+    assert.equal(request.searchParams.has("query"), false);
+  }
 });

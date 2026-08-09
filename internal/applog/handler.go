@@ -59,6 +59,7 @@ type Filter struct {
 	Level     string
 	Query     string
 	AccountID *int64
+	SyncRunID string
 	BeforeID  uint64
 	Limit     int
 }
@@ -260,6 +261,9 @@ func (h *Handler) List(filter Filter) Page {
 		if filter.AccountID != nil && !entryHasAccountID(candidate, *filter.AccountID) {
 			continue
 		}
+		if filter.SyncRunID != "" && !entryHasExactField(candidate, "sync_run_id", filter.SyncRunID) {
+			continue
+		}
 		if query != "" && !entryContains(candidate, query) {
 			continue
 		}
@@ -307,6 +311,18 @@ func entryHasAccountID(entry Entry, want int64) bool {
 		}
 		parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
 		if err == nil && parsed == want {
+			return true
+		}
+	}
+	return false
+}
+
+func entryHasExactField(entry Entry, name, want string) bool {
+	for key, value := range entry.Fields {
+		if key != name && !strings.HasSuffix(key, "."+name) {
+			continue
+		}
+		if value == want {
 			return true
 		}
 	}
