@@ -67,9 +67,12 @@ func (s *Store) ImportAliases(
 
 	var enabledCount int
 	if err := s.txQueryRowContext(ctx, tx, `
-		SELECT COUNT(*) FROM aliases WHERE account_id = ? AND enabled = TRUE`, accountID,
+		SELECT COUNT(*) FROM aliases
+		WHERE account_id = ?
+		  AND (enabled = TRUE OR (enabled = FALSE AND last_sync_error = ?))`,
+		accountID, domain.AppleAliasConfirmationPending,
 	).Scan(&enabledCount); err != nil {
-		return domain.AliasImportResult{}, fmt.Errorf("count enabled aliases before import: %w", err)
+		return domain.AliasImportResult{}, fmt.Errorf("count enabled and confirmation-pending aliases before import: %w", err)
 	}
 
 	type insertion struct {

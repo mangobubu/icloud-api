@@ -433,6 +433,8 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 			code = hmesync.CodeVerificationInvalid
 		case errors.Is(err, hmesync.ErrFlowExpired):
 			code = hmesync.CodeFlowExpired
+		case errors.Is(err, hmesync.ErrAccountActionRequired):
+			code = hmesync.CodeAccountActionRequired
 		case errors.Is(err, hmesync.ErrRateLimited):
 			code = hmesync.CodeRateLimited
 		case errors.Is(err, hmesync.ErrAccountMismatch):
@@ -460,6 +462,8 @@ func classifyAdminAPIAppleError(err error) adminAPIAppleError {
 		return adminAPIAppleError{Status: http.StatusUnprocessableEntity, Code: code, Message: "验证码不正确，请重新输入"}
 	case hmesync.CodeFlowExpired:
 		return adminAPIAppleError{Status: http.StatusGone, Code: code, Message: "验证流程已过期，请重新登录"}
+	case hmesync.CodeAccountActionRequired:
+		return adminAPIAppleError{Status: http.StatusConflict, Code: code, Message: "Apple 账户需要完成条款确认或其他账户操作，请前往 Apple 官网处理后重试"}
 	case hmesync.CodeRateLimited:
 		return adminAPIAppleError{Status: http.StatusTooManyRequests, Code: code, Message: "Apple 请求过于频繁，请稍后再试"}
 	case hmesync.CodeAccountMismatch:

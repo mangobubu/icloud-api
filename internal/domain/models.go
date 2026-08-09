@@ -7,6 +7,8 @@ const (
 	SyncStatusOK      = "ok"
 	SyncStatusError   = "error"
 
+	AppleAliasConfirmationPending = "APPLE_ALIAS_CONFIRMATION_PENDING"
+
 	MaxEnabledAliasesPerAccount = 1000
 )
 

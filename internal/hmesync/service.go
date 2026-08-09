@@ -23,7 +23,14 @@ const (
 	defaultVerificationAttempts = 5
 	autoCreateLabel             = "自动创建"
 	autoCreateNote              = "icloud-api 自动创建"
+	autoCreatePersistTimeout    = 5 * time.Second
 )
+
+var defaultAutoCreateConfirmationDelays = [...]time.Duration{
+	500 * time.Millisecond,
+	1500 * time.Millisecond,
+	3 * time.Second,
+}
 
 type Option func(*Service)
 
@@ -72,13 +79,14 @@ type Service struct {
 	locker AccountLocker
 	now    func() time.Time
 
-	challengeTTL  time.Duration
-	maxAttempts   int
-	challengeMu   sync.Mutex
-	challenges    map[string]challenge
-	accountFlows  map[int64]string
-	operationMu   sync.Mutex
-	operationLock map[int64]*operationLock
+	challengeTTL                 time.Duration
+	maxAttempts                  int
+	autoCreateConfirmationDelays []time.Duration
+	challengeMu                  sync.Mutex
+	challenges                   map[string]challenge
+	accountFlows                 map[int64]string
+	operationMu                  sync.Mutex
+	operationLock                map[int64]*operationLock
 }
 
 func New(repo Repository, cipher SessionCipher, client AppleClient, locker AccountLocker, options ...Option) (*Service, error) {
@@ -95,13 +103,17 @@ func New(repo Repository, cipher SessionCipher, client AppleClient, locker Accou
 		return nil, errors.New("account locker is required")
 	}
 	service := &Service{
-		repo:          repo,
-		cipher:        cipher,
-		client:        client,
-		locker:        locker,
-		now:           func() time.Time { return time.Now().UTC() },
-		challengeTTL:  defaultChallengeTTL,
-		maxAttempts:   defaultVerificationAttempts,
+		repo:         repo,
+		cipher:       cipher,
+		client:       client,
+		locker:       locker,
+		now:          func() time.Time { return time.Now().UTC() },
+		challengeTTL: defaultChallengeTTL,
+		maxAttempts:  defaultVerificationAttempts,
+		autoCreateConfirmationDelays: append(
+			[]time.Duration(nil),
+			defaultAutoCreateConfirmationDelays[:]...,
+		),
 		challenges:    make(map[string]challenge),
 		accountFlows:  make(map[int64]string),
 		operationLock: make(map[int64]*operationLock),
@@ -379,8 +391,8 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 
 // CreateAutoAlias reserves exactly one Hide My Email address and publishes it
 // locally with a one-time API key sealed for administrator retrieval. The
-// method intentionally performs no retry: reserve is a remote side effect and
-// repeating it after an ambiguous response could create duplicates.
+// method never retries reserve because repeating that remote side effect could
+// create duplicates; only the read-only directory confirmation is retried.
 func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.Alias, error) {
 	if accountID < 1 {
 		return domain.Alias{}, errors.New("account ID must be positive")
@@ -416,14 +428,16 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		defer releaseAccount()
 	}
 	expireAutoSession := func(sessionErr error) error {
+		cleanupContext, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
+		defer cancelCleanup()
 		var deleteErr error
 		if releaseAccount != nil {
 			// The production locker is deliberately non-reentrant. The account
 			// lock already protects this deletion across the remote operation.
-			deleteErr = s.repo.DeleteAppleWebSession(ctx, accountID)
+			deleteErr = s.repo.DeleteAppleWebSession(cleanupContext, accountID)
 		} else {
-			deleteErr = s.locker.WithAccountLock(ctx, accountID, func() error {
-				err := s.repo.DeleteAppleWebSession(ctx, accountID)
+			deleteErr = s.locker.WithAccountLock(cleanupContext, accountID, func() error {
+				err := s.repo.DeleteAppleWebSession(cleanupContext, accountID)
 				if errors.Is(err, store.ErrNotFound) {
 					return nil
 				}
@@ -449,12 +463,19 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	if !account.Enabled {
 		return domain.Alias{}, errors.New("主号已停用")
 	}
-	count, err := autoRepo.CountEnabledAliasesByAccount(ctx, accountID)
-	if err != nil {
-		return domain.Alias{}, err
+	pendingConfirmation, pendingErr := autoRepo.GetPendingAutoAliasConfirmation(ctx, accountID)
+	hasPendingConfirmation := pendingErr == nil
+	if pendingErr != nil && !errors.Is(pendingErr, store.ErrNotFound) {
+		return domain.Alias{}, pendingErr
 	}
-	if count >= domain.MaxEnabledAliasesPerAccount {
-		return domain.Alias{}, store.ErrAliasLimit
+	if !hasPendingConfirmation {
+		count, err := autoRepo.CountEnabledAliasesByAccount(ctx, accountID)
+		if err != nil {
+			return domain.Alias{}, err
+		}
+		if count >= domain.MaxEnabledAliasesPerAccount {
+			return domain.Alias{}, store.ErrAliasLimit
+		}
 	}
 
 	record, session, err := s.loadSession(ctx, accountID)
@@ -469,6 +490,10 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		mapped := mapAppleError(err, false)
 		if errors.Is(mapped, ErrSessionExpired) {
 			mapped = expireAutoSession(mapped)
+		}
+		if hasPendingConfirmation &&
+			(errors.Is(mapped, ErrUpstream) || errors.Is(mapped, ErrRateLimited)) {
+			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, mapped)
 		}
 		return domain.Alias{}, mapped
 	}
@@ -489,6 +514,10 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		if errors.Is(mapped, ErrSessionExpired) {
 			mapped = expireAutoSession(mapped)
 		}
+		if hasPendingConfirmation &&
+			(errors.Is(mapped, ErrUpstream) || errors.Is(mapped, ErrRateLimited)) {
+			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, mapped)
+		}
 		return domain.Alias{}, mapped
 	}
 	if strings.TrimSpace(listedSession.AppleID) != "" &&
@@ -501,15 +530,15 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		return domain.Alias{}, err
 	}
 	listedSession.Region = listedRegion
-	checkpointSession := func(session apple.Session) error {
+	checkpointSession := func(operationContext context.Context, session apple.Session) error {
 		if releaseAccount != nil {
-			_, err := s.saveSession(ctx, accountID, session)
+			_, err := s.saveSession(operationContext, accountID, session)
 			return err
 		}
-		_, err := s.persistSession(ctx, accountID, identityOf(account), session)
+		_, err := s.persistSession(operationContext, accountID, identityOf(account), session)
 		return err
 	}
-	checkpointReturnedSession := func(returned *apple.Session, fallbackRegion apple.Region) error {
+	checkpointReturnedSession := func(operationContext context.Context, returned *apple.Session, fallbackRegion apple.Region) error {
 		if strings.TrimSpace(returned.AppleID) != "" &&
 			!strings.EqualFold(strings.TrimSpace(returned.AppleID), strings.TrimSpace(record.AppleID)) {
 			return wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
@@ -520,13 +549,107 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 			return err
 		}
 		returned.Region = region
-		return checkpointSession(*returned)
+		return checkpointSession(operationContext, *returned)
+	}
+	publishAlias := func(operationContext context.Context, sessionRecord domain.AppleWebSession, alias domain.Alias, apiKeyCiphertext string) (domain.Alias, error) {
+		var saved domain.Alias
+		publish := func() error {
+			current, err := s.repo.GetAccount(operationContext, accountID)
+			if err != nil {
+				return err
+			}
+			if !current.Enabled {
+				return errors.New("主号已停用")
+			}
+			if !sameIdentity(identityOf(current), identityOf(account)) {
+				return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+			}
+			var saveErr error
+			saved, _, saveErr = autoRepo.CreateAliasWithPendingAPIKey(operationContext, sessionRecord, alias, apiKeyCiphertext)
+			return saveErr
+		}
+		var publishErr error
+		if releaseAccount != nil {
+			publishErr = publish()
+		} else {
+			publishErr = s.locker.WithAccountLock(operationContext, accountID, publish)
+		}
+		if errors.Is(publishErr, store.ErrAliasOwnershipConflict) {
+			return domain.Alias{}, wrapError(CodeAliasOwnershipConflict, ErrAliasOwnershipConflict, publishErr)
+		}
+		return saved, publishErr
+	}
+	confirmPendingAlias := func(operationContext context.Context, pending domain.Alias, confirmed apple.Alias, returned apple.Session) (domain.Alias, error) {
+		address, err := normalizeAutoAliasAddress(confirmed.HME)
+		if err != nil {
+			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, err)
+		}
+		if address != domain.NormalizeEmail(pending.Address) {
+			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending,
+				errors.New("Apple returned a different pending alias address"))
+		}
+		if !confirmed.IsActive {
+			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending,
+				errors.New("Apple returned an inactive pending alias"))
+		}
+		if !sameEmail(confirmed.ForwardToEmail, account.Email) {
+			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+		}
+		sessionRecord, err := s.autoCreateSessionRecord(accountID, record.AppleID, validated.Region, returned)
+		if err != nil {
+			if Code(err) != "" {
+				return domain.Alias{}, err
+			}
+			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, err)
+		}
+		var saved domain.Alias
+		confirm := func() error {
+			current, err := s.repo.GetAccount(operationContext, accountID)
+			if err != nil {
+				return err
+			}
+			if !current.Enabled {
+				return errors.New("主号已停用")
+			}
+			if !sameIdentity(identityOf(current), identityOf(account)) {
+				return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+			}
+			var confirmErr error
+			saved, _, confirmErr = autoRepo.ConfirmPendingAutoAlias(operationContext, sessionRecord, pending.ID)
+			return confirmErr
+		}
+		var confirmErr error
+		if releaseAccount != nil {
+			confirmErr = confirm()
+		} else {
+			confirmErr = s.locker.WithAccountLock(operationContext, accountID, confirm)
+		}
+		if confirmErr != nil && Code(confirmErr) == "" &&
+			!errors.Is(confirmErr, context.Canceled) &&
+			!errors.Is(confirmErr, context.DeadlineExceeded) {
+			confirmErr = wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, confirmErr)
+		}
+		return saved, confirmErr
 	}
 	// ListAliases may rotate cookies even when the forwarding preflight rejects
 	// the operation. Preserve that valid checkpoint so a corrected setting does
 	// not force an otherwise unnecessary Apple login.
-	if err := checkpointSession(listedSession); err != nil {
+	if err := checkpointSession(ctx, listedSession); err != nil {
+		if hasPendingConfirmation && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, err)
+		}
 		return domain.Alias{}, err
+	}
+	if hasPendingConfirmation {
+		confirmed, found := findAppleAlias(settings.Aliases, pendingConfirmation.Alias.Address)
+		if !found {
+			return domain.Alias{}, wrapError(
+				CodeAliasConfirmationPending,
+				ErrAliasConfirmationPending,
+				errors.New("Apple list omitted the pending reserved alias"),
+			)
+		}
+		return confirmPendingAlias(ctx, pendingConfirmation.Alias, confirmed, listedSession)
 	}
 	if strings.TrimSpace(settings.SelectedForwardTo) == "" {
 		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream,
@@ -548,127 +671,168 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		return domain.Alias{}, fmt.Errorf("encrypt automatic alias API key: %w", err)
 	}
 
-	created, updated, err := autoClient.CreateAlias(ctx, listedSession, autoCreateLabel, autoCreateNote)
-	if err != nil {
-		mapped := mapAppleError(err, false)
-		if errors.Is(mapped, ErrSessionExpired) {
-			return domain.Alias{}, expireAutoSession(mapped)
-		}
-		if !errors.Is(mapped, context.Canceled) && !errors.Is(mapped, context.DeadlineExceeded) &&
-			hasAppleSessionState(updated) {
-			if checkpointErr := checkpointReturnedSession(&updated, listedSession.Region); checkpointErr != nil {
-				return domain.Alias{}, checkpointErr
-			}
-		}
-		return domain.Alias{}, mapped
-	}
-	if err := checkpointReturnedSession(&updated, listedSession.Region); err != nil {
-		return domain.Alias{}, err
+	created, updated, createErr := autoClient.CreateAlias(ctx, listedSession, autoCreateLabel, autoCreateNote)
+	var mappedCreateErr error
+	if createErr != nil {
+		mappedCreateErr = mapAppleError(createErr, false)
 	}
 
-	if strings.TrimSpace(created.ForwardToEmail) == "" {
-		// A minimal reserve response does not identify the forwarding mailbox.
-		// Re-read the new HME entry rather than treating the pre-reserve setting
-		// as proof; it can be changed concurrently from another Apple session.
-		confirmed, confirmedSession, listErr := s.client.ListAliases(ctx, updated)
-		if listErr != nil {
-			mapped := mapAppleError(listErr, false)
-			if errors.Is(mapped, ErrSessionExpired) {
-				mapped = expireAutoSession(mapped)
+	// Once reserve may have reached Apple, a valid generated HME is the durable
+	// idempotency marker. Persist it before any session checkpoint, response
+	// validation, or use of the caller's potentially canceled context.
+	if strings.TrimSpace(created.HME) == "" {
+		if mappedCreateErr != nil {
+			if !errors.Is(mappedCreateErr, context.Canceled) &&
+				!errors.Is(mappedCreateErr, context.DeadlineExceeded) &&
+				hasAppleSessionState(updated) {
+				if checkpointErr := checkpointReturnedSession(ctx, &updated, listedSession.Region); checkpointErr != nil {
+					return domain.Alias{}, errors.Join(mappedCreateErr, checkpointErr)
+				}
 			}
-			return domain.Alias{}, mapped
+			if errors.Is(mappedCreateErr, ErrSessionExpired) {
+				mappedCreateErr = expireAutoSession(mappedCreateErr)
+			}
+			return domain.Alias{}, mappedCreateErr
 		}
-		if err := checkpointReturnedSession(&confirmedSession, updated.Region); err != nil {
-			return domain.Alias{}, err
-		}
-		confirmedAlias, found := findAppleAlias(confirmed.Aliases, created.HME)
-		if !found {
-			return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream,
-				errors.New("Apple list omitted the newly reserved alias"))
-		}
-		created = confirmedAlias
-		updated = confirmedSession
+		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream,
+			errors.New("Apple reserve response omitted the generated alias address"))
 	}
 
-	address := domain.NormalizeEmail(created.HME)
-	parsed, parseErr := mail.ParseAddress(address)
-	if address == "" || parseErr != nil || parsed.Name != "" || domain.NormalizeEmail(parsed.Address) != address {
-		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("Apple returned an invalid alias address"))
+	address, addressErr := normalizeAutoAliasAddress(created.HME)
+	if addressErr != nil {
+		if mappedCreateErr != nil {
+			return domain.Alias{}, errors.Join(mappedCreateErr, addressErr)
+		}
+		return domain.Alias{}, addressErr
 	}
-	if !created.IsActive {
-		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream, errors.New("Apple returned an inactive alias"))
+	label := strings.TrimSpace(created.Label)
+	if label == "" {
+		label = autoCreateLabel
 	}
-	if !sameEmail(created.ForwardToEmail, account.Email) {
-		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	sessionForConfirmation := updated
+	if !hasAppleSessionState(sessionForConfirmation) {
+		sessionForConfirmation = listedSession
 	}
-	updatedRegion, err := normalizeRegion(updated.Region)
-	if err != nil {
-		return domain.Alias{}, err
+	sessionRecord, sessionRecordErr := s.autoCreateSessionRecord(
+		accountID,
+		record.AppleID,
+		listedSession.Region,
+		sessionForConfirmation,
+	)
+	if sessionRecordErr != nil {
+		// Retaining the last valid encrypted session is preferable to losing the
+		// candidate altogether. A later plan can reconcile after the local
+		// encryption/configuration problem is corrected.
+		sessionRecord = record
 	}
-	updated.Region = updatedRegion
-	if strings.TrimSpace(updated.AppleID) != "" &&
-		!strings.EqualFold(strings.TrimSpace(updated.AppleID), strings.TrimSpace(record.AppleID)) {
-		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
-	}
-	normalizeSession(&updated, record.AppleID, session.Region, s.now())
-	updatedPayload, err := json.Marshal(updated)
-	if err != nil {
-		return domain.Alias{}, fmt.Errorf("encode rotated Apple session: %w", err)
-	}
-	sessionCiphertext, err := s.cipher.EncryptAppleSession(string(updatedPayload))
-	if err != nil {
-		return domain.Alias{}, fmt.Errorf("encrypt rotated Apple session: %w", err)
-	}
-	alias := domain.Alias{
+	persistContext, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
+	provisional, persistErr := publishAlias(persistContext, sessionRecord, domain.Alias{
 		AccountID:      accountID,
 		AccountEmail:   account.Email,
 		Address:        address,
-		Label:          strings.TrimSpace(created.Label),
+		Label:          label,
 		APIKeyHash:     hash,
 		APIKeyPrefix:   prefix,
-		Enabled:        true,
+		Enabled:        false,
 		LastSyncStatus: domain.SyncStatusPending,
-	}
-	sessionRecord := domain.AppleWebSession{
-		AccountID:       accountID,
-		Ciphertext:      sessionCiphertext,
-		AppleID:         strings.TrimSpace(updated.AppleID),
-		Region:          publicRegion(string(updated.Region)),
-		Authenticated:   true,
-		LastValidatedAt: &updated.ValidatedAt,
-	}
-	if sessionRecord.LastValidatedAt.IsZero() {
-		validatedAt := s.now().UTC()
-		sessionRecord.LastValidatedAt = &validatedAt
-	}
-	var saved domain.Alias
-	publish := func() error {
-		current, err := s.repo.GetAccount(ctx, accountID)
-		if err != nil {
-			return err
+		LastSyncError:  domain.AppleAliasConfirmationPending,
+	}, ciphertext)
+	cancelPersist()
+	if persistErr != nil {
+		if mappedCreateErr != nil {
+			return domain.Alias{}, errors.Join(mappedCreateErr, persistErr)
 		}
-		if !current.Enabled {
-			return errors.New("主号已停用")
+		return domain.Alias{}, persistErr
+	}
+	if sessionRecordErr != nil {
+		return domain.Alias{}, wrapError(
+			CodeAliasConfirmationPending,
+			ErrAliasConfirmationPending,
+			sessionRecordErr,
+		)
+	}
+	if mappedCreateErr != nil && (errors.Is(mappedCreateErr, context.Canceled) ||
+		errors.Is(mappedCreateErr, context.DeadlineExceeded)) {
+		return domain.Alias{}, mappedCreateErr
+	}
+	if mappedCreateErr != nil && errors.Is(mappedCreateErr, ErrSessionExpired) {
+		return domain.Alias{}, expireAutoSession(mappedCreateErr)
+	}
+
+	// A complete, internally consistent reserve response can publish the staged
+	// alias immediately. Use a detached short context because the remote side
+	// effect and its durable marker already exist even if the request timed out.
+	if mappedCreateErr == nil && strings.TrimSpace(created.ForwardToEmail) != "" {
+		if !created.IsActive {
+			return domain.Alias{}, wrapError(
+				CodeAliasConfirmationPending,
+				ErrAliasConfirmationPending,
+				errors.New("Apple returned an inactive reserved alias"),
+			)
 		}
-		if !sameIdentity(identityOf(current), identityOf(account)) {
-			return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
+		if !sameEmail(created.ForwardToEmail, account.Email) {
+			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 		}
-		var saveErr error
-		saved, _, saveErr = autoRepo.CreateAliasWithPendingAPIKey(ctx, sessionRecord, alias, ciphertext)
-		return saveErr
+		confirmContext, cancelConfirm := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
+		saved, confirmErr := confirmPendingAlias(confirmContext, provisional, created, sessionForConfirmation)
+		cancelConfirm()
+		return saved, confirmErr
 	}
-	if releaseAccount != nil {
-		err = publish()
-	} else {
-		err = s.locker.WithAccountLock(ctx, accountID, publish)
+
+	// Minimal or ambiguous reserve results are reconciled only through bounded,
+	// read-only directory requests. The pending row prevents every later plan
+	// from issuing another reserve while Apple directory visibility catches up.
+	confirmationSession := sessionForConfirmation
+	confirmationCause := mappedCreateErr
+	for attempt := 0; ; attempt++ {
+		confirmed, returnedSession, listErr := s.client.ListAliases(ctx, confirmationSession)
+		var confirmationErr error
+		if listErr != nil {
+			confirmationErr = mapAppleError(listErr, false)
+			if errors.Is(confirmationErr, ErrSessionExpired) {
+				return domain.Alias{}, expireAutoSession(confirmationErr)
+			}
+			if errors.Is(confirmationErr, context.Canceled) ||
+				errors.Is(confirmationErr, context.DeadlineExceeded) {
+				return domain.Alias{}, confirmationErr
+			}
+		}
+		if hasAppleSessionState(returnedSession) {
+			if err := checkpointReturnedSession(ctx, &returnedSession, confirmationSession.Region); err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					return domain.Alias{}, wrapError(
+						CodeAliasConfirmationPending,
+						ErrAliasConfirmationPending,
+						errors.Join(confirmationCause, confirmationErr, err),
+					)
+				}
+				return domain.Alias{}, err
+			}
+			confirmationSession = returnedSession
+		}
+
+		if listErr == nil {
+			confirmedAlias, found := findAppleAlias(confirmed.Aliases, address)
+			if found {
+				return confirmPendingAlias(ctx, provisional, confirmedAlias, confirmationSession)
+			}
+			confirmationErr = wrapError(CodeUpstreamError, ErrUpstream,
+				errors.New("Apple list omitted the newly reserved alias"))
+		}
+
+		combinedErr := errors.Join(confirmationCause, confirmationErr)
+		if !shouldRetryAutoCreateConfirmation(confirmationErr) ||
+			attempt >= len(s.autoCreateConfirmationDelays) {
+			return domain.Alias{}, wrapError(
+				CodeAliasConfirmationPending,
+				ErrAliasConfirmationPending,
+				combinedErr,
+			)
+		}
+		if err := waitForAutoCreateConfirmation(ctx, s.autoCreateConfirmationDelays[attempt]); err != nil {
+			return domain.Alias{}, err
+		}
 	}
-	if errors.Is(err, store.ErrAliasOwnershipConflict) {
-		return domain.Alias{}, wrapError(CodeAliasOwnershipConflict, ErrAliasOwnershipConflict, err)
-	}
-	if err != nil {
-		return domain.Alias{}, err
-	}
-	return saved, nil
 }
 
 func findAppleAlias(aliases []apple.Alias, address string) (apple.Alias, bool) {
@@ -679,6 +843,79 @@ func findAppleAlias(aliases []apple.Alias, address string) (apple.Alias, bool) {
 		}
 	}
 	return apple.Alias{}, false
+}
+
+func normalizeAutoAliasAddress(value string) (string, error) {
+	address := domain.NormalizeEmail(value)
+	parsed, err := mail.ParseAddress(address)
+	if address == "" || err != nil || parsed.Name != "" || domain.NormalizeEmail(parsed.Address) != address {
+		return "", wrapError(CodeUpstreamError, ErrUpstream,
+			errors.New("Apple returned an invalid alias address"))
+	}
+	return address, nil
+}
+
+func (s *Service) autoCreateSessionRecord(
+	accountID int64,
+	expectedAppleID string,
+	fallbackRegion apple.Region,
+	session apple.Session,
+) (domain.AppleWebSession, error) {
+	if strings.TrimSpace(session.AppleID) != "" &&
+		!strings.EqualFold(strings.TrimSpace(session.AppleID), strings.TrimSpace(expectedAppleID)) {
+		return domain.AppleWebSession{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	normalizeSession(&session, expectedAppleID, fallbackRegion, s.now())
+	region, err := normalizeRegion(session.Region)
+	if err != nil {
+		return domain.AppleWebSession{}, err
+	}
+	session.Region = region
+	payload, err := json.Marshal(session)
+	if err != nil {
+		return domain.AppleWebSession{}, fmt.Errorf("encode rotated Apple session: %w", err)
+	}
+	ciphertext, err := s.cipher.EncryptAppleSession(string(payload))
+	if err != nil {
+		return domain.AppleWebSession{}, fmt.Errorf("encrypt rotated Apple session: %w", err)
+	}
+	validatedAt := session.ValidatedAt
+	if validatedAt.IsZero() {
+		validatedAt = s.now().UTC()
+	}
+	return domain.AppleWebSession{
+		AccountID:       accountID,
+		Ciphertext:      ciphertext,
+		AppleID:         strings.TrimSpace(session.AppleID),
+		Region:          publicRegion(string(session.Region)),
+		Authenticated:   true,
+		LastValidatedAt: &validatedAt,
+	}, nil
+}
+
+func shouldRetryAutoCreateConfirmation(err error) bool {
+	var upstream *apple.Error
+	if errors.As(err, &upstream) && upstream != nil {
+		return upstream.Retryable
+	}
+	return errors.Is(err, ErrUpstream) || errors.Is(err, ErrRateLimited)
+}
+
+func waitForAutoCreateConfirmation(ctx context.Context, delay time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func hasAppleSessionState(session apple.Session) bool {

@@ -47,7 +47,7 @@
         <el-button
           type="primary"
           :icon="Download"
-          :disabled="aliases.length === 0"
+          :disabled="exportableAliases.length === 0"
           @click="exportAllAliases"
         >
           全部导出
@@ -110,7 +110,12 @@
           style="width: 100%"
           @selection-change="handleSelectionChange"
         >
-          <el-table-column type="selection" width="52" reserve-selection />
+          <el-table-column
+            type="selection"
+            width="52"
+            reserve-selection
+            :selectable="isAliasExportable"
+          />
           <el-table-column label="隐私邮箱" min-width="220">
             <template #default="{ row }">
               <div class="primary-stack">
@@ -148,13 +153,25 @@
           </el-table-column>
           <el-table-column label="状态" min-width="124">
             <template #default="{ row }">
-              <SyncStatus :item="row" details />
+              <el-tag
+                v-if="isAliasConfirmationPending(row)"
+                type="warning"
+                effect="plain"
+                size="small"
+              >
+                等待目录确认
+              </el-tag>
+              <SyncStatus v-else :item="row" details />
             </template>
           </el-table-column>
           <el-table-column label="操作" width="152" align="right" fixed="right">
             <template #default="{ row }">
               <div class="icon-action-row">
-                <el-tooltip content="复制邮件 API 直达链接" placement="top">
+                <el-tooltip
+                  v-if="isAliasExportable(row)"
+                  content="复制邮件 API 直达链接"
+                  placement="top"
+                >
                   <el-button
                     :icon="CopyDocument"
                     circle
@@ -186,6 +203,7 @@
               <el-checkbox
                 class="mobile-alias-selection__checkbox"
                 :model-value="isAliasSelected(alias.id)"
+                :disabled="!isAliasExportable(alias)"
                 :aria-label="`勾选 ${alias.address}`"
                 @change="setAliasSelected(alias, $event)"
               />
@@ -194,7 +212,15 @@
                 <small>{{ alias.label || "未填写用途备注" }}</small>
               </div>
             </div>
-            <SyncStatus :item="alias" details />
+            <el-tag
+              v-if="isAliasConfirmationPending(alias)"
+              type="warning"
+              effect="plain"
+              size="small"
+            >
+              等待目录确认
+            </el-tag>
+            <SyncStatus v-else :item="alias" details />
           </header>
           <dl class="mobile-kv-list">
             <div>
@@ -216,6 +242,7 @@
           </dl>
           <footer class="mobile-record__actions mobile-record__actions--direct-link">
             <el-button
+              v-if="isAliasExportable(alias)"
               :icon="CopyDocument"
               :loading="Boolean(copyLoading[alias.id])"
               :disabled="!alias.directLinkPath"
@@ -285,8 +312,23 @@ let viewActive = true;
 
 const selectedAliases = computed(() => {
   const selectedIds = new Set(selectedAliasIds.value);
-  return aliases.value.filter((alias) => selectedIds.has(alias.id));
+  return aliases.value.filter(
+    (alias) => selectedIds.has(alias.id) && isAliasExportable(alias),
+  );
 });
+const exportableAliases = computed(() => aliases.value.filter(isAliasExportable));
+
+function isAliasConfirmationPending(alias) {
+  return (
+    !alias?.enabled &&
+    String(alias?.lastSyncError || "").trim() ===
+      "APPLE_ALIAS_CONFIRMATION_PENDING"
+  );
+}
+
+function isAliasExportable(alias) {
+  return !isAliasConfirmationPending(alias) && Boolean(alias?.directLinkPath);
+}
 
 function keyPrefix(alias) {
   return alias.apiKeyPrefix ? `${alias.apiKeyPrefix}…` : "-";
@@ -336,7 +378,9 @@ async function loadAliases({ silent = false } = {}) {
     const nextAliases = await getAliases(accountId);
     if (!aliasLoadGate.isCurrent(ticket, selectedAccountId.value)) return;
     aliases.value = nextAliases;
-    const availableAliasIds = new Set(nextAliases.map((alias) => alias.id));
+    const availableAliasIds = new Set(
+      nextAliases.filter(isAliasExportable).map((alias) => alias.id),
+    );
     selectedAliasIds.value = selectedAliasIds.value.filter((id) =>
       availableAliasIds.has(id),
     );
@@ -371,7 +415,9 @@ const liveRefresh = createLiveRefresh(() => {
 });
 
 function handleSelectionChange(selection) {
-  selectedAliasIds.value = selection.map((alias) => alias.id);
+  selectedAliasIds.value = selection
+    .filter(isAliasExportable)
+    .map((alias) => alias.id);
 }
 
 function isAliasSelected(id) {
@@ -379,6 +425,7 @@ function isAliasSelected(id) {
 }
 
 function setAliasSelected(alias, selected) {
+  if (!isAliasExportable(alias)) return;
   if (aliasTable.value) {
     aliasTable.value.toggleRowSelection(alias, selected);
     return;
@@ -394,12 +441,13 @@ function setAliasSelected(alias, selected) {
 }
 
 function exportAliases(items, scope) {
-  if (!items.length) return;
+  const exportableItems = items.filter(isAliasExportable);
+  if (!exportableItems.length) return;
 
   let url = "";
   let link = null;
   try {
-    const content = buildAliasExportText(items);
+    const content = buildAliasExportText(exportableItems);
     const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
     url = URL.createObjectURL(blob);
     link = document.createElement("a");
@@ -408,7 +456,7 @@ function exportAliases(items, scope) {
     link.download = `icloud-aliases-${scope}-${timestamp}.txt`;
     document.body.appendChild(link);
     link.click();
-    successMessage(`已导出 ${items.length} 个邮箱。`);
+    successMessage(`已导出 ${exportableItems.length} 个邮箱。`);
   } catch {
     ElMessage({
       type: "error",
@@ -428,11 +476,11 @@ function exportSelectedAliases() {
 }
 
 function exportAllAliases() {
-  exportAliases(aliases.value, "all");
+  exportAliases(exportableAliases.value, "all");
 }
 
 async function copyAliasDirectLink(alias) {
-  if (!alias.directLinkPath || !copyLock.acquire(alias.id)) return;
+  if (!isAliasExportable(alias) || !copyLock.acquire(alias.id)) return;
   copyLoading[alias.id] = true;
   try {
     const directLink = buildRecentMailDirectLink(alias.directLinkPath);

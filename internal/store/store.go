@@ -17,14 +17,15 @@ import (
 
 var (
 	// ErrNotFound is returned when a requested row does not exist.
-	ErrNotFound               = sql.ErrNoRows
-	ErrInvalidPostgresURL     = errors.New("PostgreSQL URL must use postgres:// or postgresql://")
-	ErrAliasLimit             = errors.New("enabled alias limit reached")
-	ErrAliasOwnershipConflict = errors.New("alias address belongs to another account")
-	ErrAccountIdentityLocked  = errors.New("account identity is locked by aliases")
-	ErrAccountDisabled        = errors.New("primary account is disabled")
-	ErrCredentialsChanged     = errors.New("administrator credentials changed")
-	memoryID                  atomic.Uint64
+	ErrNotFound                 = sql.ErrNoRows
+	ErrInvalidPostgresURL       = errors.New("PostgreSQL URL must use postgres:// or postgresql://")
+	ErrAliasLimit               = errors.New("enabled alias limit reached")
+	ErrAliasConfirmationPending = errors.New("alias is awaiting Apple confirmation")
+	ErrAliasOwnershipConflict   = errors.New("alias address belongs to another account")
+	ErrAccountIdentityLocked    = errors.New("account identity is locked by aliases")
+	ErrAccountDisabled          = errors.New("primary account is disabled")
+	ErrCredentialsChanged       = errors.New("administrator credentials changed")
+	memoryID                    atomic.Uint64
 )
 
 type dialect uint8

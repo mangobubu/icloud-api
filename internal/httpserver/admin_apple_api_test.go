@@ -330,6 +330,7 @@ func TestAdminAPIAppleErrorsUseDedicatedCodesAndRedactedLogs(t *testing.T) {
 		{name: "credentials", err: hmesync.ErrCredentialsInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: hmesync.CodeCredentialsInvalid},
 		{name: "verification", err: hmesync.ErrVerificationInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: hmesync.CodeVerificationInvalid},
 		{name: "flow expired", err: hmesync.ErrFlowExpired, wantStatus: http.StatusGone, wantCode: hmesync.CodeFlowExpired},
+		{name: "account action required", err: hmesync.ErrAccountActionRequired, wantStatus: http.StatusConflict, wantCode: hmesync.CodeAccountActionRequired},
 		{name: "rate limited", err: hmesync.ErrRateLimited, wantStatus: http.StatusTooManyRequests, wantCode: hmesync.CodeRateLimited},
 		{name: "account mismatch", err: hmesync.ErrAccountMismatch, wantStatus: http.StatusConflict, wantCode: hmesync.CodeAccountMismatch},
 		{name: "account changed", err: hmesync.ErrAccountChanged, wantStatus: http.StatusConflict, wantCode: hmesync.CodeAccountChanged},
@@ -346,6 +347,9 @@ func TestAdminAPIAppleErrorsUseDedicatedCodesAndRedactedLogs(t *testing.T) {
 			}), "application/json", []*http.Cookie{sessionCookie}, csrf)
 			if response.Code != test.wantStatus || adminAPITestErrorCode(t, response) != test.wantCode {
 				t.Fatalf("Apple error response = %d; body=%s; want %d %s", response.Code, response.Body.String(), test.wantStatus, test.wantCode)
+			}
+			if test.wantCode == hmesync.CodeAccountActionRequired && !strings.Contains(response.Body.String(), "请前往 Apple 官网处理后重试") {
+				t.Fatalf("Apple account action response omitted actionable message: %s", response.Body.String())
 			}
 			if test.wantCode == "AUTH_REQUIRED" || test.wantCode == "SESSION_EXPIRED" {
 				t.Fatalf("Apple error reused an administrator session code: %s", test.wantCode)

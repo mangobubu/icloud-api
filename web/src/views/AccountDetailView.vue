@@ -466,11 +466,22 @@
               <template #default="{ row }">{{ formatTime(row.latestReceivedAt) }}</template>
             </el-table-column>
             <el-table-column label="同步状态" min-width="130">
-              <template #default="{ row }"><SyncStatus :item="row" details /></template>
+              <template #default="{ row }">
+                <el-tag
+                  v-if="isAliasConfirmationPending(row)"
+                  type="warning"
+                  effect="plain"
+                  size="small"
+                >
+                  等待目录确认
+                </el-tag>
+                <SyncStatus v-else :item="row" details />
+              </template>
             </el-table-column>
             <el-table-column label="启用" width="82" align="center">
               <template #default="{ row }">
                 <el-switch
+                  v-if="!isAliasConfirmationPending(row)"
                   :model-value="row.enabled"
                   :loading="Boolean(toggleLoading[row.id])"
                   :disabled="Boolean(copyLoading[row.id] || rotateLoading[row.id] || deleteLoading[row.id])"
@@ -481,7 +492,10 @@
             </el-table-column>
             <el-table-column label="操作" width="144" align="right">
               <template #default="{ row }">
-                <div class="icon-action-row">
+                <div
+                  v-if="!isAliasConfirmationPending(row)"
+                  class="icon-action-row"
+                >
                   <el-tooltip content="复制邮件 API 直达链接" placement="top">
                     <el-button
                       :icon="CopyDocument"
@@ -527,7 +541,15 @@
                 <strong>{{ alias.address }}</strong>
                 <small>{{ alias.label || "未填写用途备注" }}</small>
               </div>
-              <SyncStatus :item="alias" details />
+              <el-tag
+                v-if="isAliasConfirmationPending(alias)"
+                type="warning"
+                effect="plain"
+                size="small"
+              >
+                等待目录确认
+              </el-tag>
+              <SyncStatus v-else :item="alias" details />
             </header>
             <dl class="mobile-kv-list">
               <div>
@@ -538,7 +560,7 @@
                 <dt>最新邮件</dt>
                 <dd>{{ formatTime(alias.latestReceivedAt) }}</dd>
               </div>
-              <div>
+              <div v-if="!isAliasConfirmationPending(alias)">
                 <dt>启用</dt>
                 <dd>
                   <el-switch
@@ -551,7 +573,10 @@
                 </dd>
               </div>
             </dl>
-            <footer class="mobile-record__actions mobile-record__actions--three">
+            <footer
+              v-if="!isAliasConfirmationPending(alias)"
+              class="mobile-record__actions mobile-record__actions--three"
+            >
               <el-button
                 :icon="CopyDocument"
                 :loading="Boolean(copyLoading[alias.id])"
@@ -794,6 +819,7 @@ const appleVerificationRules = {
     },
   ],
 };
+const AUTO_CREATION_KEY_ACK_BATCH_SIZE = 1000;
 const appleSessionAuthenticated = computed(
   () => appleSession.value?.status === "authenticated",
 );
@@ -856,10 +882,14 @@ const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
     "Apple 验证码无效，请重新登录 Apple 账户并完成双重认证后重试",
   APPLE_FLOW_EXPIRED:
     "Apple 验证流程已过期，请重新登录 Apple 账户并完成双重认证后重试",
+  APPLE_ACCOUNT_ACTION_REQUIRED:
+    "Apple 账户需要完成条款确认或其他账户操作，请前往 Apple 官网处理后重试",
   APPLE_RATE_LIMITED:
     "Apple 请求过于频繁，请稍后再试；自动创建会按计划继续执行",
   APPLE_UPSTREAM_ERROR:
     "Apple 服务暂时异常，请稍后再试；自动创建会按计划继续执行",
+  APPLE_ALIAS_CONFIRMATION_PENDING:
+    "Apple 已创建隐私邮箱，正在等待目录确认；后续自动创建计划只会继续确认，不会重复创建",
   APPLE_ACCOUNT_MISMATCH:
     "Apple 登录账户或隐藏邮件地址的默认转发目标与当前主号不匹配，请确认登录了正确的 Apple 账户，并在 iCloud 设置中把‘转发到’改为当前主号后重新开启",
   ACCOUNT_CHANGED: "主号信息在创建过程中发生变化，请刷新页面并确认主号信息后重试",
@@ -875,6 +905,28 @@ function autoCreationErrorMessage(value) {
   return Object.prototype.hasOwnProperty.call(AUTO_CREATION_ERROR_MESSAGES, code)
     ? AUTO_CREATION_ERROR_MESSAGES[code]
     : original;
+}
+
+function isAliasConfirmationPending(item) {
+  return (
+    !item?.enabled &&
+    String(item?.lastSyncError || "").trim() ===
+      "APPLE_ALIAS_CONFIRMATION_PENDING"
+  );
+}
+
+function aliasIDAcknowledgementBatches(aliasIds) {
+  const batches = [];
+  for (
+    let offset = 0;
+    offset < aliasIds.length;
+    offset += AUTO_CREATION_KEY_ACK_BATCH_SIZE
+  ) {
+    batches.push(
+      aliasIds.slice(offset, offset + AUTO_CREATION_KEY_ACK_BATCH_SIZE),
+    );
+  }
+  return batches;
 }
 
 function normalizedAutoCreationStatus(item) {
@@ -1431,37 +1483,57 @@ async function acknowledgeAndCloseBatchSecrets() {
     return;
   }
   const accountId = account.value.id;
-  const aliasIds = batchSecrets.value
-    .map((item) => Number(item.aliasId))
-    .filter((id) => Number.isInteger(id) && id > 0);
+  const aliasIds = [
+    ...new Set(
+      batchSecrets.value
+        .map((item) => Number(item.aliasId))
+        .filter((id) => Number.isInteger(id) && id > 0),
+    ),
+  ];
   if (!aliasIds.length) {
     ElMessage.error("待确认的自动创建 Key 缺少隐私邮箱标识，请刷新后重试。");
     pendingAutoKeysLock.release();
     return;
   }
+  const aliasIDBatches = aliasIDAcknowledgementBatches(aliasIds);
   beginDetailMutation();
   pendingAutoKeysClearing.value = true;
+  let acknowledgedCount = 0;
   try {
-    await clearAliasAutoCreationKeys(
-      accountId,
-      aliasIds,
-      auth.state.csrfToken,
-    );
-    if (!isCurrentAccount(accountId)) return;
-    if (autoCreation.value) {
-      autoCreation.value = {
-        ...autoCreation.value,
-        pendingKeyCount: Math.max(
-          0,
-          Number(autoCreation.value.pendingKeyCount || 0) - aliasIds.length,
-        ),
-      };
+    for (const aliasIDBatch of aliasIDBatches) {
+      await clearAliasAutoCreationKeys(
+        accountId,
+        aliasIDBatch,
+        auth.state.csrfToken,
+      );
+      if (!isCurrentAccount(accountId)) return;
+
+      const acknowledgedIDs = new Set(aliasIDBatch);
+      batchSecrets.value = batchSecrets.value.filter(
+        (item) => !acknowledgedIDs.has(Number(item.aliasId)),
+      );
+      acknowledgedCount += aliasIDBatch.length;
+      if (autoCreation.value) {
+        autoCreation.value = {
+          ...autoCreation.value,
+          pendingKeyCount: Math.max(
+            0,
+            Number(autoCreation.value.pendingKeyCount || 0) -
+              aliasIDBatch.length,
+          ),
+        };
+      }
     }
     clearBatchSecrets();
     successMessage("本次自动创建的 API Key 已确认保存。");
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;
-    showRequestError(error, "确认保存失败，API Key 仍保留在待领取队列中。");
+    showRequestError(
+      error,
+      acknowledgedCount
+        ? `确认保存未完成，已确认 ${acknowledgedCount} 个 API Key；其余 Key 仍保留在待领取队列中。`
+        : "确认保存失败，API Key 仍保留在待领取队列中。",
+    );
   } finally {
     pendingAutoKeysClearing.value = false;
     pendingAutoKeysLock.release();
@@ -1728,7 +1800,13 @@ async function addAlias() {
 }
 
 async function rotateKey(alias) {
-  if (oneTimeSecretVisible.value || !aliasActionLock.acquire(alias.id)) return;
+  if (
+    isAliasConfirmationPending(alias) ||
+    oneTimeSecretVisible.value ||
+    !aliasActionLock.acquire(alias.id)
+  ) {
+    return;
+  }
   beginDetailMutation();
   const accountId = account.value.id;
   let sessionInvalid = false;
@@ -1765,7 +1843,13 @@ async function rotateKey(alias) {
 }
 
 async function copyAliasDirectLink(alias) {
-  if (!alias.directLinkPath || !aliasActionLock.acquire(alias.id)) return;
+  if (
+    isAliasConfirmationPending(alias) ||
+    !alias.directLinkPath ||
+    !aliasActionLock.acquire(alias.id)
+  ) {
+    return;
+  }
   const accountId = account.value.id;
   copyLoading[alias.id] = true;
   try {
@@ -1795,7 +1879,13 @@ async function copyAliasDirectLink(alias) {
 }
 
 async function toggleAlias(alias, enabled) {
-  if (alias.enabled === enabled || !aliasActionLock.acquire(alias.id)) return;
+  if (
+    isAliasConfirmationPending(alias) ||
+    alias.enabled === enabled ||
+    !aliasActionLock.acquire(alias.id)
+  ) {
+    return;
+  }
   beginDetailMutation();
   const accountId = account.value.id;
   toggleLoading[alias.id] = true;
@@ -1818,7 +1908,12 @@ async function toggleAlias(alias, enabled) {
 }
 
 async function removeAlias(alias) {
-  if (!aliasActionLock.acquire(alias.id)) return;
+  if (
+    isAliasConfirmationPending(alias) ||
+    !aliasActionLock.acquire(alias.id)
+  ) {
+    return;
+  }
   beginDetailMutation();
   const accountId = account.value.id;
   deleteLoading[alias.id] = true;

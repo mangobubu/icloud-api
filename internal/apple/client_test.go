@@ -516,7 +516,7 @@ func TestCreateAliasReserveFailureIsNotRetryableOrRetried(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = client.CreateAlias(context.Background(), Session{
+	alias, _, err := client.CreateAlias(context.Background(), Session{
 		Region:                 RegionGlobal,
 		DSID:                   "42",
 		ClientID:               "client-id",
@@ -526,11 +526,254 @@ func TestCreateAliasReserveFailureIsNotRetryableOrRetried(t *testing.T) {
 		t.Fatalf("error = %v, want ErrService", err)
 	}
 	var typed *Error
-	if !errors.As(err, &typed) || typed.Retryable {
+	if !errors.As(err, &typed) || typed.StatusCode != http.StatusServiceUnavailable ||
+		typed.ServiceCode != "TEMPORARY" || typed.Retryable {
 		t.Fatalf("reserve error = %#v, want non-retryable", typed)
+	}
+	if alias != (Alias{}) {
+		t.Fatalf("alias = %#v, want empty alias for explicit failure", alias)
 	}
 	if generateRequests != 1 || reserveRequests != 1 {
 		t.Fatalf("generate/reserve requests = %d/%d, want 1/1", generateRequests, reserveRequests)
+	}
+}
+
+func TestCreateAliasReturnsCandidateOnlyForUncertainReserveResults(t *testing.T) {
+	transportFailure := errors.New("connection reset after reserve write")
+	tests := []struct {
+		name          string
+		reserve       func(*http.Request) (*http.Response, error)
+		wantCandidate bool
+		wantKind      error
+	}{
+		{
+			name: "transport failure",
+			reserve: func(*http.Request) (*http.Response, error) {
+				return nil, transportFailure
+			},
+			wantCandidate: true,
+			wantKind:      ErrService,
+		},
+		{
+			name: "ambiguous server failure",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusBadGateway, `{"serverErrorCode":"TEMPORARY"}`, nil), nil
+			},
+			wantCandidate: true,
+			wantKind:      ErrService,
+		},
+		{
+			name: "redirect without location",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusTemporaryRedirect, `{}`, nil), nil
+			},
+			wantCandidate: true,
+			wantKind:      ErrService,
+		},
+		{
+			name: "malformed success response",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusOK, `{"success":`, nil), nil
+			},
+			wantCandidate: true,
+			wantKind:      ErrInvalidResponse,
+		},
+		{
+			name: "mismatched success response",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusOK, `{"success":true,"result":{"hme":{"hme":"different@icloud.com"}}}`, nil), nil
+			},
+			wantCandidate: true,
+			wantKind:      ErrInvalidResponse,
+		},
+		{
+			name: "explicit client failure",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusBadRequest, `{"errorCode":"INVALID_REQUEST"}`, nil), nil
+			},
+			wantKind: ErrService,
+		},
+		{
+			name: "rate limited",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusTooManyRequests, `{"errorCode":"RATE_LIMITED"}`, nil), nil
+			},
+			wantKind: ErrService,
+		},
+		{
+			name: "account action required",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusPreconditionFailed, `{"errorCode":"TERMS_REQUIRED"}`, nil), nil
+			},
+			wantKind: ErrTermsRequired,
+		},
+		{
+			name: "explicit success false",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusOK, `{"success":false,"error":{"errorCode":"REJECTED"}}`, nil), nil
+			},
+			wantKind: ErrService,
+		},
+		{
+			name: "explicit success false with server status",
+			reserve: func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, http.StatusServiceUnavailable, `{"success":false,"error":{"errorCode":"REJECTED"}}`, nil), nil
+			},
+			wantKind: ErrService,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			generateRequests := 0
+			reserveRequests := 0
+			client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				switch request.URL.Path {
+				case "/v1/hme/generate":
+					generateRequests++
+					return testResponse(request, http.StatusOK,
+						`{"success":true,"result":{"hme":"candidate@icloud.com"}}`, nil), nil
+				case "/v1/hme/reserve":
+					reserveRequests++
+					return test.reserve(request)
+				default:
+					return nil, fmt.Errorf("unexpected path %s", request.URL.Path)
+				}
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			alias, _, err := client.CreateAlias(context.Background(), Session{
+				Region:                 RegionGlobal,
+				DSID:                   "42",
+				ClientID:               "client-id",
+				PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+			}, "input label", "input note")
+			if !errors.Is(err, test.wantKind) {
+				t.Fatalf("error = %v, want %v", err, test.wantKind)
+			}
+			var typed *Error
+			if !errors.As(err, &typed) || typed.Retryable {
+				t.Fatalf("reserve error = %#v, want non-retryable", typed)
+			}
+			if test.wantCandidate {
+				want := Alias{HME: "candidate@icloud.com", Label: "input label", Note: "input note"}
+				if alias != want {
+					t.Fatalf("alias = %#v, want %#v", alias, want)
+				}
+			} else if alias != (Alias{}) {
+				t.Fatalf("alias = %#v, want empty alias", alias)
+			}
+			if generateRequests != 1 || reserveRequests != 1 {
+				t.Fatalf("generate/reserve requests = %d/%d, want 1/1", generateRequests, reserveRequests)
+			}
+		})
+	}
+}
+
+func TestDecodeReservedAliasPinsExactValidatedAddressField(t *testing.T) {
+	alias, err := decodeReservedAlias(
+		json.RawMessage(`{"hme":{"hme":"candidate@icloud.com","HME":""}}`),
+		"candidate@icloud.com",
+	)
+	if err != nil {
+		t.Fatalf("decode reserve alias with case variant: %v", err)
+	}
+	if alias.HME != "candidate@icloud.com" {
+		t.Fatalf("decoded reserve address = %q, want validated candidate", alias.HME)
+	}
+}
+
+func TestDecodeHMEResultPreservesServiceErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		serviceCode   string
+		wantRetryable bool
+	}{
+		{
+			name:          "non-2xx server error code",
+			status:        http.StatusServiceUnavailable,
+			body:          `{"serverErrorCode":"GENERATE_TEMPORARY"}`,
+			serviceCode:   "GENERATE_TEMPORARY",
+			wantRetryable: true,
+		},
+		{
+			name:        "non-2xx top-level error code",
+			status:      http.StatusConflict,
+			body:        `{"errorCode":"GENERATE_CONFLICT"}`,
+			serviceCode: "GENERATE_CONFLICT",
+		},
+		{
+			name:        "success false nested error code",
+			status:      http.StatusOK,
+			body:        `{"success":false,"error":{"errorCode":"GENERATE_REJECTED"}}`,
+			serviceCode: "GENERATE_REJECTED",
+		},
+		{
+			name:        "null top-level code falls back to server code",
+			status:      http.StatusConflict,
+			body:        `{"errorCode":null,"serverErrorCode":"GENERATE_FALLBACK"}`,
+			serviceCode: "GENERATE_FALLBACK",
+		},
+		{
+			name:        "empty top-level and server codes fall back to nested code",
+			status:      http.StatusConflict,
+			body:        `{"errorCode":"","serverErrorCode":" ","error":{"errorCode":"GENERATE_NESTED"}}`,
+			serviceCode: "GENERATE_NESTED",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := decodeHMEResult("generate Hide My Email alias", responseData{
+				status: test.status,
+				body:   []byte(test.body),
+			})
+			if !errors.Is(err, ErrService) {
+				t.Fatalf("error = %v, want ErrService", err)
+			}
+			var typed *Error
+			if !errors.As(err, &typed) || typed.StatusCode != test.status ||
+				typed.ServiceCode != test.serviceCode || typed.Retryable != test.wantRetryable {
+				t.Fatalf("typed error = %#v", typed)
+			}
+		})
+	}
+}
+
+func TestOperationErrorStatusZeroRetriesOnlyTransportServiceFailures(t *testing.T) {
+	local := operationError("decode local value", ErrInvalidResponse, 0, errors.New("invalid local value"))
+	var localTyped *Error
+	if !errors.As(local, &localTyped) || localTyped.Retryable {
+		t.Fatalf("local error = %#v, want non-retryable", localTyped)
+	}
+
+	transport := operationError("send request", ErrService, 0, errors.New("connection reset"))
+	var transportTyped *Error
+	if !errors.As(transport, &transportTyped) || !transportTyped.Retryable {
+		t.Fatalf("transport error = %#v, want retryable", transportTyped)
+	}
+
+	serviceWithoutCause := operationError("local service check", ErrService, 0, nil)
+	var serviceTyped *Error
+	if !errors.As(serviceWithoutCause, &serviceTyped) || serviceTyped.Retryable {
+		t.Fatalf("service error without transport cause = %#v, want non-retryable", serviceTyped)
+	}
+}
+
+func TestDecodeHMEResultMapsPreconditionFailureToTermsRequired(t *testing.T) {
+	_, err := decodeHMEResult("generate Hide My Email alias", responseData{
+		status: http.StatusPreconditionFailed,
+		body:   []byte(`{"errorCode":"TERMS_REQUIRED"}`),
+	})
+	if !errors.Is(err, ErrTermsRequired) {
+		t.Fatalf("error = %v, want ErrTermsRequired", err)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) || typed.StatusCode != http.StatusPreconditionFailed ||
+		typed.ServiceCode != "TERMS_REQUIRED" || typed.Retryable {
+		t.Fatalf("typed error = %#v", typed)
 	}
 }
 
@@ -643,6 +886,78 @@ func TestListAliasesRequiresCompleteUnpaginatedUniqueArray(t *testing.T) {
 	}
 }
 
+func TestListAliasesPreservesServiceErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		status        int
+		body          string
+		kind          error
+		serviceCode   string
+		wantRetryable bool
+	}{
+		{
+			name:          "non-2xx server error code",
+			status:        http.StatusServiceUnavailable,
+			body:          `{"serverErrorCode":"LIST_TEMPORARY"}`,
+			kind:          ErrService,
+			serviceCode:   "LIST_TEMPORARY",
+			wantRetryable: true,
+		},
+		{
+			name:        "non-2xx top-level error code",
+			status:      http.StatusConflict,
+			body:        `{"errorCode":"LIST_CONFLICT"}`,
+			kind:        ErrService,
+			serviceCode: "LIST_CONFLICT",
+		},
+		{
+			name:        "non-2xx invalid session code",
+			status:      http.StatusUnauthorized,
+			body:        `{"error":{"errorCode":"SESSION_EXPIRED"}}`,
+			kind:        ErrInvalidSession,
+			serviceCode: "SESSION_EXPIRED",
+		},
+		{
+			name:        "account action required",
+			status:      http.StatusPreconditionFailed,
+			body:        `{"errorCode":"TERMS_REQUIRED"}`,
+			kind:        ErrTermsRequired,
+			serviceCode: "TERMS_REQUIRED",
+		},
+		{
+			name:        "success false nested error code",
+			status:      http.StatusOK,
+			body:        `{"success":false,"error":{"errorCode":"LIST_REJECTED"}}`,
+			kind:        ErrService,
+			serviceCode: "LIST_REJECTED",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return testResponse(request, test.status, test.body, nil), nil
+			})})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = client.ListAliases(context.Background(), Session{
+				Region:                 RegionGlobal,
+				DSID:                   "42",
+				ClientID:               "client-id",
+				PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+			})
+			if !errors.Is(err, test.kind) {
+				t.Fatalf("error = %v, want %v", err, test.kind)
+			}
+			var typed *Error
+			if !errors.As(err, &typed) || typed.StatusCode != test.status ||
+				typed.ServiceCode != test.serviceCode || typed.Retryable != test.wantRetryable {
+				t.Fatalf("typed error = %#v", typed)
+			}
+		})
+	}
+}
+
 func TestListAliasesAcceptsExplicitEmptyArray(t *testing.T) {
 	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		return testResponse(request, http.StatusOK, `{"success":true,"result":{"hmeEmails":[],"forwardToEmails":[],"total":0,"metadata":{"totalCount":0},"summary":[{"total_count":0}]}}`, nil), nil
@@ -703,6 +1018,59 @@ func TestRedirectCannotLeaveAppleHTTPSDomains(t *testing.T) {
 	_, _, err = client.ListAliases(context.Background(), Session{Region: RegionGlobal, DSID: "1", ClientID: "client", PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com"})
 	if !errors.Is(err, ErrService) {
 		t.Fatalf("redirect error = %v, want ErrService", err)
+	}
+}
+
+func TestCreateAliasRedirectFailurePreservesCandidateAndSessionHeaders(t *testing.T) {
+	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch request.URL.Path {
+		case "/v1/hme/generate":
+			return testResponse(request, http.StatusOK,
+				`{"success":true,"result":{"hme":"candidate@icloud.com"}}`, nil), nil
+		case "/v1/hme/reserve":
+			headers := make(http.Header)
+			headers.Set("Location", "https://attacker.example/redirect")
+			headers.Set("X-Apple-ID-Session-Id", "redirect-session-id")
+			headers.Set("X-Apple-Session-Token", "redirect-session-token")
+			headers.Set("scnt", "redirect-scnt")
+			headers.Add("Set-Cookie", "redirected=session; Path=/; Secure; HttpOnly")
+			return testResponse(request, http.StatusFound, "", headers), nil
+		default:
+			return nil, fmt.Errorf("unexpected path %s", request.URL.Path)
+		}
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alias, updated, err := client.CreateAlias(context.Background(), Session{
+		Region:                 RegionGlobal,
+		DSID:                   "42",
+		ClientID:               "client-id",
+		PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+	}, "input label", "input note")
+	if !errors.Is(err, ErrService) {
+		t.Fatalf("redirect reserve error = %v, want ErrService", err)
+	}
+	var typed *Error
+	if !errors.As(err, &typed) || typed.StatusCode != http.StatusFound || typed.Retryable {
+		t.Fatalf("redirect reserve error = %#v", typed)
+	}
+	wantAlias := Alias{HME: "candidate@icloud.com", Label: "input label", Note: "input note"}
+	if alias != wantAlias {
+		t.Fatalf("redirect reserve alias = %#v, want %#v", alias, wantAlias)
+	}
+	if updated.SessionID != "redirect-session-id" || updated.SessionToken != "redirect-session-token" || updated.SCNT != "redirect-scnt" {
+		t.Fatalf("redirect session headers were not preserved: %#v", updated)
+	}
+	foundCookie := false
+	for _, cookie := range updated.Cookies {
+		if cookie.Name == "redirected" && cookie.Value == "session" {
+			foundCookie = true
+		}
+	}
+	if !foundCookie {
+		t.Fatalf("redirect cookie was not preserved: %#v", updated.Cookies)
 	}
 }
 

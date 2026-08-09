@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"icloud-api/internal/apple"
 	"icloud-api/internal/domain"
 )
 
@@ -668,6 +672,134 @@ func TestFailureIsNotWrittenToLogs(t *testing.T) {
 	manager.runDue(context.Background())
 	if bytes.Contains(logs.Bytes(), []byte("secret@example.com")) {
 		t.Fatalf("sensitive creator error leaked into logs: %q", logs.String())
+	}
+}
+
+func TestAppleFailureLogsOnlySanitizedStructuredFields(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	var logs bytes.Buffer
+	upstream := &apple.Error{
+		Op:          "reserve Hide My Email alias",
+		Kind:        apple.ErrService,
+		StatusCode:  503,
+		ServiceCode: "HME.TEMPORARY-1_2",
+		Retryable:   true,
+		Err:         errors.New(`response body {"token":"TOKEN","email":"cause-secret@example.com"}`),
+	}
+	createErr := fmt.Errorf("outer-secret@example.com: %w", upstream)
+	manager, err := New(repo, func(context.Context, int64) (domain.Alias, error) {
+		return domain.Alias{Address: "alias-secret@example.com"}, createErr
+	}, slog.New(slog.NewJSONHandler(&logs, nil)), WithClock(clock.Now), WithRandom(fixedRandom(0)))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	schedule := enableForTest(t, manager, 41)
+	clock.Set(*schedule.NextRunAt)
+	manager.runDue(context.Background())
+
+	var entry struct {
+		AccountID              int64   `json:"account_id"`
+		Operation              string  `json:"operation"`
+		HTTPStatus             int     `json:"http_status"`
+		ServiceCode            *string `json:"service_code"`
+		ServiceCodePresent     *bool   `json:"service_code_present"`
+		ServiceCodeFingerprint string  `json:"service_code_fingerprint"`
+		Retryable              bool    `json:"retryable"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
+		t.Fatalf("decode structured log: %v; log=%q", err, logs.String())
+	}
+	if entry.AccountID != 41 || entry.Operation != upstream.Op || entry.HTTPStatus != 503 || !entry.Retryable {
+		t.Fatalf("structured Apple fields = %#v", entry)
+	}
+	if entry.ServiceCode != nil || entry.ServiceCodePresent == nil || !*entry.ServiceCodePresent {
+		t.Fatalf("service code fields = %#v", entry)
+	}
+	if len(entry.ServiceCodeFingerprint) != appleServiceCodeFingerprintHexLength {
+		t.Fatalf("service code fingerprint = %q", entry.ServiceCodeFingerprint)
+	}
+	if _, err := hex.DecodeString(entry.ServiceCodeFingerprint); err != nil {
+		t.Fatalf("service code fingerprint is not hex: %q", entry.ServiceCodeFingerprint)
+	}
+	for _, secret := range []string{upstream.ServiceCode, "outer-secret@example.com", "alias-secret@example.com", "cause-secret@example.com", "TOKEN", "response body"} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("sensitive value %q leaked into log: %q", secret, logs.String())
+		}
+	}
+	if len(repo.failures) != 1 || repo.failures[0].message != failureMessage(createErr) {
+		t.Fatalf("persisted failure changed: %#v", repo.failures)
+	}
+}
+
+func TestAppleFailureFingerprintsServiceCodesAndSanitizesOperation(t *testing.T) {
+	tests := []struct {
+		name string
+		code string
+	}{
+		{name: "empty"},
+		{name: "safe", code: "HME.CODE-1_2"},
+		{name: "long token", code: strings.Repeat("A", 512)},
+		{name: "space", code: "BAD CODE"},
+		{name: "leading space", code: " BAD_CODE"},
+		{name: "slash", code: "BAD/CODE"},
+		{name: "newline", code: "BAD\nCODE"},
+		{name: "non ASCII", code: "错误码"},
+		{name: "address", code: "secret@example.com"},
+	}
+	fingerprints := make(map[string]string, len(tests))
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+			repo := newFakeRepository()
+			var logs bytes.Buffer
+			upstream := &apple.Error{
+				Op:          "reserve secret@example.com",
+				Kind:        apple.ErrService,
+				StatusCode:  502,
+				ServiceCode: test.code,
+				Retryable:   true,
+			}
+			manager, err := New(repo, func(context.Context, int64) (domain.Alias, error) {
+				return domain.Alias{}, fmt.Errorf("wrapped: %w", upstream)
+			}, slog.New(slog.NewJSONHandler(&logs, nil)), WithClock(clock.Now), WithRandom(fixedRandom(0)))
+			if err != nil {
+				t.Fatalf("new manager: %v", err)
+			}
+			schedule := enableForTest(t, manager, int64(50+index))
+			clock.Set(*schedule.NextRunAt)
+			manager.runDue(context.Background())
+
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
+				t.Fatalf("decode structured log: %v; log=%q", err, logs.String())
+			}
+			if entry["operation"] != "unknown" || strings.Contains(logs.String(), "secret@example.com") {
+				t.Fatalf("unsafe operation leaked into log: %q", logs.String())
+			}
+			if _, exists := entry["service_code"]; exists {
+				t.Fatalf("raw service code field was logged: %q", logs.String())
+			}
+			present, presentExists := entry["service_code_present"]
+			fingerprint, fingerprintExists := entry["service_code_fingerprint"].(string)
+			if test.code != "" {
+				if !presentExists || present != true || !fingerprintExists || len(fingerprint) != appleServiceCodeFingerprintHexLength {
+					t.Fatalf("fingerprint fields = %#v", entry)
+				}
+				if _, err := hex.DecodeString(fingerprint); err != nil {
+					t.Fatalf("fingerprint is not hex: %q", fingerprint)
+				}
+				if previous, duplicate := fingerprints[fingerprint]; duplicate {
+					t.Fatalf("different service codes %q and %q share fingerprint %q", previous, test.code, fingerprint)
+				}
+				fingerprints[fingerprint] = test.code
+				if test.code != "" && strings.Contains(logs.String(), test.code) {
+					t.Fatalf("raw service code leaked into log: %q", logs.String())
+				}
+			} else if presentExists || fingerprintExists {
+				t.Fatalf("empty service code produced fingerprint fields: %#v", entry)
+			}
+		})
 	}
 }
 

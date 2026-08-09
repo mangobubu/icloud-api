@@ -35,6 +35,8 @@ type AutoCreateRepository interface {
 	Repository
 	CountEnabledAliasesByAccount(context.Context, int64) (int, error)
 	CreateAliasWithPendingAPIKey(context.Context, domain.AppleWebSession, domain.Alias, string) (domain.Alias, domain.AppleWebSession, error)
+	GetPendingAutoAliasConfirmation(context.Context, int64) (domain.PendingAliasAPIKey, error)
+	ConfirmPendingAutoAlias(context.Context, domain.AppleWebSession, int64) (domain.Alias, domain.AppleWebSession, error)
 }
 
 type SessionCipher interface {

@@ -280,6 +280,10 @@ func (s *Server) rotateAliasKey(c *gin.Context) {
 		return
 	}
 	if _, err := s.store.RotateAliasAPIKey(c.Request.Context(), id, hash, prefix); err != nil {
+		if errors.Is(err, store.ErrAliasConfirmationPending) {
+			s.renderAliasConfirmationPending(c, alias.AccountID)
+			return
+		}
 		s.renderPageError(c, err)
 		return
 	}
@@ -312,6 +316,10 @@ func (s *Server) toggleAlias(c *gin.Context) {
 			s.renderAccountPage(c, alias.AccountID, http.StatusConflict, fmt.Sprintf("此主号最多启用 %d 个隐私邮箱。", domain.MaxEnabledAliasesPerAccount), "error", "")
 			return
 		}
+		if errors.Is(err, store.ErrAliasConfirmationPending) {
+			s.renderAliasConfirmationPending(c, alias.AccountID)
+			return
+		}
 		s.renderPageError(c, err)
 		return
 	}
@@ -333,12 +341,20 @@ func (s *Server) deleteAlias(c *gin.Context) {
 	if err := s.withAccountLock(c.Request.Context(), alias.AccountID, func() error {
 		return s.store.DeleteAlias(c.Request.Context(), id)
 	}); err != nil {
+		if errors.Is(err, store.ErrAliasConfirmationPending) {
+			s.renderAliasConfirmationPending(c, alias.AccountID)
+			return
+		}
 		s.renderPageError(c, err)
 		return
 	}
 	session := mustSession(c)
 	s.audit(c, &session.AdminID, session.Username, "delete", "alias", strconv.FormatInt(id, 10), "success", "")
 	c.Redirect(http.StatusSeeOther, fmt.Sprintf("/admin/accounts/%d?notice=alias_deleted", alias.AccountID))
+}
+
+func (s *Server) renderAliasConfirmationPending(c *gin.Context, accountID int64) {
+	s.renderAccountPage(c, accountID, http.StatusConflict, "该隐私邮箱正在等待 Apple 目录确认，暂时不能轮换 Key、启用或删除。", "error", "")
 }
 
 func (s *Server) auditPage(c *gin.Context) {

@@ -130,7 +130,10 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 		if _, err := s.txExecContext(ctx, tx, `
 			UPDATE aliases
 			SET last_sync_status = ?, last_sync_error = '', last_synced_at = NULL, updated_at = ?
-			WHERE account_id = ?`, domain.SyncStatusPending, timestamp(now), account.ID); err != nil {
+			WHERE account_id = ?
+			  AND NOT (enabled = FALSE AND last_sync_error = ?)`,
+			domain.SyncStatusPending, timestamp(now), account.ID,
+			domain.AppleAliasConfirmationPending); err != nil {
 			return domain.Account{}, fmt.Errorf("reset account alias statuses: %w", err)
 		}
 		if _, err := s.txExecContext(ctx, tx, `

@@ -317,28 +317,23 @@ func (c *Client) ListAliases(ctx context.Context, session Session) (list ListRes
 		return list, result, err
 	}
 	if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == 450 {
-		return list, result, operationError("list Hide My Email aliases", ErrInvalidSession, response.status, nil)
+		return list, result, responseError("list Hide My Email aliases", ErrInvalidSession, response)
+	}
+	if response.status == http.StatusPreconditionFailed {
+		return list, result, responseError("list Hide My Email aliases", ErrTermsRequired, response)
 	}
 	if response.status < 200 || response.status >= 300 {
-		return list, result, operationError("list Hide My Email aliases", ErrService, response.status, nil)
+		return list, result, responseError("list Hide My Email aliases", ErrService, response)
 	}
 	var envelope struct {
 		Success bool            `json:"success"`
 		Result  json.RawMessage `json:"result"`
-		Error   *struct {
-			Code    json.RawMessage `json:"errorCode"`
-			Message string          `json:"errorMessage"`
-		} `json:"error"`
 	}
 	if err := json.Unmarshal(response.body, &envelope); err != nil {
 		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, err)
 	}
 	if !envelope.Success {
-		serviceCode := ""
-		if envelope.Error != nil {
-			serviceCode = strings.Trim(string(envelope.Error.Code), "\"")
-		}
-		return list, result, &Error{Op: "list Hide My Email aliases", Kind: ErrService, StatusCode: response.status, ServiceCode: serviceCode}
+		return list, result, responseError("list Hide My Email aliases", ErrService, response)
 	}
 	if containsPaginationMarker(response.body) || containsPaginationMarker(envelope.Result) {
 		return list, result, operationError("decode Hide My Email list", ErrInvalidResponse, response.status, errors.New("unexpected pagination marker"))
@@ -395,7 +390,9 @@ func (c *Client) ListAliases(ctx context.Context, session Session) (list ListRes
 // CreateAlias generates and reserves one new Hide My Email address. The
 // reserve request is a remote side effect, so errors after it starts are
 // deliberately marked non-retryable even when Apple returns a transient HTTP
-// status or the response is lost.
+// status or the response is lost. When the reserve outcome is ambiguous,
+// created carries the generated address and requested metadata for read-only
+// reconciliation by the caller.
 func (c *Client) CreateAlias(ctx context.Context, session Session, label, note string) (created Alias, result Session, err error) {
 	result = session
 	op, err := c.newOperation(&result)
@@ -448,18 +445,52 @@ func (c *Client) CreateAlias(ctx context.Context, session Session, label, note s
 		op.serviceHeaders(),
 	)
 	if err != nil {
-		return created, result, nonRetryableAppleError(err)
+		err = nonRetryableAppleError(err)
+		if uncertainReserveError(err) {
+			return reserveCandidate(candidate, label, note), result, err
+		}
+		return Alias{}, result, err
 	}
 	reservedResult, err := decodeHMEResult("reserve Hide My Email alias", response)
 	if err != nil {
-		return created, result, nonRetryableAppleError(err)
+		err = nonRetryableAppleError(err)
+		if !responseExplicitlyFailed(response.body) && uncertainReserveError(err) {
+			return reserveCandidate(candidate, label, note), result, err
+		}
+		return Alias{}, result, err
 	}
 	created, err = decodeReservedAlias(reservedResult, candidate)
 	if err != nil {
 		err = operationError("decode reserved Hide My Email alias", ErrInvalidResponse, response.status, err)
-		return Alias{}, result, nonRetryableAppleError(err)
+		return reserveCandidate(candidate, label, note), result, nonRetryableAppleError(err)
 	}
 	return created, result, nil
+}
+
+func reserveCandidate(hme, label, note string) Alias {
+	return Alias{HME: hme, Label: label, Note: note}
+}
+
+func uncertainReserveError(err error) bool {
+	var typed *Error
+	if !errors.As(err, &typed) {
+		return false
+	}
+	if typed.StatusCode == 0 {
+		return errors.Is(typed, ErrService) && typed.Err != nil
+	}
+	return (typed.StatusCode > 0 && typed.StatusCode < 200) ||
+		typed.StatusCode >= 300 && typed.StatusCode < 400 ||
+		typed.StatusCode >= 500 ||
+		(typed.StatusCode >= 200 && typed.StatusCode < 300 &&
+			(errors.Is(typed, ErrInvalidResponse) || errors.Is(typed, ErrResponseTooLarge)))
+}
+
+func responseExplicitlyFailed(body []byte) bool {
+	var envelope struct {
+		Success *bool `json:"success"`
+	}
+	return json.Unmarshal(body, &envelope) == nil && envelope.Success != nil && !*envelope.Success
 }
 
 func (c *Client) premiumMailSettingsRequestURL(session Session, endpoint string) (string, error) {
@@ -479,10 +510,13 @@ func (c *Client) premiumMailSettingsRequestURL(session Session, endpoint string)
 
 func decodeHMEResult(operation string, response responseData) (json.RawMessage, error) {
 	if response.status == http.StatusUnauthorized || response.status == http.StatusForbidden || response.status == 450 {
-		return nil, operationError(operation, ErrInvalidSession, response.status, nil)
+		return nil, responseError(operation, ErrInvalidSession, response)
+	}
+	if response.status == http.StatusPreconditionFailed {
+		return nil, responseError(operation, ErrTermsRequired, response)
 	}
 	if response.status < 200 || response.status >= 300 {
-		return nil, operationError(operation, ErrService, response.status, nil)
+		return nil, responseError(operation, ErrService, response)
 	}
 	var envelope struct {
 		Success *bool           `json:"success"`
@@ -495,12 +529,7 @@ func decodeHMEResult(operation string, response responseData) (json.RawMessage, 
 		return nil, operationError("decode "+operation, ErrInvalidResponse, response.status, errors.New("success must be a boolean"))
 	}
 	if !*envelope.Success {
-		return nil, &Error{
-			Op:          operation,
-			Kind:        ErrService,
-			StatusCode:  response.status,
-			ServiceCode: responseServiceCode(response.body),
-		}
+		return nil, responseError(operation, ErrService, response)
 	}
 	trimmed := bytes.TrimSpace(envelope.Result)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -578,6 +607,10 @@ func decodeReservedAlias(result json.RawMessage, candidate string) (Alias, error
 	if err := json.Unmarshal(rawAlias, &reserved); err != nil {
 		return Alias{}, fmt.Errorf("decode reserve result.hme: %w", err)
 	}
+	// encoding/json matches struct fields case-insensitively. Pin the address to
+	// the exact lower-case JSON member validated above so a second HME variant
+	// cannot overwrite it after the candidate comparison.
+	reserved.HME = strings.TrimSpace(address)
 	// A successful reserve response is not guaranteed to repeat every field
 	// returned by the authoritative list endpoint. In particular, Apple may
 	// omit isActive; reserve success itself means the new alias is active. Keep
@@ -978,10 +1011,18 @@ func (op *operation) requestRaw(ctx context.Context, operation, method, rawURL s
 	request.Header = headers.Clone()
 	response, err := op.http.Do(request)
 	if err != nil {
+		status := 0
+		if response != nil {
+			status = response.StatusCode
+			op.capture(response.Header)
+			if response.Body != nil {
+				_ = response.Body.Close()
+			}
+		}
 		if requestContext.Err() != nil {
 			err = requestContext.Err()
 		}
-		return responseData{}, operationError(operation, ErrService, 0, err)
+		return responseData{}, operationError(operation, ErrService, status, err)
 	}
 	if response.Body == nil {
 		return responseData{}, operationError(operation, ErrInvalidResponse, response.StatusCode, errors.New("empty response body"))
@@ -1057,14 +1098,40 @@ func responseServiceCode(body []byte) string {
 	if json.Unmarshal(body, &response) != nil {
 		return ""
 	}
-	code := response.ErrorCode
-	if len(code) == 0 {
-		code = response.ServerErrorCode
+	if code := serviceCodeValue(response.ErrorCode); code != "" {
+		return code
 	}
-	if len(code) == 0 && response.Error != nil {
-		code = response.Error.ErrorCode
+	if code := serviceCodeValue(response.ServerErrorCode); code != "" {
+		return code
 	}
-	return strings.Trim(string(code), "\"")
+	if response.Error != nil {
+		return serviceCodeValue(response.Error.ErrorCode)
+	}
+	return ""
+}
+
+func serviceCodeValue(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return ""
+	}
+	if trimmed[0] == '"' {
+		var value string
+		if json.Unmarshal(trimmed, &value) == nil {
+			return strings.TrimSpace(value)
+		}
+	}
+	return string(trimmed)
+}
+
+func responseError(operation string, kind error, response responseData) error {
+	return &Error{
+		Op:          operation,
+		Kind:        kind,
+		StatusCode:  response.status,
+		ServiceCode: responseServiceCode(response.body),
+		Retryable:   retryableStatus(response.status),
+	}
 }
 
 func containsPaginationMarker(body []byte) bool {

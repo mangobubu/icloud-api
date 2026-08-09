@@ -62,8 +62,20 @@ test("account detail exposes automatic alias creation and safe key handling", as
     "Apple 登录已过期，请点击“同步隐私邮箱”并重新登录后重试",
   );
   assert.equal(
+    formatAutoCreationError("APPLE_ACCOUNT_ACTION_REQUIRED"),
+    "Apple 账户需要完成条款确认或其他账户操作，请前往 Apple 官网处理后重试",
+  );
+  assert.equal(
     formatAutoCreationError("APPLE_RATE_LIMITED"),
     "Apple 请求过于频繁，请稍后再试；自动创建会按计划继续执行",
+  );
+  assert.equal(
+    formatAutoCreationError("APPLE_UPSTREAM_ERROR"),
+    "Apple 服务暂时异常，请稍后再试；自动创建会按计划继续执行",
+  );
+  assert.equal(
+    formatAutoCreationError("APPLE_ALIAS_CONFIRMATION_PENDING"),
+    "Apple 已创建隐私邮箱，正在等待目录确认；后续自动创建计划只会继续确认，不会重复创建",
   );
   assert.equal(
     formatAutoCreationError(" unknown upstream detail "),
@@ -71,13 +83,109 @@ test("account detail exposes automatic alias creation and safe key handling", as
   );
   assert.equal(formatAutoCreationError("constructor"), "constructor");
 
+  const confirmationBody = functionBody(
+    source,
+    "function isAliasConfirmationPending",
+  );
+  const isAliasConfirmationPending = Function(
+    `"use strict"; return function (item) ${confirmationBody}`,
+  )();
+  assert.equal(
+    isAliasConfirmationPending({
+      enabled: false,
+      lastSyncError: "APPLE_ALIAS_CONFIRMATION_PENDING",
+    }),
+    true,
+  );
+  assert.equal(
+    isAliasConfirmationPending({
+      enabled: true,
+      lastSyncError: "APPLE_ALIAS_CONFIRMATION_PENDING",
+    }),
+    false,
+  );
+  assert.equal(
+    isAliasConfirmationPending({
+      enabled: false,
+      lastSyncError: "APPLE_UPSTREAM_ERROR",
+    }),
+    false,
+  );
+
+  const desktopStart = source.indexOf(
+    '<div v-if="aliases.length" class="data-panel desktop-data-table">',
+  );
+  const mobileStart = source.indexOf(
+    '<div v-if="aliases.length" class="mobile-record-list">',
+  );
+  const aliasFormStart = source.indexOf("<el-form", mobileStart);
+  assert.ok(desktopStart >= 0 && mobileStart > desktopStart);
+  assert.ok(aliasFormStart > mobileStart);
+  const desktopAliases = source.slice(desktopStart, mobileStart);
+  const mobileAliases = source.slice(mobileStart, aliasFormStart);
+
+  assert.match(
+    desktopAliases,
+    /v-if="isAliasConfirmationPending\(row\)"[\s\S]{0,180}等待目录确认/,
+  );
+  assert.match(
+    desktopAliases,
+    /<el-switch\s+v-if="!isAliasConfirmationPending\(row\)"/,
+  );
+  assert.match(
+    desktopAliases,
+    /<div\s+v-if="!isAliasConfirmationPending\(row\)"\s+class="icon-action-row"/,
+  );
+  assert.match(
+    mobileAliases,
+    /v-if="isAliasConfirmationPending\(alias\)"[\s\S]{0,180}等待目录确认/,
+  );
+  assert.match(
+    mobileAliases,
+    /<div v-if="!isAliasConfirmationPending\(alias\)">\s*<dt>启用<\/dt>/,
+  );
+  assert.match(
+    mobileAliases,
+    /<footer\s+v-if="!isAliasConfirmationPending\(alias\)"\s+class="mobile-record__actions mobile-record__actions--three"/,
+  );
+
+  for (const signature of [
+    "async function rotateKey",
+    "async function copyAliasDirectLink",
+    "async function toggleAlias",
+    "async function removeAlias",
+  ]) {
+    assert.match(
+      functionBody(source, signature),
+      /isAliasConfirmationPending\(alias\)/,
+      `${signature} must reject a pending alias`,
+    );
+  }
+
   const acknowledge = functionBody(
     source,
     "async function acknowledgeAndCloseBatchSecrets",
   );
   assert.match(acknowledge, /clearAliasAutoCreationKeys\(/);
-  assert.match(acknowledge, /aliasIds/);
+  assert.match(acknowledge, /aliasIDAcknowledgementBatches\(aliasIds\)/);
+  assert.match(acknowledge, /for \(const aliasIDBatch of aliasIDBatches\)/);
   assert.match(acknowledge, /clearBatchSecrets\(\)/);
+
+  const batchBody = functionBody(
+    source,
+    "function aliasIDAcknowledgementBatches",
+  );
+  const aliasIDAcknowledgementBatches = Function(
+    "AUTO_CREATION_KEY_ACK_BATCH_SIZE",
+    `"use strict"; return function (aliasIds) ${batchBody}`,
+  )(1000);
+  const moreThanOneBatch = Array.from({ length: 1001 }, (_, index) => index + 1);
+  const batches = aliasIDAcknowledgementBatches(moreThanOneBatch);
+  assert.deepEqual(
+    batches.map((batch) => batch.length),
+    [1000, 1],
+  );
+  assert.deepEqual(batches.flat(), moreThanOneBatch);
 
   const dismiss = functionBody(source, "function dismissBatchSecrets");
   assert.doesNotMatch(dismiss, /clearAliasAutoCreationKeys\(/);

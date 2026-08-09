@@ -4,7 +4,9 @@ package autocreate
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -14,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"icloud-api/internal/apple"
 	"icloud-api/internal/domain"
 )
 
@@ -27,9 +30,11 @@ const (
 	// CycleDuration is the duration covered by one generated plan.
 	CycleDuration = time.Hour
 
-	defaultPollInterval = 30 * time.Second
-	defaultOverdueGrace = 2 * time.Minute
-	maxErrorRunes       = 240
+	defaultPollInterval                  = 30 * time.Second
+	defaultOverdueGrace                  = 2 * time.Minute
+	maxErrorRunes                        = 240
+	maxAppleOperationLength              = 96
+	appleServiceCodeFingerprintHexLength = 16
 )
 
 const minimumCycleDuration = MinimumInterval * CreationsPerCycle
@@ -374,7 +379,7 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 				m.logScheduleError("达到容量上限后关闭自动创建失败", schedule.AccountID)
 			}
 		}
-		m.logScheduleError("自动创建隐私邮箱失败", schedule.AccountID)
+		m.logCreationError(schedule.AccountID, createErr)
 		return
 	}
 	if err := m.repo.RecordAliasCreationSuccess(ctx, schedule.AccountID, attemptedAt, address); err != nil {
@@ -556,4 +561,56 @@ func (m *Manager) logScheduleError(message string, accountID int64) {
 	// Deliberately omit upstream errors and alias addresses: Apple errors can
 	// echo request data, and an address is user data rather than diagnostics.
 	m.logger.Warn(message, "account_id", accountID)
+}
+
+func (m *Manager) logCreationError(accountID int64, err error) {
+	attributes := []any{"account_id", accountID}
+	var upstream *apple.Error
+	if errors.As(err, &upstream) && upstream != nil {
+		attributes = append(attributes,
+			"operation", safeAppleOperation(upstream.Op),
+			"http_status", upstream.StatusCode,
+		)
+		if fingerprint, ok := appleServiceCodeFingerprint(upstream.ServiceCode); ok {
+			attributes = append(attributes,
+				"service_code_present", true,
+				"service_code_fingerprint", fingerprint,
+			)
+		}
+		attributes = append(attributes, "retryable", upstream.Retryable)
+	}
+	m.logger.Warn("自动创建隐私邮箱失败", attributes...)
+}
+
+func safeAppleOperation(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxAppleOperationLength || !isSafeAppleOperation(value) {
+		return "unknown"
+	}
+	return value
+}
+
+func appleServiceCodeFingerprint(value string) (string, bool) {
+	if value == "" {
+		return "", false
+	}
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])[:appleServiceCodeFingerprintHexLength], true
+}
+
+func isSafeAppleOperation(value string) bool {
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' ||
+			character == '_' || character == '-' || character == '.' {
+			continue
+		}
+		if character == ' ' || character == '/' || character == ':' {
+			continue
+		}
+		return false
+	}
+	return true
 }

@@ -36,12 +36,17 @@
               <td data-label="隐私邮箱"><strong>{{.Address}}</strong>{{if .Label}}<small>{{.Label}}</small>{{end}}</td>
               <td data-label="API Key"><code>{{.APIKeyPrefix}}…</code></td>
               <td data-label="最新邮件">{{timefmt .LatestReceivedAt}}</td>
+              {{if and (not .Enabled) (eq .LastSyncError "APPLE_ALIAS_CONFIRMATION_PENDING")}}
+              <td data-label="状态"><span class="status status-pending">等待目录确认</span></td>
+              <td data-label="操作" class="actions"><small>确认前不可操作</small></td>
+              {{else}}
               <td data-label="状态" data-sync-status-cell data-sync-details>{{template "alias-status" .}}</td>
               <td data-label="操作" class="actions"><div class="button-row">
                 <form method="post" action="/admin/aliases/{{.ID}}/rotate"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small" type="submit" data-confirm="轮换后旧 Key 会立即失效。继续吗？">轮换 Key</button></form>
                 <form method="post" action="/admin/aliases/{{.ID}}/toggle"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small" type="submit">{{if .Enabled}}停用{{else}}启用{{end}}</button></form>
                 <form method="post" action="/admin/aliases/{{.ID}}/delete"><input type="hidden" name="csrf_token" value="{{$.CSRF}}"><button class="button button-small button-danger" type="submit" data-confirm="删除后该地址的 API Key 和最新邮件都会清除。继续吗？">删除</button></form>
               </div></td>
+              {{end}}
             </tr>{{end}}</tbody>
           </table>
         </div>

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -122,6 +123,73 @@ func TestAdminAliasPagesRenderPerAliasSyncStatus(t *testing.T) {
 				t.Fatalf("disabled alias also rendered a normal status: %s", disabledRow)
 			}
 		})
+	}
+}
+
+func TestLegacyPendingAliasIsLockedUntilDirectoryConfirmation(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	account := env.createAccount(t, "Pending Confirmation", "pending-confirmation@icloud.com", "encrypted")
+	session := env.createAdminSession(t)
+	pending, _, err := env.store.CreateAliasWithPendingAPIKey(
+		context.Background(),
+		domain.AppleWebSession{
+			AccountID:     account.ID,
+			Ciphertext:    "as1.legacy-pending-test",
+			AppleID:       account.Email,
+			Region:        "global",
+			Authenticated: true,
+		},
+		domain.Alias{
+			AccountID:    account.ID,
+			Address:      "legacy-pending@privaterelay.appleid.com",
+			Label:        "自动创建",
+			APIKeyHash:   secure.HashToken("legacy-pending-key"),
+			APIKeyPrefix: "icm_pending",
+			Enabled:      false,
+		},
+		"ak1.legacy-pending-test",
+	)
+	if err != nil {
+		t.Fatalf("create pending alias: %v", err)
+	}
+
+	accountPath := fmt.Sprintf("/admin/accounts/%d", account.ID)
+	response := env.request(t, http.MethodGet, accountPath, nil, []*http.Cookie{session})
+	if response.Code != http.StatusOK {
+		t.Fatalf("GET pending alias page status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	pendingRow := aliasStatusTableRow(t, response.Body.String(), pending.Address)
+	assertAliasStatusFragment(t, pendingRow, `status-pending">等待目录确认</span>`)
+	assertAliasStatusFragment(t, pendingRow, "确认前不可操作")
+	for _, forbidden := range []string{"data-sync-status-cell", "/rotate", "/toggle", "/delete"} {
+		if strings.Contains(pendingRow, forbidden) {
+			t.Fatalf("pending alias row exposed %q: %s", forbidden, pendingRow)
+		}
+	}
+
+	form := url.Values{"csrf_token": {testSessionCSRF}}
+	for name, suffix := range map[string]string{
+		"rotate key": "/rotate",
+		"enable":     "/toggle",
+		"delete":     "/delete",
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := env.request(t, http.MethodPost, fmt.Sprintf("/admin/aliases/%d%s", pending.ID, suffix), form, []*http.Cookie{session})
+			if response.Code != http.StatusConflict {
+				t.Fatalf("pending alias mutation status = %d, want %d; body=%s", response.Code, http.StatusConflict, response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), "正在等待 Apple 目录确认，暂时不能轮换 Key、启用或删除") {
+				t.Fatalf("pending alias conflict omitted actionable message: %s", response.Body.String())
+			}
+		})
+	}
+
+	unchanged, err := env.store.GetAlias(context.Background(), pending.ID)
+	if err != nil {
+		t.Fatalf("reload pending alias: %v", err)
+	}
+	if unchanged.Enabled || unchanged.LastSyncError != domain.AppleAliasConfirmationPending || string(unchanged.APIKeyHash) != string(pending.APIKeyHash) {
+		t.Fatalf("pending alias changed after rejected legacy mutations: before=%#v after=%#v", pending, unchanged)
 	}
 }
 

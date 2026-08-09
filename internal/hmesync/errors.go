@@ -5,32 +5,37 @@ import (
 	"errors"
 
 	"icloud-api/internal/apple"
+	"icloud-api/internal/domain"
 )
 
 const (
-	CodeLoginRequired          = "APPLE_LOGIN_REQUIRED"
-	CodeSessionExpired         = "APPLE_SESSION_EXPIRED"
-	CodeCredentialsInvalid     = "APPLE_CREDENTIALS_INVALID"
-	CodeVerificationInvalid    = "APPLE_VERIFICATION_INVALID"
-	CodeFlowExpired            = "APPLE_FLOW_EXPIRED"
-	CodeRateLimited            = "APPLE_RATE_LIMITED"
-	CodeUpstreamError          = "APPLE_UPSTREAM_ERROR"
-	CodeAccountMismatch        = "APPLE_ACCOUNT_MISMATCH"
-	CodeAccountChanged         = "ACCOUNT_CHANGED"
-	CodeAliasOwnershipConflict = "ALIAS_OWNERSHIP_CONFLICT"
+	CodeLoginRequired            = "APPLE_LOGIN_REQUIRED"
+	CodeSessionExpired           = "APPLE_SESSION_EXPIRED"
+	CodeCredentialsInvalid       = "APPLE_CREDENTIALS_INVALID"
+	CodeVerificationInvalid      = "APPLE_VERIFICATION_INVALID"
+	CodeFlowExpired              = "APPLE_FLOW_EXPIRED"
+	CodeAccountActionRequired    = "APPLE_ACCOUNT_ACTION_REQUIRED"
+	CodeRateLimited              = "APPLE_RATE_LIMITED"
+	CodeUpstreamError            = "APPLE_UPSTREAM_ERROR"
+	CodeAliasConfirmationPending = domain.AppleAliasConfirmationPending
+	CodeAccountMismatch          = "APPLE_ACCOUNT_MISMATCH"
+	CodeAccountChanged           = "ACCOUNT_CHANGED"
+	CodeAliasOwnershipConflict   = "ALIAS_OWNERSHIP_CONFLICT"
 )
 
 var (
-	ErrLoginRequired          = errors.New("Apple login required")
-	ErrSessionExpired         = errors.New("Apple session expired")
-	ErrCredentialsInvalid     = errors.New("Apple credentials invalid")
-	ErrVerificationInvalid    = errors.New("Apple verification code invalid")
-	ErrFlowExpired            = errors.New("Apple verification flow expired")
-	ErrRateLimited            = errors.New("Apple request rate limited")
-	ErrUpstream               = errors.New("Apple upstream request failed")
-	ErrAccountMismatch        = errors.New("Apple account does not own this mailbox")
-	ErrAccountChanged         = errors.New("account identity changed during Apple operation")
-	ErrAliasOwnershipConflict = errors.New("alias belongs to another account")
+	ErrLoginRequired            = errors.New("Apple login required")
+	ErrSessionExpired           = errors.New("Apple session expired")
+	ErrCredentialsInvalid       = errors.New("Apple credentials invalid")
+	ErrVerificationInvalid      = errors.New("Apple verification code invalid")
+	ErrFlowExpired              = errors.New("Apple verification flow expired")
+	ErrAccountActionRequired    = errors.New("Apple account action required")
+	ErrRateLimited              = errors.New("Apple request rate limited")
+	ErrUpstream                 = errors.New("Apple upstream request failed")
+	ErrAliasConfirmationPending = errors.New("Apple alias confirmation pending")
+	ErrAccountMismatch          = errors.New("Apple account does not own this mailbox")
+	ErrAccountChanged           = errors.New("account identity changed during Apple operation")
+	ErrAliasOwnershipConflict   = errors.New("alias belongs to another account")
 )
 
 type codedError struct {
@@ -73,6 +78,8 @@ func mapAppleError(err error, duringVerification bool) error {
 		return wrapError(CodeCredentialsInvalid, ErrCredentialsInvalid, err)
 	case errors.Is(err, apple.ErrTwoFactorCode):
 		return wrapError(CodeVerificationInvalid, ErrVerificationInvalid, err)
+	case errors.Is(err, apple.ErrTermsRequired):
+		return wrapError(CodeAccountActionRequired, ErrAccountActionRequired, err)
 	}
 	var upstream *apple.Error
 	if errors.As(err, &upstream) && upstream.StatusCode == 429 {

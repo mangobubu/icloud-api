@@ -156,6 +156,38 @@ func adminAPITestErrorCode(t *testing.T, response *httptest.ResponseRecorder) st
 	return payload.Error.Code
 }
 
+func TestAdminAPIAliasDTOWithholdsPendingConfirmationDirectLink(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	alias := domain.Alias{
+		ID:             17,
+		AccountID:      9,
+		Address:        "pending-link@icloud.com",
+		APIKeyHash:     secure.HashToken("pending-link-key"),
+		APIKeyPrefix:   "icm_pending",
+		Enabled:        false,
+		LastSyncStatus: domain.SyncStatusPending,
+		LastSyncError:  domain.AppleAliasConfirmationPending,
+	}
+
+	pendingDTO, err := env.server.adminAPIAliasFromDomain(alias)
+	if err != nil {
+		t.Fatalf("build pending alias DTO: %v", err)
+	}
+	if pendingDTO.DirectLinkPath != "" {
+		t.Fatalf("pending alias direct link = %q, want empty", pendingDTO.DirectLinkPath)
+	}
+
+	alias.Enabled = true
+	alias.LastSyncError = ""
+	confirmedDTO, err := env.server.adminAPIAliasFromDomain(alias)
+	if err != nil {
+		t.Fatalf("build confirmed alias DTO: %v", err)
+	}
+	if !strings.Contains(confirmedDTO.DirectLinkPath, "/api/v1/mail/recent?") {
+		t.Fatalf("confirmed alias direct link = %q", confirmedDTO.DirectLinkPath)
+	}
+}
+
 func TestAdminAPISyncAccountReturnsAcceptedForPendingBatch(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	sessionCookie, csrf, _ := env.createSession(t, "sync-pending-admin", "sync pending password")
@@ -451,6 +483,64 @@ func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T
 	deleteAccount := env.request(t, http.MethodDelete, accountPath, nil, "", []*http.Cookie{sessionCookie}, csrf)
 	if deleteAccount.Code != http.StatusNoContent {
 		t.Fatalf("delete account status = %d; body=%s", deleteAccount.Code, deleteAccount.Body.String())
+	}
+}
+
+func TestAdminAPIPendingAliasMutationsReturnConflict(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "pending-alias-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "pending-alias@icloud.com")
+	pending, _, err := env.store.CreateAliasWithPendingAPIKey(
+		context.Background(),
+		domain.AppleWebSession{
+			AccountID:     account.ID,
+			Ciphertext:    "as1.pending-alias-test",
+			AppleID:       account.Email,
+			Region:        "global",
+			Authenticated: true,
+		},
+		domain.Alias{
+			AccountID:    account.ID,
+			Address:      "pending@privaterelay.appleid.com",
+			Label:        "Awaiting confirmation",
+			APIKeyHash:   secure.HashToken("pending-alias-key"),
+			APIKeyPrefix: "icm_pending",
+			Enabled:      false,
+		},
+		"ak1.pending-alias-test",
+	)
+	if err != nil {
+		t.Fatalf("create pending alias: %v", err)
+	}
+
+	aliasPath := "/admin/api/v1/aliases/" + strconvFormatInt(pending.ID)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   []byte
+		typeID string
+	}{
+		{
+			name:   "enable",
+			method: http.MethodPatch,
+			path:   aliasPath,
+			body:   adminAPITestJSON(t, gin.H{"enabled": true}),
+			typeID: "application/json",
+		},
+		{name: "rotate key", method: http.MethodPost, path: aliasPath + "/rotate-key"},
+		{name: "delete", method: http.MethodDelete, path: aliasPath},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := env.request(t, test.method, test.path, test.body, test.typeID, []*http.Cookie{sessionCookie}, csrf)
+			if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "ALIAS_CONFIRMATION_PENDING" {
+				t.Fatalf("pending alias response = %d; body=%s", response.Code, response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), "正在等待 Apple 目录确认") {
+				t.Fatalf("pending alias response omitted actionable message: %s", response.Body.String())
+			}
+		})
 	}
 }
 

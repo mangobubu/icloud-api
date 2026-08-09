@@ -677,6 +677,290 @@ func TestUpdateAccountRejectsIdentityChangeAfterAliasCreation(t *testing.T) {
 	}
 }
 
+func TestPendingAliasRejectsGenericMutations(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context, *store.Store, domain.Alias) error
+	}{
+		{
+			name: "update metadata",
+			run: func(ctx context.Context, db *store.Store, alias domain.Alias) error {
+				alias.Label = "changed label"
+				_, err := db.UpdateAlias(ctx, alias)
+				return err
+			},
+		},
+		{
+			name: "enable",
+			run: func(ctx context.Context, db *store.Store, alias domain.Alias) error {
+				return db.SetAliasEnabled(ctx, alias.ID, true)
+			},
+		},
+		{
+			name: "delete",
+			run: func(ctx context.Context, db *store.Store, alias domain.Alias) error {
+				return db.DeleteAlias(ctx, alias.ID)
+			},
+		},
+		{
+			name: "rotate api key",
+			run: func(ctx context.Context, db *store.Store, alias domain.Alias) error {
+				_, err := db.RotateAliasAPIKey(ctx, alias.ID, []byte("replacement-hash"), "replacement")
+				return err
+			},
+		},
+		{
+			name: "reset snapshot",
+			run: func(ctx context.Context, db *store.Store, alias domain.Alias) error {
+				return db.ResetAliasSnapshot(ctx, alias.ID)
+			},
+		},
+		{
+			name: "update sync status",
+			run: func(ctx context.Context, db *store.Store, alias domain.Alias) error {
+				return db.UpdateAliasSyncStatus(ctx, alias.ID, domain.SyncStatusOK, "", nil)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestStore(t)
+			account := createAccount(t, ctx, db, "Pending guard", "pending-guard@icloud.com")
+			pending := createPendingConfirmationAlias(
+				t, ctx, db, account.ID, "pending-guard-alias@icloud.com",
+			)
+			at := time.Date(2026, 8, 9, 1, 0, 0, 0, time.UTC)
+			mustUpsert(t, ctx, db, domain.LatestMessage{
+				AliasID: pending.ID, UIDValidity: 71, UID: 29, Subject: "pending snapshot",
+				InternalDate: at, SyncedAt: at,
+			})
+			before, err := db.GetAlias(ctx, pending.ID)
+			if err != nil {
+				t.Fatalf("get pending alias before mutation: %v", err)
+			}
+
+			if err := tt.run(ctx, db, before); !errors.Is(err, store.ErrAliasConfirmationPending) {
+				t.Fatalf("pending alias mutation error = %v, want ErrAliasConfirmationPending", err)
+			}
+
+			after, err := db.GetAlias(ctx, pending.ID)
+			if err != nil {
+				t.Fatalf("get pending alias after rejected mutation: %v", err)
+			}
+			assertPendingAliasUnchanged(t, before, after)
+			assertLatestSubject(t, ctx, db, pending.ID, "pending snapshot", 71, 29)
+		})
+	}
+}
+
+func TestPendingAliasMarkerSurvivesAccountWideResets(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(context.Context, *store.Store, domain.Account) error
+	}{
+		{
+			name: "account source update",
+			run: func(ctx context.Context, db *store.Store, account domain.Account) error {
+				account.PasswordCiphertext = "rotated-password"
+				_, err := db.UpdateAccount(ctx, account)
+				return err
+			},
+		},
+		{
+			name: "account snapshot reset",
+			run: func(ctx context.Context, db *store.Store, account domain.Account) error {
+				return db.ResetAccountAliasSnapshots(ctx, account.ID)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openTestStore(t)
+			account := createAccount(t, ctx, db, "Pending reset", "pending-reset@icloud.com")
+			normal := createAlias(t, ctx, db, account.ID, "normal-reset@icloud.com", []byte("normal-reset-hash"))
+			pending := createPendingConfirmationAlias(
+				t, ctx, db, account.ID, "pending-reset-alias@icloud.com",
+			)
+			at := time.Date(2026, 8, 9, 2, 0, 0, 0, time.UTC)
+			if err := db.UpdateAliasSyncStatus(
+				ctx, normal.ID, domain.SyncStatusError, domain.AppleAliasConfirmationPending, &at,
+			); err != nil {
+				t.Fatalf("seed normal alias status: %v", err)
+			}
+			mustUpsert(t, ctx, db, domain.LatestMessage{
+				AliasID: pending.ID, UIDValidity: 72, UID: 30, Subject: "reserved snapshot",
+				InternalDate: at, SyncedAt: at,
+			})
+			before, err := db.GetAlias(ctx, pending.ID)
+			if err != nil {
+				t.Fatalf("get pending alias before account reset: %v", err)
+			}
+
+			if err := tt.run(ctx, db, account); err != nil {
+				t.Fatalf("run account-wide reset: %v", err)
+			}
+
+			after, err := db.GetAlias(ctx, pending.ID)
+			if err != nil {
+				t.Fatalf("get pending alias after account reset: %v", err)
+			}
+			assertPendingAliasUnchanged(t, before, after)
+			assertLatestSubject(t, ctx, db, pending.ID, "reserved snapshot", 72, 30)
+
+			resetNormal, err := db.GetAlias(ctx, normal.ID)
+			if err != nil {
+				t.Fatalf("get normal alias after account reset: %v", err)
+			}
+			if resetNormal.LastSyncStatus != domain.SyncStatusPending || resetNormal.LastSyncError != "" {
+				t.Fatalf("normal alias was not reset: %#v", resetNormal)
+			}
+		})
+	}
+}
+
+func TestConfirmationMarkerCannotBeForgedByOrdinaryAliasWrites(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Marker guard", "marker-guard@icloud.com")
+	disabled, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID: account.ID, Address: "disabled-marker-guard@icloud.com", Label: "disabled",
+		APIKeyHash: []byte("disabled-marker-guard-hash"), APIKeyPrefix: "disabled", Enabled: false,
+	})
+	if err != nil {
+		t.Fatalf("create disabled alias: %v", err)
+	}
+	if err := db.UpdateAliasSyncStatus(
+		ctx, disabled.ID, domain.SyncStatusError, domain.AppleAliasConfirmationPending, nil,
+	); !errors.Is(err, store.ErrAliasConfirmationPending) {
+		t.Fatalf("forge marker through sync status = %v", err)
+	}
+	if _, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID: account.ID, Address: "created-marker-guard@icloud.com", Label: "created",
+		APIKeyHash: []byte("created-marker-guard-hash"), APIKeyPrefix: "created", Enabled: false,
+		LastSyncError: domain.AppleAliasConfirmationPending,
+	}); !errors.Is(err, store.ErrAliasConfirmationPending) {
+		t.Fatalf("forge marker through ordinary creation = %v", err)
+	}
+
+	enabled := createAlias(t, ctx, db, account.ID, "enabled-marker-guard@icloud.com", []byte("enabled-marker-guard-hash"))
+	if err := db.UpdateAliasSyncStatus(
+		ctx, enabled.ID, domain.SyncStatusError, domain.AppleAliasConfirmationPending, nil,
+	); err != nil {
+		t.Fatalf("seed enabled marker collision: %v", err)
+	}
+	if err := db.SetAliasEnabled(ctx, enabled.ID, false); err != nil {
+		t.Fatalf("disable enabled marker collision: %v", err)
+	}
+	stored, err := db.GetAlias(ctx, enabled.ID)
+	if err != nil {
+		t.Fatalf("read disabled marker collision: %v", err)
+	}
+	if stored.Enabled || stored.LastSyncError != "" {
+		t.Fatalf("disabled marker collision retained reserved state: %#v", stored)
+	}
+}
+
+func TestUpdateAliasSyncStatusCannotRaceDisableIntoReservedState(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	db, err := store.Open(filepath.Join(t.TempDir(), "sync-status-marker-race.db"))
+	if err != nil {
+		t.Fatalf("open marker race store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close marker race store: %v", err)
+		}
+	})
+	account := createAccount(t, ctx, db, "Marker race", "marker-race@icloud.com")
+	alias := createAlias(t, ctx, db, account.ID, "marker-race-alias@icloud.com", []byte("marker-race-hash"))
+
+	disableTx, err := db.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin concurrent disable: %v", err)
+	}
+	defer func() { _ = disableTx.Rollback() }()
+	if _, err := disableTx.ExecContext(ctx, `UPDATE aliases SET enabled = FALSE WHERE id = ?`, alias.ID); err != nil {
+		t.Fatalf("stage concurrent disable: %v", err)
+	}
+
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		close(started)
+		result <- db.UpdateAliasSyncStatus(
+			ctx,
+			alias.ID,
+			domain.SyncStatusError,
+			domain.AppleAliasConfirmationPending,
+			nil,
+		)
+	}()
+	<-started
+	// Let the status writer reach SQLite while the disabling transaction owns
+	// the write lock. After commit, its state predicate must observe disabled.
+	time.Sleep(200 * time.Millisecond)
+	if err := disableTx.Commit(); err != nil {
+		t.Fatalf("commit concurrent disable: %v", err)
+	}
+
+	select {
+	case updateErr := <-result:
+		if !errors.Is(updateErr, store.ErrAliasConfirmationPending) {
+			t.Fatalf("racing marker update error = %v, want ErrAliasConfirmationPending", updateErr)
+		}
+	case <-ctx.Done():
+		t.Fatalf("racing marker update did not finish: %v", ctx.Err())
+	}
+
+	stored, err := db.GetAlias(context.Background(), alias.ID)
+	if err != nil {
+		t.Fatalf("read alias after marker race: %v", err)
+	}
+	if stored.Enabled || stored.LastSyncError == domain.AppleAliasConfirmationPending {
+		t.Fatalf("marker race created reserved state without pending key: %#v", stored)
+	}
+}
+
+func TestPendingAliasReservesFinalEnabledCapacity(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Pending capacity", "pending-capacity@icloud.com")
+	insertEnabledAliasFixtures(t, ctx, db, account.ID, domain.MaxEnabledAliasesPerAccount-1)
+	pending := createPendingConfirmationAlias(
+		t, ctx, db, account.ID, "pending-capacity-alias@icloud.com",
+	)
+
+	if _, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID: account.ID, Address: "enabled-after-pending@icloud.com",
+		APIKeyHash: []byte("enabled-after-pending-hash"), APIKeyPrefix: "enabled", Enabled: true,
+	}); !errors.Is(err, store.ErrAliasLimit) {
+		t.Fatalf("enabled alias after reserved pending slot error = %v, want ErrAliasLimit", err)
+	}
+	disabled, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID: account.ID, Address: "disabled-after-pending@icloud.com",
+		APIKeyHash: []byte("disabled-after-pending-hash"), APIKeyPrefix: "disabled", Enabled: false,
+	})
+	if err != nil {
+		t.Fatalf("create disabled alias after reserved pending slot: %v", err)
+	}
+	if err := db.SetAliasEnabled(ctx, disabled.ID, true); !errors.Is(err, store.ErrAliasLimit) {
+		t.Fatalf("enable alias after reserved pending slot error = %v, want ErrAliasLimit", err)
+	}
+	storedPending, err := db.GetAlias(ctx, pending.ID)
+	if err != nil || storedPending.LastSyncError != domain.AppleAliasConfirmationPending {
+		t.Fatalf("reserved pending alias = %#v, err=%v", storedPending, err)
+	}
+	assertAliasCounts(
+		t, ctx, db, account.ID,
+		domain.MaxEnabledAliasesPerAccount+1, domain.MaxEnabledAliasesPerAccount-1,
+	)
+}
+
 func TestEnabledAliasLimitIsEnforcedOnCreateAndReenable(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -938,6 +1222,46 @@ func createAlias(
 		t.Fatalf("create alias %q: %v", address, err)
 	}
 	return alias
+}
+
+func createPendingConfirmationAlias(
+	t *testing.T,
+	ctx context.Context,
+	db *store.Store,
+	accountID int64,
+	address string,
+) domain.Alias {
+	t.Helper()
+	alias, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID: accountID, Address: address, Label: address,
+		APIKeyHash: []byte("pending-confirmation-hash"), APIKeyPrefix: "pending", Enabled: false,
+	})
+	if err != nil {
+		t.Fatalf("create pending confirmation alias %q: %v", address, err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		UPDATE aliases SET last_sync_error = ? WHERE id = ?`,
+		domain.AppleAliasConfirmationPending, alias.ID,
+	); err != nil {
+		t.Fatalf("mark alias %q as confirmation pending: %v", address, err)
+	}
+	alias, err = db.GetAlias(ctx, alias.ID)
+	if err != nil {
+		t.Fatalf("get pending confirmation alias %q: %v", address, err)
+	}
+	return alias
+}
+
+func assertPendingAliasUnchanged(t *testing.T, before, after domain.Alias) {
+	t.Helper()
+	if after.ID != before.ID || after.AccountID != before.AccountID ||
+		after.Address != before.Address || after.Label != before.Label ||
+		!bytes.Equal(after.APIKeyHash, before.APIKeyHash) || after.APIKeyPrefix != before.APIKeyPrefix ||
+		after.Enabled != before.Enabled || after.LastSyncStatus != before.LastSyncStatus ||
+		after.LastSyncError != domain.AppleAliasConfirmationPending ||
+		!after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("pending alias changed: before=%#v after=%#v", before, after)
+	}
 }
 
 func mustUpsert(t *testing.T, ctx context.Context, db *store.Store, message domain.LatestMessage) {

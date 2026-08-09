@@ -547,6 +547,36 @@ func TestImportAliasesPreservesAllAliasesAtEnabledCapacity(t *testing.T) {
 	})
 }
 
+func TestImportAliasesCountsPendingConfirmationAsReservedCapacity(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Pending import capacity", "pending-import-capacity@icloud.com")
+	insertEnabledAliasFixtures(t, ctx, db, account.ID, domain.MaxEnabledAliasesPerAccount-1)
+	createPendingConfirmationAlias(
+		t, ctx, db, account.ID, "pending-import-capacity-alias@icloud.com",
+	)
+
+	result, err := db.ImportAliases(ctx, account.ID, []domain.AliasImportCandidate{
+		importCandidate("active-after-pending@icloud.com", "active-after-pending", true),
+		importCandidate("inactive-after-pending@icloud.com", "inactive-after-pending", false),
+	})
+	if err != nil {
+		t.Fatalf("import aliases after reserved pending slot: %v", err)
+	}
+	if len(result.Created) != 2 || result.ImportedDisabledCount != 1 {
+		t.Fatalf("import result = %#v, want two disabled aliases and one capacity-disabled active alias", result)
+	}
+	for _, alias := range result.Created {
+		if alias.Enabled {
+			t.Fatalf("imported alias %q consumed a reserved pending slot", alias.Address)
+		}
+	}
+	assertAliasCounts(
+		t, ctx, db, account.ID,
+		domain.MaxEnabledAliasesPerAccount+2, domain.MaxEnabledAliasesPerAccount-1,
+	)
+}
+
 func TestImportAliasesStoresCompleteListBeyondEnabledCapacity(t *testing.T) {
 	t.Parallel()
 

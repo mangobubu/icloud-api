@@ -3,6 +3,7 @@ package apple
 import (
 	"errors"
 	"fmt"
+	"net/http"
 )
 
 var (
@@ -64,7 +65,11 @@ func operationError(op string, kind error, status int, cause error) error {
 		Op:         op,
 		Kind:       kind,
 		StatusCode: status,
-		Retryable:  status == 0 || status == 429 || status >= 500,
+		Retryable:  retryableStatus(status) || (status == 0 && kind == ErrService && cause != nil),
 		Err:        cause,
 	}
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
 }

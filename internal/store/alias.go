@@ -30,6 +30,10 @@ func (s *Store) CreateAlias(ctx context.Context, alias domain.Alias) (domain.Ali
 	if status == "" {
 		status = domain.SyncStatusPending
 	}
+	syncError := strings.TrimSpace(sanitizePostgresText(alias.LastSyncError))
+	if !alias.Enabled && syncError == domain.AppleAliasConfirmationPending {
+		return domain.Alias{}, fmt.Errorf("create alias: reserved confirmation marker: %w", ErrAliasConfirmationPending)
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return domain.Alias{}, fmt.Errorf("begin alias creation: %w", err)
@@ -55,7 +59,7 @@ func (s *Store) CreateAlias(ctx context.Context, alias domain.Alias) (domain.Ali
 		alias.AccountID, domain.NormalizeEmail(sanitizePostgresText(alias.Address)),
 		strings.TrimSpace(sanitizePostgresText(alias.Label)),
 		alias.APIKeyHash, strings.TrimSpace(sanitizePostgresText(alias.APIKeyPrefix)), alias.Enabled,
-		status, strings.TrimSpace(sanitizePostgresText(alias.LastSyncError)), nullableTimestamp(alias.LastSyncedAt),
+		status, syncError, nullableTimestamp(alias.LastSyncedAt),
 		nullableTimestamp(alias.LastAccessedAt), timestamp(now), timestamp(now),
 	).Scan(&id)
 	if err != nil {
@@ -158,13 +162,18 @@ func (s *Store) listAliases(ctx context.Context, enabledOnly bool, accountIDs ..
 
 func (s *Store) DeleteAlias(ctx context.Context, id int64) error {
 	var accountID int64
+	var enabled bool
+	var lastSyncError string
 	if err := s.queryRowContext(ctx,
-		`SELECT account_id FROM aliases WHERE id = ?`, id,
-	).Scan(&accountID); err != nil {
+		`SELECT account_id, enabled, last_sync_error FROM aliases WHERE id = ?`, id,
+	).Scan(&accountID, &enabled, &lastSyncError); err != nil {
 		if err == sql.ErrNoRows {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read alias account before delete: %w", err)
+	}
+	if !enabled && lastSyncError == domain.AppleAliasConfirmationPending {
+		return fmt.Errorf("delete alias: %w", ErrAliasConfirmationPending)
 	}
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
@@ -176,14 +185,18 @@ func (s *Store) DeleteAlias(ctx context.Context, id int64) error {
 	if err != nil {
 		return fmt.Errorf("lock alias account before delete: %w", err)
 	}
-	var enabled bool
+	var currentEnabled bool
+	var currentLastSyncError string
 	if err := s.txQueryRowContext(ctx, tx,
-		`SELECT enabled FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
-	).Scan(&enabled); err != nil {
+		`SELECT enabled, last_sync_error FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
+	).Scan(&currentEnabled, &currentLastSyncError); err != nil {
 		if err == sql.ErrNoRows {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read alias state before delete: %w", err)
+	}
+	if !currentEnabled && currentLastSyncError == domain.AppleAliasConfirmationPending {
+		return fmt.Errorf("delete alias: %w", ErrAliasConfirmationPending)
 	}
 	result, err := s.txExecContext(ctx, tx,
 		`DELETE FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
@@ -194,7 +207,7 @@ func (s *Store) DeleteAlias(ctx context.Context, id int64) error {
 	if err := requireAffected(result, "alias"); err != nil {
 		return err
 	}
-	if enabled {
+	if currentEnabled {
 		if _, err := s.bumpAccountVersionTx(ctx, tx, accountID, accountVersion); err != nil {
 			return fmt.Errorf("advance account version after alias delete: %w", err)
 		}
@@ -214,11 +227,42 @@ func (s *Store) RotateAliasAPIKey(
 	if len(apiKeyHash) == 0 {
 		return domain.Alias{}, fmt.Errorf("rotate alias api key: hash is empty")
 	}
-	result, err := s.execContext(ctx, `
+	var accountID int64
+	if err := s.queryRowContext(ctx,
+		`SELECT account_id FROM aliases WHERE id = ?`, id,
+	).Scan(&accountID); err != nil {
+		if err == sql.ErrNoRows {
+			return domain.Alias{}, ErrNotFound
+		}
+		return domain.Alias{}, fmt.Errorf("read alias account before api key rotation: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("begin alias api key rotation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := s.lockAccountVersionForUpdate(ctx, tx, accountID); err != nil {
+		return domain.Alias{}, fmt.Errorf("lock alias account before api key rotation: %w", err)
+	}
+	var enabled bool
+	var lastSyncError string
+	if err := s.txQueryRowContext(ctx, tx,
+		`SELECT enabled, last_sync_error FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
+	).Scan(&enabled, &lastSyncError); err != nil {
+		if err == sql.ErrNoRows {
+			return domain.Alias{}, ErrNotFound
+		}
+		return domain.Alias{}, fmt.Errorf("read alias before api key rotation: %w", err)
+	}
+	if !enabled && lastSyncError == domain.AppleAliasConfirmationPending {
+		return domain.Alias{}, fmt.Errorf("rotate alias api key: %w", ErrAliasConfirmationPending)
+	}
+	result, err := s.txExecContext(ctx, tx, `
 		UPDATE aliases
 		SET api_key_hash = ?, api_key_prefix = ?, updated_at = ?
-		WHERE id = ?`,
-		apiKeyHash, strings.TrimSpace(sanitizePostgresText(apiKeyPrefix)), timestamp(s.now()), id,
+		WHERE id = ? AND account_id = ?`,
+		apiKeyHash, strings.TrimSpace(sanitizePostgresText(apiKeyPrefix)), timestamp(s.now()), id, accountID,
 	)
 	if err != nil {
 		return domain.Alias{}, fmt.Errorf("rotate alias api key: %w", err)
@@ -226,7 +270,19 @@ func (s *Store) RotateAliasAPIKey(
 	if err := requireAffected(result, "alias"); err != nil {
 		return domain.Alias{}, err
 	}
-	return s.getAliasAfterWrite(id)
+	if _, err := s.txExecContext(ctx, tx,
+		`DELETE FROM pending_alias_api_keys WHERE alias_id = ?`, id,
+	); err != nil {
+		return domain.Alias{}, fmt.Errorf("delete stale pending alias key after rotation: %w", err)
+	}
+	rotated, err := s.getAliasByIDTx(ctx, tx, id)
+	if err != nil {
+		return domain.Alias{}, fmt.Errorf("read alias after api key rotation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Alias{}, fmt.Errorf("commit alias api key rotation: %w", err)
+	}
+	return rotated, nil
 }
 
 func (s *Store) getAliasAfterWrite(id int64) (domain.Alias, error) {
@@ -251,28 +307,53 @@ func (s *Store) TouchAliasLastAccessed(ctx context.Context, id int64, accessedAt
 }
 
 func (s *Store) UpdateAliasSyncStatus(ctx context.Context, id int64, status, syncError string, syncedAt *time.Time) error {
+	sanitizedError := sanitizePostgresText(syncError)
+	reservedMarkerRequested := strings.TrimSpace(sanitizedError) == domain.AppleAliasConfirmationPending
 	result, err := s.execContext(ctx, `
 		UPDATE aliases
 		SET last_sync_status = ?, last_sync_error = ?, last_synced_at = ?, updated_at = ?
-		WHERE id = ?`,
-		sanitizePostgresText(status), sanitizePostgresText(syncError),
+		WHERE id = ?
+		  AND NOT (enabled = FALSE AND last_sync_error = ?)
+		  AND (enabled = TRUE OR ? = FALSE)`,
+		sanitizePostgresText(status), sanitizedError,
 		nullableTimestamp(syncedAt), timestamp(s.now()), id,
+		domain.AppleAliasConfirmationPending, reservedMarkerRequested,
 	)
 	if err != nil {
 		return fmt.Errorf("update alias sync status: %w", err)
 	}
-	return requireAffected(result, "alias")
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read alias sync status update result: %w", err)
+	}
+	if affected != 0 {
+		return nil
+	}
+
+	var exists int
+	if err := s.queryRowContext(ctx, `SELECT 1 FROM aliases WHERE id = ?`, id).Scan(&exists); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return fmt.Errorf("read alias after rejected sync status update: %w", err)
+	}
+	return fmt.Errorf("update alias sync status: reserved confirmation marker: %w", ErrAliasConfirmationPending)
 }
 
 func (s *Store) ResetAliasSnapshot(ctx context.Context, id int64) error {
 	var accountID int64
+	var enabled bool
+	var lastSyncError string
 	if err := s.queryRowContext(ctx,
-		`SELECT account_id FROM aliases WHERE id = ?`, id,
-	).Scan(&accountID); err != nil {
+		`SELECT account_id, enabled, last_sync_error FROM aliases WHERE id = ?`, id,
+	).Scan(&accountID, &enabled, &lastSyncError); err != nil {
 		if err == sql.ErrNoRows {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read alias account before reset: %w", err)
+	}
+	if !enabled && lastSyncError == domain.AppleAliasConfirmationPending {
+		return fmt.Errorf("reset alias snapshot: %w", ErrAliasConfirmationPending)
 	}
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
@@ -340,15 +421,20 @@ func (s *Store) updateAliasState(ctx context.Context, id int64, label *string, e
 	}
 
 	var currentEnabled bool
+	var lastSyncError string
 	if err := s.txQueryRowContext(ctx, tx,
-		`SELECT enabled FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
-	).Scan(&currentEnabled); err != nil {
+		`SELECT enabled, last_sync_error FROM aliases WHERE id = ? AND account_id = ?`, id, accountID,
+	).Scan(&currentEnabled, &lastSyncError); err != nil {
 		if err == sql.ErrNoRows {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read alias state: %w", err)
 	}
+	if !currentEnabled && lastSyncError == domain.AppleAliasConfirmationPending {
+		return ErrAliasConfirmationPending
+	}
 	reenabled := enabled && !currentEnabled
+	clearReservedMarker := !enabled && currentEnabled && lastSyncError == domain.AppleAliasConfirmationPending
 	if reenabled {
 		if err := s.requireEnabledAliasCapacity(ctx, tx, accountID); err != nil {
 			return err
@@ -376,6 +462,8 @@ func (s *Store) updateAliasState(ctx context.Context, id int64, label *string, e
 			"last_synced_at = NULL",
 		)
 		args = append(args, domain.SyncStatusPending)
+	} else if clearReservedMarker {
+		updates = append(updates, "last_sync_error = ''")
 	}
 	updates = append(updates, "updated_at = ?")
 	args = append(args, timestamp(s.now()), id)
@@ -408,9 +496,12 @@ func (s *Store) updateAliasState(ctx context.Context, id int64, label *string, e
 func (s *Store) requireEnabledAliasCapacity(ctx context.Context, tx *sql.Tx, accountID int64) error {
 	var count int
 	if err := s.txQueryRowContext(ctx, tx, `
-		SELECT COUNT(*) FROM aliases WHERE account_id = ? AND enabled = TRUE`, accountID,
+		SELECT COUNT(*) FROM aliases
+		WHERE account_id = ?
+		  AND (enabled = TRUE OR (enabled = FALSE AND last_sync_error = ?))`,
+		accountID, domain.AppleAliasConfirmationPending,
 	).Scan(&count); err != nil {
-		return fmt.Errorf("count enabled aliases: %w", err)
+		return fmt.Errorf("count enabled and confirmation-pending aliases: %w", err)
 	}
 	if count >= domain.MaxEnabledAliasesPerAccount {
 		return ErrAliasLimit
@@ -433,13 +524,20 @@ func (s *Store) ResetAccountAliasSnapshots(ctx context.Context, accountID int64)
 	}
 	if _, err := s.txExecContext(ctx, tx, `
 		DELETE FROM latest_messages
-		WHERE alias_id IN (SELECT id FROM aliases WHERE account_id = ?)`, accountID); err != nil {
+		WHERE alias_id IN (
+			SELECT id FROM aliases
+			WHERE account_id = ?
+			  AND NOT (enabled = FALSE AND last_sync_error = ?)
+		)`, accountID, domain.AppleAliasConfirmationPending); err != nil {
 		return fmt.Errorf("delete account snapshots: %w", err)
 	}
 	if _, err := s.txExecContext(ctx, tx, `
 		UPDATE aliases
 		SET last_sync_status = ?, last_sync_error = '', last_synced_at = NULL, updated_at = ?
-		WHERE account_id = ?`, domain.SyncStatusPending, timestamp(s.now()), accountID); err != nil {
+		WHERE account_id = ?
+		  AND NOT (enabled = FALSE AND last_sync_error = ?)`,
+		domain.SyncStatusPending, timestamp(s.now()), accountID,
+		domain.AppleAliasConfirmationPending); err != nil {
 		return fmt.Errorf("reset account alias statuses: %w", err)
 	}
 	nextAccountVersion, err := s.nextAccountVersion(accountVersion)

@@ -227,15 +227,18 @@ func adminAPIAccountFromDomain(account domain.Account) adminAPIAccountDTO {
 }
 
 func (s *Server) adminAPIAliasFromDomain(alias domain.Alias) (adminAPIAliasDTO, error) {
-	token, err := s.cipher.DirectLinkToken(alias.ID, alias.APIKeyHash)
-	if err != nil {
-		return adminAPIAliasDTO{}, fmt.Errorf("生成隐私邮箱直达链接: %w", err)
+	directLinkPath := ""
+	if !adminAPIAliasConfirmationPending(alias) {
+		token, err := s.cipher.DirectLinkToken(alias.ID, alias.APIKeyHash)
+		if err != nil {
+			return adminAPIAliasDTO{}, fmt.Errorf("生成隐私邮箱直达链接: %w", err)
+		}
+		query := url.Values{"api_key": {token}}
+		directLinkPath = (&url.URL{
+			Path:     "/api/v1/mail/recent",
+			RawQuery: query.Encode(),
+		}).String()
 	}
-	query := url.Values{"api_key": {token}}
-	directLinkPath := (&url.URL{
-		Path:     "/api/v1/mail/recent",
-		RawQuery: query.Encode(),
-	}).String()
 	return adminAPIAliasDTO{
 		ID:               alias.ID,
 		AccountID:        alias.AccountID,
@@ -253,6 +256,10 @@ func (s *Server) adminAPIAliasFromDomain(alias domain.Alias) (adminAPIAliasDTO, 
 		CreatedAt:        adminAPITime(alias.CreatedAt),
 		UpdatedAt:        adminAPITime(alias.UpdatedAt),
 	}, nil
+}
+
+func adminAPIAliasConfirmationPending(alias domain.Alias) bool {
+	return !alias.Enabled && strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending
 }
 
 func adminAPIAuditLogFromDomain(log domain.AuditLog) adminAPIAuditLogDTO {
@@ -1108,6 +1115,10 @@ func (s *Server) adminAPIRotateAliasKey(c *gin.Context) {
 	}
 	alias, err := s.store.RotateAliasAPIKey(c.Request.Context(), id, hash, prefix)
 	if err != nil {
+		if errors.Is(err, store.ErrAliasConfirmationPending) {
+			writeAdminAPIAliasConfirmationPending(c)
+			return
+		}
 		s.writeAdminAPIStoreReadError(c, err)
 		return
 	}
@@ -1149,6 +1160,8 @@ func (s *Server) adminAPIUpdateAlias(c *gin.Context) {
 				writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
 			} else if errors.Is(err, store.ErrAliasLimit) {
 				writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
+			} else if errors.Is(err, store.ErrAliasConfirmationPending) {
+				writeAdminAPIAliasConfirmationPending(c)
 			} else {
 				s.writeAdminAPIInternalError(c, err)
 			}
@@ -1185,6 +1198,8 @@ func (s *Server) adminAPIDeleteAlias(c *gin.Context) {
 	}); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
+		} else if errors.Is(err, store.ErrAliasConfirmationPending) {
+			writeAdminAPIAliasConfirmationPending(c)
 		} else {
 			s.writeAdminAPIInternalError(c, err)
 		}
@@ -1288,6 +1303,10 @@ func writeAdminAPIError(c *gin.Context, status int, code, message string) {
 		"message":    message,
 		"request_id": requestID(c),
 	}})
+}
+
+func writeAdminAPIAliasConfirmationPending(c *gin.Context) {
+	writeAdminAPIError(c, http.StatusConflict, "ALIAS_CONFIRMATION_PENDING", "该隐私邮箱正在等待 Apple 目录确认，暂时不能修改或删除")
 }
 
 func (s *Server) writeAdminAPIInternalError(c *gin.Context, err error) {
