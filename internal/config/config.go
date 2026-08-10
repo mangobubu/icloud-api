@@ -77,13 +77,13 @@ func Load() (Config, error) {
 	if cfg.SessionTTL, err = envDuration("ICLOUD_API_SESSION_TTL", 8*time.Hour); err != nil {
 		return Config{}, err
 	}
-	if cfg.PollInterval, err = envDuration("ICLOUD_API_POLL_INTERVAL", time.Minute); err != nil {
+	if cfg.PollInterval, err = envDuration("ICLOUD_API_POLL_INTERVAL", 10*time.Second); err != nil {
 		return Config{}, err
 	}
-	if cfg.IMAPTimeout, err = envDuration("ICLOUD_API_IMAP_TIMEOUT", 25*time.Second); err != nil {
+	if cfg.IMAPTimeout, err = envDuration("ICLOUD_API_IMAP_TIMEOUT", 8*time.Second); err != nil {
 		return Config{}, err
 	}
-	if cfg.SyncTimeout, err = envDuration("ICLOUD_API_SYNC_TIMEOUT", 10*time.Minute); err != nil {
+	if cfg.SyncTimeout, err = envDuration("ICLOUD_API_SYNC_TIMEOUT", 70*time.Second); err != nil {
 		return Config{}, err
 	}
 	if cfg.ShutdownTimeout, err = envDuration("ICLOUD_API_SHUTDOWN_TIMEOUT", 10*time.Second); err != nil {
@@ -92,10 +92,10 @@ func Load() (Config, error) {
 	if cfg.SyncConcurrency, err = envInt("ICLOUD_API_SYNC_CONCURRENCY", 3); err != nil {
 		return Config{}, err
 	}
-	if cfg.MaxMessageBytes, err = envInt64("ICLOUD_API_MAX_MESSAGE_BYTES", 10<<20); err != nil {
+	if cfg.MaxMessageBytes, err = envInt64("ICLOUD_API_MAX_MESSAGE_BYTES", 1<<20); err != nil {
 		return Config{}, err
 	}
-	if cfg.MaxBodyBytes, err = envInt64("ICLOUD_API_MAX_BODY_BYTES", 1<<20); err != nil {
+	if cfg.MaxBodyBytes, err = envInt64("ICLOUD_API_MAX_BODY_BYTES", 512<<10); err != nil {
 		return Config{}, err
 	}
 

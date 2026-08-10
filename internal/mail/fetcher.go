@@ -22,24 +22,28 @@ import (
 const (
 	defaultIMAPHost                 = "imap.mail.me.com"
 	defaultIMAPPort                 = 993
-	defaultIMAPTimeout              = 25 * time.Second
+	defaultIMAPTimeout              = 8 * time.Second
 	defaultMaxAliases               = domain.MaxEnabledAliasesPerAccount
 	defaultMaxCandidates            = 1024
 	defaultMaxIncrementalCandidates = 256
 	defaultMaxHeaderBytes           = 128 << 10
-	defaultMaxMessageBytes          = 10 << 20
-	defaultMaxBodyBytes             = 1 << 20
+	defaultMaxMessageBytes          = 1 << 20
+	defaultMaxBodyBytes             = 512 << 10
 	defaultMaxFetchResultBytes      = 64 << 20
 	// Header commands retain the configured per-message limit within the
 	// aggregate literal budget. Body commands stay deliberately small because
 	// go-imap applies one absolute deadline to transfer and parse the whole batch.
 	candidateHeaderFetchBatch   = defaultMaxIncrementalCandidates
-	messageFetchBatch           = 8
+	messageFetchBatch           = 2
 	maxContentFetchLiteralBytes = 12 << 20
 	maxSequenceFetchMessages    = defaultMaxCandidates + 1
 	compatibilityHeaderBatch    = 64
-	compatibilityMessageBatch   = 4
-	imapReconnectDelay          = 100 * time.Millisecond
+	compatibilityMessageBatch   = 1
+	// A reconnect has already spent part of the caller's bounded sync window.
+	// Halving the per-message literal makes the second attempt materially less
+	// likely to spend the remaining window on one slow MIME payload.
+	compatibilityMessageByteDivisor = 2
+	imapReconnectDelay              = 100 * time.Millisecond
 )
 
 var (
@@ -124,6 +128,7 @@ func (f *Fetcher) FetchIncremental(
 	// batch sizes used before large mailbox batching was introduced.
 	settings.headerFetchBatch = min(settings.headerFetchBatch, compatibilityHeaderBatch)
 	settings.messageFetchBatch = min(settings.messageFetchBatch, compatibilityMessageBatch)
+	settings.messageFetchByteDivisor = max(settings.messageFetchByteDivisor, compatibilityMessageByteDivisor)
 	return f.fetchIncrementalAttempt(
 		ctx, account, password, aliases, previous, settings,
 	)
@@ -346,6 +351,7 @@ func (f *Fetcher) fetchIncrementalAttempt(
 		uidToAliases,
 		resultDynamicBudget,
 		settings.messageFetchBatch,
+		settings.messageFetchByteDivisor,
 	)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -547,6 +553,7 @@ type fetchSettings struct {
 	allowWeakRecipientHeaders bool
 	headerFetchBatch          int
 	messageFetchBatch         int
+	messageFetchByteDivisor   int
 	dial                      dialSessionFunc
 	now                       func() time.Time
 }
@@ -563,6 +570,7 @@ func (f *Fetcher) settings() fetchSettings {
 		maxFetchResultBytes:      defaultMaxFetchResultBytes,
 		headerFetchBatch:         candidateHeaderFetchBatch,
 		messageFetchBatch:        messageFetchBatch,
+		messageFetchByteDivisor:  1,
 		dial:                     dialIMAPTLS,
 		now:                      time.Now,
 	}
@@ -1165,7 +1173,7 @@ func fetchMessages(
 	limits mimeLimits,
 	aliasesByUID map[uint32][]int64,
 	remainingResultBytes int64,
-	batchSizeOverride ...int,
+	fetchOverrides ...int,
 ) (map[uint32]fetchedMessage, error) {
 	if remainingResultBytes < 0 {
 		remainingResultBytes = 0
@@ -1178,8 +1186,23 @@ func fetchMessages(
 		remainingResultBytes,
 	)
 	batchSize := messageFetchBatch
-	if len(batchSizeOverride) > 0 && batchSizeOverride[0] > 0 {
-		batchSize = min(batchSize, batchSizeOverride[0])
+	if len(fetchOverrides) > 0 && fetchOverrides[0] > 0 {
+		batchSize = min(batchSize, fetchOverrides[0])
+	}
+	byteDivisor := 1
+	if len(fetchOverrides) > 1 && fetchOverrides[1] > 1 {
+		byteDivisor = fetchOverrides[1]
+	}
+	// Keep the effective per-message literal bounded by the initial two-message
+	// aggregate budget as well. A retry uses one-message batches, so applying
+	// only that batch's cap could otherwise make a large configured limit grow
+	// on reconnect before the divisor is applied.
+	initialBatchCap := boundedContentLiteralBytes(maxContentFetchLiteralBytes, messageFetchBatch)
+	if initialBatchCap > 0 {
+		messageBytes = min(messageBytes, initialBatchCap)
+	}
+	if messageBytes > 0 && byteDivisor > 1 {
+		messageBytes = max(1, messageBytes/byteDivisor)
 	}
 	result := make(map[uint32]fetchedMessage, len(uids))
 	for start := 0; start < len(uids); start += batchSize {
@@ -1298,8 +1321,10 @@ func boundedContentLiteralBytes(maxBytes, batchSize int) int {
 	return min(maxBytes, partialBytes-1)
 }
 
-// boundedWinnerMessageBytes keeps multi-winner network reads proportional to
-// the result budget. A single winner retains the configured per-message limit.
+// boundedWinnerMessageBytes keeps every network read proportional to the
+// configured message, body, parsed-result, and aggregate-result budgets. Raw
+// MIME gets one extra body allowance for transfer encoding and multipart
+// overhead, but a single winner no longer bypasses those bounds.
 func boundedWinnerMessageBytes(
 	maxMessageBytes int,
 	winnerCount int,
@@ -1307,11 +1332,8 @@ func boundedWinnerMessageBytes(
 	fairParsedBytes int64,
 	resultDynamicBudget int64,
 ) int {
-	if maxMessageBytes <= 0 {
+	if maxMessageBytes <= 0 || winnerCount <= 0 {
 		return 0
-	}
-	if winnerCount <= 1 {
-		return maxMessageBytes
 	}
 	if fairBodyBytes < 0 {
 		fairBodyBytes = 0

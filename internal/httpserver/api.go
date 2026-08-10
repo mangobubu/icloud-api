@@ -32,10 +32,17 @@ func (s *Server) availableMailboxSnapshot(c *gin.Context) (domain.MailboxBinding
 	if s.now != nil {
 		now = s.now().UTC()
 	}
+	// The external endpoints are cache reads. Wake the deduplicated background
+	// sync so a caller does not have to wait for the periodic scheduler.
+	s.requestMailboxSync(binding.Account.ID, now)
 	if err := s.store.TouchAliasAccess(c.Request.Context(), binding.Alias.ID, now); err != nil {
 		s.logger.Warn("更新 API 最近访问时间失败", "alias_id", binding.Alias.ID, "error", err, "request_id", requestID(c))
 	}
 	staleAfter := 3 * s.cfg.PollInterval
+	minimumFreshness := s.cfg.SyncTimeout + 2*s.cfg.PollInterval
+	if minimumFreshness > staleAfter {
+		staleAfter = minimumFreshness
+	}
 	if binding.Alias.LastSyncStatus != domain.SyncStatusOK || binding.Alias.LastSyncedAt == nil ||
 		binding.Alias.LastSyncedAt.After(now) || now.Sub(*binding.Alias.LastSyncedAt) > staleAfter {
 		s.writeAPIError(c, http.StatusServiceUnavailable, "SYNC_UNAVAILABLE", "邮箱同步暂不可用")

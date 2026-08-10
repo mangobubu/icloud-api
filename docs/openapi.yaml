@@ -12,6 +12,8 @@ info:
     `/api/v1/mail/latest` 使用 Bearer Header，可重复返回已保存快照的完整 UTC 数据，
     且不消费邮件或改变已读状态；`/api/v1/mail/recent` 使用 URL 查询参数，一次性消费
     IMAP 收件时间位于最近一小时内的当前最新邮件，并返回按服务端 `TZ` 格式化的紧凑数据。
+    两个邮件查询接口在鉴权后都会非阻塞唤醒所属主号的后台同步；同一主号 10 秒内的重复唤醒会合并，
+    当前 HTTP 响应仍只读取 PostgreSQL 快照，不等待 IMAP 网络操作完成。
 
     管理端 Apple 接口使用 Apple 账户密码和双重认证建立受信任 Web 会话，并通过
     `/v2/hme/list` 读取完整 Hide My Email 目录；账户密码和验证码不落库，仅加密保存会话。
@@ -155,7 +157,8 @@ paths:
         - `error`：最近一次主号级未读同步失败；
         - `ok`：最近一次主号级未读同步已追平，可以按 PostgreSQL 当前快照作答；该状态不表示逐个扫描过隐私邮箱的全部 IMAP 历史。
 
-        只有状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过三倍轮询周期时，
+        只有状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过
+        `max(3*ICLOUD_API_POLL_INTERVAL, ICLOUD_API_SYNC_TIMEOUT+2*ICLOUD_API_POLL_INTERVAL)` 时，
         才继续判断最新邮件快照。快照存在时返回 200，不额外限制邮件年龄；快照不存在时返回 404；
         其他同步状态返回 503。
 
@@ -254,7 +257,7 @@ paths:
         "503":
           description: |
             当前隐私邮箱状态不是 ok、从未完成同步、最后同步时间晚于当前时间，
-            或最后同步时间已超过三倍轮询周期时返回 SYNC_UNAVAILABLE；
+            或最后同步时间已超过 `max(3*poll_interval, sync_timeout+2*poll_interval)` 时返回 SYNC_UNAVAILABLE；
             查询 Key 或最新邮件快照时数据库暂不可用则返回 DATABASE_UNAVAILABLE。
           headers:
             X-Request-ID:
@@ -293,7 +296,8 @@ paths:
         两种凭据都只解析到它绑定的唯一隐私邮箱；接口不接受邮箱地址参数，也不会返回同一主号下其他隐私邮箱的邮件。
         派生直达凭据不能用于 `/api/v1/mail/latest` 的 Bearer 鉴权，并会在隐私邮箱 API Key 轮换后失效。
 
-        只有该隐私邮箱状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过三倍轮询周期，
+        只有该隐私邮箱状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过
+        `max(3*ICLOUD_API_POLL_INTERVAL, ICLOUD_API_SYNC_TIMEOUT+2*ICLOUD_API_POLL_INTERVAL)`，
         当前最新邮件快照的 IMAP INTERNALDATE 位于最近一小时内，并且该隐私邮箱从未消费当前
         `UIDVALIDITY + UID` 时才返回 200。接口只检查当前最新快照，不会回退到次新邮件。
 
@@ -399,7 +403,7 @@ paths:
         "503":
           description: |
             当前隐私邮箱状态不是 ok、从未完成同步、最后同步时间晚于当前时间，
-            或最后同步时间已超过三倍轮询周期时返回 SYNC_UNAVAILABLE；
+            或最后同步时间已超过 `max(3*poll_interval, sync_timeout+2*poll_interval)` 时返回 SYNC_UNAVAILABLE；
             查询 Key 或最新邮件快照、原子记录消费或持久化 `\Seen` 任务时数据库暂不可用，
             则返回 DATABASE_UNAVAILABLE；消费记录与 `\Seen` 任务在同一事务中一起提交或一起回滚。
           headers:
@@ -480,9 +484,11 @@ paths:
 
         请求会把主号加入去重的后台同步队列并立即返回 202；同一主号已有手动任务时重复请求会合并。
         后台任务先等待取得该主号的账号同步锁和全局 IMAP 连接额度，随后才开始计算整轮同步预算。
-        `ICLOUD_API_SYNC_TIMEOUT` 默认 `10m`，这 10 分钟全部用于实际数据库读取、IMAP 收取和事务提交；
-        排队等待不占用该预算。每条正文 FETCH 最多处理 8 封邮件；只读同步遇到连接关闭时会新建连接重试一次。
-        每条 IMAP 网络命令仍分别受默认 `25s` 的 `ICLOUD_API_IMAP_TIMEOUT` 限制。积压批次会在后台连续处理，
+        `ICLOUD_API_SYNC_TIMEOUT` 默认 `70s`，这 70 秒全部用于实际数据库读取、IMAP 收取和事务提交；
+        排队等待不占用该预算。每条正文 FETCH 默认最多处理 2 封邮件；只读同步遇到连接关闭时会先新建连接重试，后台调度还会使用短退避继续尝试。
+        每条 IMAP 网络命令仍分别受默认 `8s` 的 `ICLOUD_API_IMAP_TIMEOUT` 限制；
+        自动轮询调度在连接断开时会用 1 秒、3 秒短退避重试（恢复窗口默认 15 秒），并在重试时进一步缩小批量。
+        管理接口和外部取信接口只负责入队，不会在 HTTP 请求内等待这些重试。积压批次会在后台连续处理，
         客户端可通过主号详情接口轮询最终状态。
       security:
         - adminSession: []
@@ -1652,7 +1658,7 @@ components:
               request_id: 6oe7j0x3x3pJv9Dv
 
     AdminSyncBadGateway:
-      description: 主号 IMAP 同步失败，当前批次未成功完成；实际同步默认预算为取得主号锁和全局连接额度后的 10m，单条 IMAP 命令默认超时仍为 25s
+      description: 主号 IMAP 同步失败，当前批次未成功完成；实际同步默认预算为取得主号锁和全局连接额度后的 70s，单条 IMAP 命令默认超时为 8s；自动轮询遇到瞬时连接断开会在后台快速重试
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestID"
@@ -2939,7 +2945,7 @@ components:
           const: false
           description: |
             成功响应中恒为 false。若当前隐私邮箱状态不是 ok、last_synced_at 为空，
-            最后同步时间晚于当前时间，或最后同步距今超过三倍轮询周期，接口返回 503，
+            最后同步时间晚于当前时间，或最后同步距今超过上述快照新鲜度窗口，接口返回 503，
             而不会返回带 stale=true 的旧快照。
 
     MailMessage:

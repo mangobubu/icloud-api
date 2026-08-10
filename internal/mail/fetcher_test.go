@@ -546,6 +546,17 @@ func TestFetchIncrementalReportsProgressStagesAndTargetUID(t *testing.T) {
 
 func TestNewFetcherUsesSeparateCandidateDefaults(t *testing.T) {
 	fetcher := NewFetcher()
+	if fetcher.IMAPTimeout != 8*time.Second || fetcher.MaxMessageBytes != 1<<20 ||
+		fetcher.MaxBodyBytes != 512<<10 {
+		t.Fatalf(
+			"fetcher defaults = timeout:%v message:%d body:%d, want 8s/%d/%d",
+			fetcher.IMAPTimeout,
+			fetcher.MaxMessageBytes,
+			fetcher.MaxBodyBytes,
+			1<<20,
+			512<<10,
+		)
+	}
 	if fetcher.MaxCandidates != 1024 || fetcher.MaxIncrementalCandidates != 256 {
 		t.Fatalf(
 			"candidate defaults recent=%d incremental=%d, want 1024/256",
@@ -554,6 +565,17 @@ func TestNewFetcherUsesSeparateCandidateDefaults(t *testing.T) {
 		)
 	}
 	settings := (&Fetcher{}).settings()
+	if settings.timeout != 8*time.Second || settings.maxMessageBytes != 1<<20 ||
+		settings.maxBodyBytes != 512<<10 {
+		t.Fatalf(
+			"zero-value settings = timeout:%v message:%d body:%d, want 8s/%d/%d",
+			settings.timeout,
+			settings.maxMessageBytes,
+			settings.maxBodyBytes,
+			1<<20,
+			512<<10,
+		)
+	}
 	if settings.maxCandidates != 1024 || settings.maxIncrementalCandidates != 256 {
 		t.Fatalf(
 			"zero-value settings recent=%d incremental=%d, want 1024/256",
@@ -1457,11 +1479,16 @@ func TestFetchIncrementalReconnectsWithConservativeBatches(t *testing.T) {
 		return session
 	}
 	first := newSession()
-	first.fetchErrors = []error{nil, nil, errors.New("imap: connection closed")}
+	first.fetchErrors = []error{nil, errors.New("imap: connection closed")}
 	second := newSession()
 	sessions := []imapSession{first, second}
 	dialCalls := 0
 	fetcher := NewFetcher()
+	// Exercise the aggregate cap as well as the reconnect divisor. Without the
+	// initial-batch cap, switching from two UIDs to one could increase Partial.
+	fetcher.MaxMessageBytes = 20 << 20
+	fetcher.MaxBodyBytes = 20 << 20
+	fetcher.MaxParsedMessageBytes = 20 << 20
 	fetcher.dial = func(context.Context, string, string, time.Duration) (imapSession, error) {
 		if dialCalls >= len(sessions) {
 			return nil, errors.New("unexpected extra IMAP reconnect")
@@ -1488,13 +1515,26 @@ func TestFetchIncrementalReconnectsWithConservativeBatches(t *testing.T) {
 	if _, _, _, _, terminated := first.counters(); !terminated {
 		t.Fatal("failed IMAP session was not terminated before reconnect")
 	}
+	firstBodyCalls := bodyFetchCalls(first.calls())
+	if len(firstBodyCalls) != 1 {
+		t.Fatalf("initial body FETCH calls = %d, want 1; calls=%#v", len(firstBodyCalls), first.calls())
+	}
+	initialSection := bodyFetchSection(t, firstBodyCalls[0])
+	if requested := requestedSequenceCount(t, firstBodyCalls[0].seqSet, winnerCount); requested != messageFetchBatch {
+		t.Fatalf("initial body batch requested %d messages, want %d", requested, messageFetchBatch)
+	}
 	bodyCalls := bodyFetchCalls(second.calls())
-	if len(bodyCalls) != 2 {
-		t.Fatalf("conservative body FETCH calls = %d, want 2; calls=%#v", len(bodyCalls), second.calls())
+	if len(bodyCalls) != winnerCount {
+		t.Fatalf("conservative body FETCH calls = %d, want %d; calls=%#v", len(bodyCalls), winnerCount, second.calls())
 	}
 	for _, call := range bodyCalls {
-		if requested := requestedSequenceCount(t, call.seqSet, winnerCount); requested > compatibilityMessageBatch {
-			t.Fatalf("retry body batch requested %d messages, limit %d", requested, compatibilityMessageBatch)
+		if requested := requestedSequenceCount(t, call.seqSet, winnerCount); requested != compatibilityMessageBatch {
+			t.Fatalf("retry body batch requested %d messages, want %d", requested, compatibilityMessageBatch)
+		}
+		section := bodyFetchSection(t, call)
+		wantBytes := max(1, (initialSection.Partial[1]-1)/compatibilityMessageByteDivisor)
+		if gotBytes := section.Partial[1] - 1; gotBytes != wantBytes {
+			t.Fatalf("retry body partial bytes = %d, want %d from initial %d", gotBytes, wantBytes, initialSection.Partial[1]-1)
 		}
 	}
 }
@@ -1834,8 +1874,14 @@ func TestFetchMessagesBatchesUIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != len(uids) || len(session.calls()) != 2 {
-		t.Fatalf("messages = %d, FETCH calls = %d", len(messages), len(session.calls()))
+	calls := bodyFetchCalls(session.calls())
+	if len(messages) != len(uids) || len(calls) != 2 {
+		t.Fatalf("messages = %d, body FETCH calls = %d", len(messages), len(calls))
+	}
+	for _, call := range calls {
+		if requested := requestedSequenceCount(t, call.seqSet, uint32(len(uids))); requested > messageFetchBatch {
+			t.Fatalf("initial body batch requested %d messages, limit %d", requested, messageFetchBatch)
+		}
 	}
 }
 
@@ -1884,15 +1930,19 @@ func TestFetchIncrementalBoundsMultiWinnerBodyReadsByResultBudget(t *testing.T) 
 	fairBodyBytes := fairDynamicBytes
 	wantMessageBytes := int(fairParsedBytes + fairBodyBytes)
 	bodyCalls := bodyFetchCalls(session.calls())
-	if len(bodyCalls) != 1 {
-		t.Fatalf("body FETCH calls = %d, want 1; all calls = %#v", len(bodyCalls), session.calls())
+	wantBodyCalls := (winnerCount + messageFetchBatch - 1) / messageFetchBatch
+	if len(bodyCalls) != wantBodyCalls {
+		t.Fatalf("body FETCH calls = %d, want %d; all calls = %#v", len(bodyCalls), wantBodyCalls, session.calls())
 	}
-	section := bodyFetchSection(t, bodyCalls[0])
-	if !section.Peek || !reflect.DeepEqual(section.Partial, []int{0, wantMessageBytes + 1}) {
-		t.Fatalf("body section = %#v, want PEEK partial 0.%d", section, wantMessageBytes+1)
-	}
-	if total := winnerCount * section.Partial[1]; total > 2*maxResultBytes {
-		t.Fatalf("bounded body request bytes = %d, result budget = %d", total, maxResultBytes)
+	for _, call := range bodyCalls {
+		section := bodyFetchSection(t, call)
+		if !section.Peek || !reflect.DeepEqual(section.Partial, []int{0, wantMessageBytes + 1}) {
+			t.Fatalf("body section = %#v, want PEEK partial 0.%d", section, wantMessageBytes+1)
+		}
+		requested := requestedSequenceCount(t, call.seqSet, winnerCount)
+		if total := requested * section.Partial[1]; total > 2*maxResultBytes {
+			t.Fatalf("bounded body request bytes = %d, result budget = %d", total, maxResultBytes)
+		}
 	}
 	if len(result.Messages) != winnerCount {
 		t.Fatalf("messages = %d, want %d", len(result.Messages), winnerCount)
@@ -1904,13 +1954,60 @@ func TestFetchIncrementalBoundsMultiWinnerBodyReadsByResultBudget(t *testing.T) 
 	}
 }
 
-func TestBoundedWinnerMessageBytesKeepsSingleWinnerLimit(t *testing.T) {
-	const maxMessageBytes = 10 << 20
-	if got := boundedWinnerMessageBytes(maxMessageBytes, 1, 128, 1024, 2048); got != maxMessageBytes {
-		t.Fatalf("single-winner message bytes = %d, want %d", got, maxMessageBytes)
+func TestFetchMessagesBoundsSingleWinnerPartialByConfiguredBudgets(t *testing.T) {
+	tests := []struct {
+		name            string
+		maxMessageBytes int
+		maxBodyBytes    int64
+		maxParsedBytes  int64
+		wantBytes       int
+	}{
+		{
+			name:            "production defaults",
+			maxMessageBytes: defaultMaxMessageBytes,
+			maxBodyBytes:    defaultMaxBodyBytes,
+			maxParsedBytes:  defaultMaxBodyBytes + defaultMetadataResultBytes,
+			wantBytes:       min(defaultMaxMessageBytes, 2*defaultMaxBodyBytes+defaultMetadataResultBytes),
+		},
+		{
+			name:            "body and parsed budgets",
+			maxMessageBytes: 10 << 20,
+			maxBodyBytes:    256 << 10,
+			maxParsedBytes:  384 << 10,
+			wantBytes:       640 << 10,
+		},
+		{
+			name:            "message budget",
+			maxMessageBytes: 512 << 10,
+			maxBodyBytes:    1 << 20,
+			maxParsedBytes:  (1 << 20) + defaultMetadataResultBytes,
+			wantBytes:       512 << 10,
+		},
 	}
-	if got := boundedContentLiteralBytes(maxMessageBytes, 1); got != maxMessageBytes {
-		t.Fatalf("single-winner aggregate message bytes = %d, want %d", got, maxMessageBytes)
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			session := &fakeIMAPSession{bodyByUID: map[uint32][]byte{1: rawMessage(1)}}
+			messages, err := fetchMessages(
+				session,
+				[]uint32{1},
+				test.maxMessageBytes,
+				defaultMIMELimits(test.maxBodyBytes, test.maxParsedBytes),
+				map[uint32][]int64{1: {1}},
+				64<<20,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := bodyFetchCalls(session.calls())
+			if len(messages) != 1 || len(calls) != 1 {
+				t.Fatalf("messages = %d, body FETCH calls = %d", len(messages), len(calls))
+			}
+			section := bodyFetchSection(t, calls[0])
+			if !section.Peek || !reflect.DeepEqual(section.Partial, []int{0, test.wantBytes + 1}) {
+				t.Fatalf("body section = %#v, want PEEK partial 0.%d", section, test.wantBytes+1)
+			}
+		})
 	}
 }
 

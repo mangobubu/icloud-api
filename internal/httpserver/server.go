@@ -3,6 +3,7 @@ package httpserver
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +20,7 @@ import (
 	"icloud-api/internal/domain"
 	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
+	"icloud-api/internal/syncer"
 )
 
 //go:embed templates/*.html static/*
@@ -39,6 +42,9 @@ type Server struct {
 	adminSPA             *adminSPA
 	oauthTokenHash       []byte
 	oauthTokenConfigured bool
+
+	mailSyncWakeMu sync.Mutex
+	mailSyncWake   map[int64]time.Time
 
 	loginLimiter        *windowLimiter
 	loginRequestLimiter *windowLimiter
@@ -101,6 +107,40 @@ func (s *Server) withAccountLock(ctx context.Context, accountID int64, operation
 		return operation()
 	}
 	return s.lockAccount(ctx, accountID, operation)
+}
+
+// requestMailboxSync coalesces external polling into a bounded background
+// sync. API handlers never wait for IMAP work; the cooldown prevents a client
+// polling every few seconds from creating a new login for every request.
+func (s *Server) requestMailboxSync(accountID int64, now time.Time) {
+	if s == nil || s.sync == nil || accountID < 1 {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	const cooldown = 10 * time.Second
+	s.mailSyncWakeMu.Lock()
+	if s.mailSyncWake == nil {
+		s.mailSyncWake = make(map[int64]time.Time)
+	}
+	if last, ok := s.mailSyncWake[accountID]; ok && !now.Before(last) && now.Sub(last) < cooldown {
+		s.mailSyncWakeMu.Unlock()
+		return
+	}
+	s.mailSyncWake[accountID] = now
+	s.mailSyncWakeMu.Unlock()
+	syncFn := s.sync
+	logger := s.logger
+	go func() {
+		err := syncFn(accountID)
+		if err == nil || errors.Is(err, syncer.ErrSyncQueued) || errors.Is(err, syncer.ErrSyncPending) {
+			return
+		}
+		if logger != nil {
+			logger.Warn("外部邮件查询触发同步未入队", "account_id", accountID, "error", err)
+		}
+	}()
 }
 
 func (s *Server) recovery() gin.HandlerFunc {

@@ -103,6 +103,8 @@ docker compose logs -f icloud-api
 | `GET /api/v1/mail/recent` | URL 查询参数 `api_key` | 只返回最近一小时内尚未消费的当前快照；成功后记录消费并异步标记已读 |
 | `POST /api/v1/aliases` | `Authorization: Bearer <OAuth Token>` | 登记已经在 Apple 端存在的隐私邮箱，不负责创建地址 |
 
+两种邮件查询在鉴权后都会非阻塞唤醒所属主号的后台同步；同一主号 10 秒内的重复唤醒会合并。HTTP 响应仍立即读取 PostgreSQL 快照，不等待 IMAP，因此取验证码时应每 2 至 3 秒轮询 `/api/v1/mail/latest`，将 404 和 503 视为尚未就绪，并只接受新的 `message.id`。
+
 ### 完整邮件接口（推荐）
 
 ```bash
@@ -179,8 +181,9 @@ ICLOUD_API_OAUTH_TOKEN=请替换为32至4096个无空白字符的随机令牌
 ICLOUD_API_MASTER_KEY=请粘贴32字节密钥的Base64或十六进制编码
 # 通过 HTTPS 反向代理对外服务时改为 true
 ICLOUD_API_COOKIE_SECURE=false
-ICLOUD_API_POLL_INTERVAL=1m
-ICLOUD_API_SYNC_TIMEOUT=10m
+ICLOUD_API_POLL_INTERVAL=10s
+ICLOUD_API_IMAP_TIMEOUT=8s
+ICLOUD_API_SYNC_TIMEOUT=70s
 TZ=Asia/Shanghai
 ```
 
@@ -192,9 +195,11 @@ TZ=Asia/Shanghai
 | `ICLOUD_API_OAUTH_TOKEN` | 自动生成 | 外部登记接口令牌，不得与其他凭据复用 |
 | `ICLOUD_API_MASTER_KEY` | 自动生成 | 加密 IMAP 凭据、Apple 会话并签名直达凭据 |
 | `ICLOUD_API_COOKIE_SECURE` | `false` | 通过 HTTPS 对外服务时应设为 `true` |
-| `ICLOUD_API_POLL_INTERVAL` | `1m` | IMAP 轮询间隔，范围 `10s` 至 `24h` |
-| `ICLOUD_API_IMAP_TIMEOUT` | `25s` | 单次 IMAP 操作超时 |
-| `ICLOUD_API_SYNC_TIMEOUT` | `10m` | 单个主号完整同步预算，至少为 IMAP 超时的两倍 |
+| `ICLOUD_API_POLL_INTERVAL` | `10s` | IMAP 轮询间隔，范围 `10s` 至 `24h` |
+| `ICLOUD_API_IMAP_TIMEOUT` | `8s` | 单次 IMAP 操作超时；只读抓取断连会先重连，自动轮询再用短退避恢复 |
+| `ICLOUD_API_SYNC_TIMEOUT` | `70s` | 单个主号单批同步预算，至少为 IMAP 超时的两倍 |
+| `ICLOUD_API_MAX_MESSAGE_BYTES` | `1 MiB` | 单封原始邮件读取上限，超出后保留截断快照 |
+| `ICLOUD_API_MAX_BODY_BYTES` | `512 KiB` | 单封正文解析上限，超出后返回 `body_truncated=true` |
 | `ICLOUD_API_SYNC_CONCURRENCY` | `3` | 同时同步的主号数，范围 `1` 至 `16` |
 | `ICLOUD_API_TRUSTED_PROXIES` | Compose 默认私有网段 | 受信反向代理 IP 或 CIDR，生产环境建议收紧 |
 | `TZ` | `Asia/Shanghai` | 紧凑接口返回时间所用时区 |

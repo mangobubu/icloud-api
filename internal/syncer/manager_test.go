@@ -1868,6 +1868,96 @@ func TestRunContinuesOtherPendingAfterOrdinaryFailure(t *testing.T) {
 	}
 }
 
+func TestRunRetriesTransientIMAPFailureBeforePollInterval(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	var callsMu sync.Mutex
+	calls := 0
+	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		callsMu.Lock()
+		defer callsMu.Unlock()
+		calls++
+		if calls == 1 {
+			return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
+		}
+		return domain.MailboxSyncResult{
+			State: domain.IMAPSyncState{AccountID: got.ID, UIDValidity: 1, LastUID: 1},
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 1)
+	waits := make([]time.Duration, 0, 2)
+	manager.waitInterval = func(_ context.Context, interval time.Duration) bool {
+		waits = append(waits, interval)
+		return interval != time.Hour
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("transient IMAP retry did not finish")
+	}
+
+	callsMu.Lock()
+	gotCalls := calls
+	callsMu.Unlock()
+	if gotCalls != 2 {
+		t.Fatalf("fetch calls = %d, want one fast retry", gotCalls)
+	}
+	if !reflect.DeepEqual(waits, []time.Duration{time.Second, time.Hour}) {
+		t.Fatalf("wait intervals = %v, want 1s retry then normal poll", waits)
+	}
+}
+
+func TestRunDoesNotFastRetryPermanentIMAPFailure(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	fetchCalls := 0
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetchCalls++
+		return domain.MailboxSyncResult{}, errors.New("IMAP authentication rejected")
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Hour, 1)
+	waits := make([]time.Duration, 0, 1)
+	manager.waitInterval = func(_ context.Context, interval time.Duration) bool {
+		waits = append(waits, interval)
+		return false
+	}
+
+	manager.Run(context.Background())
+	if fetchCalls != 1 {
+		t.Fatalf("fetch calls = %d, want no fast retry", fetchCalls)
+	}
+	if !reflect.DeepEqual(waits, []time.Duration{time.Hour}) {
+		t.Fatalf("wait intervals = %v, want only normal poll", waits)
+	}
+}
+
+func TestTransientIMAPTransportErrorClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "generic closed", err: errors.New("imap: connection closed"), want: true},
+		{name: "wrapped timeout", err: fmt.Errorf("fetch: %w", context.DeadlineExceeded), want: true},
+		{name: "windows reset", err: errors.New("wsarecv: connection forcibly closed"), want: true},
+		{name: "authentication", err: errors.New("login IMAP account: authentication failed"), want: false},
+		{name: "canceled", err: context.Canceled, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isTransientIMAPTransportError(test.err); got != test.want {
+				t.Fatalf("classification = %v, want %v for %v", got, test.want, test.err)
+			}
+		})
+	}
+}
+
 func TestRunPreservesPendingContinuationWhileAccountBusy(t *testing.T) {
 	t.Run("lock released within queue budget", func(t *testing.T) {
 		account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}

@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,7 +42,14 @@ var ErrSyncPending = errors.New("mailbox sync batch committed; more messages rem
 // equivalent request for the same account is already queued.
 var ErrSyncQueued = errors.New("mailbox sync queued")
 
-const maxPersistedSyncErrorRunes = 8000
+const (
+	maxPersistedSyncErrorRunes = 8000
+	// The default sync budget is 70s. Keep transient recovery within a 15s
+	// window so the default automatic cycle stays inside the external 90s limit.
+	automaticIMAPRetryBudget = 15 * time.Second
+)
+
+var defaultAutomaticIMAPRetryDelays = []time.Duration{time.Second, 3 * time.Second}
 
 type accountLock struct {
 	token chan struct{}
@@ -82,6 +91,8 @@ type Manager struct {
 	syncSlots    chan struct{}
 	withTimeout  func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	waitInterval func(context.Context, time.Duration) bool
+	retryDelays  []time.Duration
+	retryBudget  time.Duration
 
 	locksMu  sync.Mutex
 	locks    map[int64]*accountLock
@@ -111,6 +122,8 @@ func New(repo Repository, cipher CredentialCipher, fetcher MailFetcher, logger *
 		syncSlots:    make(chan struct{}, concurrency),
 		withTimeout:  context.WithTimeout,
 		waitInterval: waitForInterval,
+		retryDelays:  append([]time.Duration(nil), defaultAutomaticIMAPRetryDelays...),
+		retryBudget:  automaticIMAPRetryBudget,
 		locks:        make(map[int64]*accountLock),
 		manualJobs:   make(map[int64]syncFlowSeed),
 		manualDone:   make(chan struct{}),
@@ -150,18 +163,71 @@ func (m *Manager) Run(ctx context.Context) {
 	defer m.waitForManualJobs()
 	defer m.clearProgress(domain.MailboxSyncTriggerAutomatic)
 	var continuations accountIDSet
+	var retryQueue accountIDSet
+	var retryCtx context.Context
+	var cancelRetry context.CancelFunc
+	retryAttempt := 0
+	clearRetryCycle := func() {
+		if cancelRetry != nil {
+			cancelRetry()
+		}
+		retryQueue = nil
+		retryCtx = nil
+		cancelRetry = nil
+		retryAttempt = 0
+	}
+	defer clearRetryCycle()
 	for {
-		continuations = m.syncAllRound(ctx, continuations)
+		roundCtx := ctx
+		if retryCtx != nil {
+			roundCtx = retryCtx
+		}
+		result := m.syncAllRoundDetailed(roundCtx, continuations)
 		if ctx.Err() != nil {
+			if cancelRetry != nil {
+				cancelRetry()
+			}
 			return
 		}
-		if len(continuations) > 0 {
+		retryQueue = mergeAccountIDSets(retryQueue, result.retryable)
+		if len(result.pending) > 0 && (retryCtx == nil || retryCtx.Err() == nil) {
+			continuations = result.pending
 			continue
 		}
+		continuations = nil
+
+		if len(retryQueue) > 0 && retryAttempt < len(m.retryDelays) {
+			if retryCtx == nil {
+				retryCtx, cancelRetry = context.WithTimeout(ctx, m.retryBudget)
+			}
+			delay := m.retryDelays[retryAttempt]
+			m.logger.Info(
+				"瞬时 IMAP 连接失败，正在安排自动重试",
+				"attempt", retryAttempt+1,
+				"delay", delay,
+				"account_count", len(retryQueue),
+			)
+			if m.waitInterval(retryCtx, delay) {
+				retryAttempt++
+				continuations = retryQueue
+				retryQueue = nil
+				continue
+			}
+			if ctx.Err() != nil || retryCtx.Err() == nil {
+				if cancelRetry != nil {
+					cancelRetry()
+				}
+				return
+			}
+		}
+
+		clearRetryCycle()
 		if !m.waitInterval(ctx, m.interval) {
+			if cancelRetry != nil {
+				cancelRetry()
+			}
 			return
 		}
-		continuations = nil
 	}
 }
 
@@ -408,11 +474,36 @@ func (m *Manager) syncAll(ctx context.Context) bool {
 
 type accountIDSet map[int64]struct{}
 
+type syncAllRoundResult struct {
+	pending   accountIDSet
+	retryable accountIDSet
+}
+
+func mergeAccountIDSets(destination, source accountIDSet) accountIDSet {
+	if len(source) == 0 {
+		return destination
+	}
+	if destination == nil {
+		destination = make(accountIDSet, len(source))
+	}
+	for accountID := range source {
+		destination[accountID] = struct{}{}
+	}
+	return destination
+}
+
 // syncAllRound processes at most one batch per eligible account. A previous
 // continuation waits for its account lock with a bounded budget so manual and
 // seen work neither lose the continuation nor cause a busy retry loop.
 func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) accountIDSet {
-	pending := make(accountIDSet)
+	return m.syncAllRoundDetailed(ctx, continuations).pending
+}
+
+func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accountIDSet) syncAllRoundResult {
+	result := syncAllRoundResult{
+		pending:   make(accountIDSet),
+		retryable: make(accountIDSet),
+	}
 	accounts, err := m.repo.ListEnabledAccounts(ctx)
 	if err != nil {
 		m.logger.Error("读取待同步主号失败", "error", err)
@@ -429,7 +520,7 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 			}
 			m.finishProgress(accountID, domain.MailboxSyncTriggerAutomatic)
 		}
-		return pending
+		return result
 	}
 	if continuations != nil {
 		enabled := make(accountIDSet, len(accounts))
@@ -455,12 +546,14 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 	}
 	var statusMu sync.Mutex
 	markResult := func(accountID int64, syncErr error) {
-		if !errors.Is(syncErr, ErrSyncPending) {
-			return
-		}
 		statusMu.Lock()
 		defer statusMu.Unlock()
-		pending[accountID] = struct{}{}
+		switch {
+		case errors.Is(syncErr, ErrSyncPending):
+			result.pending[accountID] = struct{}{}
+		case isTransientIMAPSyncFailure(syncErr):
+			result.retryable[accountID] = struct{}{}
+		}
 	}
 	var wg sync.WaitGroup
 	for _, account := range accounts {
@@ -597,7 +690,7 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 		}()
 	}
 	wg.Wait()
-	return pending
+	return result
 }
 
 // SyncAccountWithTimeout bounds queueing and mailbox work separately so a busy
@@ -933,7 +1026,11 @@ func (m *Manager) syncAccountLocked(
 	result, err := m.fetcher.FetchIncremental(fetchCtx, account, password, enabled, previousState, nil)
 	password = ""
 	if err != nil {
-		return fmt.Errorf("fetch IMAP mailbox increment: %w", err)
+		wrapped := fmt.Errorf("fetch IMAP mailbox increment: %w", err)
+		if isTransientIMAPTransportError(err) {
+			return &transientIMAPSyncError{cause: wrapped}
+		}
+		return wrapped
 	}
 	saving, ok := m.reportCursorProgress(accountID, trigger, previousState, result)
 	if !ok {
@@ -1011,6 +1108,56 @@ func (m *Manager) syncAccountLocked(
 		slog.Uint64("target_uid", uint64(result.TargetUID)),
 	)
 	return nil
+}
+
+type transientIMAPSyncError struct {
+	cause error
+}
+
+func (e *transientIMAPSyncError) Error() string { return e.cause.Error() }
+
+func (e *transientIMAPSyncError) Unwrap() error { return e.cause }
+
+func isTransientIMAPSyncFailure(err error) bool {
+	var transient *transientIMAPSyncError
+	return errors.As(err, &transient)
+}
+
+func isTransientIMAPTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
+		return true
+	}
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		message := strings.ToLower(strings.TrimSpace(cause.Error()))
+		switch message {
+		case "imap: connection closed", "imap: connection closed during command execution":
+			return true
+		}
+		if strings.Contains(message, "imap: connection closed") ||
+			strings.Contains(message, "unexpected eof") ||
+			strings.Contains(message, "i/o timeout") ||
+			strings.Contains(message, "connection timed out") ||
+			strings.Contains(message, "operation timed out") ||
+			strings.Contains(message, "connection reset") ||
+			strings.Contains(message, "broken pipe") ||
+			strings.Contains(message, "forcibly closed") ||
+			strings.Contains(message, "connection was aborted") ||
+			strings.Contains(message, "wsasend") ||
+			strings.Contains(message, "wsarecv") {
+			return true
+		}
+	}
+	return false
 }
 
 // WithAccountLock serializes account configuration changes with IMAP syncs.

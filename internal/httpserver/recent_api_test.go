@@ -386,6 +386,88 @@ func TestMailEndpointsValidateSyncFreshnessWindow(t *testing.T) {
 	}
 }
 
+func TestMailEndpointWakesBackgroundSyncWithCooldown(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	mailboxes := env.createMailboxFixture(t)
+	now := time.Date(2026, time.August, 7, 6, 0, 0, 0, time.UTC)
+	env.server.now = func() time.Time { return now }
+	setAliasSyncedAt(t, env, mailboxes.aliasA, now)
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-time.Minute), TextBody: "wake body", SyncedAt: now,
+	})
+
+	wakes := make(chan int64, 4)
+	env.server.sync = func(accountID int64) error {
+		wakes <- accountID
+		return nil
+	}
+	first := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first latest response = %d; body=%s", first.Code, first.Body.String())
+	}
+	select {
+	case accountID := <-wakes:
+		if accountID != mailboxes.accountA.ID {
+			t.Fatalf("wake account ID = %d, want %d", accountID, mailboxes.accountA.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("latest endpoint did not wake background sync")
+	}
+
+	second := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second latest response = %d; body=%s", second.Code, second.Body.String())
+	}
+	select {
+	case accountID := <-wakes:
+		t.Fatalf("cooldown did not coalesce wake for account %d", accountID)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	env.server.now = func() time.Time { return now.Add(10 * time.Second) }
+	third := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+	if third.Code != http.StatusOK {
+		t.Fatalf("third latest response = %d; body=%s", third.Code, third.Body.String())
+	}
+	select {
+	case accountID := <-wakes:
+		if accountID != mailboxes.accountA.ID {
+			t.Fatalf("second wake account ID = %d, want %d", accountID, mailboxes.accountA.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("latest endpoint did not wake after cooldown")
+	}
+}
+
+func TestMailEndpointsKeepSnapshotFreshDuringConfiguredSyncBudget(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	mailboxes := env.createMailboxFixture(t)
+	now := time.Date(2026, time.August, 7, 6, 0, 0, 0, time.UTC)
+	env.server.now = func() time.Time { return now }
+	env.server.cfg.PollInterval = 10 * time.Second
+	env.server.cfg.SyncTimeout = 70 * time.Second
+	setAliasSyncedAt(t, env, mailboxes.aliasA, now.Add(-90*time.Second))
+	env.upsertMessage(t, domain.LatestMessage{
+		AliasID: mailboxes.aliasA.ID, UIDValidity: 101, UID: 12,
+		InternalDate: now.Add(-time.Minute), TextBody: "budget body", SyncedAt: now.Add(-90 * time.Second),
+	})
+
+	fresh := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+	if fresh.Code != http.StatusOK {
+		t.Fatalf("snapshot at configured freshness boundary = %d; body=%s", fresh.Code, fresh.Body.String())
+	}
+
+	staleAt := now.Add(-90*time.Second - time.Nanosecond)
+	if err := env.store.UpdateAliasSyncStatus(
+		context.Background(), mailboxes.aliasA.ID, domain.SyncStatusOK, "", &staleAt,
+	); err != nil {
+		t.Fatalf("move snapshot past freshness boundary: %v", err)
+	}
+	stale := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
+	assertAPIError(t, stale, http.StatusServiceUnavailable, "SYNC_UNAVAILABLE")
+}
+
 func TestRecentMailDirectLinkRejectsDisabledAliasAndSyncFailure(t *testing.T) {
 	t.Run("disabled alias", func(t *testing.T) {
 		env := newHTTPTestEnv(t)

@@ -211,8 +211,23 @@ func TestSyncTimeoutDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.SyncTimeout != 10*time.Minute {
-		t.Fatalf("默认同步总时限 = %v, want %v", cfg.SyncTimeout, 10*time.Minute)
+	if cfg.PollInterval != 10*time.Second || cfg.IMAPTimeout != 8*time.Second ||
+		cfg.SyncTimeout != 70*time.Second {
+		t.Fatalf(
+			"default mail timing = poll:%v IMAP:%v sync:%v, want 10s/8s/70s",
+			cfg.PollInterval,
+			cfg.IMAPTimeout,
+			cfg.SyncTimeout,
+		)
+	}
+	if cfg.MaxMessageBytes != 1<<20 || cfg.MaxBodyBytes != 512<<10 {
+		t.Fatalf(
+			"default mail byte limits = message:%d body:%d, want %d/%d",
+			cfg.MaxMessageBytes,
+			cfg.MaxBodyBytes,
+			1<<20,
+			512<<10,
+		)
 	}
 }
 
