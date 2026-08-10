@@ -24,6 +24,7 @@ const (
 	autoCreateLabel             = "自动创建"
 	autoCreateNote              = "icloud-api 自动创建"
 	autoCreatePersistTimeout    = 5 * time.Second
+	autoCreateRecoveryTimeout   = 10 * time.Second
 	aliasDeletePersistTimeout   = 5 * time.Second
 )
 
@@ -34,18 +35,19 @@ var defaultAutoCreateConfirmationDelays = [...]time.Duration{
 }
 
 const (
-	autoCreatePreparingPercent          = 5
-	autoCreateCheckingAccountPercent    = 10
-	autoCreateCheckingCapacityPercent   = 15
-	autoCreateLoadingSessionPercent     = 25
-	autoCreateValidatingSessionPercent  = 35
-	autoCreateCheckingForwardingPercent = 45
-	autoCreatePreparingKeyPercent       = 55
-	autoCreateReservingPercent          = 65
-	autoCreateSavingCandidatePercent    = 75
-	autoCreateConfirmingPercent         = 85
-	autoCreateReconcilingPercent        = 85
-	autoCreateSavingResultPercent       = 95
+	autoCreatePreparingPercent              = 5
+	autoCreateCheckingAccountPercent        = 10
+	autoCreateCheckingCapacityPercent       = 15
+	autoCreateLoadingSessionPercent         = 25
+	autoCreateValidatingSessionPercent      = 35
+	autoCreateCheckingForwardingPercent     = 45
+	autoCreateInitializingForwardingPercent = 50
+	autoCreatePreparingKeyPercent           = 55
+	autoCreateReservingPercent              = 65
+	autoCreateSavingCandidatePercent        = 75
+	autoCreateConfirmingPercent             = 85
+	autoCreateReconcilingPercent            = 85
+	autoCreateSavingResultPercent           = 95
 )
 
 type Option func(*Service)
@@ -829,6 +831,11 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		}
 		return domain.Alias{}, err
 	}
+	trustedDSID := strings.TrimSpace(session.DSID)
+	if trustedDSID == "" {
+		return domain.Alias{}, expireAutoSession(wrapError(CodeSessionExpired, ErrSessionExpired,
+			errors.New("stored Apple session omitted the account identifier")))
+	}
 	reportProgress(domain.AliasCreationPhaseValidatingSession, autoCreateValidatingSessionPercent, 0)
 	validated, err := s.client.Validate(ctx, session)
 	if err != nil {
@@ -845,6 +852,12 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	if strings.TrimSpace(validated.AppleID) != "" &&
 		!strings.EqualFold(strings.TrimSpace(validated.AppleID), strings.TrimSpace(record.AppleID)) {
 		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	if identityErr := validateSessionDSID(trustedDSID, validated); identityErr != nil {
+		if errors.Is(identityErr, ErrSessionExpired) {
+			identityErr = expireAutoSession(identityErr)
+		}
+		return domain.Alias{}, identityErr
 	}
 	normalizeSession(&validated, record.AppleID, session.Region, s.now())
 
@@ -877,6 +890,12 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		!strings.EqualFold(strings.TrimSpace(listedSession.AppleID), strings.TrimSpace(record.AppleID)) {
 		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 	}
+	if identityErr := validateSessionDSID(trustedDSID, listedSession); identityErr != nil {
+		if errors.Is(identityErr, ErrSessionExpired) {
+			identityErr = expireAutoSession(identityErr)
+		}
+		return domain.Alias{}, identityErr
+	}
 	normalizeSession(&listedSession, record.AppleID, validated.Region, s.now())
 	listedRegion, err := normalizeRegion(listedSession.Region)
 	if err != nil {
@@ -895,6 +914,9 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		if strings.TrimSpace(returned.AppleID) != "" &&
 			!strings.EqualFold(strings.TrimSpace(returned.AppleID), strings.TrimSpace(record.AppleID)) {
 			return wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+		}
+		if identityErr := validateSessionDSID(trustedDSID, *returned); identityErr != nil {
+			return identityErr
 		}
 		normalizeSession(returned, record.AppleID, fallbackRegion, s.now())
 		region, err := normalizeRegion(returned.Region)
@@ -955,7 +977,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		if !sameEmail(confirmed.ForwardToEmail, account.Email) {
 			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 		}
-		sessionRecord, err := s.autoCreateSessionRecord(accountID, record.AppleID, validated.Region, returned)
+		sessionRecord, err := s.autoCreateSessionRecord(accountID, record.AppleID, trustedDSID, validated.Region, returned)
 		if err != nil {
 			if Code(err) != "" {
 				return domain.Alias{}, err
@@ -1007,12 +1029,96 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		}
 		return confirmPendingAlias(ctx, pendingConfirmation.Alias, confirmed, listedSession, 1)
 	}
-	if strings.TrimSpace(settings.SelectedForwardTo) == "" {
-		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream,
-			errors.New("Apple response omitted the selected forwarding address"))
+	forwardingErr := validateAutoCreateForwardingTarget(settings, account.Email)
+	if errors.Is(forwardingErr, ErrForwardingTargetMissing) {
+		updater, canUpdate := s.client.(ForwardingTargetUpdater)
+		if !canUpdate || len(settings.Aliases) != 0 ||
+			!containsForwardingCandidate(settings.ForwardToEmails, account.Email) {
+			return domain.Alias{}, forwardingErr
+		}
+
+		if err := ctx.Err(); err != nil {
+			return domain.Alias{}, err
+		}
+		reportProgress(domain.AliasCreationPhaseInitializingForwarding, autoCreateInitializingForwardingPercent, 0)
+		updatedForwardingSession, updateErr := updater.UpdateForwardTo(ctx, listedSession, account.Email)
+		if !hasAppleSessionState(updatedForwardingSession) {
+			updatedForwardingSession = listedSession
+		}
+		var mappedUpdateErr error
+		if updateErr != nil {
+			mappedUpdateErr = mapAppleError(updateErr, false)
+			if errors.Is(mappedUpdateErr, ErrSessionExpired) {
+				return domain.Alias{}, expireAutoSession(mappedUpdateErr)
+			}
+		}
+		checkpointContext, cancelCheckpoint := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
+		checkpointErr := checkpointReturnedSession(checkpointContext, &updatedForwardingSession, listedSession.Region)
+		cancelCheckpoint()
+		if checkpointErr != nil {
+			checkpointErr = wrapPersistenceError(checkpointErr)
+			if mappedUpdateErr != nil {
+				return domain.Alias{}, errors.Join(checkpointErr, mappedUpdateErr)
+			}
+			return domain.Alias{}, checkpointErr
+		}
+		if mappedUpdateErr != nil && !errors.Is(mappedUpdateErr, ErrUpstream) &&
+			!errors.Is(mappedUpdateErr, context.Canceled) &&
+			!errors.Is(mappedUpdateErr, context.DeadlineExceeded) {
+			return domain.Alias{}, mappedUpdateErr
+		}
+
+		verifyContext, cancelVerify := context.WithTimeout(context.WithoutCancel(ctx), autoCreateRecoveryTimeout)
+		verifiedSettings, verifiedSession, verifyErr := s.client.ListAliases(verifyContext, updatedForwardingSession)
+		cancelVerify()
+		if !hasAppleSessionState(verifiedSession) {
+			verifiedSession = updatedForwardingSession
+		}
+		var mappedVerifyErr error
+		if verifyErr != nil {
+			mappedVerifyErr = mapAppleError(verifyErr, false)
+			if errors.Is(mappedVerifyErr, ErrSessionExpired) {
+				mappedVerifyErr = expireAutoSession(mappedVerifyErr)
+				if mappedUpdateErr != nil {
+					return domain.Alias{}, errors.Join(mappedVerifyErr, mappedUpdateErr)
+				}
+				return domain.Alias{}, mappedVerifyErr
+			}
+		}
+		verifyCheckpointContext, cancelVerifyCheckpoint := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
+		checkpointErr = checkpointReturnedSession(verifyCheckpointContext, &verifiedSession, updatedForwardingSession.Region)
+		cancelVerifyCheckpoint()
+		if checkpointErr != nil {
+			checkpointErr = wrapPersistenceError(checkpointErr)
+			if mappedVerifyErr != nil {
+				checkpointErr = errors.Join(checkpointErr, mappedVerifyErr)
+			}
+			if mappedUpdateErr != nil {
+				return domain.Alias{}, errors.Join(checkpointErr, mappedUpdateErr)
+			}
+			return domain.Alias{}, checkpointErr
+		}
+		if mappedVerifyErr != nil {
+			if callerErr := ctx.Err(); callerErr != nil {
+				return domain.Alias{}, callerErr
+			}
+			if mappedUpdateErr != nil {
+				return domain.Alias{}, errors.Join(mappedVerifyErr, mappedUpdateErr)
+			}
+			return domain.Alias{}, mappedVerifyErr
+		}
+		settings = verifiedSettings
+		listedSession = verifiedSession
+		forwardingErr = validateAutoCreateForwardingTarget(settings, account.Email)
+		if callerErr := ctx.Err(); callerErr != nil {
+			return domain.Alias{}, callerErr
+		}
+		if forwardingErr != nil && mappedUpdateErr != nil {
+			return domain.Alias{}, errors.Join(forwardingErr, mappedUpdateErr)
+		}
 	}
-	if !sameEmail(settings.SelectedForwardTo, account.Email) {
-		return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	if forwardingErr != nil {
+		return domain.Alias{}, forwardingErr
 	}
 
 	// Prepare every locally fallible key operation before reserve so a local key
@@ -1026,6 +1132,9 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	rawKey = ""
 	if err != nil {
 		return domain.Alias{}, wrapCryptoError(fmt.Errorf("encrypt automatic alias API key: %w", err))
+	}
+	if err := ctx.Err(); err != nil {
+		return domain.Alias{}, err
 	}
 
 	reportProgress(domain.AliasCreationPhaseReserving, autoCreateReservingPercent, 0)
@@ -1075,6 +1184,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	sessionRecord, sessionRecordErr := s.autoCreateSessionRecord(
 		accountID,
 		record.AppleID,
+		trustedDSID,
 		listedSession.Region,
 		sessionForConfirmation,
 	)
@@ -1257,12 +1367,16 @@ func normalizeAutoAliasAddress(value string) (string, error) {
 func (s *Service) autoCreateSessionRecord(
 	accountID int64,
 	expectedAppleID string,
+	expectedDSID string,
 	fallbackRegion apple.Region,
 	session apple.Session,
 ) (domain.AppleWebSession, error) {
 	if strings.TrimSpace(session.AppleID) != "" &&
 		!strings.EqualFold(strings.TrimSpace(session.AppleID), strings.TrimSpace(expectedAppleID)) {
 		return domain.AppleWebSession{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	if err := validateSessionDSID(expectedDSID, session); err != nil {
+		return domain.AppleWebSession{}, err
 	}
 	normalizeSession(&session, expectedAppleID, fallbackRegion, s.now())
 	region, err := normalizeRegion(session.Region)
@@ -1537,6 +1651,41 @@ func filterAliases(result apple.ListResult, accountEmail string) ([]apple.Alias,
 		return nil, 0, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 	}
 	return filtered, inactive, nil
+}
+
+// validateAutoCreateForwardingTarget requires Apple's explicit default because
+// reserve does not accept a per-request forwarding target. Candidate and
+// alias-level addresses cannot safely replace selectedForwardTo.
+func validateAutoCreateForwardingTarget(result apple.ListResult, accountEmail string) error {
+	selected := domain.NormalizeEmail(result.SelectedForwardTo)
+	if selected == "" {
+		return wrapError(CodeForwardingTargetMissing, ErrForwardingTargetMissing, nil)
+	}
+	if !sameEmail(selected, accountEmail) {
+		return wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	return nil
+}
+
+func containsForwardingCandidate(candidates []string, accountEmail string) bool {
+	for _, candidate := range candidates {
+		if sameEmail(candidate, accountEmail) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateSessionDSID(expected string, returned apple.Session) error {
+	expected = strings.TrimSpace(expected)
+	actual := strings.TrimSpace(returned.DSID)
+	if expected == "" || actual == "" {
+		return wrapError(CodeSessionExpired, ErrSessionExpired, nil)
+	}
+	if expected != actual {
+		return wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
+	}
+	return nil
 }
 
 func normalizeRegion(region apple.Region) (apple.Region, error) {

@@ -2298,6 +2298,7 @@ components:
             - loading_session
             - validating_session
             - checking_forwarding
+            - initializing_forwarding
             - preparing_key
             - reserving
             - saving_candidate
@@ -2444,7 +2445,7 @@ components:
           enum:
             - "true"
             - "false"
-          description: 失败或取消前是否已进入可能在 Apple 侧创建地址的阶段。
+          description: 失败或取消前是否已进入可能在 Apple 侧修改默认转发设置或创建地址的阶段。
         pending_confirmation:
           type: string
           enum:

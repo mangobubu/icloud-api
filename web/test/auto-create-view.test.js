@@ -61,6 +61,10 @@ test("account detail exposes automatic alias creation and safe key handling", as
     "Apple 登录账户或隐藏邮件地址的默认转发目标与当前主号不匹配，请确认登录了正确的 Apple 账户，并在 iCloud 设置中把‘转发到’改为当前主号后重新开启",
   );
   assert.equal(
+    formatAutoCreationError("APPLE_FORWARDING_TARGET_MISSING"),
+    "Apple 未能确认隐私邮箱的默认转发目标，本次没有发起创建；请确认当前主号可作为转发邮箱，或先在 iCloud 手动创建一个隐私邮箱后重新同步",
+  );
+  assert.equal(
     formatAutoCreationError("APPLE_SESSION_EXPIRED"),
     "Apple 登录已过期，请点击“同步隐私邮箱”并重新登录后重试",
   );

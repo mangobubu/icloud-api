@@ -66,6 +66,12 @@ type AutoAliasClient interface {
 	CreateAlias(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error)
 }
 
+// ForwardingTargetUpdater is optional so existing AppleClient implementations
+// can still create aliases when Apple already exposes selectedForwardTo.
+type ForwardingTargetUpdater interface {
+	UpdateForwardTo(context.Context, apple.Session, string) (apple.Session, error)
+}
+
 // AliasDeletionClient exposes Apple's two-step permanent deletion flow.
 // Active aliases must be deactivated before they can be deleted.
 type AliasDeletionClient interface {

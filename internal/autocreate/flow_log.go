@@ -23,11 +23,12 @@ type aliasCreationFlow struct {
 }
 
 type aliasCreationFlowState struct {
-	mu        sync.Mutex
-	stage     domain.AliasCreationPhase
-	percent   int
-	lastEvent string
-	terminal  bool
+	mu                       sync.Mutex
+	stage                    domain.AliasCreationPhase
+	percent                  int
+	lastEvent                string
+	remoteSideEffectPossible bool
+	terminal                 bool
 }
 
 func (m *Manager) newAliasCreationFlow(startedAt time.Time) aliasCreationFlow {
@@ -53,6 +54,18 @@ func (flow aliasCreationFlow) currentStage() domain.AliasCreationPhase {
 	flow.state.mu.Lock()
 	defer flow.state.mu.Unlock()
 	return flow.state.stage
+}
+
+func (flow aliasCreationFlow) hasRemoteSideEffectPossible(stage domain.AliasCreationPhase) bool {
+	if aliasCreationRemoteSideEffectPossible(stage) {
+		return true
+	}
+	if flow.state == nil {
+		return false
+	}
+	flow.state.mu.Lock()
+	defer flow.state.mu.Unlock()
+	return flow.state.remoteSideEffectPossible
 }
 
 func (flow aliasCreationFlow) markStarted() {
@@ -144,6 +157,9 @@ func (m *Manager) logAliasCreationProgress(
 	if stage == "" {
 		stage = flow.state.stage
 	}
+	if aliasCreationRemoteSideEffectPossible(stage) {
+		flow.state.remoteSideEffectPossible = true
+	}
 	percent := normalizedAliasCreationPercent(update.Percent)
 	if percent == 0 && flow.state.percent > 0 {
 		percent = flow.state.percent
@@ -226,7 +242,7 @@ func (m *Manager) logAliasCreationFailureWithOperation(
 		slog.Bool("failure_state_recorded", failureRecorded),
 		slog.Bool("auto_creation_disabled", creationDisabled),
 		slog.String("schedule_action", aliasCreationScheduleAction(creationDisabled, nextRunAt)),
-		slog.Bool("remote_side_effect_possible", aliasCreationRemoteSideEffectPossible(failedStage)),
+		slog.Bool("remote_side_effect_possible", flow.hasRemoteSideEffectPossible(failedStage)),
 		slog.Bool("pending_confirmation", aliasCreationPendingConfirmation(err, info.code)),
 	}
 	attributes = append(attributes, aliasCreationTimingAttrs(scheduledFor, attemptedAt, nextRunAt)...)
@@ -293,7 +309,7 @@ func (m *Manager) logAliasCreationCancellationWithError(
 		slog.String("error_context", reason),
 		slog.String("error", reason),
 		slog.String("schedule_action", aliasCreationScheduleAction(false, nextRunAt)),
-		slog.Bool("remote_side_effect_possible", aliasCreationRemoteSideEffectPossible(previousStage)),
+		slog.Bool("remote_side_effect_possible", flow.hasRemoteSideEffectPossible(previousStage)),
 		slog.Bool("pending_confirmation", aliasCreationPendingConfirmation(cause, code)),
 	}
 	attributes = append(attributes, aliasCreationTimingAttrs(scheduledFor, attemptedAt, nextRunAt)...)
@@ -434,6 +450,8 @@ func aliasCreationStageMessage(stage domain.AliasCreationPhase) string {
 		return "正在验证 Apple 登录会话"
 	case domain.AliasCreationPhaseCheckingForwarding:
 		return "正在核对隐私邮箱转发目标"
+	case domain.AliasCreationPhaseInitializingForwarding:
+		return "正在初始化隐私邮箱转发目标"
 	case domain.AliasCreationPhasePreparingKey:
 		return "正在准备本地 API Key"
 	case domain.AliasCreationPhaseReserving:
@@ -473,6 +491,7 @@ func isKnownAliasCreationPhase(value domain.AliasCreationPhase) bool {
 		domain.AliasCreationPhaseLoadingSession,
 		domain.AliasCreationPhaseValidatingSession,
 		domain.AliasCreationPhaseCheckingForwarding,
+		domain.AliasCreationPhaseInitializingForwarding,
 		domain.AliasCreationPhasePreparingKey,
 		domain.AliasCreationPhaseReserving,
 		domain.AliasCreationPhaseSavingCandidate,
@@ -624,6 +643,7 @@ func isAllowedAliasCreationErrorCode(code string) bool {
 		"APPLE_UPSTREAM_ERROR",
 		"APPLE_ALIAS_CONFIRMATION_PENDING",
 		"APPLE_ACCOUNT_MISMATCH",
+		"APPLE_FORWARDING_TARGET_MISSING",
 		"ACCOUNT_CHANGED",
 		"ALIAS_OWNERSHIP_CONFLICT",
 		"ACCOUNT_DISABLED",
@@ -651,6 +671,7 @@ func aliasCreationErrorClass(code string) string {
 	case code == "CONTEXT_CANCELED" || code == "CONTEXT_DEADLINE_EXCEEDED":
 		return "context"
 	case code == "APPLE_ACCOUNT_ACTION_REQUIRED" || code == "APPLE_ACCOUNT_MISMATCH" ||
+		code == "APPLE_FORWARDING_TARGET_MISSING" ||
 		code == "ACCOUNT_CHANGED" || code == "ALIAS_OWNERSHIP_CONFLICT" || code == "ACCOUNT_DISABLED":
 		return "account_state"
 	case strings.HasPrefix(code, "APPLE_SESSION") || strings.HasPrefix(code, "APPLE_LOGIN") ||
@@ -750,6 +771,8 @@ func aliasCreationErrorReason(code string) string {
 		return "Apple 请求被限流，本次计划槽已结束，后续计划会继续执行"
 	case "APPLE_ACCOUNT_MISMATCH":
 		return "Apple 登录账户或默认转发目标与当前主号不匹配"
+	case "APPLE_FORWARDING_TARGET_MISSING":
+		return "Apple 未能确认隐私邮箱的默认转发目标，本次未发起创建；请确认当前主号可作为转发邮箱，或先在 iCloud 手动创建一个隐私邮箱"
 	case "APPLE_ALIAS_CONFIRMATION_PENDING":
 		return "Apple 地址已创建但目录确认尚未完成，后续计划会继续确认"
 	case "ALIAS_LIMIT_REACHED":
@@ -811,6 +834,8 @@ func aliasCreationOperation(stage domain.AliasCreationPhase) string {
 		return "validate_apple_session"
 	case domain.AliasCreationPhaseCheckingForwarding:
 		return "list_aliases_and_check_forwarding"
+	case domain.AliasCreationPhaseInitializingForwarding:
+		return "initialize_forwarding_target"
 	case domain.AliasCreationPhasePreparingKey:
 		return "prepare_api_key"
 	case domain.AliasCreationPhaseReserving:
@@ -830,7 +855,8 @@ func aliasCreationOperation(stage domain.AliasCreationPhase) string {
 
 func aliasCreationRemoteSideEffectPossible(stage domain.AliasCreationPhase) bool {
 	switch stage {
-	case domain.AliasCreationPhaseReserving,
+	case domain.AliasCreationPhaseInitializingForwarding,
+		domain.AliasCreationPhaseReserving,
 		domain.AliasCreationPhaseSavingCandidate,
 		domain.AliasCreationPhaseConfirming,
 		domain.AliasCreationPhaseReconciling,

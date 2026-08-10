@@ -820,6 +820,8 @@ func safeAppleOperation(value string) string {
 		"decode Apple session",
 		"list Hide My Email aliases",
 		"decode Hide My Email list",
+		"update Hide My Email forwarding target",
+		"decode update Hide My Email forwarding target",
 		"generate Hide My Email alias",
 		"decode generate Hide My Email alias",
 		"decode generated Hide My Email alias",

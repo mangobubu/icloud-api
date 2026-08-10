@@ -27,6 +27,7 @@ const AUTO_CREATE_STAGE_LABELS = Object.freeze({
   loading_session: "读取 Apple 登录会话",
   validating_session: "验证 Apple 登录会话",
   checking_forwarding: "核对隐私邮箱转发目标",
+  initializing_forwarding: "初始化隐私邮箱转发目标",
   preparing_key: "准备本地 API Key",
   reserving: "请求 Apple 创建隐私邮箱",
   saving_candidate: "保存待确认隐私邮箱",

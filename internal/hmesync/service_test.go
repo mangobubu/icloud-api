@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -849,19 +851,248 @@ func TestCreateAutoAliasPersistsCandidateAfterCallerCancellation(t *testing.T) {
 	}
 }
 
-func TestCreateAutoAliasRejectsMissingSelectedForwardBeforeReserve(t *testing.T) {
-	ctx := context.Background()
+func TestValidateAutoCreateForwardingTarget(t *testing.T) {
+	tests := []struct {
+		name     string
+		result   apple.ListResult
+		wantCode string
+		wantKind error
+	}{
+		{
+			name:   "selected target is authoritative",
+			result: apple.ListResult{SelectedForwardTo: " PRIMARY@ICLOUD.COM ", ForwardToEmails: []string{"other@example.com"}},
+		},
+		{
+			name: "selected mismatch is not overridden",
+			result: apple.ListResult{
+				SelectedForwardTo: "other@example.com",
+				ForwardToEmails:   []string{"primary@icloud.com"},
+			},
+			wantCode: CodeAccountMismatch,
+			wantKind: ErrAccountMismatch,
+		},
+		{
+			name:     "available target does not replace missing selection",
+			result:   apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}},
+			wantCode: CodeForwardingTargetMissing,
+			wantKind: ErrForwardingTargetMissing,
+		},
+		{
+			name: "existing alias does not replace missing selection",
+			result: apple.ListResult{Aliases: []apple.Alias{{
+				HME: "existing@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true,
+			}}},
+			wantCode: CodeForwardingTargetMissing,
+			wantKind: ErrForwardingTargetMissing,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateAutoCreateForwardingTarget(test.result, "primary@icloud.com")
+			if Code(err) != test.wantCode {
+				t.Fatalf("error = %v code=%q, want %q", err, Code(err), test.wantCode)
+			}
+			if test.wantKind == nil && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if test.wantKind != nil && !errors.Is(err, test.wantKind) {
+				t.Fatalf("error = %v, want kind %v", err, test.wantKind)
+			}
+		})
+	}
+}
+
+func TestCreateAutoAliasInitializesMissingForwardingTarget(t *testing.T) {
+	var progress []domain.AliasCreationProgressUpdate
+	ctx := domain.WithAliasCreationProgressReporter(context.Background(), func(update domain.AliasCreationProgressUpdate) {
+		progress = append(progress, update)
+	})
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	var events []string
+	listCalls := 0
 	client := &fakeAppleClient{
 		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
 			return session, nil
 		},
 		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
-			return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
+			listCalls++
+			events = append(events, fmt.Sprintf("list-%d", listCalls))
+			if listCalls == 1 {
+				session.SessionToken = "listed-session"
+				return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
+			}
+			if session.SessionToken != "updated-session" {
+				t.Fatalf("forwarding verification session = %#v", session)
+			}
+			session.SessionToken = "verified-session"
+			return apple.ListResult{
+				SelectedForwardTo: "primary@icloud.com",
+				ForwardToEmails:   []string{"primary@icloud.com"},
+			}, session, nil
+		},
+		update: func(_ context.Context, session apple.Session, forwardToEmail string) (apple.Session, error) {
+			events = append(events, "update")
+			if session.SessionToken != "listed-session" || forwardToEmail != "primary@icloud.com" {
+				t.Fatalf("forwarding update = session %#v target %q", session, forwardToEmail)
+			}
+			session.SessionToken = "updated-session"
+			return session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			events = append(events, "create")
+			if session.SessionToken != "verified-session" {
+				t.Fatalf("reserve session = %#v", session)
+			}
+			return apple.Alias{
+				HME: "created@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true,
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal, DSID: "42"})
+
+	created, err := service.CreateAutoAlias(ctx, 3)
+	if err != nil {
+		t.Fatalf("initialize forwarding and create: %v", err)
+	}
+	if created.Address != "created@icloud.com" || listCalls != 2 || client.updateCalls.Load() != 1 ||
+		client.createCalls.Load() != 1 || repo.creates.Load() != 1 || strings.Join(events, ",") != "list-1,update,list-2,create" {
+		t.Fatalf("created=%#v lists=%d updates=%d reserves=%d writes=%d events=%v",
+			created, listCalls, client.updateCalls.Load(), client.createCalls.Load(), repo.creates.Load(), events)
+	}
+	if !containsAliasCreationPhase(progress, domain.AliasCreationPhaseInitializingForwarding) {
+		t.Fatalf("forwarding initialization progress missing: %#v", progress)
+	}
+}
+
+func TestCreateAutoAliasDoesNotInitializeUnsafeForwardingState(t *testing.T) {
+	tests := []struct {
+		name   string
+		result apple.ListResult
+	}{
+		{
+			name: "existing remote alias",
+			result: apple.ListResult{
+				ForwardToEmails: []string{"primary@icloud.com"},
+				Aliases: []apple.Alias{{
+					HME: "existing@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true,
+				}},
+			},
+		},
+		{name: "current mailbox absent from candidates", result: apple.ListResult{ForwardToEmails: []string{"other@example.com"}}},
+		{name: "no forwarding candidates", result: apple.ListResult{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+			repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+			client := &fakeAppleClient{
+				validate: func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil },
+				list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+					return test.result, session, nil
+				},
+				update: func(context.Context, apple.Session, string) (apple.Session, error) {
+					t.Fatal("unsafe forwarding state reached account-level update")
+					return apple.Session{}, nil
+				},
+				create: func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error) {
+					t.Fatal("unsafe forwarding state reached reserve")
+					return apple.Alias{}, apple.Session{}, nil
+				},
+			}
+			service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+			storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+			_, err := service.CreateAutoAlias(context.Background(), 3)
+			if !errors.Is(err, ErrForwardingTargetMissing) || Code(err) != CodeForwardingTargetMissing {
+				t.Fatalf("unsafe forwarding error = %v code=%q", err, Code(err))
+			}
+			if client.updateCalls.Load() != 0 || client.createCalls.Load() != 0 || repo.creates.Load() != 0 {
+				t.Fatalf("unsafe forwarding side effects: updates=%d reserves=%d writes=%d",
+					client.updateCalls.Load(), client.createCalls.Load(), repo.creates.Load())
+			}
+		})
+	}
+}
+
+func TestCreateAutoAliasReconcilesUncertainForwardingUpdate(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	listCalls := 0
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil },
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			listCalls++
+			if listCalls == 1 {
+				return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
+			}
+			return apple.ListResult{
+				SelectedForwardTo: "primary@icloud.com",
+				ForwardToEmails:   []string{"primary@icloud.com"},
+			}, session, nil
+		},
+		update: func(_ context.Context, session apple.Session, _ string) (apple.Session, error) {
+			session.SessionToken = "rotated-during-uncertain-update"
+			return session, &apple.Error{
+				Op: "update Hide My Email forwarding target", Kind: apple.ErrService,
+				StatusCode: http.StatusServiceUnavailable, Retryable: true,
+			}
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			if session.SessionToken != "rotated-during-uncertain-update" {
+				t.Fatalf("reserve lost uncertain update session: %#v", session)
+			}
+			return apple.Alias{
+				HME: "created@icloud.com", ForwardToEmail: "primary@icloud.com", IsActive: true,
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	created, err := service.CreateAutoAlias(ctx, 3)
+	if err != nil || created.Address != "created@icloud.com" || listCalls != 2 ||
+		client.updateCalls.Load() != 1 || client.createCalls.Load() != 1 {
+		t.Fatalf("created=%#v err=%v lists=%d updates=%d reserves=%d",
+			created, err, listCalls, client.updateCalls.Load(), client.createCalls.Load())
+	}
+}
+
+func TestCreateAutoAliasReconcilesCanceledForwardingUpdateWithoutReserve(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	listCalls := 0
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil },
+		list: func(callContext context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			listCalls++
+			if listCalls == 1 {
+				return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
+			}
+			if callContext.Err() != nil {
+				t.Fatalf("forwarding recovery inherited canceled context: %v", callContext.Err())
+			}
+			if _, hasDeadline := callContext.Deadline(); !hasDeadline {
+				t.Fatal("forwarding recovery context has no deadline")
+			}
+			if session.SessionToken != "rotated-during-canceled-update" {
+				t.Fatalf("forwarding recovery session = %#v", session)
+			}
+			return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+		},
+		update: func(_ context.Context, session apple.Session, _ string) (apple.Session, error) {
+			session.SessionToken = "rotated-during-canceled-update"
+			cancel()
+			return session, &apple.Error{
+				Op: "update Hide My Email forwarding target", Kind: apple.ErrInvalidResponse,
+				StatusCode: http.StatusOK, Err: context.Canceled,
+			}
 		},
 		create: func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error) {
-			t.Fatal("missing selected forwarding target reached Apple reserve")
+			t.Fatal("canceled forwarding recovery reached reserve")
 			return apple.Alias{}, apple.Session{}, nil
 		},
 	}
@@ -869,11 +1100,157 @@ func TestCreateAutoAliasRejectsMissingSelectedForwardBeforeReserve(t *testing.T)
 	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
 
 	_, err := service.CreateAutoAlias(ctx, 3)
-	if !errors.Is(err, ErrUpstream) || Code(err) != CodeUpstreamError {
-		t.Fatalf("missing selected target error = %v code=%q", err, Code(err))
+	if !errors.Is(err, context.Canceled) || listCalls != 2 || client.updateCalls.Load() != 1 ||
+		client.createCalls.Load() != 0 || repo.creates.Load() != 0 {
+		t.Fatalf("err=%v lists=%d updates=%d reserves=%d writes=%d",
+			err, listCalls, client.updateCalls.Load(), client.createCalls.Load(), repo.creates.Load())
 	}
-	if client.createCalls.Load() != 0 || repo.creates.Load() != 0 {
-		t.Fatalf("missing target caused side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
+	assertStoredAppleSessionToken(t, service, repo, 3, "rotated-during-canceled-update")
+}
+
+func TestCreateAutoAliasPersistsForwardingVerificationSessionOnFailure(t *testing.T) {
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	listCalls := 0
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil },
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			listCalls++
+			if listCalls == 1 {
+				return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
+			}
+			session.SessionToken = "rotated-during-failed-verification"
+			return apple.ListResult{}, session, &apple.Error{
+				Op: "list Hide My Email aliases", Kind: apple.ErrService,
+				StatusCode: http.StatusServiceUnavailable, Retryable: true,
+			}
+		},
+		update: func(_ context.Context, session apple.Session, _ string) (apple.Session, error) {
+			session.SessionToken = "rotated-during-update"
+			return session, nil
+		},
+		create: func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error) {
+			t.Fatal("failed forwarding verification reached reserve")
+			return apple.Alias{}, apple.Session{}, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(context.Background(), 3)
+	if Code(err) != CodeUpstreamError || !errors.Is(err, ErrUpstream) || listCalls != 2 ||
+		client.updateCalls.Load() != 1 || client.createCalls.Load() != 0 {
+		t.Fatalf("err=%v code=%q lists=%d updates=%d reserves=%d",
+			err, Code(err), listCalls, client.updateCalls.Load(), client.createCalls.Load())
+	}
+	assertStoredAppleSessionToken(t, service, repo, 3, "rotated-during-failed-verification")
+}
+
+func TestCreateAutoAliasRequiresExplicitForwardingReadback(t *testing.T) {
+	tests := []struct {
+		name     string
+		verified apple.ListResult
+		wantCode string
+		wantKind error
+	}{
+		{
+			name:     "selection still missing",
+			verified: apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}},
+			wantCode: CodeForwardingTargetMissing,
+			wantKind: ErrForwardingTargetMissing,
+		},
+		{
+			name:     "selection changed to another mailbox",
+			verified: apple.ListResult{SelectedForwardTo: "other@example.com"},
+			wantCode: CodeAccountMismatch,
+			wantKind: ErrAccountMismatch,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+			repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+			listCalls := 0
+			client := &fakeAppleClient{
+				validate: func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil },
+				list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+					listCalls++
+					if listCalls == 1 {
+						return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
+					}
+					return test.verified, session, nil
+				},
+				update: func(_ context.Context, session apple.Session, _ string) (apple.Session, error) {
+					return session, nil
+				},
+				create: func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error) {
+					t.Fatal("unverified forwarding initialization reached reserve")
+					return apple.Alias{}, apple.Session{}, nil
+				},
+			}
+			service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+			storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+			_, err := service.CreateAutoAlias(context.Background(), 3)
+			if Code(err) != test.wantCode || !errors.Is(err, test.wantKind) || listCalls != 2 ||
+				client.updateCalls.Load() != 1 || client.createCalls.Load() != 0 || repo.creates.Load() != 0 {
+				t.Fatalf("err=%v code=%q lists=%d updates=%d reserves=%d writes=%d",
+					err, Code(err), listCalls, client.updateCalls.Load(), client.createCalls.Load(), repo.creates.Load())
+			}
+		})
+	}
+}
+
+func TestCreateAutoAliasRejectsDSIDChangeDuringForwardingInitialization(t *testing.T) {
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	listCalls := 0
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) { return session, nil },
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			listCalls++
+			return apple.ListResult{ForwardToEmails: []string{"primary@icloud.com"}}, session, nil
+		},
+		update: func(_ context.Context, session apple.Session, _ string) (apple.Session, error) {
+			session.DSID = "different-account"
+			return session, nil
+		},
+		create: func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error) {
+			t.Fatal("changed Apple account reached reserve")
+			return apple.Alias{}, apple.Session{}, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{
+		AppleID: "owner@example.com", Region: apple.RegionGlobal, DSID: "expected-account",
+	})
+
+	_, err := service.CreateAutoAlias(context.Background(), 3)
+	if Code(err) != CodeAccountMismatch || !errors.Is(err, ErrAccountMismatch) || listCalls != 1 ||
+		client.updateCalls.Load() != 1 || client.createCalls.Load() != 0 {
+		t.Fatalf("err=%v code=%q lists=%d updates=%d reserves=%d",
+			err, Code(err), listCalls, client.updateCalls.Load(), client.createCalls.Load())
+	}
+}
+
+func TestCreateAutoAliasRejectsStoredSessionWithoutDSID(t *testing.T) {
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(context.Context, apple.Session) (apple.Session, error) {
+			t.Fatal("session without a trusted DSID reached Apple validation")
+			return apple.Session{}, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSessionExactly(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(context.Background(), 3)
+	if Code(err) != CodeSessionExpired || !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("missing DSID error = %v code=%q", err, Code(err))
+	}
+	if _, sessionErr := repo.GetAppleWebSession(context.Background(), 3); !errors.Is(sessionErr, store.ErrNotFound) {
+		t.Fatalf("session without DSID was not removed: %v", sessionErr)
 	}
 }
 
@@ -1829,11 +2206,13 @@ type fakeAppleClient struct {
 	verify       func(context.Context, apple.Session, string) (apple.Session, error)
 	validate     func(context.Context, apple.Session) (apple.Session, error)
 	list         func(context.Context, apple.Session) (apple.ListResult, apple.Session, error)
+	update       func(context.Context, apple.Session, string) (apple.Session, error)
 	create       func(context.Context, apple.Session, string, string) (apple.Alias, apple.Session, error)
 	deactivate   func(context.Context, apple.Session, string) (apple.Session, error)
 	deleteRemote func(context.Context, apple.Session, string) (apple.Session, error)
 
 	verifyCalls     atomic.Int32
+	updateCalls     atomic.Int32
 	createCalls     atomic.Int32
 	deactivateCalls atomic.Int32
 	deleteCalls     atomic.Int32
@@ -1866,6 +2245,14 @@ func (c *fakeAppleClient) ListAliases(ctx context.Context, session apple.Session
 		panic("unexpected ListAliases")
 	}
 	return c.list(ctx, session)
+}
+
+func (c *fakeAppleClient) UpdateForwardTo(ctx context.Context, session apple.Session, forwardToEmail string) (apple.Session, error) {
+	c.updateCalls.Add(1)
+	if c.update == nil {
+		panic("unexpected UpdateForwardTo")
+	}
+	return c.update(ctx, session, forwardToEmail)
 }
 
 func (c *fakeAppleClient) CreateAlias(ctx context.Context, session apple.Session, label, note string) (apple.Alias, apple.Session, error) {
@@ -2188,6 +2575,14 @@ func newTestService(t *testing.T, repo Repository, client AppleClient, locker Ac
 }
 
 func storeSession(t *testing.T, service *Service, repo *fakeRepository, accountID int64, session apple.Session) {
+	t.Helper()
+	if strings.TrimSpace(session.DSID) == "" {
+		session.DSID = "test-dsid"
+	}
+	storeSessionExactly(t, service, repo, accountID, session)
+}
+
+func storeSessionExactly(t *testing.T, service *Service, repo *fakeRepository, accountID int64, session apple.Session) {
 	t.Helper()
 	if session.ValidatedAt.IsZero() {
 		session.ValidatedAt = repo.now

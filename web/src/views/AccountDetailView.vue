@@ -916,6 +916,8 @@ const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
     "Apple 已创建隐私邮箱，正在等待目录确认；后续自动创建计划只会继续确认，不会重复创建",
   APPLE_ACCOUNT_MISMATCH:
     "Apple 登录账户或隐藏邮件地址的默认转发目标与当前主号不匹配，请确认登录了正确的 Apple 账户，并在 iCloud 设置中把‘转发到’改为当前主号后重新开启",
+  APPLE_FORWARDING_TARGET_MISSING:
+    "Apple 未能确认隐私邮箱的默认转发目标，本次没有发起创建；请确认当前主号可作为转发邮箱，或先在 iCloud 手动创建一个隐私邮箱后重新同步",
   ACCOUNT_CHANGED: "主号信息在创建过程中发生变化，请刷新页面并确认主号信息后重试",
   ALIAS_OWNERSHIP_CONFLICT:
     "Apple 创建的隐私邮箱已属于其他主号，请检查主号归属后重试",

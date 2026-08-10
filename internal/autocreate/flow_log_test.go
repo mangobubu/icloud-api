@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -328,6 +329,93 @@ func TestAliasCreationRealFailureWinsCancellationRaceAndIsRecorded(t *testing.T)
 		t.Fatalf("cancellation race failure state = %#v", repo.failures)
 	}
 	assertAutoCreateEventsAbsent(t, logs, "run_cancelled")
+}
+
+func TestAliasCreationMissingForwardingTargetIsSpecificAndSafe(t *testing.T) {
+	const code = "APPLE_FORWARDING_TARGET_MISSING"
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	manager, logs := newFlowLogManager(t, repo, clock, func(ctx context.Context, _ int64) (domain.Alias, error) {
+		domain.ReportAliasCreationProgress(ctx, domain.AliasCreationPhaseCheckingForwarding, 45, 0)
+		return domain.Alias{}, testDiagnosticError{code: code, detail: "sensitive forwarding fixture"}
+	})
+	schedule := enableForTest(t, manager, 91)
+	clock.Set(*schedule.NextRunAt)
+	manager.runDue(context.Background())
+
+	failed := requireAutoCreateEvent(t, logs, "run_failed")
+	if failed.Fields["error_code"] != code ||
+		failed.Fields["error_class"] != "account_state" ||
+		failed.Fields["cause_category"] != "account_state" ||
+		failed.Fields["failed_stage"] != string(domain.AliasCreationPhaseCheckingForwarding) ||
+		failed.Fields["failed_operation"] != "list_aliases_and_check_forwarding" ||
+		failed.Fields["remote_side_effect_possible"] != "false" {
+		t.Fatalf("forwarding failure diagnostics = %#v", failed.Fields)
+	}
+	for _, field := range []string{"operation", "http_status", "retryable", "service_code_fingerprint"} {
+		if failed.Fields[field] != "" {
+			t.Fatalf("local forwarding failure unexpectedly logged %s=%q", field, failed.Fields[field])
+		}
+	}
+	wantReason := aliasCreationErrorReason(code)
+	if failed.Fields["error_context"] != wantReason || strings.Contains(wantReason, "HTTP") ||
+		len(repo.failures) != 1 || repo.failures[0].message != wantReason {
+		t.Fatalf("forwarding failure reason=%q persisted=%#v", failed.Fields["error_context"], repo.failures)
+	}
+	current, err := manager.GetSchedule(context.Background(), 91)
+	if err != nil || !current.Enabled || current.NextRunAt == nil {
+		t.Fatalf("schedule after forwarding failure = %#v err=%v", current, err)
+	}
+	assertFlowLogsDoNotContain(t, logs, "sensitive forwarding fixture")
+}
+
+func TestAliasCreationForwardingInitializationReportsRemoteMutation(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	manager, logs := newFlowLogManager(t, repo, clock, func(ctx context.Context, _ int64) (domain.Alias, error) {
+		domain.ReportAliasCreationProgress(ctx, domain.AliasCreationPhaseInitializingForwarding, 50, 0)
+		return domain.Alias{}, &apple.Error{
+			Op:         "update Hide My Email forwarding target",
+			Kind:       apple.ErrService,
+			StatusCode: http.StatusServiceUnavailable,
+			Retryable:  true,
+		}
+	})
+	schedule := enableForTest(t, manager, 92)
+	clock.Set(*schedule.NextRunAt)
+	manager.runDue(context.Background())
+
+	failed := requireAutoCreateEvent(t, logs, "run_failed")
+	if failed.Fields["failed_stage"] != string(domain.AliasCreationPhaseInitializingForwarding) ||
+		failed.Fields["failed_operation"] != "initialize_forwarding_target" ||
+		failed.Fields["operation"] != "update Hide My Email forwarding target" ||
+		failed.Fields["remote_side_effect_possible"] != "true" {
+		t.Fatalf("forwarding initialization diagnostics = %#v", failed.Fields)
+	}
+	current, err := manager.GetSchedule(context.Background(), 92)
+	if err != nil || !current.Enabled || current.NextRunAt == nil {
+		t.Fatalf("forwarding initialization unexpectedly disabled schedule: current=%#v err=%v", current, err)
+	}
+}
+
+func TestAliasCreationRetainsForwardingMutationAcrossLaterStages(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	manager, logs := newFlowLogManager(t, repo, clock, func(ctx context.Context, _ int64) (domain.Alias, error) {
+		domain.ReportAliasCreationProgress(ctx, domain.AliasCreationPhaseInitializingForwarding, 50, 0)
+		domain.ReportAliasCreationProgress(ctx, domain.AliasCreationPhasePreparingKey, 55, 0)
+		return domain.Alias{}, testDiagnosticError{code: "AUTO_CREATION_CRYPTO_ERROR", detail: "sensitive crypto fixture"}
+	})
+	schedule := enableForTest(t, manager, 93)
+	clock.Set(*schedule.NextRunAt)
+	manager.runDue(context.Background())
+
+	failed := requireAutoCreateEvent(t, logs, "run_failed")
+	if failed.Fields["failed_stage"] != string(domain.AliasCreationPhasePreparingKey) ||
+		failed.Fields["failed_operation"] != "prepare_api_key" ||
+		failed.Fields["remote_side_effect_possible"] != "true" {
+		t.Fatalf("later forwarding failure diagnostics = %#v", failed.Fields)
+	}
 }
 
 func TestAliasCreationDeadlineLogsTimeoutReason(t *testing.T) {

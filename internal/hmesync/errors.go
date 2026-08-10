@@ -17,6 +17,7 @@ const (
 	CodeAccountActionRequired    = "APPLE_ACCOUNT_ACTION_REQUIRED"
 	CodeRateLimited              = "APPLE_RATE_LIMITED"
 	CodeUpstreamError            = "APPLE_UPSTREAM_ERROR"
+	CodeForwardingTargetMissing  = "APPLE_FORWARDING_TARGET_MISSING"
 	CodeAliasConfirmationPending = domain.AppleAliasConfirmationPending
 	CodeAccountMismatch          = "APPLE_ACCOUNT_MISMATCH"
 	CodeAccountChanged           = "ACCOUNT_CHANGED"
@@ -35,6 +36,7 @@ var (
 	ErrAccountActionRequired    = errors.New("Apple account action required")
 	ErrRateLimited              = errors.New("Apple request rate limited")
 	ErrUpstream                 = errors.New("Apple upstream request failed")
+	ErrForwardingTargetMissing  = errors.New("Apple forwarding target is missing")
 	ErrAliasConfirmationPending = errors.New("Apple alias confirmation pending")
 	ErrAccountMismatch          = errors.New("Apple account does not own this mailbox")
 	ErrAccountChanged           = errors.New("account identity changed during Apple operation")

@@ -432,6 +432,10 @@ test("runtime log display metadata and attributes remain predictable", () => {
     "核对隐私邮箱转发目标",
   );
   assert.equal(
+    runtimeLogAutoCreateStageLabel("initializing_forwarding"),
+    "初始化隐私邮箱转发目标",
+  );
+  assert.equal(
     runtimeLogAutoCreateStageLabel("reconciling"),
     "等待并核对 Apple 隐私邮箱目录",
   );

@@ -387,6 +387,45 @@ func (c *Client) ListAliases(ctx context.Context, session Session) (list ListRes
 	return list, result, nil
 }
 
+// UpdateForwardTo sets the account-wide Hide My Email forwarding target. The
+// caller must verify the selected target with ListAliases before reserving an
+// alias because a lost response can leave the mutation outcome uncertain.
+func (c *Client) UpdateForwardTo(ctx context.Context, session Session, forwardToEmail string) (result Session, err error) {
+	result = session
+	forwardToEmail, err = normalizeHMEAddress(forwardToEmail)
+	if err != nil {
+		return result, operationError("update Hide My Email forwarding target", ErrInvalidConfig, 0,
+			errors.New("invalid forwarding email address"))
+	}
+	op, err := c.newOperation(&result)
+	if err != nil {
+		return result, err
+	}
+	defer op.persist(&result)
+	if result.PremiumMailSettingsURL == "" || result.DSID == "" {
+		return result, operationError("update Hide My Email forwarding target", ErrInvalidSession, 0, nil)
+	}
+	requestURL, err := c.premiumMailSettingsRequestURL(result, "/v1/hme/updateForwardTo")
+	if err != nil {
+		return result, fmt.Errorf("%w: invalid premium mail service URL", ErrInvalidSession)
+	}
+	response, err := op.request(
+		ctx,
+		"update Hide My Email forwarding target",
+		http.MethodPost,
+		requestURL,
+		map[string]string{"forwardToEmail": forwardToEmail},
+		op.serviceHeaders(),
+	)
+	if err != nil {
+		return result, err
+	}
+	if err := decodeHMEMutation("update Hide My Email forwarding target", response); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
 // DeactivateAlias stops delivery to one Hide My Email address. Apple requires
 // the opaque anonymous ID returned by ListAliases rather than the address.
 func (c *Client) DeactivateAlias(ctx context.Context, session Session, anonymousID string) (Session, error) {

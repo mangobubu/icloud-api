@@ -546,6 +546,143 @@ func TestAliasMutationsPostAnonymousIDAndPersistSession(t *testing.T) {
 	}
 }
 
+func TestUpdateForwardToPostsVerifiedAddressAndPersistsSession(t *testing.T) {
+	tests := []struct {
+		name   string
+		region Region
+		host   string
+		home   string
+	}{
+		{name: "global", region: RegionGlobal, host: "p01-maildomainws.icloud.com", home: "https://www.icloud.com"},
+		{name: "china", region: RegionChina, host: "p01-maildomainws.icloud.com.cn", home: "https://www.icloud.com.cn"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			requests := 0
+			client, err := NewClient(Config{
+				ClientBuildNumber:     "build-test",
+				ClientMasteringNumber: "mastering-test",
+				Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					requests++
+					if request.Method != http.MethodPost || request.URL.Path != "/v1/hme/updateForwardTo" ||
+						request.URL.Host != test.host {
+						return nil, fmt.Errorf("unexpected forwarding request %s %s", request.Method, request.URL.String())
+					}
+					query := request.URL.Query()
+					if query.Get("clientBuildNumber") != "build-test" ||
+						query.Get("clientMasteringNumber") != "mastering-test" ||
+						query.Get("clientId") != "client-id" || query.Get("dsid") != "42" {
+						return nil, fmt.Errorf("unexpected forwarding query: %s", request.URL.RawQuery)
+					}
+					if request.Header.Get("Accept") != "application/json" ||
+						request.Header.Get("Content-Type") != "application/json" ||
+						request.Header.Get("Origin") != test.home ||
+						request.Header.Get("Referer") != test.home+"/" {
+						return nil, fmt.Errorf("unexpected forwarding headers: %#v", request.Header)
+					}
+					if !strings.Contains(request.Header.Get("Cookie"), "existing=session") {
+						return nil, errors.New("persisted forwarding cookie was not restored")
+					}
+					body, err := io.ReadAll(request.Body)
+					if err != nil {
+						return nil, err
+					}
+					var payload map[string]string
+					if err := json.Unmarshal(body, &payload); err != nil || len(payload) != 1 ||
+						payload["forwardToEmail"] != "owner@example.com" {
+						return nil, fmt.Errorf("forwarding payload = %s", body)
+					}
+					headers := make(http.Header)
+					headers.Set("X-Apple-ID-Session-Id", "updated-session")
+					headers.Set("X-Apple-Session-Token", "updated-token")
+					headers.Add("Set-Cookie", "forwarding=complete; Path=/; Secure; HttpOnly")
+					return testResponse(request, http.StatusOK, `{"success":true}`, headers), nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			updated, err := client.UpdateForwardTo(context.Background(), Session{
+				Region:                 test.region,
+				DSID:                   "42",
+				ClientID:               "client-id",
+				PremiumMailSettingsURL: "https://" + test.host,
+				Cookies: []PersistentCookie{{
+					Name: "existing", Value: "session", Domain: test.host,
+					Path: "/", HostOnly: true, Secure: true,
+				}},
+			}, " OWNER@example.com ")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if requests != 1 || updated.SessionID != "updated-session" || updated.SessionToken != "updated-token" {
+				t.Fatalf("requests=%d updated session=%#v", requests, updated)
+			}
+			foundCookie := false
+			for _, cookie := range updated.Cookies {
+				if cookie.Name == "forwarding" && cookie.Value == "complete" {
+					foundCookie = true
+				}
+			}
+			if !foundCookie {
+				t.Fatalf("updated cookies = %#v", updated.Cookies)
+			}
+		})
+	}
+}
+
+func TestUpdateForwardToRejectsInvalidAddressWithoutRequest(t *testing.T) {
+	requests := 0
+	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		return testResponse(request, http.StatusOK, `{"success":true}`, nil), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.UpdateForwardTo(context.Background(), Session{}, "not-an-email")
+	if !errors.Is(err, ErrInvalidConfig) || requests != 0 {
+		t.Fatalf("error=%v requests=%d, want invalid config without request", err, requests)
+	}
+}
+
+func TestUpdateForwardToPreservesRetryableServiceFailure(t *testing.T) {
+	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		headers := make(http.Header)
+		headers.Set("X-Apple-ID-Session-Id", "rotated-session")
+		headers.Set("X-Apple-Session-Token", "rotated-token")
+		headers.Add("Set-Cookie", "rotated=forwarding; Path=/; Secure; HttpOnly")
+		return testResponse(request, http.StatusServiceUnavailable,
+			`{"success":false,"error":{"errorCode":"FORWARD_TEMPORARY"}}`, headers), nil
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := client.UpdateForwardTo(context.Background(), Session{
+		Region:                 RegionGlobal,
+		DSID:                   "42",
+		ClientID:               "client-id",
+		PremiumMailSettingsURL: "https://p01-maildomainws.icloud.com",
+	}, "owner@example.com")
+	var typed *Error
+	if !errors.Is(err, ErrService) || !errors.As(err, &typed) ||
+		typed.StatusCode != http.StatusServiceUnavailable || typed.ServiceCode != "FORWARD_TEMPORARY" || !typed.Retryable {
+		t.Fatalf("forwarding error = %#v", typed)
+	}
+	if updated.SessionID != "rotated-session" || updated.SessionToken != "rotated-token" {
+		t.Fatalf("failed forwarding update lost rotated session: %#v", updated)
+	}
+	foundCookie := false
+	for _, cookie := range updated.Cookies {
+		if cookie.Name == "rotated" && cookie.Value == "forwarding" {
+			foundCookie = true
+		}
+	}
+	if !foundCookie {
+		t.Fatalf("failed forwarding update lost rotated cookies: %#v", updated.Cookies)
+	}
+}
+
 func TestAliasMutationsRejectInvalidAnonymousIDsWithoutRequest(t *testing.T) {
 	requests := 0
 	client, err := NewClient(Config{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
