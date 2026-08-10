@@ -224,8 +224,7 @@ func mapAppleError(err error, duringVerification bool) error {
 	case errors.Is(err, apple.ErrTermsRequired):
 		return wrapError(CodeAccountActionRequired, ErrAccountActionRequired, err)
 	}
-	var upstream *apple.Error
-	if errors.As(err, &upstream) && upstream.StatusCode == 429 {
+	if apple.IsRateLimited(err) {
 		return wrapError(CodeRateLimited, ErrRateLimited, err)
 	}
 	return wrapError(CodeUpstreamError, ErrUpstream, err)

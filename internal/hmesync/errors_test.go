@@ -38,10 +38,28 @@ func TestMapAppleErrorKeepsStableCodesAndTypedCause(t *testing.T) {
 			wantKind: ErrSessionExpired,
 		},
 		{
-			name:     "rate limited",
+			name:     "HTTP rate limited",
 			err:      &apple.Error{Kind: apple.ErrService, StatusCode: http.StatusTooManyRequests, Retryable: true},
 			wantCode: CodeRateLimited,
 			wantKind: ErrRateLimited,
+		},
+		{
+			name: "Hide My Email batch limit in successful HTTP response",
+			err: &apple.Error{
+				Op: "reserve Hide My Email alias", Kind: apple.ErrService,
+				StatusCode: http.StatusOK, ServiceCode: "-41015",
+			},
+			wantCode: CodeRateLimited,
+			wantKind: ErrRateLimited,
+		},
+		{
+			name: "expired Hide My Email candidate is not rate limited",
+			err: &apple.Error{
+				Op: "reserve Hide My Email alias", Kind: apple.ErrService,
+				StatusCode: http.StatusOK, ServiceCode: "-41003",
+			},
+			wantCode: CodeUpstreamError,
+			wantKind: ErrUpstream,
 		},
 		{
 			name:     "temporary upstream failure",

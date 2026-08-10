@@ -909,7 +909,7 @@ const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
   APPLE_ACCOUNT_ACTION_REQUIRED:
     "Apple 账户需要完成条款确认或其他账户操作，请前往 Apple 官网处理后重试",
   APPLE_RATE_LIMITED:
-    "Apple 请求过于频繁，请稍后再试；自动创建会按计划继续执行",
+    "Apple 请求过于频繁，自动创建已进入冷却，冷却后会继续执行",
   APPLE_UPSTREAM_ERROR:
     "Apple 服务暂时异常，请稍后再试；自动创建会按计划继续执行",
   APPLE_ALIAS_CONFIRMATION_PENDING:

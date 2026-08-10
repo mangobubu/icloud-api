@@ -4,6 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
+)
+
+const (
+	// Apple's Hide My Email service reports the batch creation throttle inside
+	// an HTTP 200 response. It is not expressed as HTTP 429.
+	hmeRateLimitCodeBatch = "-41015"
 )
 
 var (
@@ -74,4 +81,41 @@ func operationError(op string, kind error, status int, cause error) error {
 
 func retryableStatus(status int) bool {
 	return status == http.StatusTooManyRequests || status >= 500
+}
+
+// IsRateLimited reports both HTTP-level throttling and Hide My Email business
+// throttles returned in a successful HTTP response envelope.
+func IsRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	if upstream, ok := err.(*Error); ok && isRateLimitedError(upstream) {
+		return true
+	}
+	switch unwrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range unwrapped.Unwrap() {
+			if IsRateLimited(child) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return IsRateLimited(unwrapped.Unwrap())
+	}
+	return false
+}
+
+func isRateLimitedError(upstream *Error) bool {
+	if upstream == nil {
+		return false
+	}
+	if upstream.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	switch strings.TrimSpace(upstream.ServiceCode) {
+	case hmeRateLimitCodeBatch:
+		return true
+	default:
+		return false
+	}
 }

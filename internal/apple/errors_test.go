@@ -2,6 +2,8 @@ package apple
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
 	"testing"
 )
 
@@ -30,5 +32,49 @@ func TestErrorIsTraversesCauseOnce(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("wrapped Is calls = %d, want 1", count)
+	}
+}
+
+func TestIsRateLimitedRecognizesHTTPAndHMEThrottleCodes(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil"},
+		{
+			name: "HTTP 429",
+			err:  &Error{Kind: ErrService, StatusCode: http.StatusTooManyRequests},
+			want: true,
+		},
+		{
+			name: "HME batch limit",
+			err:  &Error{Kind: ErrService, StatusCode: http.StatusOK, ServiceCode: "  " + hmeRateLimitCodeBatch + "  "},
+			want: true,
+		},
+		{
+			name: "expired HME candidate is not a throttle",
+			err:  &Error{Kind: ErrService, StatusCode: http.StatusOK, ServiceCode: "-41003"},
+			want: false,
+		},
+		{
+			name: "unrelated business error",
+			err:  &Error{Kind: ErrService, StatusCode: http.StatusOK, ServiceCode: "-41099"},
+		},
+		{
+			name: "rate limit in a later joined cause",
+			err: errors.Join(
+				&Error{Kind: ErrService, StatusCode: http.StatusOK, ServiceCode: "-41099"},
+				fmt.Errorf("wrapped: %w", &Error{Kind: ErrService, StatusCode: http.StatusOK, ServiceCode: hmeRateLimitCodeBatch}),
+			),
+			want: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsRateLimited(test.err); got != test.want {
+				t.Fatalf("IsRateLimited() = %v, want %v", got, test.want)
+			}
+		})
 	}
 }

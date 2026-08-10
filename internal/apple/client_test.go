@@ -1142,6 +1142,12 @@ func TestDecodeHMEResultPreservesServiceErrors(t *testing.T) {
 			serviceCode: "GENERATE_REJECTED",
 		},
 		{
+			name:        "success false numeric Hide My Email batch limit",
+			status:      http.StatusOK,
+			body:        `{"success":false,"error":{"errorCode":-41015}}`,
+			serviceCode: hmeRateLimitCodeBatch,
+		},
+		{
 			name:        "null top-level code falls back to server code",
 			status:      http.StatusConflict,
 			body:        `{"errorCode":null,"serverErrorCode":"GENERATE_FALLBACK"}`,

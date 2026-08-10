@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"icloud-api/internal/apple"
 	"icloud-api/internal/domain"
 )
 
@@ -29,6 +30,10 @@ const (
 
 	// CycleDuration is the duration covered by one generated plan.
 	CycleDuration = time.Hour
+
+	// appleRateLimitCooldown clears Apple's observed 30-60 minute reserve
+	// batch window before another generated address is submitted.
+	appleRateLimitCooldown = 61 * time.Minute
 
 	defaultPollInterval                  = 30 * time.Second
 	defaultOverdueGrace                  = 2 * time.Minute
@@ -499,6 +504,41 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 			)
 		}
 		cancelFailureStateContext()
+		if aliasCreationRequiresRateLimitCooldown(createErr) && nextRunAt != nil {
+			// Start the cooldown at the observed failure time. The claim timestamp
+			// can precede Apple's response by several seconds, which would otherwise
+			// shorten the provider's rolling window.
+			cooldownPlan, cooldownPlanErr := m.newPlanStartingAt(m.now().Add(appleRateLimitCooldown))
+			if cooldownPlanErr == nil {
+				expectedNext := nextRunAt.UTC()
+				cooldownContext, cancelCooldownContext := context.WithTimeout(logContext, terminalStatePersistTimeout)
+				var changed bool
+				changed, cooldownPlanErr = m.repo.RescheduleAliasCreation(
+					cooldownContext,
+					schedule.AccountID,
+					expectedNext,
+					cooldownPlan,
+					m.now(),
+				)
+				cancelCooldownContext()
+				if cooldownPlanErr == nil && !changed {
+					cooldownPlanErr = errAliasCreationPlanConflict
+				}
+			}
+			if cooldownPlanErr != nil {
+				m.logAliasCreationStateError(
+					logContext,
+					"Apple 限流后推迟自动创建计划失败",
+					schedule.AccountID,
+					flow,
+					"reschedule_rate_limit_cooldown",
+					cooldownPlanErr,
+				)
+			} else {
+				next := cooldownPlan[0].UTC()
+				nextRunAt = &next
+			}
+		}
 		creationDisabled := false
 		disableOperation := ""
 		disableMessage := ""
@@ -676,6 +716,17 @@ func (m *Manager) newPlan(anchor time.Time) ([]time.Time, error) {
 	return generatePlan(anchor, m.random)
 }
 
+func (m *Manager) newPlanStartingAt(first time.Time) ([]time.Time, error) {
+	planned, err := m.newPlan(first)
+	if err != nil {
+		return nil, err
+	}
+	// Keep five attempts in the following hour, but make the first deadline the
+	// exact end of the cooldown instead of adding another random scheduling gap.
+	planned[0] = first.UTC()
+	return planned, nil
+}
+
 // generatePlan creates five cumulative deadlines. The five random gaps are
 // integer minutes, each at least five minutes, and add up to one hour.
 func generatePlan(anchor time.Time, random RandomSource) ([]time.Time, error) {
@@ -734,6 +785,14 @@ func validateAccountID(accountID int64) error {
 
 func failureMessage(err error) string {
 	return diagnoseAliasCreationError(err).reason
+}
+
+func aliasCreationRequiresRateLimitCooldown(err error) bool {
+	// Keep the stable diagnostic-code path for callers that only expose a
+	// classified error, but also inspect wrapped Apple causes. A reserve can
+	// return a rate-limit response while a session checkpoint fails, in which
+	// case hmesync joins the persistence error before APPLE_RATE_LIMITED.
+	return diagnoseAliasCreationError(err).code == "APPLE_RATE_LIMITED" || apple.IsRateLimited(err)
 }
 
 func (m *Manager) logAutomaticScheduleError(

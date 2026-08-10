@@ -263,6 +263,62 @@ func TestAliasCreationTransportFailureOmitsHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestExplicitRateLimitRejectionLogsNoRemoteSideEffectAndCooldown(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	upstream := &apple.Error{
+		Op:          "reserve Hide My Email alias",
+		Kind:        apple.ErrService,
+		StatusCode:  http.StatusOK,
+		ServiceCode: "-41015",
+		Retryable:   false,
+	}
+	manager, logs := newFlowLogManager(t, repo, clock, func(ctx context.Context, _ int64) (domain.Alias, error) {
+		domain.ReportAliasCreationProgress(ctx, domain.AliasCreationPhaseReserving, 65, 0)
+		return domain.Alias{}, upstream
+	})
+	schedule := enableForTest(t, manager, 94)
+	attemptedAt := schedule.NextRunAt.UTC()
+	clock.Set(attemptedAt)
+	manager.runDue(context.Background())
+
+	failed := requireAutoCreateEvent(t, logs, "run_failed")
+	wantNext := attemptedAt.Add(appleRateLimitCooldown)
+	if failed.Fields["error_code"] != "APPLE_RATE_LIMITED" ||
+		failed.Fields["http_status"] != "200" || failed.Fields["retryable"] != "false" ||
+		failed.Fields["service_code_fingerprint"] != "788d3a404740e3a9" ||
+		failed.Fields["remote_side_effect_possible"] != "false" ||
+		failed.Fields["pending_confirmation"] != "false" ||
+		failed.Fields["next_run_at"] != wantNext.Format(time.RFC3339Nano) {
+		t.Fatalf("explicit rate-limit diagnostics = %#v", failed.Fields)
+	}
+	current, err := manager.GetSchedule(context.Background(), 94)
+	if err != nil || !current.Enabled || current.NextRunAt == nil || !current.NextRunAt.Equal(wantNext) {
+		t.Fatalf("rate-limit cooldown schedule = %#v err=%v", current, err)
+	}
+	assertFlowLogsDoNotContain(t, logs, upstream.ServiceCode)
+}
+
+func TestJoinedGenericAppleDiagnosticRefinesToExplicitRateLimit(t *testing.T) {
+	upstream := &apple.Error{
+		Op:          "reserve Hide My Email alias",
+		Kind:        apple.ErrService,
+		StatusCode:  http.StatusOK,
+		ServiceCode: "-41015",
+	}
+	err := errors.Join(
+		testDiagnosticError{code: "APPLE_UPSTREAM_ERROR", detail: "generic upstream failure"},
+		upstream,
+	)
+	if info := diagnoseAliasCreationError(err); info.code != "APPLE_RATE_LIMITED" {
+		t.Fatalf("joined rate-limit diagnostic code = %q, want APPLE_RATE_LIMITED", info.code)
+	}
+	flow := aliasCreationFlow{state: &aliasCreationFlowState{stage: domain.AliasCreationPhaseReserving}}
+	if flow.hasRemoteSideEffectPossibleForError(domain.AliasCreationPhaseReserving, err) {
+		t.Fatal("explicit joined rate-limit rejection was marked as a possible remote side effect")
+	}
+}
+
 func TestAliasCreationCancellationLogsTerminalEvent(t *testing.T) {
 	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
 	repo := newFakeRepository()

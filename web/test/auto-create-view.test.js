@@ -74,7 +74,7 @@ test("account detail exposes automatic alias creation and safe key handling", as
   );
   assert.equal(
     formatAutoCreationError("APPLE_RATE_LIMITED"),
-    "Apple 请求过于频繁，请稍后再试；自动创建会按计划继续执行",
+    "Apple 请求过于频繁，自动创建已进入冷却，冷却后会继续执行",
   );
   assert.equal(
     formatAutoCreationError("APPLE_UPSTREAM_ERROR"),

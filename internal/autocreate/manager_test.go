@@ -583,6 +583,79 @@ func TestFailureAdvancesPlanWithoutImmediateRetry(t *testing.T) {
 	}
 }
 
+func TestRateLimitedFailureSkipsRemainingCycleAndStartsAfterCooldown(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	creatorCalls := 0
+	manager := newManagerForTest(t, repo, clock, func(context.Context, int64) (domain.Alias, error) {
+		creatorCalls++
+		if creatorCalls == 1 {
+			return domain.Alias{}, testDiagnosticError{code: "APPLE_RATE_LIMITED", detail: "rate limited"}
+		}
+		return domain.Alias{Address: "after-cooldown@example.com"}, nil
+	})
+	schedule := enableForTest(t, manager, 60)
+	originalPlan := append([]time.Time(nil), schedule.PlannedAt...)
+	attemptedAt := schedule.NextRunAt.UTC()
+	clock.Set(attemptedAt)
+	manager.runDue(context.Background())
+
+	current, err := manager.GetSchedule(context.Background(), 60)
+	if err != nil {
+		t.Fatalf("read rate-limited schedule: %v", err)
+	}
+	wantNext := attemptedAt.Add(appleRateLimitCooldown)
+	if current.NextRunAt == nil || !current.NextRunAt.Equal(wantNext) ||
+		len(current.PlannedAt) != CreationsPerCycle ||
+		!current.PlannedAt[len(current.PlannedAt)-1].Equal(wantNext.Add(CycleDuration)) {
+		t.Fatalf("rate-limited replacement plan = %#v, want first=%v last=%v", current.PlannedAt, wantNext, wantNext.Add(CycleDuration))
+	}
+	if len(repo.reschedules) != 1 || !repo.reschedules[0].expected.Equal(originalPlan[1]) {
+		t.Fatalf("rate-limit reschedules = %#v, want replacement of next old slot %v", repo.reschedules, originalPlan[1])
+	}
+
+	clock.Set(originalPlan[len(originalPlan)-1])
+	manager.runDue(context.Background())
+	if creatorCalls != 1 {
+		t.Fatalf("old cycle executed after rate limit: creator calls=%d", creatorCalls)
+	}
+	clock.Set(wantNext)
+	manager.runDue(context.Background())
+	if creatorCalls != 2 || len(repo.successes) != 1 || repo.successes[0].address != "after-cooldown@example.com" {
+		t.Fatalf("post-cooldown execution: calls=%d successes=%#v", creatorCalls, repo.successes)
+	}
+}
+
+func TestRateLimitedAppleCauseBehindPersistenceErrorStillStartsCooldown(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	createErr := errors.Join(
+		testDiagnosticError{code: "AUTO_CREATION_PERSISTENCE_ERROR", detail: "checkpoint failed"},
+		&apple.Error{
+			Op:          "reserve Hide My Email alias",
+			Kind:        apple.ErrService,
+			StatusCode:  200,
+			ServiceCode: "-41015",
+		},
+	)
+	manager := newManagerForTest(t, repo, clock, func(context.Context, int64) (domain.Alias, error) {
+		return domain.Alias{}, createErr
+	})
+	schedule := enableForTest(t, manager, 62)
+	attemptedAt := schedule.NextRunAt.UTC()
+	clock.Set(attemptedAt)
+	manager.runDue(context.Background())
+
+	current, err := manager.GetSchedule(context.Background(), 62)
+	if err != nil {
+		t.Fatalf("read joined-error schedule: %v", err)
+	}
+	wantNext := attemptedAt.Add(appleRateLimitCooldown)
+	if current.NextRunAt == nil || !current.NextRunAt.Equal(wantNext) {
+		t.Fatalf("joined rate-limit next run = %v, want %v", current.NextRunAt, wantNext)
+	}
+}
+
 func TestUntrackedRemoteSideEffectPausesScheduleBeforeNextSlot(t *testing.T) {
 	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
 	repo := newFakeRepository()

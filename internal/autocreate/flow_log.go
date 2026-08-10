@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,56 @@ func (flow aliasCreationFlow) hasRemoteSideEffectPossible(stage domain.AliasCrea
 	flow.state.mu.Lock()
 	defer flow.state.mu.Unlock()
 	return flow.state.remoteSideEffectPossible
+}
+
+func (flow aliasCreationFlow) hasRecordedRemoteSideEffect() bool {
+	if flow.state == nil {
+		return false
+	}
+	flow.state.mu.Lock()
+	defer flow.state.mu.Unlock()
+	return flow.state.remoteSideEffectPossible
+}
+
+func (flow aliasCreationFlow) hasRemoteSideEffectPossibleForError(stage domain.AliasCreationPhase, err error) bool {
+	if stage == domain.AliasCreationPhaseReserving && explicitRateLimitRejection(err) {
+		// A known HME throttle in a definitive HTTP response rejects the
+		// business operation. Preserve an earlier forwarding mutation marker, but
+		// do not infer an alias mutation from the reserve stage alone.
+		return flow.hasRecordedRemoteSideEffect()
+	}
+	return flow.hasRemoteSideEffectPossible(stage)
+}
+
+func explicitRateLimitRejection(err error) bool {
+	if err == nil || !aliasCreationRequiresRateLimitCooldown(err) {
+		return false
+	}
+	var visit func(error) bool
+	visit = func(current error) bool {
+		if current == nil {
+			return false
+		}
+		if upstream, ok := current.(*apple.Error); ok && upstream != nil {
+			if apple.IsRateLimited(upstream) &&
+				(upstream.StatusCode == http.StatusTooManyRequests ||
+					upstream.StatusCode >= http.StatusOK && upstream.StatusCode < http.StatusMultipleChoices) {
+				return true
+			}
+		}
+		switch unwrapped := current.(type) {
+		case interface{ Unwrap() []error }:
+			for _, child := range unwrapped.Unwrap() {
+				if visit(child) {
+					return true
+				}
+			}
+		case interface{ Unwrap() error }:
+			return visit(unwrapped.Unwrap())
+		}
+		return false
+	}
+	return visit(err)
 }
 
 func (flow aliasCreationFlow) markStarted() {
@@ -157,7 +208,12 @@ func (m *Manager) logAliasCreationProgress(
 	if stage == "" {
 		stage = flow.state.stage
 	}
-	if aliasCreationRemoteSideEffectPossible(stage) {
+	// Reaching reserve is conservatively treated as an ambiguous remote
+	// operation, but merely entering that stage is not itself evidence that a
+	// side effect occurred. Keep the recorded marker for mutations that happened
+	// before reserve separate so an explicit Apple rejection can be reported as
+	// non-mutating without weakening transport-failure diagnostics.
+	if stage != domain.AliasCreationPhaseReserving && aliasCreationRemoteSideEffectPossible(stage) {
 		flow.state.remoteSideEffectPossible = true
 	}
 	percent := normalizedAliasCreationPercent(update.Percent)
@@ -242,7 +298,7 @@ func (m *Manager) logAliasCreationFailureWithOperation(
 		slog.Bool("failure_state_recorded", failureRecorded),
 		slog.Bool("auto_creation_disabled", creationDisabled),
 		slog.String("schedule_action", aliasCreationScheduleAction(creationDisabled, nextRunAt)),
-		slog.Bool("remote_side_effect_possible", flow.hasRemoteSideEffectPossible(failedStage)),
+		slog.Bool("remote_side_effect_possible", flow.hasRemoteSideEffectPossibleForError(failedStage, err)),
 		slog.Bool("pending_confirmation", aliasCreationPendingConfirmation(err, info.code)),
 	}
 	attributes = append(attributes, aliasCreationTimingAttrs(scheduledFor, attemptedAt, nextRunAt)...)
@@ -309,7 +365,7 @@ func (m *Manager) logAliasCreationCancellationWithError(
 		slog.String("error_context", reason),
 		slog.String("error", reason),
 		slog.String("schedule_action", aliasCreationScheduleAction(false, nextRunAt)),
-		slog.Bool("remote_side_effect_possible", flow.hasRemoteSideEffectPossible(previousStage)),
+		slog.Bool("remote_side_effect_possible", flow.hasRemoteSideEffectPossibleForError(previousStage, cause)),
 		slog.Bool("pending_confirmation", aliasCreationPendingConfirmation(cause, code)),
 	}
 	attributes = append(attributes, aliasCreationTimingAttrs(scheduledFor, attemptedAt, nextRunAt)...)
@@ -405,6 +461,8 @@ func aliasCreationPersistenceReason(operation string) string {
 		return "已达到隐私邮箱容量上限，但关闭自动创建计划失败"
 	case "pause_after_untracked_remote_side_effect":
 		return "Apple 可能已创建地址但本地候选未保存，暂停自动创建计划失败"
+	case "reschedule_rate_limit_cooldown":
+		return "Apple 已触发创建限流，但推迟后续自动创建计划失败"
 	case "record_plan_correction_failure":
 		return "认领计划后修正失败状态写入数据库失败"
 	default:
@@ -603,9 +661,9 @@ func diagnoseAliasCreationError(err error) aliasCreationErrorInfo {
 	if errors.As(err, &upstream) && upstream != nil {
 		info.upstream = upstream
 		info.retryable = upstream.Retryable
-		if info.code == "" || info.code == "AUTO_CREATE_FAILED" {
+		if info.code == "" || info.code == "AUTO_CREATE_FAILED" || info.code == "APPLE_UPSTREAM_ERROR" {
 			switch {
-			case upstream.StatusCode == 429:
+			case apple.IsRateLimited(err):
 				info.code = "APPLE_RATE_LIMITED"
 			case errors.Is(upstream, apple.ErrInvalidSession):
 				info.code = "APPLE_SESSION_EXPIRED"
@@ -768,7 +826,7 @@ func aliasCreationErrorReason(code string) string {
 	case "APPLE_ACCOUNT_ACTION_REQUIRED":
 		return "Apple 账户需要完成条款确认或其他账户操作"
 	case "APPLE_RATE_LIMITED":
-		return "Apple 请求被限流，本次计划槽已结束，后续计划会继续执行"
+		return "Apple 请求被限流，当前周期剩余计划槽已跳过，冷却后会继续执行"
 	case "APPLE_ACCOUNT_MISMATCH":
 		return "Apple 登录账户或默认转发目标与当前主号不匹配"
 	case "APPLE_FORWARDING_TARGET_MISSING":
