@@ -1065,12 +1065,15 @@ paths:
       description: |
         返回当前应用进程环形缓冲区中保留的最近最多 2000 条日志，按 `id` 从新到旧排列。
         环形缓冲区还受总字节数限制，较大的记录可能使更早日志在达到 2000 条前被覆盖。
-        可按级别、关键词、主号和 `sync_run_id` 筛选，并使用排他的 `before_id` 游标向更早的记录翻页。
+        可按级别、关键词、主号、`sync_run_id` 和 `auto_create_run_id` 筛选，并使用排他的
+        `before_id` 游标向更早的记录翻页。
 
         邮件同步流程为每次逻辑同步分配一个 `sync_run_id`；同一次追平任务的多个批次继续使用同一值。
-        使用 `sync_run_id` 会按结构化字段完整值精确匹配，前端据此读取当前环形窗口内同一轮同步的
-        全部分页，再按时间从早到晚组成详情时间线。日志不会跨进程重启保留，较早流程事件也可能已被覆盖；
-        因此时间线可能只包含部分流程，不属于持久审计记录。敏感字段会在进入日志缓冲区前脱敏。
+        每个被任务认领的自动创建计划槽分配一个 `auto_create_run_id`。两个运行标识都按结构化字段
+        完整值精确匹配，前端据此读取当前环形窗口内同一轮流程的全部分页，再按时间从早到晚组成
+        详情时间线。日志不会跨进程重启保留，较早流程事件也可能已被覆盖，因此时间线可能只包含
+        部分流程，不属于持久审计记录。隐私邮箱地址、原始 API Key、Apple 会话、Cookie、令牌和
+        凭据等敏感内容不会写入流程日志，其他敏感字段会在进入日志缓冲区前脱敏。
       security:
         - adminSession: []
       parameters:
@@ -1113,6 +1116,20 @@ paths:
             maxLength: 128
             pattern: "^[A-Za-z0-9_.:-]+$"
           example: sync-1875f21a4c8b0000-00000001
+        - name: auto_create_run_id
+          in: query
+          required: false
+          description: |
+            自动创建计划槽运行标识的精确筛选值。校验规则与 `sync_run_id` 相同：参数出现时会忽略
+            前后空白，之后必须包含 1 至 128 个字符，且只能使用 ASCII 字母、数字、连字符、下划线、
+            句点和冒号。服务生成的值通常采用
+            `auto-create-<16位十六进制时间>-<至少8位十六进制序号>` 格式。
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: "^[A-Za-z0-9_.:-]+$"
+          example: auto-create-1875f21a4c8b0000-00000001
         - name: limit
           in: query
           required: false
@@ -1142,7 +1159,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminApplicationLogListResponse"
         "400":
-          description: level、query、account_id、sync_run_id、limit 或 before_id 参数无效
+          description: level、query、account_id、sync_run_id、auto_create_run_id、limit 或 before_id 参数无效
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -2238,12 +2255,21 @@ components:
           description: |
             日志属于邮件同步流程时返回；非同步日志省略。该值也保留在 attributes 中，
             同一次逻辑同步的多个追平批次共用同一值。
+        auto_create_run_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+          description: |
+            日志属于自动创建流程时返回；其他日志省略。该值也保留在 attributes 中，
+            每个被任务认领的计划槽使用一个独立值。
 
     AdminApplicationLogAttributes:
       type: object
       description: |
         已脱敏的结构化日志属性，所有值均编码为字符串。普通日志可以包含其他字符串属性；
-        邮件同步流程使用下列标准字段构建详情时间线。
+        邮件同步和自动创建流程使用下列标准字段构建详情时间线。隐私邮箱地址、原始 API Key、
+        Apple 会话、Cookie、令牌和凭据等敏感内容不会写入这些流程属性。
       properties:
         account_id:
           type: string
@@ -2256,6 +2282,46 @@ components:
           maxLength: 128
           pattern: "^[A-Za-z0-9_.:-]+$"
           description: 一次逻辑邮件同步的聚合标识。
+        auto_create_run_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: "^[A-Za-z0-9_.:-]+$"
+          description: 一个已认领自动创建计划槽的聚合标识。
+        auto_create_stage:
+          type: string
+          description: 当前自动创建阶段；终态分别使用 completed、failed 或 cancelled。
+          enum:
+            - preparing
+            - checking_account
+            - checking_capacity
+            - loading_session
+            - validating_session
+            - checking_forwarding
+            - preparing_key
+            - reserving
+            - saving_candidate
+            - confirming
+            - reconciling
+            - saving_result
+            - completed
+            - failed
+            - cancelled
+        auto_create_percent:
+          type: string
+          pattern: "^(100|[1-9]?[0-9])$"
+          description: 当前自动创建进度百分比，范围 0 至 100。
+        auto_create_event:
+          type: string
+          description: 当前自动创建流程事件，用于区分开始、阶段变化和各类终态或状态写入异常。
+          enum:
+            - run_started
+            - stage_started
+            - run_completed
+            - run_completed_with_warning
+            - run_failed
+            - run_cancelled
+            - state_persist_failed
         trigger:
           type: string
           enum:
@@ -2302,23 +2368,127 @@ components:
         elapsed_ms:
           type: string
           pattern: "^[0-9]+$"
-          description: 从本次逻辑同步开始到当前事件的毫秒数。
+          description: 从当前邮件同步或自动创建流程开始到本事件的累计毫秒数。
         batch_elapsed_ms:
           type: string
           pattern: "^[0-9]+$"
           description: 从当前批次开始到当前事件的毫秒数；批次尚未开始时省略。
         failed_stage:
           type: string
-          description: 失败或取消前正在执行的同步阶段，仅终止事件使用。
+          description: 邮件同步或自动创建失败、取消前正在执行的阶段，仅终止事件使用。
         failed_operation:
           type: string
-          description: 失败或取消时对应的内部操作位置，仅终止事件使用。
+          description: 失败或取消时对应的内部操作位置；自动创建结果状态写入异常时也会返回。
+        error_code:
+          type: string
+          description: 自动创建失败、取消或结果状态写入异常的稳定诊断代码。
+        error_class:
+          type: string
+          description: 自动创建失败、取消或结果状态写入异常所属的诊断类别。
+        cause_category:
+          type: string
+          description: 受控的直接原因分类，不包含底层错误原文或敏感值。
+          enum:
+            - account_state
+            - apple_upstream
+            - capacity
+            - context
+            - crypto
+            - internal
+            - persistence
+            - plan_conflict
+            - schedule
+            - session
         error_context:
           type: string
-          description: 已移除当前主号凭据和邮箱地址等敏感值的详细错误上下文，仅终止事件使用。
+          description: |
+            不含邮箱地址、Key、Apple 会话或凭据等敏感值的错误说明；用于流程终止事件，
+            以及自动创建结果状态写入异常事件。
+        http_status:
+          type: string
+          pattern: "^[1-5][0-9]{2}$"
+          description: Apple 上游返回的 HTTP 状态；失败不涉及 HTTP 响应时省略。
+        retryable:
+          type: string
+          enum:
+            - "true"
+            - "false"
+          description: Apple 上游错误是否标记为可重试；不涉及上游错误时省略。
+        upstream_retryable:
+          type: string
+          enum:
+            - "true"
+            - "false"
+          description: 与 retryable 相同的 Apple 上游重试标记，供日志消费者显式区分。
+        schedule_action:
+          type: string
+          enum:
+            - continue
+            - disabled
+            - none
+          description: 本计划槽结束后继续运行、关闭自动创建或没有后续动作。
+        next_run_at:
+          type: string
+          format: date-time
+          description: 自动创建计划的下次运行时间；没有后续计划时省略。
+        scheduled_for:
+          type: string
+          format: date-time
+          description: 当前自动创建计划槽原定的运行时间。
+        attempted_at:
+          type: string
+          format: date-time
+          description: 当前计划槽实际被认领并开始执行的时间。
+        remote_side_effect_possible:
+          type: string
+          enum:
+            - "true"
+            - "false"
+          description: 失败或取消前是否已进入可能在 Apple 侧创建地址的阶段。
+        pending_confirmation:
+          type: string
+          enum:
+            - "true"
+            - "false"
+          description: 本地是否已保存待确认候选，后续计划会优先对账而不会重复创建。
+        failure_state_recorded:
+          type: string
+          enum:
+            - "true"
+            - "false"
+          description: 本次失败的受控摘要是否已写入自动创建计划状态。
+        auto_creation_disabled:
+          type: string
+          enum:
+            - "true"
+            - "false"
+          description: 本次失败后是否已关闭该主号的自动创建计划。
+        result_state_recorded:
+          type: string
+          enum:
+            - "true"
+            - "false"
+          description: 创建完成后成功结果是否已写入自动创建计划状态。
+        operation:
+          type: string
+          description: 受控白名单中的 Apple 操作名称；无法识别时为 unknown。
+        service_code_present:
+          type: string
+          enum:
+            - "true"
+            - "false"
+          description: Apple 响应是否带服务码；原始服务码不会写入日志。
+        service_code_fingerprint:
+          type: string
+          pattern: "^[a-f0-9]{16}$"
+          description: 原始 Apple 服务码的不可逆短指纹，仅用于聚合同类失败。
+        confirmation_attempt:
+          type: string
+          pattern: "^[1-9][0-9]*$"
+          description: 当前只读目录确认或对账的尝试次数。
         error:
           type: string
-          description: 已脱敏的详细错误文本，仅终止事件使用。
+          description: 已脱敏的详细错误文本；用于流程终止或自动创建结果状态写入异常事件。
       additionalProperties:
         type: string
 

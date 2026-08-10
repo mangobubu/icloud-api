@@ -6,6 +6,7 @@ import {
   deleteAlias,
   deleteAppleSession,
   getAliasAutoCreationKeys,
+  getAutoCreateLogRun,
   getAccount,
   getAccounts,
   getAliases,
@@ -189,6 +190,11 @@ test("account detail normalizes automatic alias creation state", async () => {
         status: "scheduled",
         next_run_at: "2026-08-08T09:00:00Z",
         planned_at: "2026-08-08T09:00:00Z",
+        planned_times: [
+          "2026-08-08T09:00:00Z",
+          "2026-08-08T09:15:00Z",
+          "2026-08-08T09:35:00Z",
+        ],
         last_attempted_at: "2026-08-08T08:00:00Z",
         last_created_at: "2026-08-08T07:00:00Z",
         last_alias_address: "new@icloud.com",
@@ -204,6 +210,11 @@ test("account detail normalizes automatic alias creation state", async () => {
     status: "scheduled",
     nextRunAt: "2026-08-08T09:00:00Z",
     plannedAt: "2026-08-08T09:00:00Z",
+    plannedTimes: [
+      "2026-08-08T09:00:00Z",
+      "2026-08-08T09:15:00Z",
+      "2026-08-08T09:35:00Z",
+    ],
     lastAttemptedAt: "2026-08-08T08:00:00Z",
     lastCreatedAt: "2026-08-08T07:00:00Z",
     lastAliasAddress: "new@icloud.com",
@@ -217,6 +228,10 @@ test("account detail normalizes automatic alias creation state", async () => {
       Status: "ready",
       NextRunAt: "2026-08-08T10:00:00Z",
       PlannedAt: "2026-08-08T10:00:00Z",
+      PlannedTimes: [
+        "2026-08-08T10:00:00Z",
+        "2026-08-08T10:20:00Z",
+      ],
       LastAttemptedAt: "2026-08-08T09:00:00Z",
       LastCreatedAt: "2026-08-08T08:00:00Z",
       LastAliasAddress: "pascal@icloud.com",
@@ -228,6 +243,10 @@ test("account detail normalizes automatic alias creation state", async () => {
       status: "ready",
       nextRunAt: "2026-08-08T10:00:00Z",
       plannedAt: "2026-08-08T10:00:00Z",
+      plannedTimes: [
+        "2026-08-08T10:00:00Z",
+        "2026-08-08T10:20:00Z",
+      ],
       lastAttemptedAt: "2026-08-08T09:00:00Z",
       lastCreatedAt: "2026-08-08T08:00:00Z",
       lastAliasAddress: "pascal@icloud.com",
@@ -264,6 +283,7 @@ test("automatic alias creation toggle uses an encoded account URL and CSRF", asy
     status: "scheduled",
     nextRunAt: null,
     plannedAt: null,
+    plannedTimes: [],
     lastAttemptedAt: null,
     lastCreatedAt: null,
     lastAliasAddress: "",
@@ -604,7 +624,23 @@ test("runtime logs use filter and cursor parameters and normalize the response",
           source: "syncer.manager",
           account_id: 12,
           request_id: "req-log-1",
-          attributes: { error: "connection closed" },
+          auto_create_run_id: "auto-run-1",
+          attributes: {
+            auto_create_stage: "failed",
+            auto_create_percent: "100",
+            auto_create_event: "run_failed",
+            error: "connection closed",
+            error_code: "APPLE_RATE_LIMITED",
+            error_class: "apple_upstream",
+            cause_category: "apple_upstream",
+            error_context: "Apple 请求被限流",
+            failed_stage: "reserving",
+            failed_operation: "reserve_alias",
+            http_status: "429",
+            retryable: "true",
+            elapsed_ms: "3821",
+            schedule_action: "continue",
+          },
         },
       ],
       has_more: true,
@@ -616,6 +652,7 @@ test("runtime logs use filter and cursor parameters and normalize the response",
     level: "error",
     query: "同步失败",
     accountId: 12,
+    autoCreateRunId: "auto-run-1",
     limit: 50,
     beforeId: 90,
   });
@@ -626,6 +663,7 @@ test("runtime logs use filter and cursor parameters and normalize the response",
     level: "error",
     query: "同步失败",
     account_id: "12",
+    auto_create_run_id: "auto-run-1",
     limit: "50",
     before_id: "90",
   });
@@ -634,6 +672,20 @@ test("runtime logs use filter and cursor parameters and normalize the response",
   assert.equal(result.items[0].level, "error");
   assert.equal(result.items[0].accountId, 12);
   assert.equal(result.items[0].requestId, "req-log-1");
+  assert.equal(result.items[0].autoCreateRunId, "auto-run-1");
+  assert.equal(result.items[0].autoCreateStage, "failed");
+  assert.equal(result.items[0].autoCreatePercent, 100);
+  assert.equal(result.items[0].autoCreateEvent, "run_failed");
+  assert.equal(result.items[0].errorCode, "APPLE_RATE_LIMITED");
+  assert.equal(result.items[0].errorClass, "apple_upstream");
+  assert.equal(result.items[0].causeCategory, "apple_upstream");
+  assert.equal(result.items[0].errorContext, "Apple 请求被限流");
+  assert.equal(result.items[0].failedStage, "reserving");
+  assert.equal(result.items[0].failedOperation, "reserve_alias");
+  assert.equal(result.items[0].httpStatus, 429);
+  assert.equal(result.items[0].retryable, true);
+  assert.equal(result.items[0].elapsedMs, 3821);
+  assert.equal(result.items[0].scheduleAction, "continue");
   assert.equal(result.hasMore, true);
   assert.equal(result.nextBeforeId, 81);
 });
@@ -686,6 +738,81 @@ test("sync run logs follow every cursor without inheriting list filters", async 
   assert.equal(requests[1].searchParams.get("before_id"), "5");
   assert.equal(requests[2].searchParams.get("before_id"), "3");
   for (const request of requests) {
+    assert.equal(request.searchParams.has("level"), false);
+    assert.equal(request.searchParams.has("query"), false);
+  }
+});
+
+test("automatic creation run logs follow every cursor with their own run filter", async () => {
+  const requests = [];
+  const pages = [
+    {
+      items: [
+        {
+          id: 4,
+          created_at: "2026-08-09T08:00:04Z",
+          attributes: {
+            auto_create_run_id: "auto-run-42",
+            auto_create_event: "run_failed",
+          },
+        },
+        {
+          id: 3,
+          created_at: "2026-08-09T08:00:03Z",
+          attributes: {
+            auto_create_run_id: "auto-run-42",
+            auto_create_event: "stage_started",
+          },
+        },
+      ],
+      has_more: true,
+      next_before_id: 3,
+    },
+    {
+      items: [
+        {
+          id: 2,
+          created_at: "2026-08-09T08:00:02Z",
+          attributes: {
+            auto_create_run_id: "auto-run-42",
+            auto_create_event: "stage_started",
+          },
+        },
+        {
+          id: 1,
+          created_at: "2026-08-09T08:00:01Z",
+          attributes: {
+            auto_create_run_id: "auto-run-42",
+            auto_create_event: "run_started",
+          },
+        },
+      ],
+      has_more: false,
+      next_before_id: 0,
+    },
+  ];
+
+  globalThis.fetch = async (url) => {
+    requests.push(new URL(url, "https://admin.invalid"));
+    return jsonResponse(pages.shift());
+  };
+
+  const result = await getAutoCreateLogRun(" auto-run-42 ", {
+    accountId: 12,
+  });
+
+  assert.deepEqual(result.map((item) => item.id), [1, 2, 3, 4]);
+  assert.equal(result[0].autoCreateEvent, "run_started");
+  assert.equal(result.at(-1).autoCreateEvent, "run_failed");
+  assert.equal(requests.length, 2);
+  assert.deepEqual(Object.fromEntries(requests[0].searchParams), {
+    account_id: "12",
+    auto_create_run_id: "auto-run-42",
+    limit: "200",
+  });
+  assert.equal(requests[1].searchParams.get("before_id"), "3");
+  for (const request of requests) {
+    assert.equal(request.searchParams.has("sync_run_id"), false);
     assert.equal(request.searchParams.has("level"), false);
     assert.equal(request.searchParams.has("query"), false);
   }

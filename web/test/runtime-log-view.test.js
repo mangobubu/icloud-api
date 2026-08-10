@@ -44,6 +44,9 @@ test("all logs view supports filters, cursor paging, live refresh, and responsiv
   assert.match(source, /class="mobile-record-list"/);
   assert.match(source, /<RuntimeLogDetailDialog/);
   assert.match(source, /getRuntimeLogRun\(syncRunId,\s*\{/);
+  assert.match(source, /getAutoCreateLogRun\(autoCreateRunId,\s*\{/);
+  assert.match(source, /const autoCreateRunId = String\(log\?\.autoCreateRunId/);
+  assert.match(source, /if \(autoCreateRunId\) return `auto-create:\$\{autoCreateRunId\}`/);
   assert.match(source, /detailFlowAbortController\?\.abort\(\)/);
   assert.match(source, /:flow-loading="detailFlowLoading"/);
   assert.match(source, /:flow-error="detailFlowError"/);
@@ -74,7 +77,7 @@ test("reenabling live refresh cancels an in-flight historical page before loadin
   }
 });
 
-test("runtime log details show a loadable, copyable, responsive sync timeline", async () => {
+test("runtime log details show loadable, copyable sync and automatic creation timelines", async () => {
   const source = await readFile(detailPath, "utf8");
 
   assert.match(source, /<pre>\{\{ log\.message \|\| "-" \}\}<\/pre>/);
@@ -83,18 +86,48 @@ test("runtime log details show a loadable, copyable, responsive sync timeline", 
   assert.match(source, /v-if="flowLoading"[\s\S]{0,300}<el-skeleton/);
   assert.match(source, /v-if="flowError"[\s\S]{0,300}<RequestAlert/);
   assert.match(source, /重新加载完整流程/);
-  assert.match(source, /content="刷新同步流程"[\s\S]{0,180}@click="emit\('retry-flow'\)"/);
+  assert.match(source, /v-if="hasFlow"[\s\S]{0,250}@click="emit\('retry-flow'\)"/);
+  assert.match(source, /"刷新自动创建流程"\s*:\s*"刷新同步流程"/);
   assert.match(source, /v-for="entry in orderedFlowLogs"/);
-  assert.match(source, /失败于 \{\{ runtimeLogSyncStageLabel\(entry\.failedStage\) \}\}/);
+  assert.match(source, /失败于 \{\{ stageLabel\(entry\.failedStage\) \}\}/);
   assert.match(source, /<strong>错误详情<\/strong>[\s\S]{0,100}entry\.errorDetail/);
+  assert.match(source, /entry\.errorCode/);
+  assert.match(source, /entry\.errorClass/);
+  assert.match(source, /entry\.causeCategory/);
+  assert.match(source, /原因分类/);
+  assert.match(source, /schedule:\s*"计划调度"/);
+  assert.match(source, /entry\.errorContext/);
+  assert.match(source, /entry\.httpStatus/);
+  assert.match(source, /entry\.retryable/);
+  assert.match(source, /entry\.elapsedMs/);
+  assert.match(source, /batchElapsedMs\(entry\)/);
+  assert.match(source, /batch_elapsed_ms/);
+  assert.match(source, /entry\.scheduleAction/);
+  assert.match(source, /可能已产生远端变更/);
+  assert.match(source, /resultStateRecorded\(entry\)/);
+  assert.match(source, /result_state_recorded/);
+  assert.match(source, /计划状态写回/);
+  assert.match(source, /function diagnosticLines\(entry\)/);
+  assert.match(source, /失败诊断/);
   assert.match(source, /操作位置：[\s\S]{0,100}entry\.failedOperation/);
   assert.match(source, /当前仅展示日志缓冲区内保留的部分流程/);
   assert.match(source, /\["started", "run_started", "run_queued"\]/);
   assert.match(source, /v-else-if="flowIsRunning"/);
   assert.match(source, /该次同步尚未结束/);
+  assert.match(source, /该次自动创建尚未结束/);
+  assert.match(source, /Boolean\(props\.log\?\.autoCreateRunId\)/);
+  assert.match(source, /自动创建流程详情/);
+  assert.match(source, /创建编号/);
+  assert.match(source, /自动创建流程/);
+  assert.match(source, /runtimeLogAutoCreateStageLabel\(stage\)/);
+  assert.match(source, /entry\?\.autoCreateStage/);
+  assert.match(source, /entry\?\.autoCreatePercent/);
+  assert.match(source, /entry\?\.autoCreateEvent/);
   assert.match(source, /await copyText\(fullLogText\.value\)/);
   assert.match(source, /完整日志已复制/);
   assert.match(source, /完整同步流程已复制/);
+  assert.match(source, /完整自动创建流程已复制/);
+  assert.match(source, /复制完整自动创建流程/);
   assert.match(source, /function flowLogText\(\)/);
   assert.match(source, /role="status"[\s\S]{0,100}aria-live="polite"/);
   assert.doesNotMatch(source, /runtime-log-detail__announcement/);

@@ -33,15 +33,16 @@ func (s *Server) SetApplicationLogSource(source ApplicationLogSource) {
 }
 
 type adminAPIApplicationLogDTO struct {
-	ID         uint64            `json:"id"`
-	CreatedAt  string            `json:"created_at"`
-	Level      string            `json:"level"`
-	Message    string            `json:"message"`
-	Source     string            `json:"source"`
-	AccountID  *int64            `json:"account_id,omitempty"`
-	RequestID  string            `json:"request_id,omitempty"`
-	SyncRunID  string            `json:"sync_run_id,omitempty"`
-	Attributes map[string]string `json:"attributes"`
+	ID              uint64            `json:"id"`
+	CreatedAt       string            `json:"created_at"`
+	Level           string            `json:"level"`
+	Message         string            `json:"message"`
+	Source          string            `json:"source"`
+	AccountID       *int64            `json:"account_id,omitempty"`
+	RequestID       string            `json:"request_id,omitempty"`
+	SyncRunID       string            `json:"sync_run_id,omitempty"`
+	AutoCreateRunID string            `json:"auto_create_run_id,omitempty"`
+	Attributes      map[string]string `json:"attributes"`
 }
 
 func (s *Server) adminAPIListApplicationLogs(c *gin.Context) {
@@ -92,6 +93,10 @@ func adminAPIApplicationLogFilter(c *gin.Context) (applog.Filter, bool) {
 	if !ok {
 		return applog.Filter{}, false
 	}
+	autoCreateRunID, ok := adminAPIOptionalRunID(c, "auto_create_run_id")
+	if !ok {
+		return applog.Filter{}, false
+	}
 	beforeID, ok := adminAPIOptionalUint64(c, "before_id")
 	if !ok {
 		return applog.Filter{}, false
@@ -102,23 +107,28 @@ func adminAPIApplicationLogFilter(c *gin.Context) (applog.Filter, bool) {
 	}
 
 	return applog.Filter{
-		Level:     level,
-		Query:     query,
-		AccountID: accountID,
-		SyncRunID: syncRunID,
-		BeforeID:  beforeID,
-		Limit:     limit,
+		Level:           level,
+		Query:           query,
+		AccountID:       accountID,
+		SyncRunID:       syncRunID,
+		AutoCreateRunID: autoCreateRunID,
+		BeforeID:        beforeID,
+		Limit:           limit,
 	}, true
 }
 
 func adminAPIOptionalSyncRunID(c *gin.Context) (string, bool) {
-	raw, present := c.GetQuery("sync_run_id")
+	return adminAPIOptionalRunID(c, "sync_run_id")
+}
+
+func adminAPIOptionalRunID(c *gin.Context, name string) (string, bool) {
+	raw, present := c.GetQuery(name)
 	if !present {
 		return "", true
 	}
 	value := strings.TrimSpace(raw)
 	if value == "" || len([]rune(value)) > adminAPIMaxSyncRunIDRunes {
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "sync_run_id 参数无效")
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", name+" 参数无效")
 		return "", false
 	}
 	for _, char := range value {
@@ -126,7 +136,7 @@ func adminAPIOptionalSyncRunID(c *gin.Context) (string, bool) {
 			(char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' || char == ':' {
 			continue
 		}
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "sync_run_id 参数无效")
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", name+" 参数无效")
 		return "", false
 	}
 	return value, true
@@ -172,15 +182,16 @@ func adminAPIApplicationLogFromEntry(entry applog.Entry) adminAPIApplicationLogD
 		createdAt = entry.Time.UTC().Format(time.RFC3339Nano)
 	}
 	return adminAPIApplicationLogDTO{
-		ID:         entry.ID,
-		CreatedAt:  createdAt,
-		Level:      strings.ToLower(entry.Level.String()),
-		Message:    entry.Message,
-		Source:     entry.Source,
-		AccountID:  accountID,
-		RequestID:  adminAPIApplicationLogAttribute(entry.Fields, "request_id"),
-		SyncRunID:  adminAPIApplicationLogAttribute(entry.Fields, "sync_run_id"),
-		Attributes: attributes,
+		ID:              entry.ID,
+		CreatedAt:       createdAt,
+		Level:           strings.ToLower(entry.Level.String()),
+		Message:         entry.Message,
+		Source:          entry.Source,
+		AccountID:       accountID,
+		RequestID:       adminAPIApplicationLogAttribute(entry.Fields, "request_id"),
+		SyncRunID:       adminAPIApplicationLogAttribute(entry.Fields, "sync_run_id"),
+		AutoCreateRunID: adminAPIApplicationLogAttribute(entry.Fields, "auto_create_run_id"),
+		Attributes:      attributes,
 	}
 }
 
@@ -189,11 +200,13 @@ func adminAPIApplicationLogAttribute(fields map[string]string, name string) stri
 		return value
 	}
 	matchedKey := ""
-	suffix := "." + name
 	for key := range fields {
-		if strings.HasSuffix(key, suffix) && (matchedKey == "" || key < matchedKey) {
+		if applog.FieldKeyHasSuffix(key, name) && key != name && (matchedKey == "" || key < matchedKey) {
 			matchedKey = key
 		}
+	}
+	if matchedKey == "" {
+		return ""
 	}
 	return fields[matchedKey]
 }

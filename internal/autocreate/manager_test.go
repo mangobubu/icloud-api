@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +19,16 @@ import (
 )
 
 var errCreate = errors.New("upstream alias creation failed for secret@example.com")
+
+type untrackedRemoteSideEffectTestError struct {
+	cause error
+}
+
+func (e *untrackedRemoteSideEffectTestError) Error() string { return e.cause.Error() }
+func (e *untrackedRemoteSideEffectTestError) Unwrap() error { return e.cause }
+func (e *untrackedRemoteSideEffectTestError) RemoteSideEffectPossible() bool {
+	return true
+}
 
 type testRandom struct {
 	state uint64
@@ -97,8 +106,10 @@ type fakeRepository struct {
 	claimResult      bool
 	claimErr         error
 	claimHook        func()
+	disableErr       error
 	rescheduleResult bool
 	rescheduleErr    error
+	rescheduleHook   func()
 	listErr          error
 	creatorObserved  bool
 }
@@ -157,6 +168,9 @@ func (r *fakeRepository) EnableAliasCreation(_ context.Context, accountID int64,
 func (r *fakeRepository) DisableAliasCreation(_ context.Context, accountID int64, now time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.disableErr != nil {
+		return r.disableErr
+	}
 	schedule, ok := r.schedules[accountID]
 	if !ok {
 		return nil
@@ -172,6 +186,9 @@ func (r *fakeRepository) DisableAliasCreation(_ context.Context, accountID int64
 func (r *fakeRepository) RescheduleAliasCreation(_ context.Context, accountID int64, expectedNext time.Time, planned []time.Time, now time.Time) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.rescheduleHook != nil {
+		r.rescheduleHook()
+	}
 	if r.rescheduleErr != nil {
 		return false, r.rescheduleErr
 	}
@@ -221,7 +238,10 @@ func (r *fakeRepository) ClaimAliasCreation(_ context.Context, accountID int64, 
 	return true, nil
 }
 
-func (r *fakeRepository) RecordAliasCreationSuccess(_ context.Context, accountID int64, attemptedAt time.Time, address string) error {
+func (r *fakeRepository) RecordAliasCreationSuccess(ctx context.Context, accountID int64, attemptedAt time.Time, address string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.successes = append(r.successes, successRecord{accountID: accountID, attemptedAt: attemptedAt, address: address})
@@ -552,11 +572,67 @@ func TestFailureAdvancesPlanWithoutImmediateRetry(t *testing.T) {
 	if len(repo.failures) != 1 || current.LastError == "" {
 		t.Fatalf("failure state: failures=%d schedule=%#v", len(repo.failures), current)
 	}
-	if stringsContains(current.LastError, "secret@example.com") == false {
-		t.Fatalf("failure message unexpectedly sanitized in persistence: %q", current.LastError)
+	if stringsContains(current.LastError, "secret@example.com") {
+		t.Fatalf("failure message leaked sensitive detail in persistence: %q", current.LastError)
+	}
+	if current.LastError != failureMessage(errCreate) {
+		t.Fatalf("failure message = %q, want stable diagnostic %q", current.LastError, failureMessage(errCreate))
 	}
 	if current.NextRunAt == nil || current.LastAttemptedAt == nil || current.NextRunAt.Sub(*current.LastAttemptedAt) < MinimumInterval {
 		t.Fatalf("next attempt interval = %#v", current)
+	}
+}
+
+func TestUntrackedRemoteSideEffectPausesScheduleBeforeNextSlot(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	creatorCalls := 0
+	manager, logs := newFlowLogManager(t, repo, clock, func(ctx context.Context, _ int64) (domain.Alias, error) {
+		creatorCalls++
+		domain.ReportAliasCreationProgress(ctx, domain.AliasCreationPhaseSavingCandidate, 70, 0)
+		return domain.Alias{}, &untrackedRemoteSideEffectTestError{cause: errCreate}
+	})
+	schedule := enableForTest(t, manager, 61)
+	clock.Set(*schedule.NextRunAt)
+	manager.runDue(context.Background())
+
+	current, err := manager.GetSchedule(context.Background(), 61)
+	if err != nil {
+		t.Fatalf("read paused schedule: %v", err)
+	}
+	if current.Enabled || current.NextRunAt != nil || len(current.PlannedAt) != 0 {
+		t.Fatalf("untracked remote side effect did not pause schedule: %#v", current)
+	}
+	clock.Advance(CycleDuration)
+	manager.runDue(context.Background())
+	if creatorCalls != 1 {
+		t.Fatalf("creator calls after paused schedule = %d, want 1", creatorCalls)
+	}
+	failed := requireAutoCreateEvent(t, logs, "run_failed")
+	if failed.Fields["auto_creation_disabled"] != "true" ||
+		failed.Fields["schedule_action"] != "disabled" ||
+		failed.Fields["remote_side_effect_possible"] != "true" ||
+		failed.Fields["pending_confirmation"] != "false" {
+		t.Fatalf("paused failure diagnostics = %#v", failed.Fields)
+	}
+}
+
+func TestSuccessfulCreationRecordsTerminalStateAfterCancellation(t *testing.T) {
+	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
+	repo := newFakeRepository()
+	ctx, cancel := context.WithCancel(context.Background())
+	manager := newManagerForTest(t, repo, clock, func(context.Context, int64) (domain.Alias, error) {
+		cancel()
+		return domain.Alias{ID: 91, Address: "created@example.com"}, nil
+	})
+	schedule := enableForTest(t, manager, 62)
+	clock.Set(*schedule.NextRunAt)
+	manager.processDue(ctx, schedule)
+
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.successes) != 1 || repo.successes[0].address != "created@example.com" {
+		t.Fatalf("success state after cancellation = %#v", repo.successes)
 	}
 }
 
@@ -656,29 +732,30 @@ func TestRunCancellationPropagatesToCreator(t *testing.T) {
 	}
 }
 
-func TestFailureIsNotWrittenToLogs(t *testing.T) {
+func TestOrdinaryFailureLogsSanitizedDiagnostics(t *testing.T) {
 	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
 	repo := newFakeRepository()
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	manager, err := New(repo, func(context.Context, int64) (domain.Alias, error) {
+	manager, logs := newFlowLogManager(t, repo, clock, func(ctx context.Context, _ int64) (domain.Alias, error) {
+		domain.ReportAliasCreationProgress(ctx, domain.AliasCreationPhaseReserving, 60, 0)
 		return domain.Alias{}, errCreate
-	}, logger, WithClock(clock.Now), WithRandom(fixedRandom(0)))
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
+	})
 	schedule := enableForTest(t, manager, 9)
 	clock.Set(*schedule.NextRunAt)
 	manager.runDue(context.Background())
-	if bytes.Contains(logs.Bytes(), []byte("secret@example.com")) {
-		t.Fatalf("sensitive creator error leaked into logs: %q", logs.String())
+
+	failed := requireAutoCreateEvent(t, logs, "run_failed")
+	const reason = "自动创建在本地处理阶段失败，请结合失败步骤和部署日志排查"
+	if failed.Fields["failed_stage"] != string(domain.AliasCreationPhaseReserving) ||
+		failed.Fields["error_code"] != "AUTO_CREATE_FAILED" ||
+		failed.Fields["error"] != reason || failed.Fields["error_context"] != reason {
+		t.Fatalf("ordinary failure diagnostics = %#v", failed)
 	}
+	assertFlowLogsDoNotContain(t, logs, "secret@example.com", errCreate.Error())
 }
 
 func TestAppleFailureLogsOnlySanitizedStructuredFields(t *testing.T) {
 	clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
 	repo := newFakeRepository()
-	var logs bytes.Buffer
 	upstream := &apple.Error{
 		Op:          "reserve Hide My Email alias",
 		Kind:        apple.ErrService,
@@ -688,45 +765,30 @@ func TestAppleFailureLogsOnlySanitizedStructuredFields(t *testing.T) {
 		Err:         errors.New(`response body {"token":"TOKEN","email":"cause-secret@example.com"}`),
 	}
 	createErr := fmt.Errorf("outer-secret@example.com: %w", upstream)
-	manager, err := New(repo, func(context.Context, int64) (domain.Alias, error) {
+	manager, logs := newFlowLogManager(t, repo, clock, func(context.Context, int64) (domain.Alias, error) {
 		return domain.Alias{Address: "alias-secret@example.com"}, createErr
-	}, slog.New(slog.NewJSONHandler(&logs, nil)), WithClock(clock.Now), WithRandom(fixedRandom(0)))
-	if err != nil {
-		t.Fatalf("new manager: %v", err)
-	}
+	})
 	schedule := enableForTest(t, manager, 41)
 	clock.Set(*schedule.NextRunAt)
 	manager.runDue(context.Background())
 
-	var entry struct {
-		AccountID              int64   `json:"account_id"`
-		Operation              string  `json:"operation"`
-		HTTPStatus             int     `json:"http_status"`
-		ServiceCode            *string `json:"service_code"`
-		ServiceCodePresent     *bool   `json:"service_code_present"`
-		ServiceCodeFingerprint string  `json:"service_code_fingerprint"`
-		Retryable              bool    `json:"retryable"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
-		t.Fatalf("decode structured log: %v; log=%q", err, logs.String())
-	}
-	if entry.AccountID != 41 || entry.Operation != upstream.Op || entry.HTTPStatus != 503 || !entry.Retryable {
+	entry := requireAutoCreateEvent(t, logs, "run_failed")
+	if entry.Fields["account_id"] != "41" || entry.Fields["operation"] != upstream.Op ||
+		entry.Fields["http_status"] != "503" || entry.Fields["retryable"] != "true" ||
+		entry.Fields["upstream_retryable"] != "true" || entry.Fields["error_code"] != "APPLE_UPSTREAM_ERROR" {
 		t.Fatalf("structured Apple fields = %#v", entry)
 	}
-	if entry.ServiceCode != nil || entry.ServiceCodePresent == nil || !*entry.ServiceCodePresent {
+	if _, exists := entry.Fields["service_code"]; exists || entry.Fields["service_code_present"] != "true" {
 		t.Fatalf("service code fields = %#v", entry)
 	}
-	if len(entry.ServiceCodeFingerprint) != appleServiceCodeFingerprintHexLength {
-		t.Fatalf("service code fingerprint = %q", entry.ServiceCodeFingerprint)
+	fingerprint := entry.Fields["service_code_fingerprint"]
+	if len(fingerprint) != appleServiceCodeFingerprintHexLength {
+		t.Fatalf("service code fingerprint = %q", fingerprint)
 	}
-	if _, err := hex.DecodeString(entry.ServiceCodeFingerprint); err != nil {
-		t.Fatalf("service code fingerprint is not hex: %q", entry.ServiceCodeFingerprint)
+	if _, err := hex.DecodeString(fingerprint); err != nil {
+		t.Fatalf("service code fingerprint is not hex: %q", fingerprint)
 	}
-	for _, secret := range []string{upstream.ServiceCode, "outer-secret@example.com", "alias-secret@example.com", "cause-secret@example.com", "TOKEN", "response body"} {
-		if strings.Contains(logs.String(), secret) {
-			t.Fatalf("sensitive value %q leaked into log: %q", secret, logs.String())
-		}
-	}
+	assertFlowLogsDoNotContain(t, logs, upstream.ServiceCode, "outer-secret@example.com", "alias-secret@example.com", "cause-secret@example.com", "TOKEN", "response body")
 	if len(repo.failures) != 1 || repo.failures[0].message != failureMessage(createErr) {
 		t.Fatalf("persisted failure changed: %#v", repo.failures)
 	}
@@ -752,7 +814,6 @@ func TestAppleFailureFingerprintsServiceCodesAndSanitizesOperation(t *testing.T)
 		t.Run(test.name, func(t *testing.T) {
 			clock := newTestClock(time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC))
 			repo := newFakeRepository()
-			var logs bytes.Buffer
 			upstream := &apple.Error{
 				Op:          "reserve secret@example.com",
 				Kind:        apple.ErrService,
@@ -760,30 +821,24 @@ func TestAppleFailureFingerprintsServiceCodesAndSanitizesOperation(t *testing.T)
 				ServiceCode: test.code,
 				Retryable:   true,
 			}
-			manager, err := New(repo, func(context.Context, int64) (domain.Alias, error) {
+			manager, logs := newFlowLogManager(t, repo, clock, func(context.Context, int64) (domain.Alias, error) {
 				return domain.Alias{}, fmt.Errorf("wrapped: %w", upstream)
-			}, slog.New(slog.NewJSONHandler(&logs, nil)), WithClock(clock.Now), WithRandom(fixedRandom(0)))
-			if err != nil {
-				t.Fatalf("new manager: %v", err)
-			}
+			})
 			schedule := enableForTest(t, manager, int64(50+index))
 			clock.Set(*schedule.NextRunAt)
 			manager.runDue(context.Background())
 
-			var entry map[string]any
-			if err := json.Unmarshal(bytes.TrimSpace(logs.Bytes()), &entry); err != nil {
-				t.Fatalf("decode structured log: %v; log=%q", err, logs.String())
+			entry := requireAutoCreateEvent(t, logs, "run_failed")
+			if entry.Fields["operation"] != "unknown" {
+				t.Fatalf("unsafe operation was not sanitized: %#v", entry)
 			}
-			if entry["operation"] != "unknown" || strings.Contains(logs.String(), "secret@example.com") {
-				t.Fatalf("unsafe operation leaked into log: %q", logs.String())
+			if _, exists := entry.Fields["service_code"]; exists {
+				t.Fatalf("raw service code field was logged: %#v", entry)
 			}
-			if _, exists := entry["service_code"]; exists {
-				t.Fatalf("raw service code field was logged: %q", logs.String())
-			}
-			present, presentExists := entry["service_code_present"]
-			fingerprint, fingerprintExists := entry["service_code_fingerprint"].(string)
+			present, presentExists := entry.Fields["service_code_present"]
+			fingerprint, fingerprintExists := entry.Fields["service_code_fingerprint"]
 			if test.code != "" {
-				if !presentExists || present != true || !fingerprintExists || len(fingerprint) != appleServiceCodeFingerprintHexLength {
+				if !presentExists || present != "true" || !fingerprintExists || len(fingerprint) != appleServiceCodeFingerprintHexLength {
 					t.Fatalf("fingerprint fields = %#v", entry)
 				}
 				if _, err := hex.DecodeString(fingerprint); err != nil {
@@ -793,12 +848,10 @@ func TestAppleFailureFingerprintsServiceCodesAndSanitizesOperation(t *testing.T)
 					t.Fatalf("different service codes %q and %q share fingerprint %q", previous, test.code, fingerprint)
 				}
 				fingerprints[fingerprint] = test.code
-				if test.code != "" && strings.Contains(logs.String(), test.code) {
-					t.Fatalf("raw service code leaked into log: %q", logs.String())
-				}
 			} else if presentExists || fingerprintExists {
 				t.Fatalf("empty service code produced fingerprint fields: %#v", entry)
 			}
+			assertFlowLogsDoNotContain(t, logs, "secret@example.com", test.code)
 		})
 	}
 }

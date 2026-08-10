@@ -433,7 +433,15 @@
             </div>
             <div>
               <dt>计划时间</dt>
-              <dd>{{ formatAutoPlannedAt(autoCreation.plannedAt) }}</dd>
+              <dd>
+                {{
+                  formatAutoPlannedAt(
+                    autoCreation.plannedTimes?.length
+                      ? autoCreation.plannedTimes
+                      : autoCreation.plannedAt,
+                  )
+                }}
+              </dd>
             </div>
             <div>
               <dt>最近尝试</dt>
@@ -913,6 +921,11 @@ const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
     "Apple 创建的隐私邮箱已属于其他主号，请检查主号归属后重试",
   ACCOUNT_DISABLED: "当前主号已停用，请先启用主号后再开启自动创建",
   AUTO_CREATION_UNAVAILABLE: "自动创建服务暂不可用，请稍后重试",
+  ALIAS_LIMIT_REACHED: "当前主号已达到隐私邮箱容量上限，请确认自动创建计划状态",
+  AUTO_CREATE_PLAN_CORRECTION_FAILED: "认领计划后无法保存下一次执行时间，请检查数据库状态",
+  AUTO_CREATE_SCHEDULE_ERROR: "自动创建计划处理失败，请查看失败阶段和操作位置",
+  AUTO_CREATION_PERSISTENCE_ERROR: "自动创建结果未能完整写入数据库，请检查数据库状态",
+  AUTO_CREATION_CRYPTO_ERROR: "自动创建所需的本地密钥处理失败，请检查主密钥配置",
 });
 
 function autoCreationErrorMessage(value) {

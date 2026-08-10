@@ -14,9 +14,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"icloud-api/internal/apple"
 	"icloud-api/internal/domain"
 )
 
@@ -32,19 +32,20 @@ const (
 
 	defaultPollInterval                  = 30 * time.Second
 	defaultOverdueGrace                  = 2 * time.Minute
-	maxErrorRunes                        = 240
-	maxAppleOperationLength              = 96
+	terminalStatePersistTimeout          = 5 * time.Second
 	appleServiceCodeFingerprintHexLength = 16
 )
 
 const minimumCycleDuration = MinimumInterval * CreationsPerCycle
 
 var (
-	errNilRepository     = errors.New("alias creation repository is required")
-	errNilCreator        = errors.New("alias creator is required")
-	errInvalidAccountID  = errors.New("account ID must be positive")
-	errInvalidRandom     = errors.New("random source returned an invalid index")
-	errEmptyAliasAddress = errors.New("alias creator returned an empty address")
+	errNilRepository               = errors.New("alias creation repository is required")
+	errNilCreator                  = errors.New("alias creator is required")
+	errInvalidAccountID            = errors.New("account ID must be positive")
+	errInvalidRandom               = errors.New("random source returned an invalid index")
+	errEmptyAliasAddress           = errors.New("alias creator returned an empty address")
+	errAliasCreationPlanCorrection = errors.New("automatic alias creation plan correction failed")
+	errAliasCreationPlanConflict   = errors.New("automatic alias creation plan changed before correction")
 	// ErrCapacityReached tells the worker that the account's provider-side
 	// alias limit has been reached permanently for this schedule. The current
 	// slot is recorded as failed and the opt-in is disabled to prevent further
@@ -169,7 +170,22 @@ type Manager struct {
 	pollInterval time.Duration
 	overdueGrace time.Duration
 	randomMu     sync.Mutex
+	runSeq       atomic.Uint64
 }
+
+type aliasCreationScheduleDiagnosticError struct {
+	cause error
+}
+
+func (e aliasCreationScheduleDiagnosticError) Error() string {
+	return "automatic alias schedule operation failed"
+}
+
+func (e aliasCreationScheduleDiagnosticError) DiagnosticCode() string {
+	return "AUTO_CREATE_SCHEDULE_ERROR"
+}
+
+func (e aliasCreationScheduleDiagnosticError) Unwrap() error { return e.cause }
 
 // New constructs an automatic alias creation manager.
 func New(repo Repository, creator Creator, logger *slog.Logger, options ...Option) (*Manager, error) {
@@ -275,7 +291,7 @@ func (m *Manager) runDue(ctx context.Context) {
 	schedules, err := m.repo.ListDueAliasCreationSchedules(ctx, now)
 	if err != nil {
 		if ctx.Err() == nil {
-			m.logger.Warn("读取自动创建计划失败")
+			m.logAutomaticScheduleError(ctx, 0, "list_due_schedules", domain.AliasCreationPhasePreparing, now, err)
 		}
 		return
 	}
@@ -299,11 +315,15 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 	if now.Sub(expected) > m.overdueGrace {
 		planned, err := m.newPlan(now)
 		if err != nil {
-			m.logScheduleError("重排自动创建计划失败", schedule.AccountID)
+			m.logAutomaticScheduleError(ctx, schedule.AccountID, "build_overdue_schedule", domain.AliasCreationPhasePreparing, expected, err)
 			return
 		}
 		if _, err := m.repo.RescheduleAliasCreation(ctx, schedule.AccountID, expected, planned, now); err != nil {
-			m.logScheduleError("保存自动创建重排失败", schedule.AccountID)
+			if ctx.Err() != nil {
+				m.logAutomaticScheduleCancellation(ctx, schedule.AccountID, expected, now)
+			} else {
+				m.logAutomaticScheduleError(ctx, schedule.AccountID, "reschedule_overdue_schedule", domain.AliasCreationPhasePreparing, expected, err)
+			}
 		}
 		return
 	}
@@ -313,11 +333,15 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 		if now.Before(earliest) {
 			planned, err := m.shiftCurrentPlan(schedule, expected, earliest)
 			if err != nil {
-				m.logScheduleError("修正自动创建间隔失败", schedule.AccountID)
+				m.logAutomaticScheduleError(ctx, schedule.AccountID, "build_minimum_interval_schedule", domain.AliasCreationPhasePreparing, expected, err)
 				return
 			}
 			if _, err := m.repo.RescheduleAliasCreation(ctx, schedule.AccountID, expected, planned, now); err != nil {
-				m.logScheduleError("保存自动创建间隔修正失败", schedule.AccountID)
+				if ctx.Err() != nil {
+					m.logAutomaticScheduleCancellation(ctx, schedule.AccountID, expected, now)
+				} else {
+					m.logAutomaticScheduleError(ctx, schedule.AccountID, "reschedule_minimum_interval", domain.AliasCreationPhasePreparing, expected, err)
+				}
 			}
 			return
 		}
@@ -326,17 +350,19 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 	claimAt := now
 	planned, err := m.planAfterClaim(schedule, expected, claimAt)
 	if err != nil {
-		m.logScheduleError("生成下一组自动创建计划失败", schedule.AccountID)
+		m.logAutomaticScheduleError(ctx, schedule.AccountID, "build_next_schedule", domain.AliasCreationPhasePreparing, expected, err)
 		return
 	}
 	claimed, err := m.repo.ClaimAliasCreation(ctx, schedule.AccountID, expected, planned, claimAt)
 	if err != nil {
 		if ctx.Err() == nil {
-			m.logScheduleError("认领自动创建计划失败", schedule.AccountID)
+			m.logAutomaticScheduleError(ctx, schedule.AccountID, "claim_schedule_slot", domain.AliasCreationPhasePreparing, expected, err)
+		} else {
+			m.logAutomaticScheduleCancellation(ctx, schedule.AccountID, expected, claimAt)
 		}
 		return
 	}
-	if !claimed || ctx.Err() != nil {
+	if !claimed {
 		return
 	}
 	// Claim time is persisted before the remote side effect. Re-read the clock
@@ -344,56 +370,217 @@ func (m *Manager) processDue(ctx context.Context, schedule domain.AliasCreationS
 	// five minutes of the post-claim start boundary.
 	attemptedAt := claimAt
 	actualAt := m.now()
+	flow := m.newAliasCreationFlow(actualAt)
+	var nextRunAt *time.Time
+	if len(planned) > 0 {
+		next := planned[0].UTC()
+		nextRunAt = &next
+	}
+	flow.markStarted()
+	startAttributes := aliasCreationTimingAttrs(expected, attemptedAt, nextRunAt)
+	startAttributes = append(startAttributes, slog.String("schedule_action", aliasCreationScheduleAction(false, nextRunAt)))
+	m.logAliasCreationFlow(
+		context.WithoutCancel(ctx),
+		slog.LevelDebug,
+		"自动创建隐私邮箱开始",
+		schedule.AccountID,
+		flow,
+		"run_started",
+		startAttributes...,
+	)
+	if ctx.Err() != nil {
+		m.logAliasCreationCancellationWithError(
+			context.WithoutCancel(ctx),
+			schedule.AccountID,
+			flow,
+			flow.currentStage(),
+			ctx.Err(),
+			expected,
+			attemptedAt,
+			nextRunAt,
+		)
+		return
+	}
 	if actualAt.After(attemptedAt) {
-		corrected, correctionErr := m.correctPlanAfterClaim(ctx, schedule.AccountID, planned, actualAt)
+		corrected, correctedPlan, correctionErr := m.correctPlanAfterClaim(ctx, schedule.AccountID, planned, actualAt)
 		if correctionErr != nil || !corrected {
-			if ctx.Err() == nil {
-				message := errors.New("adjust automatic alias creation interval after claim")
-				if correctionErr != nil {
-					message = errors.New("persist automatic alias creation interval after claim")
-				}
-				if recordErr := m.repo.RecordAliasCreationFailure(ctx, schedule.AccountID, actualAt, failureMessage(message)); recordErr != nil {
-					m.logScheduleError("记录自动创建间隔修正失败状态失败", schedule.AccountID)
-				}
-				m.logScheduleError("自动创建间隔修正失败", schedule.AccountID)
+			if ctx.Err() != nil {
+				m.logAliasCreationCancellationWithError(
+					context.WithoutCancel(ctx),
+					schedule.AccountID,
+					flow,
+					flow.currentStage(),
+					ctx.Err(),
+					expected,
+					attemptedAt,
+					nextRunAt,
+				)
+				return
 			}
+			correctionCause := error(errAliasCreationPlanConflict)
+			if correctionErr != nil {
+				correctionCause = fmt.Errorf("%w: %w", errAliasCreationPlanCorrection, correctionErr)
+			}
+			failureRecorded := true
+			if recordErr := m.repo.RecordAliasCreationFailure(ctx, schedule.AccountID, actualAt, aliasCreationErrorReason("AUTO_CREATE_PLAN_CORRECTION_FAILED")); recordErr != nil {
+				failureRecorded = false
+				m.logAliasCreationStateError(
+					ctx,
+					"记录自动创建间隔修正失败状态失败",
+					schedule.AccountID,
+					flow,
+					"record_plan_correction_failure",
+					recordErr,
+				)
+			}
+			m.logAliasCreationFailureWithOperation(
+				context.WithoutCancel(ctx),
+				schedule.AccountID,
+				flow,
+				domain.AliasCreationPhasePreparing,
+				"correct_schedule_after_claim",
+				correctionCause,
+				expected,
+				attemptedAt,
+				nextRunAt,
+				failureRecorded,
+				false,
+			)
 			return
 		}
+		planned = correctedPlan
 		attemptedAt = actualAt
 	}
 
-	alias, createErr := m.creator(ctx, schedule.AccountID)
+	nextRunAt = nil
+	if len(planned) > 0 {
+		next := planned[0].UTC()
+		nextRunAt = &next
+	}
+	flow.startedAt = attemptedAt
+	creatorContext := domain.WithAliasCreationProgressReporter(ctx, func(update domain.AliasCreationProgressUpdate) {
+		m.logAliasCreationProgress(ctx, schedule.AccountID, &flow, update)
+	})
+	alias, createErr := m.creator(creatorContext, schedule.AccountID)
 	address := strings.TrimSpace(alias.Address)
 	if createErr == nil && address == "" {
 		createErr = errEmptyAliasAddress
 	}
 	if createErr != nil {
+		failedStage := flow.currentStage()
 		if ctx.Err() != nil {
-			return
-		}
-		if err := m.repo.RecordAliasCreationFailure(ctx, schedule.AccountID, attemptedAt, failureMessage(createErr)); err != nil {
-			m.logScheduleError("记录自动创建失败状态失败", schedule.AccountID)
-		}
-		if errors.Is(createErr, ErrCapacityReached) {
-			if err := m.repo.DisableAliasCreation(ctx, schedule.AccountID, m.now()); err != nil {
-				m.logScheduleError("达到容量上限后关闭自动创建失败", schedule.AccountID)
+			info := diagnoseAliasCreationError(createErr)
+			if info.code == "CONTEXT_CANCELED" || info.code == "CONTEXT_DEADLINE_EXCEEDED" {
+				m.logAliasCreationCancellationWithError(
+					context.WithoutCancel(ctx),
+					schedule.AccountID,
+					flow,
+					failedStage,
+					createErr,
+					expected,
+					attemptedAt,
+					nextRunAt,
+				)
+				return
 			}
 		}
-		m.logCreationError(schedule.AccountID, createErr)
+		logContext := context.WithoutCancel(ctx)
+		failureStateContext, cancelFailureStateContext := context.WithTimeout(logContext, terminalStatePersistTimeout)
+		failureRecorded := true
+		if recordErr := m.repo.RecordAliasCreationFailure(failureStateContext, schedule.AccountID, attemptedAt, failureMessage(createErr)); recordErr != nil {
+			failureRecorded = false
+			m.logAliasCreationStateError(
+				logContext,
+				"记录自动创建失败状态失败",
+				schedule.AccountID,
+				flow,
+				"record_creation_failure",
+				recordErr,
+			)
+		}
+		cancelFailureStateContext()
+		creationDisabled := false
+		disableOperation := ""
+		disableMessage := ""
+		switch {
+		case errors.Is(createErr, ErrCapacityReached):
+			disableOperation = "disable_creation_schedule"
+			disableMessage = "达到容量上限后关闭自动创建失败"
+		case aliasCreationUntrackedRemoteSideEffect(createErr):
+			disableOperation = "pause_after_untracked_remote_side_effect"
+			disableMessage = "远端地址可能已创建但本地候选未保存，暂停自动创建失败"
+		}
+		if disableOperation != "" {
+			disableContext, cancelDisableContext := context.WithTimeout(logContext, terminalStatePersistTimeout)
+			disableErr := m.repo.DisableAliasCreation(disableContext, schedule.AccountID, m.now())
+			cancelDisableContext()
+			if disableErr != nil {
+				m.logAliasCreationStateError(
+					logContext,
+					disableMessage,
+					schedule.AccountID,
+					flow,
+					disableOperation,
+					disableErr,
+				)
+			} else {
+				creationDisabled = true
+				nextRunAt = nil
+			}
+		}
+		m.logAliasCreationFailure(
+			logContext,
+			schedule.AccountID,
+			flow,
+			failedStage,
+			createErr,
+			expected,
+			attemptedAt,
+			nextRunAt,
+			failureRecorded,
+			creationDisabled,
+		)
 		return
 	}
-	if err := m.repo.RecordAliasCreationSuccess(ctx, schedule.AccountID, attemptedAt, address); err != nil {
-		m.logScheduleError("记录自动创建成功状态失败", schedule.AccountID)
+	logContext := context.WithoutCancel(ctx)
+	stateContext, cancelStateContext := context.WithTimeout(logContext, terminalStatePersistTimeout)
+	defer cancelStateContext()
+	resultRecorded := true
+	if recordErr := m.repo.RecordAliasCreationSuccess(stateContext, schedule.AccountID, attemptedAt, address); recordErr != nil {
+		resultRecorded = false
+		m.logAliasCreationStateError(
+			logContext,
+			"记录自动创建成功状态失败",
+			schedule.AccountID,
+			flow,
+			"record_creation_success",
+			recordErr,
+		)
 	}
+	m.logAliasCreationCompleted(
+		logContext,
+		schedule.AccountID,
+		flow,
+		alias.ID,
+		expected,
+		attemptedAt,
+		nextRunAt,
+		resultRecorded,
+	)
 }
 
-func (m *Manager) correctPlanAfterClaim(ctx context.Context, accountID int64, planned []time.Time, actualAt time.Time) (bool, error) {
+func (m *Manager) correctPlanAfterClaim(
+	ctx context.Context,
+	accountID int64,
+	planned []time.Time,
+	actualAt time.Time,
+) (bool, []time.Time, error) {
 	if len(planned) == 0 {
-		return true, nil
+		return true, nil, nil
 	}
 	earliest := actualAt.Add(MinimumInterval)
 	if !planned[0].Before(earliest) {
-		return true, nil
+		return true, append([]time.Time(nil), planned...), nil
 	}
 	shifted := append([]time.Time(nil), planned...)
 	shift := earliest.Sub(shifted[0])
@@ -401,7 +588,10 @@ func (m *Manager) correctPlanAfterClaim(ctx context.Context, accountID int64, pl
 		shifted[index] = shifted[index].Add(shift)
 	}
 	changed, err := m.repo.RescheduleAliasCreation(ctx, accountID, planned[0], shifted, actualAt)
-	return changed, err
+	if err != nil || !changed {
+		return changed, nil, err
+	}
+	return true, shifted, nil
 }
 
 func (m *Manager) planAfterClaim(schedule domain.AliasCreationSchedule, expected, attemptedAt time.Time) ([]time.Time, error) {
@@ -543,51 +733,109 @@ func validateAccountID(accountID int64) error {
 }
 
 func failureMessage(err error) string {
-	if err == nil {
-		return "自动创建失败"
-	}
-	message := strings.Join(strings.Fields(err.Error()), " ")
-	if message == "" {
-		message = "自动创建失败"
-	}
-	runes := []rune(message)
-	if len(runes) > maxErrorRunes {
-		runes = runes[:maxErrorRunes]
-	}
-	return string(runes)
+	return diagnoseAliasCreationError(err).reason
 }
 
-func (m *Manager) logScheduleError(message string, accountID int64) {
-	// Deliberately omit upstream errors and alias addresses: Apple errors can
-	// echo request data, and an address is user data rather than diagnostics.
-	m.logger.Warn(message, "account_id", accountID)
+func (m *Manager) logAutomaticScheduleError(
+	ctx context.Context,
+	accountID int64,
+	operation string,
+	stage domain.AliasCreationPhase,
+	scheduledFor time.Time,
+	err error,
+) {
+	attemptedAt := m.now()
+	flow := m.newAliasCreationFlow(attemptedAt)
+	flow.markStarted()
+	var nextRunAt *time.Time
+	if accountID > 0 && !scheduledFor.IsZero() {
+		next := scheduledFor.UTC()
+		nextRunAt = &next
+	}
+	startAttributes := aliasCreationTimingAttrs(scheduledFor, attemptedAt, nextRunAt)
+	startAttributes = append(startAttributes, slog.String("schedule_action", aliasCreationScheduleAction(false, nextRunAt)))
+	m.logAliasCreationFlow(
+		context.WithoutCancel(ctx),
+		slog.LevelDebug,
+		"自动创建隐私邮箱计划处理开始",
+		accountID,
+		flow,
+		"run_started",
+		startAttributes...,
+	)
+	wrapped := aliasCreationScheduleDiagnosticError{cause: err}
+	m.logAliasCreationFailureWithOperation(
+		context.WithoutCancel(ctx),
+		accountID,
+		flow,
+		stage,
+		operation,
+		wrapped,
+		scheduledFor,
+		attemptedAt,
+		nextRunAt,
+		false,
+		false,
+	)
 }
 
-func (m *Manager) logCreationError(accountID int64, err error) {
-	attributes := []any{"account_id", accountID}
-	var upstream *apple.Error
-	if errors.As(err, &upstream) && upstream != nil {
-		attributes = append(attributes,
-			"operation", safeAppleOperation(upstream.Op),
-			"http_status", upstream.StatusCode,
-		)
-		if fingerprint, ok := appleServiceCodeFingerprint(upstream.ServiceCode); ok {
-			attributes = append(attributes,
-				"service_code_present", true,
-				"service_code_fingerprint", fingerprint,
-			)
-		}
-		attributes = append(attributes, "retryable", upstream.Retryable)
-	}
-	m.logger.Warn("自动创建隐私邮箱失败", attributes...)
+func (m *Manager) logAutomaticScheduleCancellation(
+	ctx context.Context,
+	accountID int64,
+	scheduledFor, attemptedAt time.Time,
+) {
+	flow := m.newAliasCreationFlow(m.now())
+	nextRunAt := scheduledFor.UTC()
+	m.logAliasCreationCancellationWithError(
+		context.WithoutCancel(ctx),
+		accountID,
+		flow,
+		domain.AliasCreationPhasePreparing,
+		ctx.Err(),
+		scheduledFor,
+		attemptedAt,
+		&nextRunAt,
+	)
 }
 
 func safeAppleOperation(value string) string {
 	value = strings.TrimSpace(value)
-	if value == "" || len(value) > maxAppleOperationLength || !isSafeAppleOperation(value) {
+	switch value {
+	case "sign in",
+		"initialize sign in",
+		"initialize SRP",
+		"derive SRP proof",
+		"complete SRP sign in",
+		"decode SRP challenge",
+		"decode SRP salt",
+		"decode SRP public value",
+		"federate Apple ID",
+		"request two-factor code",
+		"verify two-factor code",
+		"complete two-factor authentication",
+		"trust Apple session",
+		"exchange Apple session token",
+		"decode Apple account",
+		"validate Apple session",
+		"decode Apple session",
+		"list Hide My Email aliases",
+		"decode Hide My Email list",
+		"generate Hide My Email alias",
+		"decode generate Hide My Email alias",
+		"decode generated Hide My Email alias",
+		"reserve Hide My Email alias",
+		"decode reserve Hide My Email alias",
+		"decode reserved Hide My Email alias",
+		"deactivate Hide My Email alias",
+		"decode deactivate Hide My Email alias",
+		"delete Hide My Email alias",
+		"decode delete Hide My Email alias",
+		"create Hide My Email alias",
+		"reserve alias":
+		return value
+	default:
 		return "unknown"
 	}
-	return value
 }
 
 func appleServiceCodeFingerprint(value string) (string, bool) {
@@ -596,21 +844,4 @@ func appleServiceCodeFingerprint(value string) (string, bool) {
 	}
 	digest := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(digest[:])[:appleServiceCodeFingerprintHexLength], true
-}
-
-func isSafeAppleOperation(value string) bool {
-	for index := 0; index < len(value); index++ {
-		character := value[index]
-		if character >= 'a' && character <= 'z' ||
-			character >= 'A' && character <= 'Z' ||
-			character >= '0' && character <= '9' ||
-			character == '_' || character == '-' || character == '.' {
-			continue
-		}
-		if character == ' ' || character == '/' || character == ':' {
-			continue
-		}
-		return false
-	}
-	return true
 }

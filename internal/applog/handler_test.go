@@ -105,6 +105,33 @@ func TestListFiltersSyncRunIDExactly(t *testing.T) {
 	}
 }
 
+func TestListFiltersAutoCreateRunIDExactly(t *testing.T) {
+	handler := New(10)
+	logger := slog.New(handler)
+	logger.Info("exact", "auto_create_run_id", "auto-run-1")
+	logger.Info("different", "auto_create_run_id", "auto-run-10")
+	logger.Info("grouped", slog.Group("autocreate", "auto_create_run_id", "auto-run-1"))
+	logger.Info("missing")
+
+	page := handler.List(Filter{AutoCreateRunID: "auto-run-1", Limit: 10})
+	if len(page.Items) != 2 || page.Items[0].Message != "grouped" || page.Items[1].Message != "exact" {
+		t.Fatalf("exact auto-create run page = %#v", page)
+	}
+	logger.Info("literal-dot-key", slog.String("other.auto_create_run_id", "auto-run-1"))
+	if page := handler.List(Filter{AutoCreateRunID: "auto-run-1", Limit: 10}); len(page.Items) != 2 {
+		t.Fatalf("literal dotted key was treated as grouped run id: %#v", page.Items)
+	}
+}
+
+func TestFieldKeyHasSuffixDistinguishesEscapedDots(t *testing.T) {
+	if !FieldKeyHasSuffix("autocreate.auto_create_run_id", "auto_create_run_id") {
+		t.Fatal("grouped field was not recognized")
+	}
+	if FieldKeyHasSuffix(`other\.auto_create_run_id`, "auto_create_run_id") {
+		t.Fatal("escaped literal dot was recognized as a group")
+	}
+}
+
 func TestWithAttrsAndGroupsPreserveBindingOrder(t *testing.T) {
 	handler := New(10)
 	derived := handler.
@@ -189,6 +216,25 @@ func TestHandlerRedactsSensitiveKeysAndBoundsEntries(t *testing.T) {
 	}
 	if total > configured.totalBytes {
 		t.Fatalf("ring size = %d, want <= %d", total, configured.totalBytes)
+	}
+}
+
+func TestHandlerRedactsNestedAndDottedSensitiveKeys(t *testing.T) {
+	handler := New(10)
+	logger := slog.New(handler)
+	logger.Info("sensitive paths",
+		slog.String("api.key", "API_KEY_SECRET"),
+		slog.Group("http", slog.String("headers", "Authorization: TOKEN")),
+		slog.String("private.key", "PRIVATE_KEY_SECRET"),
+	)
+	entry := handler.List(Filter{Limit: 1}).Items[0]
+	for key, value := range entry.Fields {
+		if strings.Contains(value, "API_KEY_SECRET") || strings.Contains(value, "TOKEN") || strings.Contains(value, "PRIVATE_KEY_SECRET") {
+			t.Fatalf("sensitive value leaked at %q: %#v", key, entry.Fields)
+		}
+	}
+	if entry.Fields[`api\.key`] != redactedValue || entry.Fields[`http.headers`] != redactedValue || entry.Fields[`private\.key`] != redactedValue {
+		t.Fatalf("sensitive paths were not redacted: %#v", entry.Fields)
 	}
 }
 

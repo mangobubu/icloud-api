@@ -305,7 +305,13 @@ func TestCreateAutoAliasChecksSelectedForwardBeforeReserve(t *testing.T) {
 }
 
 func TestCreateAutoAliasAcceptsMinimalReserveResponseAfterPreflight(t *testing.T) {
-	ctx := context.Background()
+	var progress []domain.AliasCreationProgressUpdate
+	ctx := domain.WithAliasCreationProgressReporter(
+		context.Background(),
+		func(update domain.AliasCreationProgressUpdate) {
+			progress = append(progress, update)
+		},
+	)
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "Primary@icloud.com", Enabled: true}, now)
 	var listCalls atomic.Int32
@@ -352,6 +358,38 @@ func TestCreateAutoAliasAcceptsMinimalReserveResponseAfterPreflight(t *testing.T
 		client.createCalls.Load() != 1 || listCalls.Load() != 2 || repo.creates.Load() != 1 {
 		t.Fatalf("created=%#v lists=%d reserves=%d writes=%d", created, listCalls.Load(), client.createCalls.Load(), repo.creates.Load())
 	}
+	wantProgress := []domain.AliasCreationProgressUpdate{
+		{Phase: domain.AliasCreationPhasePreparing, Percent: 5},
+		{Phase: domain.AliasCreationPhaseCheckingAccount, Percent: 10},
+		{Phase: domain.AliasCreationPhaseCheckingCapacity, Percent: 15},
+		{Phase: domain.AliasCreationPhaseLoadingSession, Percent: 25},
+		{Phase: domain.AliasCreationPhaseValidatingSession, Percent: 35},
+		{Phase: domain.AliasCreationPhaseCheckingForwarding, Percent: 45},
+		{Phase: domain.AliasCreationPhasePreparingKey, Percent: 55},
+		{Phase: domain.AliasCreationPhaseReserving, Percent: 65},
+		{Phase: domain.AliasCreationPhaseSavingCandidate, Percent: 75},
+		{Phase: domain.AliasCreationPhaseReconciling, Percent: 85, Attempt: 1},
+		{Phase: domain.AliasCreationPhaseConfirming, Percent: 85, Attempt: 1},
+		{Phase: domain.AliasCreationPhaseSavingResult, Percent: 95, Attempt: 1},
+		{Phase: domain.AliasCreationPhaseCompleted, Percent: 100},
+	}
+	if len(progress) != len(wantProgress) {
+		t.Fatalf("progress updates = %#v, want %#v", progress, wantProgress)
+	}
+	for index := range wantProgress {
+		if progress[index] != wantProgress[index] {
+			t.Fatalf("progress[%d] = %#v, want %#v", index, progress[index], wantProgress[index])
+		}
+	}
+	encodedProgress, err := json.Marshal(progress)
+	if err != nil {
+		t.Fatalf("encode progress: %v", err)
+	}
+	for _, sensitive := range []string{"new-alias@icloud.com", "owner@example.com", "listed-session-token"} {
+		if strings.Contains(string(encodedProgress), sensitive) {
+			t.Fatalf("progress exposed sensitive value %q: %s", sensitive, encodedProgress)
+		}
+	}
 }
 
 func TestShouldRetryAutoCreateConfirmation(t *testing.T) {
@@ -381,6 +419,23 @@ func TestShouldRetryAutoCreateConfirmation(t *testing.T) {
 				StatusCode: 409,
 			}),
 		},
+		{
+			name: "retryable Apple response in a later joined cause",
+			err: errors.Join(
+				wrapError(CodeUpstreamError, ErrUpstream, &apple.Error{
+					Op:         "reserve Hide My Email alias",
+					Kind:       apple.ErrService,
+					StatusCode: 409,
+				}),
+				wrapError(CodeUpstreamError, ErrUpstream, &apple.Error{
+					Op:         "list Hide My Email aliases",
+					Kind:       apple.ErrService,
+					StatusCode: 503,
+					Retryable:  true,
+				}),
+			),
+			want: true,
+		},
 		{name: "rate limit without typed cause", err: ErrRateLimited, want: true},
 		{name: "canceled", err: context.Canceled},
 	}
@@ -394,7 +449,13 @@ func TestShouldRetryAutoCreateConfirmation(t *testing.T) {
 }
 
 func TestCreateAutoAliasRetriesConfirmationUntilReservedAliasAppears(t *testing.T) {
-	ctx := context.Background()
+	var progress []domain.AliasCreationProgressUpdate
+	ctx := domain.WithAliasCreationProgressReporter(
+		context.Background(),
+		func(update domain.AliasCreationProgressUpdate) {
+			progress = append(progress, update)
+		},
+	)
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
 	var listCalls atomic.Int32
@@ -465,6 +526,25 @@ func TestCreateAutoAliasRetriesConfirmationUntilReservedAliasAppears(t *testing.
 	stored, decryptErr := service.decryptSession(repo.mustSession(t, 3))
 	if decryptErr != nil || stored.SessionToken != "confirmation-session-token-3" {
 		t.Fatalf("latest confirmation session was not persisted: session=%#v err=%v", stored, decryptErr)
+	}
+	var reconciliationAttempts []int
+	for _, update := range progress {
+		if update.Phase != domain.AliasCreationPhaseReconciling {
+			continue
+		}
+		if update.Percent != 85 {
+			t.Fatalf("reconciliation percent = %d, want 85", update.Percent)
+		}
+		reconciliationAttempts = append(reconciliationAttempts, update.Attempt)
+	}
+	wantAttempts := []int{1, 2, 3}
+	if len(reconciliationAttempts) != len(wantAttempts) {
+		t.Fatalf("reconciliation attempts = %v, want %v", reconciliationAttempts, wantAttempts)
+	}
+	for index := range wantAttempts {
+		if reconciliationAttempts[index] != wantAttempts[index] {
+			t.Fatalf("reconciliation attempts = %v, want %v", reconciliationAttempts, wantAttempts)
+		}
 	}
 }
 
@@ -864,6 +944,208 @@ func TestCreateAutoAliasRejectsExplicitInactiveReserveResult(t *testing.T) {
 	if pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil ||
 		pending.Alias.Address != "new-alias@icloud.com" {
 		t.Fatalf("inactive reserve lost pending alias: pending=%#v err=%v", pending, pendingErr)
+	}
+}
+
+func TestCreateAutoAliasPreservesConfirmationPersistenceCause(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.confirmErr = store.ErrAliasLimit
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			return apple.Alias{
+				HME:            "new-alias@icloud.com",
+				IsActive:       true,
+				ForwardToEmail: "primary@icloud.com",
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if Code(err) != CodePersistenceError || !errors.Is(err, ErrPersistence) ||
+		!errors.Is(err, store.ErrAliasLimit) {
+		t.Fatalf("confirmation persistence error = %v code=%q", err, Code(err))
+	}
+	if repo.creates.Load() != 1 || repo.confirms.Load() != 0 {
+		t.Fatalf("confirmation persistence side effects: creates=%d confirms=%d", repo.creates.Load(), repo.confirms.Load())
+	}
+	if _, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil {
+		t.Fatalf("pending alias was lost after confirmation persistence failure: %v", pendingErr)
+	}
+}
+
+func TestCreateAutoAliasClassifiesPendingSessionCheckpointAsPersistence(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	repo.pending = &domain.PendingAliasAPIKey{
+		Alias: domain.Alias{
+			ID:             77,
+			AccountID:      3,
+			Address:        "pending@icloud.com",
+			Enabled:        false,
+			LastSyncStatus: domain.SyncStatusPending,
+			LastSyncError:  domain.AppleAliasConfirmationPending,
+		},
+		APIKeyCiphertext: "sealed-key",
+	}
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			session.SessionToken = "rotated-session-token"
+			return apple.ListResult{
+				SelectedForwardTo: "primary@icloud.com",
+				Aliases: []apple.Alias{{
+					HME:            "pending@icloud.com",
+					IsActive:       true,
+					ForwardToEmail: "primary@icloud.com",
+				}},
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+	repo.upsertSessionErr = errors.New("database unavailable")
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if Code(err) != CodePersistenceError || !errors.Is(err, ErrPersistence) {
+		t.Fatalf("pending session checkpoint error = %v code=%q", err, Code(err))
+	}
+	if errors.Is(err, ErrAliasConfirmationPending) {
+		t.Fatalf("pending session checkpoint was relabeled as directory confirmation: %v", err)
+	}
+	if repo.confirms.Load() != 0 {
+		t.Fatalf("failed session checkpoint reached confirmation: confirms=%d", repo.confirms.Load())
+	}
+}
+
+func TestCreateAutoAliasFallsBackOnlyForUncodedSessionPersistenceError(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			session.Region = apple.Region("unknown")
+			return apple.Alias{
+				HME:            "new-alias@icloud.com",
+				IsActive:       true,
+				ForwardToEmail: "primary@icloud.com",
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if Code(err) != CodePersistenceError || !errors.Is(err, ErrPersistence) {
+		t.Fatalf("uncoded session persistence error = %v code=%q", err, Code(err))
+	}
+	if client.createCalls.Load() != 1 || repo.creates.Load() != 1 || repo.confirms.Load() != 0 {
+		t.Fatalf("uncoded session fallback side effects: reserves=%d creates=%d confirms=%d",
+			client.createCalls.Load(), repo.creates.Load(), repo.confirms.Load())
+	}
+	if _, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil {
+		t.Fatalf("uncoded session fallback did not retain candidate: %v", pendingErr)
+	}
+}
+
+func TestCreateAutoAliasPublishesCandidateBeforeReturningCodedSessionError(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			session.AppleID = "other@example.com"
+			return apple.Alias{
+				HME:            "new-alias@icloud.com",
+				IsActive:       true,
+				ForwardToEmail: "primary@icloud.com",
+			}, session, nil
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if Code(err) != CodeAccountMismatch || !errors.Is(err, ErrAccountMismatch) {
+		t.Fatalf("coded session error = %v code=%q", err, Code(err))
+	}
+	var pendingMarker interface{ PendingConfirmation() bool }
+	if !errors.As(err, &pendingMarker) || !pendingMarker.PendingConfirmation() {
+		t.Fatalf("coded session error did not report a pending candidate: %T %v", err, err)
+	}
+	if client.createCalls.Load() != 1 || repo.creates.Load() != 1 {
+		t.Fatalf("coded session error candidate writes: reserves=%d creates=%d", client.createCalls.Load(), repo.creates.Load())
+	}
+	if pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil || pending.Alias.Address != "new-alias@icloud.com" {
+		t.Fatalf("coded session error lost pending alias: pending=%#v err=%v", pending, pendingErr)
+	}
+}
+
+func TestCreateAutoAliasPrioritizesLatestConfirmationError(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
+	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
+	var listCalls atomic.Int32
+	reserveCause := &apple.Error{
+		Op: "reserve Hide My Email alias", Kind: apple.ErrService, StatusCode: 503,
+		ServiceCode: "RESERVE_FIXTURE", Retryable: true,
+	}
+	confirmationCause := &apple.Error{
+		Op: "list Hide My Email aliases", Kind: apple.ErrService, StatusCode: 409,
+		ServiceCode: "CONFIRM_FIXTURE", Retryable: false,
+	}
+	client := &fakeAppleClient{
+		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
+			return session, nil
+		},
+		list: func(_ context.Context, session apple.Session) (apple.ListResult, apple.Session, error) {
+			if listCalls.Add(1) == 1 {
+				return apple.ListResult{SelectedForwardTo: "primary@icloud.com"}, session, nil
+			}
+			return apple.ListResult{}, session, confirmationCause
+		},
+		create: func(_ context.Context, session apple.Session, _, _ string) (apple.Alias, apple.Session, error) {
+			return apple.Alias{HME: "new-alias@icloud.com"}, session, reserveCause
+		},
+	}
+	service := newTestService(t, repo, client, &fakeLocker{}, func() time.Time { return now })
+	service.autoCreateConfirmationDelays = nil
+	storeSession(t, service, repo, 3, apple.Session{AppleID: "owner@example.com", Region: apple.RegionGlobal})
+
+	_, err := service.CreateAutoAlias(ctx, 3)
+	if Code(err) != CodeAliasConfirmationPending || !errors.Is(err, ErrAliasConfirmationPending) {
+		t.Fatalf("confirmation error = %v code=%q", err, Code(err))
+	}
+	var got *apple.Error
+	if !errors.As(err, &got) || got != confirmationCause {
+		t.Fatalf("latest confirmation cause = %#v, want %#v", got, confirmationCause)
+	}
+	if !errors.Is(err, reserveCause) {
+		t.Fatalf("initial reserve cause was dropped: %v", err)
 	}
 }
 
@@ -1671,6 +1953,9 @@ type fakeRepository struct {
 	now              time.Time
 	deleteSessionErr error
 	deleteAliasErr   error
+	createErr        error
+	confirmErr       error
+	upsertSessionErr error
 	getAliasFn       func(context.Context, int64) error
 	deleteAliasFn    func(context.Context, int64) error
 	importFn         func(context.Context, int64, []domain.AliasImportCandidate) (domain.AliasImportResult, error)
@@ -1713,6 +1998,9 @@ func (r *fakeRepository) UpsertAppleWebSession(_ context.Context, session domain
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.upserts.Add(1)
+	if r.upsertSessionErr != nil {
+		return domain.AppleWebSession{}, r.upsertSessionErr
+	}
 	if existing, ok := r.sessions[session.AccountID]; ok {
 		session.CreatedAt = existing.CreatedAt
 	} else {
@@ -1794,6 +2082,9 @@ func (r *fakeRepository) CreateAliasWithPendingAPIKey(
 	r.creates.Add(1)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.createErr != nil {
+		return domain.Alias{}, domain.AppleWebSession{}, r.createErr
+	}
 	if alias.AccountID != r.account.ID || len(alias.APIKeyHash) != 32 ||
 		alias.APIKeyPrefix == "" || strings.TrimSpace(apiKeyCiphertext) == "" {
 		return domain.Alias{}, domain.AppleWebSession{}, errors.New("invalid automatic alias publication")
@@ -1825,6 +2116,9 @@ func (r *fakeRepository) ConfirmPendingAutoAlias(
 ) (domain.Alias, domain.AppleWebSession, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, err
+	}
+	if r.confirmErr != nil {
+		return domain.Alias{}, domain.AppleWebSession{}, r.confirmErr
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

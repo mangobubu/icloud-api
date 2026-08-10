@@ -122,7 +122,7 @@ func run() error {
 		func(ctx context.Context, accountID int64) (domain.Alias, error) {
 			alias, createErr := hmeService.CreateAutoAlias(ctx, accountID)
 			if errors.Is(createErr, store.ErrAliasLimit) {
-				return domain.Alias{}, fmt.Errorf("%w: %v", autocreate.ErrCapacityReached, createErr)
+				return domain.Alias{}, fmt.Errorf("%w: %w", autocreate.ErrCapacityReached, createErr)
 			}
 			return alias, createErr
 		},

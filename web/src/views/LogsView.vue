@@ -259,6 +259,7 @@ import {
 import { useRoute, useRouter } from "vue-router";
 
 import {
+  getAutoCreateLogRun,
   getAccounts,
   getRuntimeLogRun,
   getRuntimeLogs,
@@ -493,24 +494,38 @@ function resetFilters() {
   reloadForFilters();
 }
 
+function logFlowKey(log) {
+  const autoCreateRunId = String(log?.autoCreateRunId || "").trim();
+  if (autoCreateRunId) return `auto-create:${autoCreateRunId}`;
+  const syncRunId = String(log?.syncRunId || "").trim();
+  return syncRunId ? `sync:${syncRunId}` : "";
+}
+
 async function loadSelectedLogFlow() {
   const log = selectedLog.value;
+  const autoCreateRunId = String(log?.autoCreateRunId || "").trim();
   const syncRunId = String(log?.syncRunId || "").trim();
-  if (!syncRunId || !detailVisible.value) return;
+  const flowKey = logFlowKey(log);
+  if (!flowKey || !detailVisible.value) return;
 
   detailFlowAbortController?.abort();
   detailFlowAbortController = new AbortController();
-  const ticket = detailRequestGate.begin(syncRunId);
+  const ticket = detailRequestGate.begin(flowKey);
   detailFlowLoading.value = true;
   detailFlowError.value = null;
 
   try {
-    const nextLogs = await getRuntimeLogRun(syncRunId, {
-      accountId: log.accountId,
-      signal: detailFlowAbortController.signal,
-    });
+    const nextLogs = autoCreateRunId
+      ? await getAutoCreateLogRun(autoCreateRunId, {
+          accountId: log.accountId,
+          signal: detailFlowAbortController.signal,
+        })
+      : await getRuntimeLogRun(syncRunId, {
+          accountId: log.accountId,
+          signal: detailFlowAbortController.signal,
+        });
     if (
-      detailRequestGate.isCurrent(ticket, selectedLog.value?.syncRunId) &&
+      detailRequestGate.isCurrent(ticket, logFlowKey(selectedLog.value)) &&
       detailVisible.value
     ) {
       detailFlowLogs.value = nextLogs;
@@ -518,13 +533,13 @@ async function loadSelectedLogFlow() {
   } catch (error) {
     if (
       error?.name !== "AbortError" &&
-      detailRequestGate.isCurrent(ticket, selectedLog.value?.syncRunId) &&
+      detailRequestGate.isCurrent(ticket, logFlowKey(selectedLog.value)) &&
       detailVisible.value
     ) {
       detailFlowError.value = error;
     }
   } finally {
-    if (detailRequestGate.isCurrent(ticket, selectedLog.value?.syncRunId)) {
+    if (detailRequestGate.isCurrent(ticket, logFlowKey(selectedLog.value))) {
       detailFlowLoading.value = false;
     }
   }
@@ -536,9 +551,9 @@ function openLogDetail(log) {
   selectedLog.value = log;
   detailFlowLogs.value = [];
   detailFlowError.value = null;
-  detailFlowLoading.value = Boolean(log?.syncRunId);
+  detailFlowLoading.value = Boolean(logFlowKey(log));
   detailVisible.value = true;
-  if (log?.syncRunId) void loadSelectedLogFlow();
+  if (logFlowKey(log)) void loadSelectedLogFlow();
 }
 
 const liveRefresh = createLiveRefresh(() => loadLatestLogs({ silent: true }));

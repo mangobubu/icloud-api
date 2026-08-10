@@ -173,6 +173,22 @@ export function normalizeAppleSession(raw) {
 
 export function normalizeAutoCreation(raw = {}) {
   const value = raw && typeof raw === "object" ? raw : {};
+  const plannedTimesRaw = firstDefined(
+    value,
+    "planned_times",
+    "plannedTimes",
+    "PlannedTimes",
+  );
+  const plannedTimes = Array.isArray(plannedTimesRaw)
+    ? plannedTimesRaw
+        .filter((planned) => planned !== null && planned !== undefined)
+        .map((planned) => String(planned).trim())
+        .filter(Boolean)
+    : [];
+  const plannedAt =
+    firstDefined(value, "planned_at", "plannedAt", "PlannedAt") ||
+    plannedTimes[0] ||
+    null;
   const pendingRaw = firstDefined(
     value,
     "pending_key_count",
@@ -191,8 +207,8 @@ export function normalizeAutoCreation(raw = {}) {
     status: firstDefined(value, "status", "Status") || "",
     nextRunAt:
       firstDefined(value, "next_run_at", "nextRunAt", "NextRunAt") || null,
-    plannedAt:
-      firstDefined(value, "planned_at", "plannedAt", "PlannedAt") || null,
+    plannedAt,
+    plannedTimes,
     lastAttemptedAt:
       firstDefined(
         value,
@@ -601,10 +617,8 @@ export async function getRuntimeLogs(options = {}) {
   return normalizeRuntimeLogPage(data || {});
 }
 
-export async function getRuntimeLogRun(syncRunId, options = {}) {
-  const normalizedRunId = String(syncRunId ?? "").trim();
-  if (!normalizedRunId) return [];
-
+async function getRuntimeLogFlow(runFilter, options = {}) {
+  if (!Object.values(runFilter).some(Boolean)) return [];
   const maximum = 2000;
   const seenCursors = new Set();
   let beforeId = "";
@@ -616,7 +630,7 @@ export async function getRuntimeLogRun(syncRunId, options = {}) {
       beforeId,
       limit: 200,
       signal: options.signal,
-      syncRunId: normalizedRunId,
+      ...runFilter,
     });
     items = mergeRuntimeLogs(items, page.items).slice(0, maximum);
 
@@ -627,4 +641,14 @@ export async function getRuntimeLogRun(syncRunId, options = {}) {
   }
 
   return chronologicalRuntimeLogs(items);
+}
+
+export function getRuntimeLogRun(syncRunId, options = {}) {
+  const normalizedRunId = String(syncRunId ?? "").trim();
+  return getRuntimeLogFlow({ syncRunId: normalizedRunId }, options);
+}
+
+export function getAutoCreateLogRun(autoCreateRunId, options = {}) {
+  const normalizedRunId = String(autoCreateRunId ?? "").trim();
+  return getRuntimeLogFlow({ autoCreateRunId: normalizedRunId }, options);
 }

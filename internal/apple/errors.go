@@ -57,7 +57,9 @@ func (e *Error) Unwrap() error {
 }
 
 func (e *Error) Is(target error) bool {
-	return e != nil && (target == e.Kind || errors.Is(e.Err, target))
+	// Keep this comparison shallow. The errors package follows Unwrap after
+	// calling Is, so walking Err here would duplicate traversal of the chain.
+	return e != nil && target == e.Kind
 }
 
 func operationError(op string, kind error, status int, cause error) error {

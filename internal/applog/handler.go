@@ -56,12 +56,13 @@ type Entry struct {
 // starts at the newest retained entry. Level is empty for all levels or a slog
 // level name such as INFO, WARN, or ERROR.
 type Filter struct {
-	Level     string
-	Query     string
-	AccountID *int64
-	SyncRunID string
-	BeforeID  uint64
-	Limit     int
+	Level           string
+	Query           string
+	AccountID       *int64
+	SyncRunID       string
+	AutoCreateRunID string
+	BeforeID        uint64
+	Limit           int
 }
 
 // Page is one reverse-chronological cursor page.
@@ -264,6 +265,9 @@ func (h *Handler) List(filter Filter) Page {
 		if filter.SyncRunID != "" && !entryHasExactField(candidate, "sync_run_id", filter.SyncRunID) {
 			continue
 		}
+		if filter.AutoCreateRunID != "" && !entryHasExactField(candidate, "auto_create_run_id", filter.AutoCreateRunID) {
+			continue
+		}
 		if query != "" && !entryContains(candidate, query) {
 			continue
 		}
@@ -306,7 +310,7 @@ func matchesLevel(candidate, filter slog.Level) bool {
 
 func entryHasAccountID(entry Entry, want int64) bool {
 	for key, value := range entry.Fields {
-		if key != "account_id" && !strings.HasSuffix(key, ".account_id") {
+		if !FieldKeyHasSuffix(key, "account_id") {
 			continue
 		}
 		parsed, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
@@ -319,7 +323,7 @@ func entryHasAccountID(entry Entry, want int64) bool {
 
 func entryHasExactField(entry Entry, name, want string) bool {
 	for key, value := range entry.Fields {
-		if key != name && !strings.HasSuffix(key, "."+name) {
+		if !FieldKeyHasSuffix(key, name) {
 			continue
 		}
 		if value == want {
@@ -397,6 +401,15 @@ func (c *fieldCollector) addAttr(groups []string, attr slog.Attr) {
 	if attr.Equal(slog.Attr{}) {
 		return
 	}
+	parts := append(append([]string(nil), groups...), attr.Key)
+	if attr.Value.Kind() != slog.KindGroup && sensitiveKeyParts(parts) {
+		c.addValue(parts, redactedValue)
+		return
+	}
+	if attr.Value.Kind() == slog.KindGroup && attr.Key != "" && sensitiveKeyParts(parts) {
+		c.addValue(parts, redactedValue)
+		return
+	}
 	value := attr.Value.Resolve()
 	if value.Kind() == slog.KindGroup {
 		nestedGroups := groups
@@ -408,20 +421,68 @@ func (c *fieldCollector) addAttr(groups []string, attr slog.Attr) {
 		}
 		return
 	}
-	parts := append(append([]string(nil), groups...), attr.Key)
-	key := truncateUTF8(flattenKey(parts), c.limits.fieldKeyBytes)
 	field := renderValue(value)
-	if sensitiveKey(flattenKey(parts)) {
+	if sensitiveKeyParts(parts) {
 		field = redactedValue
 	} else {
 		field = truncateUTF8(field, c.limits.fieldValueBytes)
 	}
+	c.addValue(parts, field)
+}
+
+func (c *fieldCollector) addValue(parts []string, field string) {
+	key := truncateUTF8(flattenKey(parts), c.limits.fieldKeyBytes)
 	if existing, ok := c.index[key]; ok {
 		c.values[existing].value = field
 		return
 	}
 	c.index[key] = len(c.values)
 	c.values = append(c.values, fieldValue{key: key, value: field})
+}
+
+// FieldKeyHasSuffix matches a root field or a true grouped field path. A
+// literal dot in a slog key is escaped by flattenKey and must not count as a
+// group separator.
+func FieldKeyHasSuffix(key, name string) bool {
+	segments := splitFlattenedKey(key)
+	return len(segments) > 0 && segments[len(segments)-1] == name
+}
+
+func splitFlattenedKey(key string) []string {
+	segments := []string{}
+	current := strings.Builder{}
+	escaped := false
+	for _, character := range key {
+		if escaped {
+			current.WriteRune(character)
+			escaped = false
+			continue
+		}
+		if character == '\\' {
+			escaped = true
+			continue
+		}
+		if character == '.' {
+			segments = append(segments, current.String())
+			current.Reset()
+			continue
+		}
+		current.WriteRune(character)
+	}
+	if escaped {
+		current.WriteRune('\\')
+	}
+	segments = append(segments, current.String())
+	return segments
+}
+
+func sensitiveKeyParts(parts []string) bool {
+	for _, part := range parts {
+		if sensitiveKey(part) {
+			return true
+		}
+	}
+	return false
 }
 
 func flattenKey(parts []string) string {

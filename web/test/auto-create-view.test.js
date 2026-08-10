@@ -51,6 +51,9 @@ test("account detail exposes automatic alias creation and safe key handling", as
     source,
     /autoCreationErrorMessage\(autoCreation\.lastError\)/,
   );
+  assert.match(source, /autoCreation\.plannedTimes\?\.length/);
+  assert.match(source, /autoCreation\.plannedTimes/);
+  assert.match(source, /autoCreation\.plannedAt/);
 
   const formatAutoCreationError = autoCreationErrorFormatter(source);
   assert.equal(
@@ -76,6 +79,10 @@ test("account detail exposes automatic alias creation and safe key handling", as
   assert.equal(
     formatAutoCreationError("APPLE_ALIAS_CONFIRMATION_PENDING"),
     "Apple 已创建隐私邮箱，正在等待目录确认；后续自动创建计划只会继续确认，不会重复创建",
+  );
+  assert.equal(
+    formatAutoCreationError("ALIAS_LIMIT_REACHED"),
+    "当前主号已达到隐私邮箱容量上限，请确认自动创建计划状态",
   );
   assert.equal(
     formatAutoCreationError(" unknown upstream detail "),

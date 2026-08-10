@@ -33,6 +33,21 @@ var defaultAutoCreateConfirmationDelays = [...]time.Duration{
 	3 * time.Second,
 }
 
+const (
+	autoCreatePreparingPercent          = 5
+	autoCreateCheckingAccountPercent    = 10
+	autoCreateCheckingCapacityPercent   = 15
+	autoCreateLoadingSessionPercent     = 25
+	autoCreateValidatingSessionPercent  = 35
+	autoCreateCheckingForwardingPercent = 45
+	autoCreatePreparingKeyPercent       = 55
+	autoCreateReservingPercent          = 65
+	autoCreateSavingCandidatePercent    = 75
+	autoCreateConfirmingPercent         = 85
+	autoCreateReconcilingPercent        = 85
+	autoCreateSavingResultPercent       = 95
+)
+
 type Option func(*Service)
 
 func WithChallengeTTL(ttl time.Duration) Option {
@@ -692,7 +707,33 @@ func findAppleAliasForDeletion(all, owned []apple.Alias, address string) (apple.
 // locally with a one-time API key sealed for administrator retrieval. The
 // method never retries reserve because repeating that remote side effect could
 // create duplicates; only the read-only directory confirmation is retried.
-func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.Alias, error) {
+func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (createdAlias domain.Alias, resultErr error) {
+	currentPercent := autoCreatePreparingPercent
+	pendingConfirmationTracked := false
+	reportProgress := func(phase domain.AliasCreationPhase, percent, attempt int) {
+		if percent < 0 {
+			percent = 0
+		} else if percent > 100 {
+			percent = 100
+		}
+		currentPercent = percent
+		domain.ReportAliasCreationProgress(ctx, phase, percent, attempt)
+	}
+	reportProgress(domain.AliasCreationPhasePreparing, currentPercent, 0)
+	defer func() {
+		if resultErr != nil && pendingConfirmationTracked {
+			resultErr = markPendingConfirmation(resultErr)
+		}
+		switch {
+		case resultErr == nil:
+			reportProgress(domain.AliasCreationPhaseCompleted, 100, 0)
+		case ctx.Err() != nil && contextOnlyError(resultErr):
+			reportProgress(domain.AliasCreationPhaseCancelled, currentPercent, 0)
+		default:
+			reportProgress(domain.AliasCreationPhaseFailed, currentPercent, 0)
+		}
+	}()
+
 	if accountID < 1 {
 		return domain.Alias{}, errors.New("account ID must be positive")
 	}
@@ -755,15 +796,18 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		))
 	}
 
+	reportProgress(domain.AliasCreationPhaseCheckingAccount, autoCreateCheckingAccountPercent, 0)
 	account, err := s.repo.GetAccount(ctx, accountID)
 	if err != nil {
 		return domain.Alias{}, err
 	}
 	if !account.Enabled {
-		return domain.Alias{}, errors.New("主号已停用")
+		return domain.Alias{}, wrapError(CodeAccountDisabled, ErrAccountDisabled, nil)
 	}
+	reportProgress(domain.AliasCreationPhaseCheckingCapacity, autoCreateCheckingCapacityPercent, 0)
 	pendingConfirmation, pendingErr := autoRepo.GetPendingAutoAliasConfirmation(ctx, accountID)
 	hasPendingConfirmation := pendingErr == nil
+	pendingConfirmationTracked = hasPendingConfirmation
 	if pendingErr != nil && !errors.Is(pendingErr, store.ErrNotFound) {
 		return domain.Alias{}, pendingErr
 	}
@@ -777,6 +821,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		}
 	}
 
+	reportProgress(domain.AliasCreationPhaseLoadingSession, autoCreateLoadingSessionPercent, 0)
 	record, session, err := s.loadSession(ctx, accountID)
 	if err != nil {
 		if errors.Is(err, ErrSessionExpired) {
@@ -784,6 +829,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		}
 		return domain.Alias{}, err
 	}
+	reportProgress(domain.AliasCreationPhaseValidatingSession, autoCreateValidatingSessionPercent, 0)
 	validated, err := s.client.Validate(ctx, session)
 	if err != nil {
 		mapped := mapAppleError(err, false)
@@ -807,6 +853,14 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	// the irreversible reserve call. The reserve response may omit
 	// forwardToEmail, so checking only after creation both misclassifies a valid
 	// response and can leave an untracked remote alias.
+	if hasPendingConfirmation {
+		// With a staged alias, this directory read is reconciliation rather
+		// than a forwarding preflight. Report the real operation before the
+		// network call so failures retain the correct stage.
+		reportProgress(domain.AliasCreationPhaseReconciling, autoCreateReconcilingPercent, 1)
+	} else {
+		reportProgress(domain.AliasCreationPhaseCheckingForwarding, autoCreateCheckingForwardingPercent, 0)
+	}
 	settings, listedSession, err := s.client.ListAliases(ctx, validated)
 	if err != nil {
 		mapped := mapAppleError(err, false)
@@ -858,7 +912,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 				return err
 			}
 			if !current.Enabled {
-				return errors.New("主号已停用")
+				return wrapError(CodeAccountDisabled, ErrAccountDisabled, nil)
 			}
 			if !sameIdentity(identityOf(current), identityOf(account)) {
 				return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
@@ -878,7 +932,14 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		}
 		return saved, publishErr
 	}
-	confirmPendingAlias := func(operationContext context.Context, pending domain.Alias, confirmed apple.Alias, returned apple.Session) (domain.Alias, error) {
+	confirmPendingAlias := func(
+		operationContext context.Context,
+		pending domain.Alias,
+		confirmed apple.Alias,
+		returned apple.Session,
+		attempt int,
+	) (domain.Alias, error) {
+		reportProgress(domain.AliasCreationPhaseConfirming, autoCreateConfirmingPercent, attempt)
 		address, err := normalizeAutoAliasAddress(confirmed.HME)
 		if err != nil {
 			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, err)
@@ -899,8 +960,9 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 			if Code(err) != "" {
 				return domain.Alias{}, err
 			}
-			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, err)
+			return domain.Alias{}, wrapPersistenceError(err)
 		}
+		reportProgress(domain.AliasCreationPhaseSavingResult, autoCreateSavingResultPercent, attempt)
 		var saved domain.Alias
 		confirm := func() error {
 			current, err := s.repo.GetAccount(operationContext, accountID)
@@ -908,7 +970,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 				return err
 			}
 			if !current.Enabled {
-				return errors.New("主号已停用")
+				return wrapError(CodeAccountDisabled, ErrAccountDisabled, nil)
 			}
 			if !sameIdentity(identityOf(current), identityOf(account)) {
 				return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
@@ -923,10 +985,8 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		} else {
 			confirmErr = s.locker.WithAccountLock(operationContext, accountID, confirm)
 		}
-		if confirmErr != nil && Code(confirmErr) == "" &&
-			!errors.Is(confirmErr, context.Canceled) &&
-			!errors.Is(confirmErr, context.DeadlineExceeded) {
-			confirmErr = wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, confirmErr)
+		if confirmErr != nil {
+			confirmErr = wrapPersistenceError(confirmErr)
 		}
 		return saved, confirmErr
 	}
@@ -934,10 +994,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	// the operation. Preserve that valid checkpoint so a corrected setting does
 	// not force an otherwise unnecessary Apple login.
 	if err := checkpointSession(ctx, listedSession); err != nil {
-		if hasPendingConfirmation && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			return domain.Alias{}, wrapError(CodeAliasConfirmationPending, ErrAliasConfirmationPending, err)
-		}
-		return domain.Alias{}, err
+		return domain.Alias{}, wrapPersistenceError(err)
 	}
 	if hasPendingConfirmation {
 		confirmed, found := findAppleAlias(settings.Aliases, pendingConfirmation.Alias.Address)
@@ -948,7 +1005,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 				errors.New("Apple list omitted the pending reserved alias"),
 			)
 		}
-		return confirmPendingAlias(ctx, pendingConfirmation.Alias, confirmed, listedSession)
+		return confirmPendingAlias(ctx, pendingConfirmation.Alias, confirmed, listedSession, 1)
 	}
 	if strings.TrimSpace(settings.SelectedForwardTo) == "" {
 		return domain.Alias{}, wrapError(CodeUpstreamError, ErrUpstream,
@@ -960,16 +1017,18 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 
 	// Prepare every locally fallible key operation before reserve so a local key
 	// failure cannot strand an address after Apple's irreversible side effect.
+	reportProgress(domain.AliasCreationPhasePreparingKey, autoCreatePreparingKeyPercent, 0)
 	rawKey, hash, prefix, err := secure.NewAPIKey()
 	if err != nil {
-		return domain.Alias{}, fmt.Errorf("generate automatic alias API key: %w", err)
+		return domain.Alias{}, wrapCryptoError(fmt.Errorf("generate automatic alias API key: %w", err))
 	}
 	ciphertext, err := keyCipher.EncryptPendingAliasAPIKey(rawKey)
 	rawKey = ""
 	if err != nil {
-		return domain.Alias{}, fmt.Errorf("encrypt automatic alias API key: %w", err)
+		return domain.Alias{}, wrapCryptoError(fmt.Errorf("encrypt automatic alias API key: %w", err))
 	}
 
+	reportProgress(domain.AliasCreationPhaseReserving, autoCreateReservingPercent, 0)
 	created, updated, createErr := autoClient.CreateAlias(ctx, listedSession, autoCreateLabel, autoCreateNote)
 	var mappedCreateErr error
 	if createErr != nil {
@@ -985,7 +1044,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 				!errors.Is(mappedCreateErr, context.DeadlineExceeded) &&
 				hasAppleSessionState(updated) {
 				if checkpointErr := checkpointReturnedSession(ctx, &updated, listedSession.Region); checkpointErr != nil {
-					return domain.Alias{}, errors.Join(mappedCreateErr, checkpointErr)
+					return domain.Alias{}, errors.Join(wrapPersistenceError(checkpointErr), mappedCreateErr)
 				}
 			}
 			if errors.Is(mappedCreateErr, ErrSessionExpired) {
@@ -999,6 +1058,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 
 	address, addressErr := normalizeAutoAliasAddress(created.HME)
 	if addressErr != nil {
+		addressErr = markRemoteSideEffectPossible(addressErr)
 		if mappedCreateErr != nil {
 			return domain.Alias{}, errors.Join(mappedCreateErr, addressErr)
 		}
@@ -1019,11 +1079,11 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 		sessionForConfirmation,
 	)
 	if sessionRecordErr != nil {
-		// Retaining the last valid encrypted session is preferable to losing the
-		// candidate altogether. A later plan can reconcile after the local
-		// encryption/configuration problem is corrected.
+		// Reserve already returned an address, so keep the last valid session and
+		// publish the candidate before returning any account or crypto diagnostic.
 		sessionRecord = record
 	}
+	reportProgress(domain.AliasCreationPhaseSavingCandidate, autoCreateSavingCandidatePercent, 0)
 	persistContext, cancelPersist := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
 	provisional, persistErr := publishAlias(persistContext, sessionRecord, domain.Alias{
 		AccountID:      accountID,
@@ -1038,17 +1098,27 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	}, ciphertext)
 	cancelPersist()
 	if persistErr != nil {
+		persistErr = markRemoteSideEffectPossible(wrapPersistenceError(persistErr))
+		if sessionRecordErr != nil {
+			persistErr = errors.Join(persistErr, wrapPersistenceError(sessionRecordErr))
+		}
 		if mappedCreateErr != nil {
-			return domain.Alias{}, errors.Join(mappedCreateErr, persistErr)
+			return domain.Alias{}, errors.Join(persistErr, mappedCreateErr)
 		}
 		return domain.Alias{}, persistErr
 	}
+	pendingConfirmationTracked = true
 	if sessionRecordErr != nil {
-		return domain.Alias{}, wrapError(
-			CodeAliasConfirmationPending,
-			ErrAliasConfirmationPending,
-			sessionRecordErr,
-		)
+		sessionPersistenceErr := sessionRecordErr
+		if Code(sessionPersistenceErr) == "" {
+			sessionPersistenceErr = wrapPersistenceError(sessionPersistenceErr)
+		}
+		if mappedCreateErr != nil &&
+			!errors.Is(mappedCreateErr, context.Canceled) &&
+			!errors.Is(mappedCreateErr, context.DeadlineExceeded) {
+			return domain.Alias{}, errors.Join(sessionPersistenceErr, mappedCreateErr)
+		}
+		return domain.Alias{}, sessionPersistenceErr
 	}
 	if mappedCreateErr != nil && (errors.Is(mappedCreateErr, context.Canceled) ||
 		errors.Is(mappedCreateErr, context.DeadlineExceeded)) {
@@ -1063,6 +1133,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	// effect and its durable marker already exist even if the request timed out.
 	if mappedCreateErr == nil && strings.TrimSpace(created.ForwardToEmail) != "" {
 		if !created.IsActive {
+			reportProgress(domain.AliasCreationPhaseConfirming, autoCreateConfirmingPercent, 1)
 			return domain.Alias{}, wrapError(
 				CodeAliasConfirmationPending,
 				ErrAliasConfirmationPending,
@@ -1070,10 +1141,11 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 			)
 		}
 		if !sameEmail(created.ForwardToEmail, account.Email) {
+			reportProgress(domain.AliasCreationPhaseConfirming, autoCreateConfirmingPercent, 1)
 			return domain.Alias{}, wrapError(CodeAccountMismatch, ErrAccountMismatch, nil)
 		}
 		confirmContext, cancelConfirm := context.WithTimeout(context.WithoutCancel(ctx), autoCreatePersistTimeout)
-		saved, confirmErr := confirmPendingAlias(confirmContext, provisional, created, sessionForConfirmation)
+		saved, confirmErr := confirmPendingAlias(confirmContext, provisional, created, sessionForConfirmation, 1)
 		cancelConfirm()
 		return saved, confirmErr
 	}
@@ -1083,52 +1155,80 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (domain.
 	// from issuing another reserve while Apple directory visibility catches up.
 	confirmationSession := sessionForConfirmation
 	confirmationCause := mappedCreateErr
-	for attempt := 0; ; attempt++ {
+	for attemptIndex := 0; ; attemptIndex++ {
+		attempt := attemptIndex + 1
+		reportProgress(domain.AliasCreationPhaseReconciling, autoCreateReconcilingPercent, attempt)
 		confirmed, returnedSession, listErr := s.client.ListAliases(ctx, confirmationSession)
 		var confirmationErr error
+		requiresAccountAction := false
 		if listErr != nil {
 			confirmationErr = mapAppleError(listErr, false)
 			if errors.Is(confirmationErr, ErrSessionExpired) {
-				return domain.Alias{}, expireAutoSession(confirmationErr)
+				expiredErr := expireAutoSession(confirmationErr)
+				if confirmationCause != nil {
+					return domain.Alias{}, errors.Join(expiredErr, confirmationCause)
+				}
+				return domain.Alias{}, expiredErr
 			}
 			if errors.Is(confirmationErr, context.Canceled) ||
 				errors.Is(confirmationErr, context.DeadlineExceeded) {
 				return domain.Alias{}, confirmationErr
 			}
+			// These responses require an account/session action and will not be
+			// fixed by waiting for directory propagation. Preserve their stable
+			// Apple diagnostic code instead of relabeling them as pending.
+			if errors.Is(confirmationErr, ErrAccountActionRequired) ||
+				errors.Is(confirmationErr, ErrAccountMismatch) ||
+				errors.Is(confirmationErr, ErrCredentialsInvalid) ||
+				errors.Is(confirmationErr, ErrLoginRequired) {
+				requiresAccountAction = true
+			}
 		}
 		if hasAppleSessionState(returnedSession) {
 			if err := checkpointReturnedSession(ctx, &returnedSession, confirmationSession.Region); err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					return domain.Alias{}, wrapError(
-						CodeAliasConfirmationPending,
-						ErrAliasConfirmationPending,
-						errors.Join(confirmationCause, confirmationErr, err),
+					return domain.Alias{}, errors.Join(
+						wrapPersistenceError(err),
+						confirmationErr,
+						confirmationCause,
 					)
 				}
 				return domain.Alias{}, err
 			}
 			confirmationSession = returnedSession
 		}
+		if requiresAccountAction {
+			return domain.Alias{}, errors.Join(confirmationErr, confirmationCause)
+		}
 
 		if listErr == nil {
 			confirmedAlias, found := findAppleAlias(confirmed.Aliases, address)
 			if found {
-				return confirmPendingAlias(ctx, provisional, confirmedAlias, confirmationSession)
+				saved, confirmErr := confirmPendingAlias(ctx, provisional, confirmedAlias, confirmationSession, attempt)
+				if confirmErr != nil && confirmationCause != nil &&
+					!errors.Is(confirmErr, context.Canceled) &&
+					!errors.Is(confirmErr, context.DeadlineExceeded) {
+					return domain.Alias{}, errors.Join(confirmErr, confirmationCause)
+				}
+				return saved, confirmErr
 			}
 			confirmationErr = wrapError(CodeUpstreamError, ErrUpstream,
 				errors.New("Apple list omitted the newly reserved alias"))
 		}
 
-		combinedErr := errors.Join(confirmationCause, confirmationErr)
+		// Keep the latest read-only confirmation failure first so errors.As
+		// exposes its HTTP operation/status; the reserve cause remains useful
+		// context for diagnosing the original ambiguous side effect.
+		combinedErr := errors.Join(confirmationErr, confirmationCause)
 		if !shouldRetryAutoCreateConfirmation(confirmationErr) ||
-			attempt >= len(s.autoCreateConfirmationDelays) {
+			attemptIndex >= len(s.autoCreateConfirmationDelays) {
 			return domain.Alias{}, wrapError(
 				CodeAliasConfirmationPending,
 				ErrAliasConfirmationPending,
 				combinedErr,
 			)
 		}
-		if err := waitForAutoCreateConfirmation(ctx, s.autoCreateConfirmationDelays[attempt]); err != nil {
+		if err := waitForAutoCreateConfirmation(ctx, s.autoCreateConfirmationDelays[attemptIndex]); err != nil {
 			return domain.Alias{}, err
 		}
 	}
@@ -1172,11 +1272,11 @@ func (s *Service) autoCreateSessionRecord(
 	session.Region = region
 	payload, err := json.Marshal(session)
 	if err != nil {
-		return domain.AppleWebSession{}, fmt.Errorf("encode rotated Apple session: %w", err)
+		return domain.AppleWebSession{}, wrapCryptoError(fmt.Errorf("encode rotated Apple session: %w", err))
 	}
 	ciphertext, err := s.cipher.EncryptAppleSession(string(payload))
 	if err != nil {
-		return domain.AppleWebSession{}, fmt.Errorf("encrypt rotated Apple session: %w", err)
+		return domain.AppleWebSession{}, wrapCryptoError(fmt.Errorf("encrypt rotated Apple session: %w", err))
 	}
 	validatedAt := session.ValidatedAt
 	if validatedAt.IsZero() {
@@ -1193,11 +1293,57 @@ func (s *Service) autoCreateSessionRecord(
 }
 
 func shouldRetryAutoCreateConfirmation(err error) bool {
-	var upstream *apple.Error
-	if errors.As(err, &upstream) && upstream != nil {
-		return upstream.Retryable
+	if err == nil {
+		return false
 	}
-	return errors.Is(err, ErrUpstream) || errors.Is(err, ErrRateLimited)
+	// errors.As returns the first matching branch of errors.Join. A failed
+	// reserve/read pair can contain a non-retryable Apple error followed by a
+	// retryable directory error, so inspect every branch before deciding.
+	foundApple := false
+	retryableApple := false
+	var visit func(error)
+	visit = func(current error) {
+		if current == nil || retryableApple {
+			return
+		}
+		if upstream, ok := current.(*apple.Error); ok {
+			if upstream == nil {
+				return
+			}
+			foundApple = true
+			if upstream.Retryable {
+				retryableApple = true
+			}
+			// Continue into the wrapped cause only when the typed error itself
+			// was not retryable; a nested Apple error may carry the decision.
+			if !upstream.Retryable {
+				visit(upstream.Err)
+				if upstream.Err == nil {
+					visit(upstream.Kind)
+				}
+			}
+			return
+		}
+		switch unwrapped := current.(type) {
+		case interface{ Unwrap() []error }:
+			for _, child := range unwrapped.Unwrap() {
+				visit(child)
+				if retryableApple {
+					return
+				}
+			}
+		case interface{ Unwrap() error }:
+			visit(unwrapped.Unwrap())
+		}
+	}
+	visit(err)
+	if retryableApple {
+		return true
+	}
+	// A mapped non-Apple upstream marker has no typed retry metadata. Preserve
+	// the historical retry behavior for that case, but do not let it override
+	// an explicitly non-retryable typed Apple response.
+	return !foundApple && (errors.Is(err, ErrUpstream) || errors.Is(err, ErrRateLimited))
 }
 
 func waitForAutoCreateConfirmation(ctx context.Context, delay time.Duration) error {
