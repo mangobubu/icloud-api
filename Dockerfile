@@ -46,7 +46,32 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w" \
     -o /out/icloud-api \
-    ./cmd/icloud-api
+    ./cmd/icloud-api \
+    && CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/icloud-imap-test \
+    ./cmd/icloud-imap-test
+
+FROM ${DOCKER_HUB_MIRROR}/library/alpine:3.22 AS test-imap-runtime
+
+ARG ALPINE_MIRROR=mirrors.aliyun.com
+RUN sed -i "s#dl-cdn.alpinelinux.org#${ALPINE_MIRROR}#g" /etc/apk/repositories \
+    && apk add --no-cache ca-certificates tzdata \
+    && addgroup -S -g 10001 app \
+    && adduser -S -D -H -u 10001 -G app app \
+    && mkdir -p /app/data /data \
+    && chown -R app:app /app /data
+
+WORKDIR /app
+
+COPY --from=go-builder --chown=app:app /out/icloud-imap-test /app/icloud-imap-test
+
+USER app
+
+EXPOSE 1993 8081
+
+ENTRYPOINT ["/app/icloud-imap-test"]
 
 FROM ${DOCKER_HUB_MIRROR}/library/alpine:3.22 AS runtime
 

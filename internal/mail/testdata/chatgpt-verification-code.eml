@@ -1,0 +1,81 @@
+From: ChatGPT <noreply@tm.openai.com>
+To: Alias User <{{ALIAS_ADDRESS}}>
+Subject: Your temporary ChatGPT verification code
+Reply-To: noreply@tm.openai.com
+Date: {{DATE_RFC2822}}
+Message-ID: <{{MESSAGE_ID}}@example.test>
+Original-Recipient: rfc822; {{FORWARD_ADDRESS}}
+X-ICLOUD-HME: p={{ALIAS_ADDRESS}}; f={{FORWARD_ADDRESS}}; r=to; s=noreply@tm.openai.com
+MIME-Version: 1.0
+Content-Type: text/html; charset="UTF-8"
+Content-Transfer-Encoding: 8bit
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Your temporary ChatGPT verification code</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 0;
+        background: #ffffff;
+        color: #353740;
+        font-family: Söhne, Roboto, Helvetica, Arial, sans-serif;
+      }
+      table { border-collapse: collapse; }
+      .page { width: 100%; min-height: 100%; background: #ffffff; }
+      .container { width: 560px; max-width: 100%; margin: 0 auto; }
+      .header { padding: 56px 16px 32px; }
+      .brand { width: 145px; height: auto; display: block; }
+      .content { padding: 0 16px; font-size: 16px; line-height: 24px; }
+      .code {
+        margin: 24px 0;
+        padding: 28px 24px;
+        border-radius: 16px;
+        background: #f3f3f3;
+        color: #5d5d5d;
+        font-family: Menlo, Monaco, "Lucida Console", monospace;
+        font-size: 24px;
+        line-height: 28px;
+      }
+      .divider { height: 1px; margin: 40px 0; background: #e5e5e5; }
+      .footer { padding: 0 16px 32px; color: #8f8f8f; font-size: 12px; line-height: 16px; }
+      .footer a { color: #8f8f8f; }
+      @media only screen and (max-width: 480px) {
+        .container { width: 100% !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <table class="page" role="presentation" width="100%">
+      <tr>
+        <td>
+          <table class="container" role="presentation" width="560" align="center">
+            <tr>
+              <td class="header">
+                <img class="brand" src="{{LOGO_URL}}" alt="ChatGPT">
+              </td>
+            </tr>
+            <tr>
+              <td class="content">
+                <p>Enter this temporary verification code to continue:</p>
+                <div class="code">{{VERIFICATION_CODE}}</div>
+                <p>Please ignore this email if this wasn’t you trying to create a ChatGPT account.</p>
+                <p style="color:#8f8f8f"><br>Best,<br>The ChatGPT team</p>
+                <div class="divider"></div>
+              </td>
+            </tr>
+            <tr>
+              <td class="footer">
+                <p><a href="{{CHATGPT_URL}}">ChatGPT</a></p>
+                <p><a href="{{HELP_CENTER_URL}}">Help center</a></p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

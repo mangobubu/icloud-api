@@ -1,0 +1,59 @@
+services:
+  icloud-api:
+    container_name: icloud-api-ui-test
+    depends_on:
+      test-imap:
+        condition: service_healthy
+    environment:
+      ICLOUD_API_TEST_IMAP_ENABLED: "true"
+      ICLOUD_API_TEST_IMAP_ADDR: test-imap:1993
+      ICLOUD_API_TEST_IMAP_SERVER_NAME: test-imap
+      ICLOUD_API_TEST_IMAP_CA_FILE: /run/test-imap/ca.pem
+    volumes:
+      - test_imap_ca:/run/test-imap:ro
+
+  test-imap:
+    container_name: icloud-api-ui-test-imap
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: test-imap-runtime
+      args:
+        DOCKER_HUB_MIRROR: ${DOCKER_HUB_MIRROR:-docker.m.daocloud.io}
+        GOPROXY: ${GOPROXY:-https://goproxy.cn}
+        ALPINE_MIRROR: ${ALPINE_MIRROR:-mirrors.aliyun.com}
+    image: icloud-api-test-imap:local
+    restart: "no"
+    ports:
+      - "127.0.0.1:${TEST_IMAP_PORT:-1993}:1993"
+      - "127.0.0.1:${TEST_IMAP_CONTROL_PORT:-8081}:8081"
+    environment:
+      TEST_IMAP_ADDR: 0.0.0.0:1993
+      TEST_IMAP_CONTROL_ADDR: 0.0.0.0:8081
+      TEST_IMAP_SERVER_NAME: test-imap
+      TEST_IMAP_CA_FILE: /data/ca.pem
+      TEST_IMAP_CONTROL_TOKEN: ${TEST_IMAP_CONTROL_TOKEN:-icloud-api-test-control-token}
+      TEST_IMAP_SEED_DEFAULT: ${TEST_IMAP_SEED_DEFAULT:-true}
+      TEST_IMAP_DEFAULT_USERNAME: ${TEST_IMAP_DEFAULT_USERNAME:-ui-test@icloud.test}
+      TEST_IMAP_DEFAULT_PASSWORD: ${TEST_IMAP_DEFAULT_PASSWORD:-ui-test-password}
+      TEST_IMAP_DEFAULT_FORWARD_ADDRESS: ${TEST_IMAP_DEFAULT_FORWARD_ADDRESS:-ui-test@icloud.test}
+      TEST_IMAP_DEFAULT_ALIAS: ${TEST_IMAP_DEFAULT_ALIAS:-alias@icloud.test}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - test_imap_ca:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8081/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+
+volumes:
+  test_imap_ca:

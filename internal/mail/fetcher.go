@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -83,8 +84,15 @@ type Fetcher struct {
 	MaxFetchResultBytes       int
 	AllowWeakRecipientHeaders bool
 
-	dial dialSessionFunc
-	now  func() time.Time
+	dial         dialSessionFunc
+	now          func() time.Time
+	testEndpoint *testIMAPEndpoint
+}
+
+type testIMAPEndpoint struct {
+	address    string
+	serverName string
+	rootCAs    *x509.CertPool
 }
 
 // NewFetcher returns a fetcher with production defaults. Its limits can be
@@ -101,6 +109,37 @@ func NewFetcher() *Fetcher {
 		dial:                     dialIMAPTLS,
 		now:                      time.Now,
 	}
+}
+
+// ConfigureTestIMAPEndpoint redirects validated Apple account connections to
+// one dedicated test IMAPS endpoint. Account records are still validated as
+// imap.mail.me.com:993, so this cannot be enabled through user-managed fields.
+func (f *Fetcher) ConfigureTestIMAPEndpoint(address, serverName string, caPEM []byte) error {
+	if f == nil {
+		return fmt.Errorf("%w: nil fetcher", ErrInvalidIMAPConfig)
+	}
+	address = strings.TrimSpace(address)
+	serverName = strings.TrimSpace(serverName)
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return fmt.Errorf("%w: test IMAP address must be host:port", ErrInvalidIMAPConfig)
+	}
+	port, err := net.LookupPort("tcp", portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("%w: invalid test IMAP port", ErrInvalidIMAPConfig)
+	}
+	if serverName == "" || strings.ContainsAny(serverName, " \t\r\n") {
+		return fmt.Errorf("%w: invalid test IMAP TLS server name", ErrInvalidIMAPConfig)
+	}
+	rootCAs := x509.NewCertPool()
+	if len(caPEM) == 0 || !rootCAs.AppendCertsFromPEM(caPEM) {
+		return fmt.Errorf("%w: test IMAP CA file contains no certificates", ErrInvalidIMAPConfig)
+	}
+	f.testEndpoint = &testIMAPEndpoint{address: address, serverName: serverName, rootCAs: rootCAs}
+	f.dial = func(ctx context.Context, address, serverName string, timeout time.Duration) (imapSession, error) {
+		return dialIMAPTLSWithRootCAs(ctx, address, serverName, timeout, rootCAs)
+	}
+	return nil
 }
 
 // FetchIncremental reads one bounded account-level UID window and classifies
@@ -157,7 +196,7 @@ func (f *Fetcher) fetchIncrementalAttempt(
 	if err != nil {
 		return failure, err
 	}
-	host, address, username, err := accountEndpoint(account)
+	host, address, username, err := accountEndpointForSettings(account, settings.testEndpoint)
 	if err != nil {
 		return failure, err
 	}
@@ -556,6 +595,7 @@ type fetchSettings struct {
 	messageFetchByteDivisor   int
 	dial                      dialSessionFunc
 	now                       func() time.Time
+	testEndpoint              *testIMAPEndpoint
 }
 
 func (f *Fetcher) settings() fetchSettings {
@@ -615,6 +655,7 @@ func (f *Fetcher) settings() fetchSettings {
 	if f.now != nil {
 		settings.now = f.now
 	}
+	settings.testEndpoint = f.testEndpoint
 	return settings
 }
 
@@ -734,6 +775,14 @@ func accountEndpoint(account domain.Account) (host, address, username string, er
 		return "", "", "", fmt.Errorf("%w: empty username", ErrInvalidIMAPConfig)
 	}
 	return defaultIMAPHost, "imap.mail.me.com:993", username, nil
+}
+
+func accountEndpointForSettings(account domain.Account, testEndpoint *testIMAPEndpoint) (host, address, username string, err error) {
+	host, address, username, err = accountEndpoint(account)
+	if err != nil || testEndpoint == nil {
+		return host, address, username, err
+	}
+	return testEndpoint.serverName, testEndpoint.address, username, nil
 }
 
 func validateIMAPAccount(account domain.Account, password string) error {
@@ -1422,6 +1471,10 @@ func mapKeys(values map[uint32][]int64) []uint32 {
 }
 
 func dialIMAPTLS(ctx context.Context, address, serverName string, timeout time.Duration) (imapSession, error) {
+	return dialIMAPTLSWithRootCAs(ctx, address, serverName, timeout, nil)
+}
+
+func dialIMAPTLSWithRootCAs(ctx context.Context, address, serverName string, timeout time.Duration, rootCAs *x509.CertPool) (imapSession, error) {
 	dialer := &net.Dialer{Timeout: timeout}
 	connection, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
@@ -1441,6 +1494,7 @@ func dialIMAPTLS(ctx context.Context, address, serverName string, timeout time.D
 	tlsConnection := tls.Client(connection, &tls.Config{
 		ServerName: serverName,
 		MinVersion: tls.VersionTLS12,
+		RootCAs:    rootCAs,
 	})
 	handshakeContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

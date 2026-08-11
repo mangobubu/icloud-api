@@ -49,7 +49,7 @@ func (f *Fetcher) MarkSeen(
 	}
 
 	settings := f.settings()
-	host, address, username, err := accountEndpoint(account)
+	host, address, username, err := accountEndpointForSettings(account, settings.testEndpoint)
 	if err != nil {
 		return err
 	}

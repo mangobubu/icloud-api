@@ -252,6 +252,53 @@ npm run dev
 
 开发管理端默认位于 <http://127.0.0.1:5173/admin/>。生产环境建议使用 Docker Compose 构建，不需要单独运行前端服务。
 
+### 使用本地测试 IMAP 调试前端
+
+项目提供一个只用于开发的真实 TLS/IMAPS 测试服务。它为每个测试账号维护独立的内存 INBOX，支持验证码、HTML、附件、过期、已读、无效 HME 路由和批量邮件预设；控制台会显示每封邮件及账号合计的原始 MIME 字节数。账号和邮件在测试服务重启后清空。该服务只模拟 IMAP，不模拟 Apple 登录、双重认证、隐私邮箱目录同步或自动创建接口。
+
+先用独立的 Compose 项目名启动后端、PostgreSQL 和测试 IMAP；覆盖文件也会使用独立容器名，避免与普通环境的 `icloud-api` 容器重名：
+
+```bash
+docker compose -p icloud-api-ui-test -f compose.yaml -f compose.test.yaml up -d --build
+docker compose -p icloud-api-ui-test -f compose.yaml -f compose.test.yaml exec -T icloud-api cat /app/keys/admin-password
+```
+
+然后另开终端启动 Vite：
+
+```bash
+cd web
+npm ci
+npm run dev
+```
+
+打开以下两个页面：
+
+- 管理端：<http://127.0.0.1:5173/admin/>
+- 测试邮件控制台：<http://127.0.0.1:8081/>，默认控制令牌为 `icloud-api-test-control-token`
+
+在管理端新增主号时填写下面的测试值；业务记录中的 IMAP 地址仍会保持为 `imap.mail.me.com:993`，只有显式启用测试开关的进程会改拨 Compose 内的测试服务。
+
+| 字段 | 默认测试值 |
+| --- | --- |
+| 主号邮箱 | `ui-test@icloud.test` |
+| IMAP 用户名 | `ui-test@icloud.test` |
+| App 专用密码 | `ui-test-password` |
+| 手动登记的隐私邮箱 | `alias@icloud.test` |
+
+登记隐私邮箱后，在测试邮件控制台选择该账号并再次注入“验证码模板”，再回到主号详情页触发同步或等待自动轮询。这样会产生一个新 UID，避免账号尚未登记隐私邮箱时已建立的同步游标跳过启动时样例。
+
+测试 IMAP 使用运行时生成的专用 CA；CA 通过只读卷提供给应用，不会加入系统信任库。单独重启测试 IMAP 会轮换 CA，此时应同时重启应用容器：
+
+```bash
+docker compose -p icloud-api-ui-test -f compose.yaml -f compose.test.yaml restart icloud-api
+```
+
+停止环境：
+
+```bash
+docker compose -p icloud-api-ui-test -f compose.yaml -f compose.test.yaml down
+```
+
 ## 数据与备份
 
 需要作为同一恢复点备份的命名卷：

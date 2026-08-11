@@ -100,6 +100,20 @@ func run() error {
 	fetcher.MaxMessageBytes = int(cfg.MaxMessageBytes)
 	fetcher.MaxBodyBytes = int(cfg.MaxBodyBytes)
 	fetcher.AllowWeakRecipientHeaders = cfg.AllowWeakRecipientHeaders
+	if cfg.TestIMAPEnabled {
+		caPEM, err := os.ReadFile(cfg.TestIMAPCAFile)
+		if err != nil {
+			return fmt.Errorf("读取测试 IMAP CA: %w", err)
+		}
+		if err := fetcher.ConfigureTestIMAPEndpoint(cfg.TestIMAPAddr, cfg.TestIMAPServerName, caPEM); err != nil {
+			return fmt.Errorf("配置测试 IMAP 端点: %w", err)
+		}
+		logger.Warn(
+			"已启用测试 IMAP 端点",
+			"address", cfg.TestIMAPAddr,
+			"tls_server_name", cfg.TestIMAPServerName,
+		)
+	}
 
 	signalContext, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()

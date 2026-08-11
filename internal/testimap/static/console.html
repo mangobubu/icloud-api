@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>iCloud API 测试 IMAP 控制台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #172033;
+      background: #f4f6fb;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header {
+      padding: 28px clamp(20px, 5vw, 72px);
+      color: #fff;
+      background: linear-gradient(120deg, #3157d5, #6e43c7);
+    }
+    header h1 { margin: 0 0 8px; font-size: clamp(24px, 3vw, 36px); }
+    header p { margin: 0; opacity: .85; }
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 24px auto 48px;
+      display: grid;
+      gap: 18px;
+    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+    section {
+      padding: 20px;
+      border: 1px solid #e1e6f0;
+      border-radius: 14px;
+      background: #fff;
+      box-shadow: 0 8px 28px rgb(26 38 70 / 7%);
+    }
+    h2 { margin: 0 0 16px; font-size: 18px; }
+    label { display: grid; gap: 6px; margin: 10px 0; color: #4c576d; font-size: 13px; }
+    input, select, textarea, button {
+      width: 100%;
+      border: 1px solid #cdd5e3;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font: inherit;
+    }
+    textarea { min-height: 96px; resize: vertical; }
+    button {
+      border-color: #3157d5;
+      color: #fff;
+      background: #3157d5;
+      cursor: pointer;
+      font-weight: 650;
+    }
+    button.secondary { color: #3157d5; background: #fff; }
+    button.danger { border-color: #c33c48; background: #c33c48; }
+    button.small { width: auto; padding: 6px 9px; font-size: 12px; }
+    button:disabled { cursor: wait; opacity: .55; }
+    .row { display: flex; gap: 10px; align-items: end; }
+    .row > * { flex: 1; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .actions > * { width: auto; }
+    .muted { color: #758097; font-size: 13px; }
+    .status {
+      min-height: 44px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      color: #28553a;
+      background: #eaf8ef;
+      white-space: pre-wrap;
+    }
+    .status.error { color: #8c2430; background: #fff0f1; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid #e8ecf3; text-align: left; vertical-align: top; }
+    th { color: #657087; font-weight: 650; }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .empty { padding: 18px 8px; text-align: center; color: #8791a5; }
+    @media (max-width: 700px) {
+      .row { display: grid; }
+      .table-wrap { overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>测试 IMAP 控制台</h1>
+    <p>创建隔离账号、注入邮件预设，然后在项目管理端触发真实 TLS/IMAP 同步。</p>
+  </header>
+  <main>
+    <section>
+      <h2>连接</h2>
+      <div class="row">
+        <label>控制令牌
+          <input id="token" type="password" autocomplete="off" placeholder="TEST_IMAP_CONTROL_TOKEN">
+        </label>
+        <div class="actions"><button id="connect">连接并刷新</button></div>
+      </div>
+      <p class="muted">令牌只保存在当前浏览器标签页的 sessionStorage 中。</p>
+      <div id="status" class="status">等待连接。</div>
+    </section>
+
+    <div class="grid">
+      <section>
+        <h2>新建测试账号</h2>
+        <form id="account-form">
+          <label>IMAP 用户名<input name="username" value="ui-test@icloud.test" required></label>
+          <label>IMAP 密码<input name="password" value="ui-test-password" required></label>
+          <label>转发主号邮箱<input name="forward_address" value="ui-test@icloud.test" required></label>
+          <button type="submit">创建账号</button>
+        </form>
+      </section>
+
+      <section>
+        <h2>注入邮件预设</h2>
+        <form id="preset-form">
+          <label>账号<select id="preset-account" required></select></label>
+          <label>隐私邮箱地址<input name="alias" value="alias@icloud.test" required></label>
+          <div class="row">
+            <label>预设
+              <select name="preset">
+                <option value="verification-code">验证码模板</option>
+                <option value="plain">纯文本</option>
+                <option value="html">HTML</option>
+                <option value="attachment">带附件</option>
+                <option value="old">过期邮件</option>
+                <option value="seen">已读邮件</option>
+                <option value="invalid-hme">无效 HME 路由</option>
+                <option value="bulk">批量邮件</option>
+              </select>
+            </label>
+            <label>数量（可选）<input name="count" type="number" min="1" max="2000" placeholder="默认"></label>
+          </div>
+          <button type="submit">注入预设</button>
+        </form>
+      </section>
+    </div>
+
+    <section>
+      <div class="row">
+        <div><h2>账号</h2><span class="muted">项目管理端填写相同的 IMAP 用户名和密码。</span></div>
+        <div class="actions">
+          <button id="refresh" class="secondary">刷新</button>
+          <button id="reset" class="danger">清空全部内存状态</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>ID</th><th>用户名</th><th>转发主号</th><th>UIDVALIDITY / UIDNEXT</th><th>邮件 / 原始大小</th><th>操作</th></tr></thead>
+          <tbody id="accounts"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <div class="row">
+        <div><h2>邮件</h2><span id="message-account" class="muted">请选择账号</span></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>UID</th><th>主题</th><th>发件人 / 收件人</th><th>大小</th><th>收件时间</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody id="messages"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const state = { accounts: [], selectedAccount: null };
+    const el = id => document.getElementById(id);
+    el("token").value = sessionStorage.getItem("test-imap-token") || "";
+
+    function setStatus(message, error = false) {
+      el("status").textContent = message;
+      el("status").classList.toggle("error", error);
+    }
+
+    async function request(path, options = {}) {
+      const token = el("token").value.trim();
+      const headers = new Headers(options.headers || {});
+      headers.set("Authorization", `Bearer ${token}`);
+      if (options.body && !(options.body instanceof Blob)) headers.set("Content-Type", "application/json");
+      const response = await fetch(path, { ...options, headers });
+      if (response.status === 204) return null;
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error?.message || `HTTP ${response.status}`);
+      return payload.data;
+    }
+
+    function escapeHTML(value) {
+      return String(value ?? "").replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"})[char]);
+    }
+
+    async function refreshAccounts(selectFirst = false) {
+      const data = await request("/control/v1/accounts");
+      state.accounts = data.accounts || [];
+      if (selectFirst && !state.selectedAccount && state.accounts.length) state.selectedAccount = state.accounts[0].id;
+      if (state.selectedAccount && !state.accounts.some(account => account.id === state.selectedAccount)) state.selectedAccount = null;
+      renderAccounts();
+      renderAccountOptions();
+      await refreshMessages();
+    }
+
+    function renderAccounts() {
+      el("accounts").innerHTML = state.accounts.length ? state.accounts.map(account => `
+        <tr>
+          <td>${account.id}</td>
+          <td><code>${escapeHTML(account.username)}</code></td>
+          <td>${escapeHTML(account.forward_address)}</td>
+          <td>${account.uid_validity} / ${account.uid_next}</td>
+          <td>${account.message_count}<br><span class="muted">${new Intl.NumberFormat().format(account.message_bytes)} B</span></td>
+          <td><div class="actions">
+            <button class="small" data-action="select" data-id="${account.id}">查看</button>
+            <button class="small secondary" data-action="uidvalidity" data-id="${account.id}">重置 UID</button>
+            <button class="small danger" data-action="delete-account" data-id="${account.id}">删除</button>
+          </div></td>
+        </tr>`).join("") : '<tr><td colspan="6" class="empty">暂无测试账号</td></tr>';
+    }
+
+    function renderAccountOptions() {
+      el("preset-account").innerHTML = state.accounts.map(account =>
+        `<option value="${account.id}">${escapeHTML(account.username)} (#${account.id})</option>`
+      ).join("");
+      if (state.selectedAccount) el("preset-account").value = String(state.selectedAccount);
+    }
+
+    async function refreshMessages() {
+      if (!state.selectedAccount) {
+        el("message-account").textContent = "请选择账号";
+        el("messages").innerHTML = '<tr><td colspan="7" class="empty">暂无邮件</td></tr>';
+        return;
+      }
+      const account = state.accounts.find(item => item.id === state.selectedAccount);
+      el("message-account").textContent = account ? account.username : `账号 #${state.selectedAccount}`;
+      const data = await request(`/control/v1/accounts/${state.selectedAccount}/messages`);
+      const messages = data.messages || [];
+      el("messages").innerHTML = messages.length ? messages.map(message => `
+        <tr>
+          <td>${message.uid}</td>
+          <td>${escapeHTML(message.subject || "（无主题）")}</td>
+          <td>${escapeHTML(message.from || "-")}<br><span class="muted">→ ${escapeHTML(message.to || "-")}</span></td>
+          <td>${new Intl.NumberFormat().format(message.size)} B</td>
+          <td>${escapeHTML(new Date(message.internal_date).toLocaleString())}</td>
+          <td>${message.seen ? "已读" : "未读"}</td>
+          <td><div class="actions">
+            <button class="small secondary" data-action="seen" data-uid="${message.uid}" data-seen="${!message.seen}">${message.seen ? "设为未读" : "设为已读"}</button>
+            <button class="small danger" data-action="delete-message" data-uid="${message.uid}">删除</button>
+          </div></td>
+        </tr>`).join("") : '<tr><td colspan="7" class="empty">该账号暂无邮件</td></tr>';
+    }
+
+    async function perform(action, successMessage) {
+      try {
+        await action();
+        await refreshAccounts();
+        setStatus(successMessage);
+      } catch (error) {
+        setStatus(error.message, true);
+      }
+    }
+
+    el("connect").addEventListener("click", () => {
+      sessionStorage.setItem("test-imap-token", el("token").value.trim());
+      perform(() => refreshAccounts(true), "已连接测试 IMAP 控制 API。");
+    });
+    el("refresh").addEventListener("click", () => perform(() => refreshAccounts(), "状态已刷新。"));
+    el("account-form").addEventListener("submit", event => {
+      event.preventDefault();
+      const values = Object.fromEntries(new FormData(event.currentTarget));
+      perform(async () => {
+        const data = await request("/control/v1/accounts", { method: "POST", body: JSON.stringify(values) });
+        state.selectedAccount = data.account.id;
+      }, "测试账号已创建。");
+    });
+    el("preset-form").addEventListener("submit", event => {
+      event.preventDefault();
+      const values = Object.fromEntries(new FormData(event.currentTarget));
+      const body = { account_id: Number(el("preset-account").value), alias: values.alias };
+      if (values.count) body.count = Number(values.count);
+      perform(() => request(`/control/v1/presets/${encodeURIComponent(values.preset)}`, {
+        method: "POST", body: JSON.stringify(body)
+      }), "邮件预设已注入。");
+    });
+    el("accounts").addEventListener("click", event => {
+      const button = event.target.closest("button[data-action]");
+      if (!button) return;
+      const id = Number(button.dataset.id);
+      if (button.dataset.action === "select") {
+        state.selectedAccount = id;
+        renderAccountOptions();
+        perform(() => refreshMessages(), `正在查看账号 #${id}。`);
+      } else if (button.dataset.action === "uidvalidity") {
+        perform(() => request(`/control/v1/accounts/${id}/uidvalidity/reset`, {
+          method: "POST", body: JSON.stringify({ clear_messages: true })
+        }), `账号 #${id} 的 UIDVALIDITY 已重置，邮件已清空。`);
+      } else if (button.dataset.action === "delete-account" && confirm(`删除测试账号 #${id}？`)) {
+        perform(() => request(`/control/v1/accounts/${id}`, { method: "DELETE" }), `测试账号 #${id} 已删除。`);
+      }
+    });
+    el("messages").addEventListener("click", event => {
+      const button = event.target.closest("button[data-action]");
+      if (!button || !state.selectedAccount) return;
+      const uid = Number(button.dataset.uid);
+      if (button.dataset.action === "seen") {
+        perform(() => request(`/control/v1/accounts/${state.selectedAccount}/messages/${uid}`, {
+          method: "PATCH", body: JSON.stringify({ seen: button.dataset.seen === "true" })
+        }), `邮件 UID ${uid} 状态已更新。`);
+      } else if (button.dataset.action === "delete-message") {
+        perform(() => request(`/control/v1/accounts/${state.selectedAccount}/messages/${uid}`, { method: "DELETE" }), `邮件 UID ${uid} 已删除。`);
+      }
+    });
+    el("reset").addEventListener("click", () => {
+      if (!confirm("清空全部测试账号和邮件？")) return;
+      perform(async () => {
+        await request("/control/v1/state", { method: "DELETE" });
+        state.selectedAccount = null;
+      }, "全部内存状态已清空。");
+    });
+  </script>
+</body>
+</html>

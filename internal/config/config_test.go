@@ -20,6 +20,10 @@ var configEnvironment = []string{
 	"ICLOUD_API_SESSION_TTL",
 	"ICLOUD_API_POLL_INTERVAL",
 	"ICLOUD_API_IMAP_TIMEOUT",
+	"ICLOUD_API_TEST_IMAP_ENABLED",
+	"ICLOUD_API_TEST_IMAP_ADDR",
+	"ICLOUD_API_TEST_IMAP_SERVER_NAME",
+	"ICLOUD_API_TEST_IMAP_CA_FILE",
 	"ICLOUD_API_SYNC_TIMEOUT",
 	"ICLOUD_API_SYNC_CONCURRENCY",
 	"ICLOUD_API_SHUTDOWN_TIMEOUT",
@@ -228,6 +232,78 @@ func TestSyncTimeoutDefault(t *testing.T) {
 			1<<20,
 			512<<10,
 		)
+	}
+}
+
+func TestTestIMAPDefaultsDisabled(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TestIMAPEnabled || cfg.TestIMAPAddr != "" || cfg.TestIMAPServerName != "" || cfg.TestIMAPCAFile != "" {
+		t.Fatalf("测试 IMAP 默认配置 = enabled:%v addr:%q name:%q ca:%q, want disabled and empty", cfg.TestIMAPEnabled, cfg.TestIMAPAddr, cfg.TestIMAPServerName, cfg.TestIMAPCAFile)
+	}
+}
+
+func TestTestIMAPRequiresExplicitCompleteConfiguration(t *testing.T) {
+	tests := []struct {
+		name    string
+		values  map[string]string
+		wantErr string
+	}{
+		{
+			name: "override while disabled",
+			values: map[string]string{
+				"ICLOUD_API_TEST_IMAP_ADDR": "test-imap:1993",
+			},
+			wantErr: "ICLOUD_API_TEST_IMAP_ENABLED=true",
+		},
+		{
+			name: "partial override",
+			values: map[string]string{
+				"ICLOUD_API_TEST_IMAP_ENABLED": "true",
+				"ICLOUD_API_TEST_IMAP_ADDR":    "test-imap:1993",
+			},
+			wantErr: "必须同时设置",
+		},
+		{
+			name: "invalid address",
+			values: map[string]string{
+				"ICLOUD_API_TEST_IMAP_ENABLED":     "true",
+				"ICLOUD_API_TEST_IMAP_ADDR":        "test-imap",
+				"ICLOUD_API_TEST_IMAP_SERVER_NAME": "test-imap",
+				"ICLOUD_API_TEST_IMAP_CA_FILE":     "test-ca.pem",
+			},
+			wantErr: "host:port",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			for name, value := range test.values {
+				t.Setenv(name, value)
+			}
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Load() error = %v, want containing %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestTestIMAPCompleteConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_TEST_IMAP_ENABLED", "true")
+	t.Setenv("ICLOUD_API_TEST_IMAP_ADDR", "  test-imap:1993  ")
+	t.Setenv("ICLOUD_API_TEST_IMAP_SERVER_NAME", "  test-imap  ")
+	t.Setenv("ICLOUD_API_TEST_IMAP_CA_FILE", "  /run/test-imap/ca.pem  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.TestIMAPEnabled || cfg.TestIMAPAddr != "test-imap:1993" || cfg.TestIMAPServerName != "test-imap" || cfg.TestIMAPCAFile != "/run/test-imap/ca.pem" {
+		t.Fatalf("测试 IMAP 配置 = %#v", cfg)
 	}
 }
 

@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -28,6 +29,10 @@ type Config struct {
 	SessionTTL                time.Duration
 	PollInterval              time.Duration
 	IMAPTimeout               time.Duration
+	TestIMAPEnabled           bool
+	TestIMAPAddr              string
+	TestIMAPServerName        string
+	TestIMAPCAFile            string
 	SyncTimeout               time.Duration
 	SyncConcurrency           int
 	ShutdownTimeout           time.Duration
@@ -46,10 +51,15 @@ func Load() (Config, error) {
 		LegacySQLitePath: strings.TrimSpace(os.Getenv("ICLOUD_API_LEGACY_SQLITE")),
 		WebRoot:          strings.TrimSpace(os.Getenv("ICLOUD_API_WEB_ROOT")),
 		OAuthToken:       strings.TrimSpace(os.Getenv("ICLOUD_API_OAUTH_TOKEN")),
-		AdminUsername:    env("ICLOUD_API_ADMIN_USER", "admin"),
-		AdminPassword:    os.Getenv("ICLOUD_API_ADMIN_PASSWORD"),
-		GinMode:          env("GIN_MODE", "release"),
-		Timezone:         time.Local,
+		TestIMAPAddr:     strings.TrimSpace(os.Getenv("ICLOUD_API_TEST_IMAP_ADDR")),
+		TestIMAPServerName: strings.TrimSpace(
+			os.Getenv("ICLOUD_API_TEST_IMAP_SERVER_NAME"),
+		),
+		TestIMAPCAFile: strings.TrimSpace(os.Getenv("ICLOUD_API_TEST_IMAP_CA_FILE")),
+		AdminUsername:  env("ICLOUD_API_ADMIN_USER", "admin"),
+		AdminPassword:  os.Getenv("ICLOUD_API_ADMIN_PASSWORD"),
+		GinMode:        env("GIN_MODE", "release"),
+		Timezone:       time.Local,
 	}
 	if value := strings.TrimSpace(os.Getenv("TZ")); value != "" {
 		location, err := time.LoadLocation(value)
@@ -72,6 +82,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if cfg.AllowWeakRecipientHeaders, err = envBool("ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS", false); err != nil {
+		return Config{}, err
+	}
+	if cfg.TestIMAPEnabled, err = envBool("ICLOUD_API_TEST_IMAP_ENABLED", false); err != nil {
 		return Config{}, err
 	}
 	if cfg.SessionTTL, err = envDuration("ICLOUD_API_SESSION_TTL", 8*time.Hour); err != nil {
@@ -120,6 +133,9 @@ func Load() (Config, error) {
 	if cfg.IMAPTimeout < time.Second || cfg.IMAPTimeout > 5*time.Minute {
 		return Config{}, fmt.Errorf("ICLOUD_API_IMAP_TIMEOUT 必须在 1s 到 5m 之间")
 	}
+	if err := validateTestIMAPConfig(cfg); err != nil {
+		return Config{}, err
+	}
 	if cfg.SyncTimeout < 10*time.Second || cfg.SyncTimeout > 30*time.Minute {
 		return Config{}, fmt.Errorf("ICLOUD_API_SYNC_TIMEOUT 必须在 10s 到 30m 之间")
 	}
@@ -140,6 +156,31 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("ICLOUD_API_MAX_BODY_BYTES 必须在 1 KiB 到邮件上限之间")
 	}
 	return cfg, nil
+}
+
+func validateTestIMAPConfig(cfg Config) error {
+	configured := cfg.TestIMAPAddr != "" || cfg.TestIMAPServerName != "" || cfg.TestIMAPCAFile != ""
+	if !cfg.TestIMAPEnabled {
+		if configured {
+			return fmt.Errorf("测试 IMAP 地址、TLS 名称或 CA 仅可在 ICLOUD_API_TEST_IMAP_ENABLED=true 时配置")
+		}
+		return nil
+	}
+	if cfg.TestIMAPAddr == "" || cfg.TestIMAPServerName == "" || cfg.TestIMAPCAFile == "" {
+		return fmt.Errorf("启用测试 IMAP 时必须同时设置 ICLOUD_API_TEST_IMAP_ADDR、ICLOUD_API_TEST_IMAP_SERVER_NAME 和 ICLOUD_API_TEST_IMAP_CA_FILE")
+	}
+	host, portText, err := net.SplitHostPort(cfg.TestIMAPAddr)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return fmt.Errorf("ICLOUD_API_TEST_IMAP_ADDR 必须是 host:port")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("ICLOUD_API_TEST_IMAP_ADDR 端口必须在 1 到 65535 之间")
+	}
+	if strings.ContainsAny(cfg.TestIMAPServerName, " \t\r\n") {
+		return fmt.Errorf("ICLOUD_API_TEST_IMAP_SERVER_NAME 不能包含空白")
+	}
+	return nil
 }
 
 func env(name, fallback string) string {
