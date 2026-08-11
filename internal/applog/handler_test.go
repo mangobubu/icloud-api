@@ -77,17 +77,50 @@ func TestListFiltersAndCursorPagination(t *testing.T) {
 	accountID := int64(1)
 	accountPage := handler.List(Filter{AccountID: &accountID, Limit: 2})
 	assertIDs(t, accountPage.Items, 4, 3)
+	if accountPage.Total != 3 {
+		t.Fatalf("first cursor page total = %d, want 3", accountPage.Total)
+	}
 	if !accountPage.HasMore || accountPage.NextBeforeID != 3 {
 		t.Fatalf("first cursor page = %#v", accountPage)
 	}
 	next := handler.List(Filter{AccountID: &accountID, BeforeID: accountPage.NextBeforeID, Limit: 2})
 	assertIDs(t, next.Items, 1)
+	if next.Total != 3 {
+		t.Fatalf("next cursor page total = %d, want 3", next.Total)
+	}
 	if next.HasMore || next.NextBeforeID != 0 {
 		t.Fatalf("last cursor page = %#v", next)
 	}
 
 	if got := handler.List(Filter{Level: "not-a-level", Limit: 10}); len(got.Items) != 0 {
 		t.Fatalf("invalid level returned %d items", len(got.Items))
+	}
+}
+
+func TestListOffsetPaginationCountsAllFilteredEntries(t *testing.T) {
+	handler := New(20)
+	logger := slog.New(handler)
+	logger.Info("first", "kind", "included")
+	logger.Info("ignored", "kind", "other")
+	logger.Warn("second", "kind", "included")
+	logger.Error("third", "kind", "included")
+	logger.Info("fourth", "kind", "included")
+
+	page := handler.List(Filter{Query: "included", Offset: 1, Limit: 2})
+	assertIDs(t, page.Items, 4, 3)
+	if page.Total != 4 || !page.HasMore || page.NextBeforeID != 3 {
+		t.Fatalf("middle offset page = %#v, want total=4 has-more=true next-before=3", page)
+	}
+
+	last := handler.List(Filter{Query: "included", Offset: 3, Limit: 2})
+	assertIDs(t, last.Items, 1)
+	if last.Total != 4 || last.HasMore || last.NextBeforeID != 0 {
+		t.Fatalf("last offset page = %#v, want total=4 and no next page", last)
+	}
+
+	empty := handler.List(Filter{Query: "included", Offset: 10, Limit: 2})
+	if len(empty.Items) != 0 || empty.Total != 4 || empty.HasMore || empty.NextBeforeID != 0 {
+		t.Fatalf("empty offset page = %#v, want retained total with no page", empty)
 	}
 }
 

@@ -756,6 +756,10 @@ export function normalizeRuntimeLogPage(data = {}) {
     : Array.isArray(data?.items)
       ? data.items
       : [];
+  const pagination =
+    data && !Array.isArray(data) && typeof data.pagination === "object"
+      ? data.pagination || {}
+      : {};
   const nextBeforeId = firstDefined(
     data,
     "next_before_id",
@@ -763,13 +767,38 @@ export function normalizeRuntimeLogPage(data = {}) {
     "NextBeforeID",
   );
   const hasMore = Boolean(
-    firstDefined(data, "has_more", "hasMore", "HasMore"),
+    firstDefined(pagination, "has_more", "hasMore", "HasMore") ??
+      firstDefined(data, "has_more", "hasMore", "HasMore"),
   );
+  const rawLimit = Number(
+    firstDefined(pagination, "limit", "Limit") ??
+      firstDefined(data, "limit", "Limit"),
+  );
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0
+    ? Math.trunc(rawLimit)
+    : rawItems.length || 50;
+  const rawOffset = Number(
+    firstDefined(pagination, "offset", "Offset") ??
+      firstDefined(data, "offset", "Offset"),
+  );
+  const offset = Number.isFinite(rawOffset) && rawOffset >= 0
+    ? Math.trunc(rawOffset)
+    : 0;
+  const rawTotal = Number(
+    firstDefined(pagination, "total", "Total") ??
+      firstDefined(data, "total", "Total"),
+  );
+  const total = Number.isFinite(rawTotal) && rawTotal >= 0
+    ? Math.trunc(rawTotal)
+    : offset + rawItems.length + (hasMore ? 1 : 0);
 
   return {
     items: rawItems.map(normalizeRuntimeLog),
     hasMore,
     nextBeforeId: nextBeforeId ?? null,
+    total,
+    limit,
+    offset,
   };
 }
 
@@ -782,6 +811,10 @@ export function buildRuntimeLogQuery(options = {}) {
   const limit = Number.isFinite(rawLimit)
     ? Math.min(200, Math.max(1, Math.trunc(rawLimit)))
     : 50;
+  const rawOffset = Number(options.offset);
+  const offset = Number.isFinite(rawOffset)
+    ? Math.min(1_000_000, Math.max(0, Math.trunc(rawOffset)))
+    : 0;
   const beforeId = String(options.beforeId ?? "").trim();
   const syncRunId = String(options.syncRunId ?? "").trim();
   const autoCreateRunId = String(options.autoCreateRunId ?? "").trim();
@@ -792,6 +825,7 @@ export function buildRuntimeLogQuery(options = {}) {
   if (syncRunId) parameters.set("sync_run_id", syncRunId);
   if (autoCreateRunId) parameters.set("auto_create_run_id", autoCreateRunId);
   parameters.set("limit", String(limit));
+  if (offset > 0) parameters.set("offset", String(offset));
   if (beforeId) parameters.set("before_id", beforeId);
   return parameters.toString();
 }

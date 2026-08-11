@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -20,6 +21,17 @@ const aliasJoins = `
 	FROM aliases al
 	JOIN accounts ac ON ac.id = al.account_id
 	LEFT JOIN latest_messages lm ON lm.alias_id = al.id`
+
+type AliasListFilter struct {
+	AccountID *int64
+	Limit     int
+	Offset    int
+}
+
+type AliasPage struct {
+	Items []domain.Alias
+	Total int
+}
 
 func (s *Store) CreateAlias(ctx context.Context, alias domain.Alias) (domain.Alias, error) {
 	if len(alias.APIKeyHash) == 0 {
@@ -108,6 +120,54 @@ func (s *Store) GetAliasByAddress(ctx context.Context, address string) (domain.A
 // single supplied account ID.
 func (s *Store) ListAliases(ctx context.Context, accountIDs ...int64) ([]domain.Alias, error) {
 	return s.listAliases(ctx, false, accountIDs...)
+}
+
+// ListAliasesPage returns one administrator-facing page and the total number
+// of aliases matching the optional primary-account filter.
+func (s *Store) ListAliasesPage(ctx context.Context, filter AliasListFilter) (AliasPage, error) {
+	if err := validateListPage(filter.Limit, filter.Offset); err != nil {
+		return AliasPage{}, fmt.Errorf("list aliases page: %w", err)
+	}
+
+	predicate := ""
+	var filterArgs []any
+	if filter.AccountID != nil {
+		if *filter.AccountID < 1 {
+			return AliasPage{}, errors.New("list aliases page: account ID must be positive")
+		}
+		predicate = ` WHERE al.account_id = ?`
+		filterArgs = append(filterArgs, *filter.AccountID)
+	}
+
+	var total int
+	if err := s.queryRowContext(ctx,
+		`SELECT COUNT(*) FROM aliases al`+predicate,
+		filterArgs...,
+	).Scan(&total); err != nil {
+		return AliasPage{}, fmt.Errorf("count aliases page: %w", err)
+	}
+
+	query := `SELECT ` + aliasColumns + aliasJoins + predicate +
+		` ORDER BY al.address, al.id LIMIT ? OFFSET ?`
+	args := append(append([]any{}, filterArgs...), filter.Limit, filter.Offset)
+	rows, err := s.queryContext(ctx, query, args...)
+	if err != nil {
+		return AliasPage{}, fmt.Errorf("list aliases page: %w", err)
+	}
+	defer rows.Close()
+
+	aliases := make([]domain.Alias, 0, filter.Limit)
+	for rows.Next() {
+		alias, err := scanAlias(rows)
+		if err != nil {
+			return AliasPage{}, err
+		}
+		aliases = append(aliases, alias)
+	}
+	if err := rows.Err(); err != nil {
+		return AliasPage{}, fmt.Errorf("iterate aliases page: %w", err)
+	}
+	return AliasPage{Items: aliases, Total: total}, nil
 }
 
 func (s *Store) ListAliasesByAccount(ctx context.Context, accountID int64) ([]domain.Alias, error) {

@@ -21,7 +21,7 @@ test("all logs view is routed and exposed in admin navigation", async () => {
   assert.match(layout, /to:\s*"\/admin\/logs"[\s\S]{0,100}label:\s*"全部日志"/);
 });
 
-test("all logs view supports filters, cursor paging, live refresh, and responsive records", async () => {
+test("all logs view supports filters, server paging, live refresh, and responsive records", async () => {
   const source = await readFile(viewPath, "utf8");
 
   assert.match(source, /v-model="filters\.level"/);
@@ -30,14 +30,15 @@ test("all logs view supports filters, cursor paging, live refresh, and responsiv
   assert.match(source, /route\.query\.account_id/);
   assert.match(source, /route\.query\.level/);
   assert.match(source, /route\.query\.query/);
-  assert.match(source, /getRuntimeLogs\(currentRequestOptions\(cursor\)\)/);
-  assert.match(source, /nextBeforeId/);
-  assert.match(source, /加载更多/);
-  assert.match(source, /MAX_VISIBLE_LOGS\s*=\s*2000/);
-  assert.match(
-    source,
-    /if \(autoRefreshEnabled\.value\)[\s\S]{0,100}autoRefreshEnabled\.value = false/,
-  );
+  assert.match(source, /getRuntimeLogs\(currentRequestOptions\(page\)\)/);
+  assert.match(source, /offset:\s*\(page - 1\) \* PAGE_SIZE/);
+  assert.match(source, /<ListPagination/);
+  assert.match(source, /:page="currentPage"/);
+  assert.match(source, /:total="total"/);
+  assert.match(source, /PAGE_SIZE\s*=\s*50/);
+  assert.match(source, /getAccountPage\(\{/);
+  assert.match(source, /:remote-method="searchAccounts"/);
+  assert.doesNotMatch(source, /加载更多|MAX_VISIBLE_LOGS|appendRuntimeLogPage/);
   assert.match(source, /createLiveRefresh\(\(\) => loadLatestLogs\(\{ silent: true \}\)\)/);
   assert.match(source, /v-model="autoRefreshEnabled"/);
   assert.match(source, /class="data-panel desktop-data-table"/);
@@ -54,27 +55,24 @@ test("all logs view supports filters, cursor paging, live refresh, and responsiv
   assert.match(source, /@media \(max-width: 720px\)/);
 });
 
-test("reenabling live refresh cancels an in-flight historical page before loading latest logs", async () => {
+test("historical pages stop live refresh and the switch controls the scheduler", async () => {
   const source = await readFile(viewPath, "utf8");
+  const pageHandlerStart = source.indexOf("function handlePageChange");
+  const pageHandlerEnd = source.indexOf("\n}", pageHandlerStart);
+  const pageHandler = source.slice(pageHandlerStart, pageHandlerEnd);
   const watcherStart = source.indexOf("watch(autoRefreshEnabled");
   const watcherEnd = source.indexOf("\n});", watcherStart);
   const watcher = source.slice(watcherStart, watcherEnd);
-  const operations = [
-    "logRequestGate.invalidate();",
-    "loadMoreGeneration += 1;",
-    "loadingMore.value = false;",
-    "loadLatestLogs({ force: true });",
-    "liveRefresh.start({ immediate: false });",
-  ];
 
+  assert.notEqual(pageHandlerStart, -1);
+  assert.notEqual(pageHandlerEnd, -1);
+  assert.match(pageHandler, /nextPage > 1 && autoRefreshEnabled\.value/);
+  assert.match(pageHandler, /autoRefreshEnabled\.value = false/);
   assert.notEqual(watcherStart, -1);
   assert.notEqual(watcherEnd, -1);
-  let previousIndex = -1;
-  for (const operation of operations) {
-    const operationIndex = watcher.indexOf(operation);
-    assert.ok(operationIndex > previousIndex, `${operation} must run in order`);
-    previousIndex = operationIndex;
-  }
+  assert.match(watcher, /logRequestGate\.invalidate\(\)/);
+  assert.match(watcher, /loadLatestLogs\(\{ force: true \}\)/);
+  assert.match(watcher, /liveRefresh\.start\(\{ immediate: false \}\)/);
 });
 
 test("runtime log details show loadable, copyable sync and automatic creation timelines", async () => {

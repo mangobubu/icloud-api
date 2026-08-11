@@ -26,10 +26,14 @@ import (
 )
 
 const (
-	adminAPILoginCSRFCookie = "icloud_api_login_csrf"
-	adminAPILoginCSRFPath   = "/admin/api/v1/auth"
-	adminAPICSRFHeader      = "X-CSRF-Token"
-	adminAPIMaxJSONBytes    = 64 << 10
+	adminAPILoginCSRFCookie   = "icloud_api_login_csrf"
+	adminAPILoginCSRFPath     = "/admin/api/v1/auth"
+	adminAPICSRFHeader        = "X-CSRF-Token"
+	adminAPIMaxJSONBytes      = 64 << 10
+	adminAPIDefaultPageLimit  = 50
+	adminAPIMaxPageLimit      = 200
+	adminAPIMaxPageOffset     = 1_000_000
+	adminAPIMaxListQueryRunes = 200
 )
 
 // registerAdminAPIRoutes attaches the JSON admin API to a group whose base
@@ -637,12 +641,28 @@ func (s *Server) adminAPIChangePassword(c *gin.Context) {
 }
 
 func (s *Server) adminAPIListAccounts(c *gin.Context) {
-	accounts, err := s.store.ListAccounts(c.Request.Context())
+	limit, offset, ok := adminAPIListPage(c)
+	if !ok {
+		return
+	}
+	query := strings.TrimSpace(c.Query("query"))
+	if len([]rune(query)) > adminAPIMaxListQueryRunes {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "query 参数不能超过 200 个字符")
+		return
+	}
+	page, err := s.store.ListAccountsPage(c.Request.Context(), store.AccountListFilter{
+		Query:  query,
+		Limit:  limit,
+		Offset: offset,
+	})
 	if err != nil {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	writeAdminAPIData(c, http.StatusOK, s.adminAPIAccountsFromDomain(accounts))
+	writeAdminAPIData(c, http.StatusOK, gin.H{
+		"items":      s.adminAPIAccountsFromDomain(page.Items),
+		"pagination": adminAPIPagination(limit, offset, page.Total),
+	})
 }
 
 func (s *Server) adminAPICreateAccount(c *gin.Context) {
@@ -1104,30 +1124,37 @@ func (s *Server) adminAPIAcknowledgeAliasAutoCreationKeys(c *gin.Context) {
 }
 
 func (s *Server) adminAPIListAliases(c *gin.Context) {
-	var (
-		aliases []domain.Alias
-		err     error
-	)
+	limit, offset, ok := adminAPIListPage(c)
+	if !ok {
+		return
+	}
+	var accountID *int64
 	if rawAccountID := strings.TrimSpace(c.Query("account_id")); rawAccountID != "" {
-		accountID, parseErr := strconv.ParseInt(rawAccountID, 10, 64)
-		if parseErr != nil || accountID < 1 {
+		parsedID, parseErr := strconv.ParseInt(rawAccountID, 10, 64)
+		if parseErr != nil || parsedID < 1 {
 			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "account_id 必须是正整数")
 			return
 		}
-		aliases, err = s.store.ListAliasesByAccount(c.Request.Context(), accountID)
-	} else {
-		aliases, err = s.store.ListAliases(c.Request.Context())
+		accountID = &parsedID
 	}
+	page, err := s.store.ListAliasesPage(c.Request.Context(), store.AliasListFilter{
+		AccountID: accountID,
+		Limit:     limit,
+		Offset:    offset,
+	})
 	if err != nil {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	aliasDTOs, err := s.adminAPIAliasesFromDomain(aliases)
+	aliasDTOs, err := s.adminAPIAliasesFromDomain(page.Items)
 	if err != nil {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	writeAdminAPIData(c, http.StatusOK, aliasDTOs)
+	writeAdminAPIData(c, http.StatusOK, gin.H{
+		"items":      aliasDTOs,
+		"pagination": adminAPIPagination(limit, offset, page.Total),
+	})
 }
 
 func (s *Server) adminAPIGetAlias(c *gin.Context) {
@@ -1269,31 +1296,52 @@ func (s *Server) adminAPIDeleteAlias(c *gin.Context) {
 }
 
 func (s *Server) adminAPIListAuditLogs(c *gin.Context) {
-	limit, ok := adminAPIQueryInt(c, "limit", 200, 1, 200)
+	limit, ok := adminAPIQueryInt(c, "limit", adminAPIDefaultPageLimit, 1, adminAPIMaxPageLimit)
 	if !ok {
 		return
 	}
-	offset, ok := adminAPIQueryInt(c, "offset", 0, 0, 1_000_000)
+	offset, ok := adminAPIQueryInt(c, "offset", 0, 0, adminAPIMaxPageOffset)
 	if !ok {
 		return
 	}
-	logs, err := s.store.ListAuditLogs(c.Request.Context(), limit+1, offset)
+	page, err := s.store.ListAuditLogsPage(c.Request.Context(), store.AuditLogFilter{Limit: limit, Offset: offset})
 	if err != nil {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	hasMore := len(logs) > limit
-	if hasMore {
-		logs = logs[:limit]
-	}
-	items := make([]adminAPIAuditLogDTO, 0, len(logs))
-	for _, log := range logs {
+	items := make([]adminAPIAuditLogDTO, 0, len(page.Items))
+	for _, log := range page.Items {
 		items = append(items, adminAPIAuditLogFromDomain(log))
 	}
 	writeAdminAPIData(c, http.StatusOK, gin.H{
 		"items":      items,
-		"pagination": gin.H{"limit": limit, "offset": offset, "has_more": hasMore},
+		"pagination": adminAPIPagination(limit, offset, page.Total),
 	})
+}
+
+func adminAPIListPage(c *gin.Context) (int, int, bool) {
+	limit, ok := adminAPIQueryInt(c, "limit", adminAPIDefaultPageLimit, 1, adminAPIMaxPageLimit)
+	if !ok {
+		return 0, 0, false
+	}
+	offset, ok := adminAPIQueryInt(c, "offset", 0, 0, adminAPIMaxPageOffset)
+	if !ok {
+		return 0, 0, false
+	}
+	return limit, offset, true
+}
+
+func adminAPIPagination(limit, offset, total int) gin.H {
+	if total < 0 {
+		total = 0
+	}
+	hasMore := offset < total && total-offset > limit
+	return gin.H{
+		"limit":    limit,
+		"offset":   offset,
+		"total":    total,
+		"has_more": hasMore,
+	}
 }
 
 func adminAPIQueryInt(c *gin.Context, name string, fallback, minimum, maximum int) (int, bool) {

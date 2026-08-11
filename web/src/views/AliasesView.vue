@@ -12,9 +12,12 @@
             v-model="selectedAccountId"
             class="alias-filter__select"
             filterable
+            remote
+            reserve-keyword
             clearable
             :disabled="accountsLoading || accounts.length === 0"
             :loading="accountsLoading"
+            :remote-method="searchAccounts"
             placeholder="全部主号"
             aria-label="按所属主号筛选"
             no-data-text="暂无主号"
@@ -47,7 +50,8 @@
         <el-button
           type="primary"
           :icon="Download"
-          :disabled="exportableAliases.length === 0"
+          :loading="exportingAll"
+          :disabled="total === 0 || exportingAll"
           @click="exportAllAliases"
         >
           全部导出
@@ -103,29 +107,40 @@
       />
 
       <div class="data-panel desktop-data-table" :aria-busy="loading">
-        <el-table
-          ref="aliasTable"
+        <VirtualDataTable
+          :columns="aliasColumns"
           :data="aliases"
           row-key="id"
-          style="width: 100%"
-          @selection-change="handleSelectionChange"
+          :height="560"
+          :row-height="64"
+          :loading="loading"
         >
-          <el-table-column
-            type="selection"
-            width="52"
-            reserve-selection
-            :selectable="isAliasExportable"
-          />
-          <el-table-column label="隐私邮箱" min-width="220">
-            <template #default="{ row }">
+          <template #header-cell="{ column }">
+            <el-checkbox
+              v-if="column.key === 'selection'"
+              :model-value="allExportableAliasesSelected"
+              :indeterminate="someExportableAliasesSelected"
+              :disabled="exportableAliases.length === 0"
+              aria-label="勾选本页可导出的隐私邮箱"
+              @change="setAllAliasesSelected"
+            />
+            <template v-else>{{ column.title }}</template>
+          </template>
+          <template #cell="{ column, row }">
+            <el-checkbox
+              v-if="column.key === 'selection'"
+              :model-value="isAliasSelected(row.id)"
+              :disabled="!isAliasExportable(row)"
+              :aria-label="`勾选 ${row.address}`"
+              @change="setAliasSelected(row, $event)"
+            />
+            <template v-else-if="column.key === 'address'">
               <div class="primary-stack">
                 <strong>{{ row.address }}</strong>
                 <small>{{ row.label || "未填写用途备注" }}</small>
               </div>
             </template>
-          </el-table-column>
-          <el-table-column label="所属主号" min-width="190">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'account'">
               <el-button
                 class="account-link"
                 link
@@ -135,24 +150,16 @@
                 {{ row.accountEmail || "查看主号" }}
               </el-button>
             </template>
-          </el-table-column>
-          <el-table-column label="API Key" min-width="120">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'apiKey'">
               <code class="key-prefix">{{ keyPrefix(row) }}</code>
             </template>
-          </el-table-column>
-          <el-table-column label="最近调用" min-width="150">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'lastAccessedAt'">
               {{ formatTime(row.lastAccessedAt) }}
             </template>
-          </el-table-column>
-          <el-table-column label="最新邮件" min-width="150">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'latestReceivedAt'">
               {{ formatTime(row.latestReceivedAt) }}
             </template>
-          </el-table-column>
-          <el-table-column label="状态" min-width="124">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'status'">
               <el-tag
                 v-if="isAliasConfirmationPending(row)"
                 type="warning"
@@ -163,9 +170,7 @@
               </el-tag>
               <SyncStatus v-else :item="row" details />
             </template>
-          </el-table-column>
-          <el-table-column label="操作" width="152" align="right" fixed="right">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'actions'">
               <div class="icon-action-row">
                 <el-tooltip
                   v-if="isAliasExportable(row)"
@@ -191,9 +196,8 @@
                 </el-button>
               </div>
             </template>
-          </el-table-column>
-        </el-table>
-        <div v-if="loading" class="table-loading-mask" aria-hidden="true"></div>
+          </template>
+        </VirtualDataTable>
       </div>
 
       <div class="mobile-record-list" :aria-busy="loading">
@@ -261,6 +265,15 @@
           </footer>
         </article>
       </div>
+
+      <ListPagination
+        :page="currentPage"
+        :page-size="PAGE_SIZE"
+        :total="total"
+        :loading="loading"
+        aria-label="隐私邮箱列表分页"
+        @change="handlePageChange"
+      />
     </template>
   </section>
 </template>
@@ -276,11 +289,13 @@ import { ElMessage } from "element-plus";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
-import { getAccounts, getAliases } from "../api/admin.js";
+import { getAccountPage, getAliasPage, getAllAliases } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
+import ListPagination from "../components/ListPagination.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncStatus from "../components/SyncStatus.vue";
+import VirtualDataTable from "../components/VirtualDataTable.vue";
 import {
   createActionLock,
   createLatestRequestGate,
@@ -290,24 +305,38 @@ import {
   buildRecentMailDirectLink,
   copyText,
 } from "../utils/clipboard.js";
-import { successMessage } from "../utils/feedback.js";
+import { showRequestError, successMessage } from "../utils/feedback.js";
 import { formatTime } from "../utils/format.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
 
 const router = useRouter();
+const PAGE_SIZE = 50;
+const aliasColumns = [
+  { key: "selection", title: "", width: 52, align: "center", fixed: "left" },
+  { key: "address", title: "隐私邮箱", width: 220, flexGrow: 2 },
+  { key: "account", title: "所属主号", width: 190, flexGrow: 1 },
+  { key: "apiKey", title: "API Key", width: 120 },
+  { key: "lastAccessedAt", title: "最近调用", width: 150, flexGrow: 1 },
+  { key: "latestReceivedAt", title: "最新邮件", width: 150, flexGrow: 1 },
+  { key: "status", title: "状态", width: 134, flexGrow: 1 },
+  { key: "actions", title: "操作", width: 152, align: "right", fixed: "right" },
+];
 const aliases = ref([]);
 const accounts = ref([]);
 const selectedAccountId = ref("");
-const aliasTable = ref(null);
+const currentPage = ref(1);
+const total = ref(0);
 const selectedAliasIds = ref([]);
 const loading = ref(false);
 const loadError = ref(null);
 const accountsLoading = ref(false);
 const accountsLoadError = ref(null);
+const exportingAll = ref(false);
 const copyLoading = reactive({});
 const copyLock = createActionLock();
 const aliasLoadGate = createLatestRequestGate();
 const accountsLoadGate = createLatestRequestGate();
+let accountSearchTimer = null;
 let viewActive = true;
 
 const selectedAliases = computed(() => {
@@ -316,7 +345,20 @@ const selectedAliases = computed(() => {
     (alias) => selectedIds.has(alias.id) && isAliasExportable(alias),
   );
 });
+
 const exportableAliases = computed(() => aliases.value.filter(isAliasExportable));
+
+const allExportableAliasesSelected = computed(() =>
+  exportableAliases.value.length > 0 &&
+  exportableAliases.value.every((alias) => isAliasSelected(alias.id)),
+);
+
+const someExportableAliasesSelected = computed(() => {
+  const selectedCount = exportableAliases.value.filter((alias) =>
+    isAliasSelected(alias.id),
+  ).length;
+  return selectedCount > 0 && selectedCount < exportableAliases.value.length;
+});
 
 function isAliasConfirmationPending(alias) {
   return (
@@ -334,50 +376,84 @@ function keyPrefix(alias) {
   return alias.apiKeyPrefix ? `${alias.apiKeyPrefix}…` : "-";
 }
 
-async function loadAccounts({ silent = false } = {}) {
-  const ticket = accountsLoadGate.begin("accounts");
+async function loadAccounts({ silent = false, query = "" } = {}) {
+  const normalizedQuery = String(query || "").trim();
+  const ticket = accountsLoadGate.begin(normalizedQuery);
   if (!silent) {
     accountsLoading.value = true;
     accountsLoadError.value = null;
   }
   try {
-    const nextAccounts = await getAccounts();
-    if (!accountsLoadGate.isCurrent(ticket)) return;
-    accounts.value = nextAccounts;
-    accountsLoadError.value = null;
-
-    if (
-      selectedAccountId.value &&
+    const result = await getAccountPage({
+      limit: PAGE_SIZE,
+      offset: 0,
+      query: normalizedQuery,
+    });
+    if (!accountsLoadGate.isCurrent(ticket, normalizedQuery)) return;
+    const nextAccounts = Array.isArray(result?.items) ? result.items : [];
+    const selected = accounts.value.find(
+      (account) => String(account.id) === String(selectedAccountId.value),
+    );
+    accounts.value =
+      selected &&
       !nextAccounts.some(
-        (account) => String(account.id) === String(selectedAccountId.value),
+        (account) => String(account.id) === String(selected.id),
       )
-    ) {
-      selectedAccountId.value = "";
-      clearAliasSelection();
-      void loadAliases({ silent });
-    }
+        ? [selected, ...nextAccounts]
+        : nextAccounts;
+    accountsLoadError.value = null;
   } catch (error) {
-    if (accountsLoadGate.isCurrent(ticket) && !silent) {
+    if (
+      accountsLoadGate.isCurrent(ticket, normalizedQuery) &&
+      !silent
+    ) {
       accountsLoadError.value = error;
     }
   } finally {
-    if (accountsLoadGate.isCurrent(ticket)) {
+    if (accountsLoadGate.isCurrent(ticket, normalizedQuery)) {
       accountsLoading.value = false;
     }
   }
 }
 
+function searchAccounts(query) {
+  if (accountSearchTimer !== null) {
+    window.clearTimeout(accountSearchTimer);
+  }
+  accountSearchTimer = window.setTimeout(() => {
+    accountSearchTimer = null;
+    void loadAccounts({ query });
+  }, query ? 220 : 0);
+}
+
 async function loadAliases({ silent = false } = {}) {
   const accountId = selectedAccountId.value;
-  const ticket = aliasLoadGate.begin(accountId);
+  const page = currentPage.value;
+  const requestKey = `${accountId}\u0000${page}`;
+  const ticket = aliasLoadGate.begin(requestKey);
   if (!silent) {
     loading.value = true;
     loadError.value = null;
   }
   try {
-    const nextAliases = await getAliases(accountId);
-    if (!aliasLoadGate.isCurrent(ticket, selectedAccountId.value)) return;
+    const result = await getAliasPage(accountId, {
+      limit: PAGE_SIZE,
+      offset: (page - 1) * PAGE_SIZE,
+    });
+    const currentKey = `${selectedAccountId.value}\u0000${currentPage.value}`;
+    if (!aliasLoadGate.isCurrent(ticket, currentKey)) return;
+    const nextTotal = Math.max(0, Number(result?.total) || 0);
+    const lastPage = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE));
+    if (page > lastPage) {
+      currentPage.value = lastPage;
+      aliases.value = [];
+      total.value = nextTotal;
+      void loadAliases();
+      return;
+    }
+    const nextAliases = Array.isArray(result?.items) ? result.items : [];
     aliases.value = nextAliases;
+    total.value = nextTotal;
     const availableAliasIds = new Set(
       nextAliases.filter(isAliasExportable).map((alias) => alias.id),
     );
@@ -386,11 +462,22 @@ async function loadAliases({ silent = false } = {}) {
     );
     loadError.value = null;
   } catch (error) {
-    if (aliasLoadGate.isCurrent(ticket, selectedAccountId.value) && !silent) {
+    if (
+      aliasLoadGate.isCurrent(
+        ticket,
+        `${selectedAccountId.value}\u0000${currentPage.value}`,
+      ) &&
+      !silent
+    ) {
       loadError.value = error;
     }
   } finally {
-    if (aliasLoadGate.isCurrent(ticket, selectedAccountId.value)) {
+    if (
+      aliasLoadGate.isCurrent(
+        ticket,
+        `${selectedAccountId.value}\u0000${currentPage.value}`,
+      )
+    ) {
       loading.value = false;
     }
   }
@@ -398,27 +485,30 @@ async function loadAliases({ silent = false } = {}) {
 
 function clearAliasSelection() {
   selectedAliasIds.value = [];
-  aliasTable.value?.clearSelection();
 }
 
 function handleAccountFilterChange(value) {
   selectedAccountId.value = value == null ? "" : value;
+  currentPage.value = 1;
   clearAliasSelection();
+  aliases.value = [];
+  total.value = 0;
   loadAliases();
 }
 
-const liveRefresh = createLiveRefresh(() => {
-  return Promise.all([
-    loadAliases({ silent: true }),
-    loadAccounts({ silent: true }),
-  ]);
-});
-
-function handleSelectionChange(selection) {
-  selectedAliasIds.value = selection
-    .filter(isAliasExportable)
-    .map((alias) => alias.id);
+function handlePageChange(page) {
+  const nextPage = Math.max(1, Number(page) || 1);
+  if (nextPage === currentPage.value) return;
+  currentPage.value = nextPage;
+  clearAliasSelection();
+  aliases.value = [];
+  loadError.value = null;
+  void loadAliases();
 }
+
+const liveRefresh = createLiveRefresh(() => {
+  return loadAliases({ silent: true });
+});
 
 function isAliasSelected(id) {
   return selectedAliasIds.value.includes(id);
@@ -426,11 +516,6 @@ function isAliasSelected(id) {
 
 function setAliasSelected(alias, selected) {
   if (!isAliasExportable(alias)) return;
-  if (aliasTable.value) {
-    aliasTable.value.toggleRowSelection(alias, selected);
-    return;
-  }
-
   const selectedIds = new Set(selectedAliasIds.value);
   if (selected) {
     selectedIds.add(alias.id);
@@ -438,6 +523,12 @@ function setAliasSelected(alias, selected) {
     selectedIds.delete(alias.id);
   }
   selectedAliasIds.value = [...selectedIds];
+}
+
+function setAllAliasesSelected(selected) {
+  selectedAliasIds.value = selected
+    ? exportableAliases.value.map((alias) => alias.id)
+    : [];
 }
 
 function exportAliases(items, scope) {
@@ -476,7 +567,22 @@ function exportSelectedAliases() {
 }
 
 function exportAllAliases() {
-  exportAliases(exportableAliases.value, "all");
+  if (exportingAll.value) return;
+  exportingAll.value = true;
+  getAllAliases(selectedAccountId.value)
+    .then((items) => {
+      if (viewActive) {
+        exportAliases(items, selectedAccountId.value || "all");
+      }
+    })
+    .catch((error) => {
+      if (viewActive) {
+        showRequestError(error, "导出隐私邮箱失败，请稍后重试。");
+      }
+    })
+    .finally(() => {
+      exportingAll.value = false;
+    });
 }
 
 async function copyAliasDirectLink(alias) {
@@ -524,6 +630,10 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   viewActive = false;
+  if (accountSearchTimer !== null) {
+    window.clearTimeout(accountSearchTimer);
+    accountSearchTimer = null;
+  }
   aliasLoadGate.deactivate();
   accountsLoadGate.deactivate();
   liveRefresh.stop();

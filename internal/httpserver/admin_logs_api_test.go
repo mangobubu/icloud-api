@@ -48,13 +48,14 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 		},
 		HasMore:      true,
 		NextBeforeID: 99,
+		Total:        57,
 	}}
 	env.server.SetApplicationLogSource(source)
 
 	response := env.request(
 		t,
 		http.MethodGet,
-		"/admin/api/v1/logs?level=ERROR&query=%20imap%20&keyword=ignored&account_id=42&sync_run_id=sync-run-123&auto_create_run_id=auto-run-123&before_id=100&limit=20",
+		"/admin/api/v1/logs?level=ERROR&query=%20imap%20&keyword=ignored&account_id=42&sync_run_id=sync-run-123&auto_create_run_id=auto-run-123&before_id=100&offset=0&limit=20",
 		nil,
 		"",
 		[]*http.Cookie{sessionCookie},
@@ -84,6 +85,12 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 			Items        []adminAPIApplicationLogDTO `json:"items"`
 			HasMore      bool                        `json:"has_more"`
 			NextBeforeID uint64                      `json:"next_before_id"`
+			Pagination   struct {
+				Limit   int  `json:"limit"`
+				Offset  int  `json:"offset"`
+				Total   int  `json:"total"`
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
@@ -91,6 +98,9 @@ func TestAdminAPIApplicationLogsFiltersAndMapsPage(t *testing.T) {
 	}
 	if !payload.Data.HasMore || payload.Data.NextBeforeID != 99 || len(payload.Data.Items) != 1 {
 		t.Fatalf("application log page = %#v", payload.Data)
+	}
+	if payload.Data.Pagination.Limit != 20 || payload.Data.Pagination.Offset != 0 || payload.Data.Pagination.Total != 57 || !payload.Data.Pagination.HasMore {
+		t.Fatalf("application log pagination = %#v", payload.Data.Pagination)
 	}
 	item := payload.Data.Items[0]
 	if item.ID != 99 || item.CreatedAt != loggedAt.Format(time.RFC3339Nano) || item.Level != "error" || item.Message != "同步主号失败" || item.Source != "manager.go:371" {
@@ -120,8 +130,44 @@ func TestAdminAPIApplicationLogsKeywordCompatibilityAndEmptySource(t *testing.T)
 
 	env.server.SetApplicationLogSource(nil)
 	response = env.request(t, http.MethodGet, "/admin/api/v1/logs", nil, "", []*http.Cookie{sessionCookie}, "")
-	if response.Code != http.StatusOK || response.Body.String() != `{"data":{"has_more":false,"items":[],"next_before_id":0}}` {
+	if response.Code != http.StatusOK || response.Body.String() != `{"data":{"has_more":false,"items":[],"next_before_id":0,"pagination":{"has_more":false,"limit":100,"offset":0,"total":0}}}` {
 		t.Fatalf("unconfigured application logs response = %d; body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAdminAPIApplicationLogsMapsOffsetPagination(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, _, _ := env.createSession(t, "offset-log-admin", "unused-password")
+	source := &stubApplicationLogSource{page: applog.Page{
+		Items:   []applog.Entry{{ID: 60, Message: "offset page"}},
+		HasMore: true,
+		Total:   83,
+	}}
+	env.server.SetApplicationLogSource(source)
+
+	response := env.request(t, http.MethodGet, adminAPIApplicationLogsPath+"?limit=20&offset=40", nil, "", []*http.Cookie{sessionCookie}, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("offset application logs status = %d; body=%s", response.Code, response.Body.String())
+	}
+	if source.filter.Limit != 20 || source.filter.Offset != 40 || source.filter.BeforeID != 0 {
+		t.Fatalf("offset application log filter = %#v", source.filter)
+	}
+
+	var payload struct {
+		Data struct {
+			Pagination struct {
+				Limit   int  `json:"limit"`
+				Offset  int  `json:"offset"`
+				Total   int  `json:"total"`
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode offset application logs: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Data.Pagination.Limit != 20 || payload.Data.Pagination.Offset != 40 || payload.Data.Pagination.Total != 83 || !payload.Data.Pagination.HasMore {
+		t.Fatalf("offset application log pagination = %#v", payload.Data.Pagination)
 	}
 }
 
@@ -154,6 +200,10 @@ func TestAdminAPIApplicationLogsRejectInvalidFilters(t *testing.T) {
 		"before_id=not-an-id",
 		"limit=0",
 		"limit=201",
+		"offset=-1",
+		"offset=1000001",
+		"offset=not-an-offset",
+		"before_id=100&offset=1",
 		"sync_run_id=",
 		"sync_run_id=%20",
 		"sync_run_id=bad%20run",

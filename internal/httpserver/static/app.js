@@ -471,14 +471,24 @@
     updateSyncError(record, item.lastSyncError);
   }
 
+  function syncListItems(data) {
+    if (Array.isArray(data)) {
+      return data;
+    }
+    if (data && Array.isArray(data.items)) {
+      return data.items;
+    }
+    return [];
+  }
+
   function syncItemsFromPayload(page, data) {
-    if (page === "accounts" && Array.isArray(data)) {
-      return data.map(function (item) {
+    if (page === "accounts") {
+      return syncListItems(data).map(function (item) {
         return { kind: "account", item: normalizedSyncItem(item) };
       });
     }
-    if (page === "aliases" && Array.isArray(data)) {
-      return data.map(function (item) {
+    if (page === "aliases") {
+      return syncListItems(data).map(function (item) {
         return { kind: "alias", item: normalizedSyncItem(item) };
       });
     }

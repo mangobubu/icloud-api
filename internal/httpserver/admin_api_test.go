@@ -535,12 +535,22 @@ func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T
 		t.Fatal(err)
 	}
 	var aliasesPayload struct {
-		Data []adminAPIAliasDTO `json:"data"`
+		Data struct {
+			Items      []adminAPIAliasDTO `json:"items"`
+			Pagination struct {
+				Offset  int  `json:"offset"`
+				Total   int  `json:"total"`
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(aliases.Body.Bytes(), &aliasesPayload); err != nil || len(aliasesPayload.Data) != 1 {
+	if err := json.Unmarshal(aliases.Body.Bytes(), &aliasesPayload); err != nil || len(aliasesPayload.Data.Items) != 1 {
 		t.Fatalf("decode aliases response: err=%v body=%s", err, aliases.Body.String())
 	}
-	if err := assertAdminDirectLinkPath(t, aliasesPayload.Data[0], secure.HashToken(firstKey), env.cipher); err != nil {
+	if aliasesPayload.Data.Pagination.Total != 1 || aliasesPayload.Data.Pagination.Offset != 0 || aliasesPayload.Data.Pagination.HasMore {
+		t.Fatalf("aliases pagination = %#v", aliasesPayload.Data.Pagination)
+	}
+	if err := assertAdminDirectLinkPath(t, aliasesPayload.Data.Items[0], secure.HashToken(firstKey), env.cipher); err != nil {
 		t.Fatal(err)
 	}
 	for name, response := range map[string]*httptest.ResponseRecorder{"detail": detail, "aliases": aliases} {
@@ -726,13 +736,23 @@ func TestAdminAPIListAliasesFiltersByPrimaryAccount(t *testing.T) {
 		t.Fatalf("filtered aliases status = %d; body=%s", response.Code, response.Body.String())
 	}
 	var payload struct {
-		Data []adminAPIAliasDTO `json:"data"`
+		Data struct {
+			Items      []adminAPIAliasDTO `json:"items"`
+			Pagination struct {
+				Offset  int  `json:"offset"`
+				Total   int  `json:"total"`
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode filtered aliases: %v; body=%s", err, response.Body.String())
 	}
-	if len(payload.Data) != 1 || payload.Data[0].AccountID != first.ID || payload.Data[0].Address != "first-filter-alias@icloud.com" {
-		t.Fatalf("filtered aliases = %#v, want only first account", payload.Data)
+	if len(payload.Data.Items) != 1 || payload.Data.Items[0].AccountID != first.ID || payload.Data.Items[0].Address != "first-filter-alias@icloud.com" {
+		t.Fatalf("filtered aliases = %#v, want only first account", payload.Data.Items)
+	}
+	if payload.Data.Pagination.Total != 1 || payload.Data.Pagination.Offset != 0 || payload.Data.Pagination.HasMore {
+		t.Fatalf("filtered aliases pagination = %#v", payload.Data.Pagination)
 	}
 
 	invalid := env.request(
@@ -746,6 +766,65 @@ func TestAdminAPIListAliasesFiltersByPrimaryAccount(t *testing.T) {
 	)
 	if invalid.Code != http.StatusBadRequest || adminAPITestErrorCode(t, invalid) != "VALIDATION_FAILED" {
 		t.Fatalf("invalid account filter status = %d; body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
+func TestAdminAPIListAccountsUsesServerPagingAndSearch(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, _, _ := env.createSession(t, "account-page-admin", "account page password")
+	for _, email := range []string{
+		"charlie-page-list@icloud.com",
+		"alpha-page-list@icloud.com",
+		"bravo-page-list@icloud.com",
+	} {
+		adminAPITestCreateAccount(t, env, email)
+	}
+
+	response := env.request(
+		t,
+		http.MethodGet,
+		"/admin/api/v1/accounts?query=PAGE-LIST&limit=1&offset=1",
+		nil,
+		"",
+		[]*http.Cookie{sessionCookie},
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("paged accounts status = %d; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Items      []adminAPIAccountDTO `json:"items"`
+			Pagination struct {
+				Limit   int  `json:"limit"`
+				Offset  int  `json:"offset"`
+				Total   int  `json:"total"`
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode paged accounts: %v; body=%s", err, response.Body.String())
+	}
+	if len(payload.Data.Items) != 1 || payload.Data.Items[0].Email != "bravo-page-list@icloud.com" {
+		t.Fatalf("paged accounts = %#v, want the second sorted account", payload.Data.Items)
+	}
+	if pagination := payload.Data.Pagination; pagination.Limit != 1 || pagination.Offset != 1 || pagination.Total != 3 || !pagination.HasMore {
+		t.Fatalf("accounts pagination = %#v", pagination)
+	}
+
+	invalidTargets := []string{
+		"/admin/api/v1/accounts?limit=0",
+		"/admin/api/v1/accounts?limit=201",
+		"/admin/api/v1/accounts?offset=-1",
+		"/admin/api/v1/accounts?offset=1000001",
+		"/admin/api/v1/accounts?query=" + url.QueryEscape(strings.Repeat("界", adminAPIMaxListQueryRunes+1)),
+	}
+	for _, target := range invalidTargets {
+		invalid := env.request(t, http.MethodGet, target, nil, "", []*http.Cookie{sessionCookie}, "")
+		if invalid.Code != http.StatusBadRequest || adminAPITestErrorCode(t, invalid) != "VALIDATION_FAILED" {
+			t.Fatalf("invalid account page %q = %d; body=%s", target, invalid.Code, invalid.Body.String())
+		}
 	}
 }
 

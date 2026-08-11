@@ -64,6 +64,12 @@ func (s *Server) adminAPIListApplicationLogs(c *gin.Context) {
 		"items":          items,
 		"has_more":       page.HasMore,
 		"next_before_id": page.NextBeforeID,
+		"pagination": gin.H{
+			"limit":    filter.Limit,
+			"offset":   filter.Offset,
+			"total":    page.Total,
+			"has_more": page.HasMore,
+		},
 	})
 }
 
@@ -105,6 +111,14 @@ func adminAPIApplicationLogFilter(c *gin.Context) (applog.Filter, bool) {
 	if !ok {
 		return applog.Filter{}, false
 	}
+	offset, ok := adminAPIQueryInt(c, "offset", 0, 0, adminAPIMaxPageOffset)
+	if !ok {
+		return applog.Filter{}, false
+	}
+	if offset > 0 && beforeID != 0 {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "offset 与 before_id 不能同时使用")
+		return applog.Filter{}, false
+	}
 
 	return applog.Filter{
 		Level:           level,
@@ -113,6 +127,7 @@ func adminAPIApplicationLogFilter(c *gin.Context) (applog.Filter, bool) {
 		SyncRunID:       syncRunID,
 		AutoCreateRunID: autoCreateRunID,
 		BeforeID:        beforeID,
+		Offset:          offset,
 		Limit:           limit,
 	}, true
 }

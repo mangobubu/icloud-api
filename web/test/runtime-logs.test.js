@@ -87,11 +87,11 @@ test("runtime logs normalize timestamps, levels, attributes, and promoted contex
   assert.equal(fieldsLog.requestId, "req-456");
 });
 
-test("runtime log pages normalize the cursor response", () => {
+test("runtime log pages normalize page totals while preserving flow cursors", () => {
   assert.deepEqual(
     normalizeRuntimeLogPage({
       items: [{ id: 9, timestamp: "2026-08-09T08:00:00Z", level: "INFO" }],
-      has_more: true,
+      pagination: { total: 91, limit: 50, offset: 50, has_more: true },
       next_before_id: 9,
     }),
     {
@@ -144,6 +144,9 @@ test("runtime log pages normalize the cursor response", () => {
       ],
       hasMore: true,
       nextBeforeId: 9,
+      total: 91,
+      limit: 50,
+      offset: 50,
     },
   );
 });
@@ -156,6 +159,7 @@ test("runtime log queries trim filters, encode values, and clamp limits", () => 
     syncRunId: "sync-run-7",
     autoCreateRunId: "auto-run-7",
     limit: 500,
+    offset: 175,
     beforeId: 91,
   });
   const parameters = new URLSearchParams(query);
@@ -167,6 +171,7 @@ test("runtime log queries trim filters, encode values, and clamp limits", () => 
     sync_run_id: "sync-run-7",
     auto_create_run_id: "auto-run-7",
     limit: "200",
+    offset: "175",
     before_id: "91",
   });
   assert.equal(buildRuntimeLogQuery({ limit: "invalid" }), "limit=50");

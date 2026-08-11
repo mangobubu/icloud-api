@@ -46,8 +46,11 @@
         <el-select
           v-model="filters.accountId"
           filterable
+          remote
+          reserve-keyword
           clearable
           :loading="accountsLoading"
+          :remote-method="searchAccounts"
           aria-label="按主号筛选日志"
           placeholder="全部主号"
           no-data-text="暂无主号"
@@ -125,15 +128,20 @@
         @close="loadError = null"
       />
 
-      <div class="data-panel desktop-data-table" :aria-busy="loading || loadingMore">
-        <el-table :data="logs" row-key="id" style="width: 100%">
-          <el-table-column label="时间" min-width="178">
-            <template #default="{ row }">
+      <div class="data-panel desktop-data-table" :aria-busy="loading">
+        <VirtualDataTable
+          :columns="runtimeLogColumns"
+          :data="logs"
+          row-key="id"
+          :height="560"
+          :row-height="68"
+          :loading="loading"
+        >
+          <template #cell="{ column, row }">
+            <template v-if="column.key === 'time'">
               {{ formatTime(row.time, { seconds: true }) }}
             </template>
-          </el-table-column>
-          <el-table-column label="级别" width="92">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'level'">
               <el-tag
                 class="runtime-log-level"
                 :type="runtimeLogLevelMeta(row.level).type"
@@ -143,29 +151,19 @@
                 {{ runtimeLogLevelMeta(row.level).label }}
               </el-tag>
             </template>
-          </el-table-column>
-          <el-table-column label="来源" min-width="150">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'source'">
               <code class="runtime-log-source">{{ row.source || "system" }}</code>
             </template>
-          </el-table-column>
-          <el-table-column label="消息" min-width="360">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'message'">
               <p class="runtime-log-message">{{ row.message || "-" }}</p>
             </template>
-          </el-table-column>
-          <el-table-column label="主号" min-width="170">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'accountId'">
               {{ accountLabel(row.accountId) }}
             </template>
-          </el-table-column>
-          <el-table-column label="请求编号" min-width="180">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'requestId'">
               <code class="runtime-log-request-id">{{ row.requestId || "-" }}</code>
             </template>
-          </el-table-column>
-          <el-table-column label="详情" width="70" align="right" fixed="right">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'actions'">
               <el-tooltip content="查看日志详情" placement="top">
                 <el-button
                   :icon="View"
@@ -175,12 +173,11 @@
                 />
               </el-tooltip>
             </template>
-          </el-table-column>
-        </el-table>
-        <div v-if="loading" class="table-loading-mask" aria-hidden="true"></div>
+          </template>
+        </VirtualDataTable>
       </div>
 
-      <div class="mobile-record-list" :aria-busy="loading || loadingMore">
+      <div class="mobile-record-list" :aria-busy="loading">
         <article v-for="log in logs" :key="log.id" class="mobile-record">
           <header class="mobile-record__header">
             <div class="primary-stack">
@@ -216,16 +213,14 @@
       </div>
 
       <div class="runtime-log-pagination" aria-live="polite">
-        <span>已显示 {{ logs.length }} 条</span>
-        <el-button
-          v-if="hasMore"
-          :loading="loadingMore"
-          :disabled="loading"
-          @click="loadMoreLogs"
-        >
-          加载更多
-        </el-button>
-        <span v-else>已显示全部日志</span>
+        <ListPagination
+          :page="currentPage"
+          :page-size="PAGE_SIZE"
+          :total="total"
+          :loading="loading"
+          aria-label="全部日志分页"
+          @change="handlePageChange"
+        />
       </div>
     </template>
 
@@ -260,25 +255,35 @@ import { useRoute, useRouter } from "vue-router";
 
 import {
   getAutoCreateLogRun,
-  getAccounts,
+  getAccountPage,
   getRuntimeLogRun,
   getRuntimeLogs,
 } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
+import ListPagination from "../components/ListPagination.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import RuntimeLogDetailDialog from "../components/RuntimeLogDetailDialog.vue";
 import SectionHeader from "../components/SectionHeader.vue";
+import VirtualDataTable from "../components/VirtualDataTable.vue";
 import { createLatestRequestGate } from "../utils/asyncState.js";
 import { formatTime } from "../utils/format.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
 import {
-  appendRuntimeLogPage,
   normalizeRuntimeLogLevel,
   runtimeLogLevelMeta,
 } from "../utils/runtimeLogs.js";
 
 const PAGE_SIZE = 50;
-const MAX_VISIBLE_LOGS = 2000;
+const ACCOUNT_OPTION_LIMIT = 50;
+const runtimeLogColumns = [
+  { key: "time", title: "时间", width: 178, flexGrow: 1 },
+  { key: "level", title: "级别", width: 92 },
+  { key: "source", title: "来源", width: 150, flexGrow: 1 },
+  { key: "message", title: "消息", width: 360, flexGrow: 3 },
+  { key: "accountId", title: "主号", width: 170, flexGrow: 1 },
+  { key: "requestId", title: "请求编号", width: 180, flexGrow: 1 },
+  { key: "actions", title: "详情", width: 70, align: "right", fixed: "right" },
+];
 const selectableLevels = new Set(["debug", "info", "warn", "error"]);
 const route = useRoute();
 const router = useRouter();
@@ -308,12 +313,11 @@ const filters = reactive({
 const keywordDraft = ref(initialFilters.query);
 const appliedKeyword = ref(initialFilters.query);
 const loading = ref(false);
-const loadingMore = ref(false);
 const loadError = ref(null);
 const accountsLoading = ref(false);
 const accountsLoadError = ref(null);
-const hasMore = ref(false);
-const nextBeforeId = ref(null);
+const currentPage = ref(1);
+const total = ref(0);
 const autoRefreshEnabled = ref(true);
 const detailVisible = ref(false);
 const selectedLog = ref(null);
@@ -322,9 +326,10 @@ const detailFlowLoading = ref(false);
 const detailFlowError = ref(null);
 const logRequestGate = createLatestRequestGate();
 const detailRequestGate = createLatestRequestGate();
+const accountLoadGate = createLatestRequestGate();
 let latestRequest = null;
 let latestRequestKey = "";
-let loadMoreGeneration = 0;
+let accountSearchTimer = null;
 let detailFlowAbortController = null;
 let viewActive = true;
 
@@ -346,38 +351,71 @@ function accountLabel(accountId) {
   return account?.email || `主号 #${accountId}`;
 }
 
-async function loadAccounts() {
+async function loadAccounts({ query = "" } = {}) {
+  const normalizedQuery = String(query || "").trim();
+  const ticket = accountLoadGate.begin(normalizedQuery);
   accountsLoading.value = true;
   accountsLoadError.value = null;
   try {
-    const nextAccounts = await getAccounts();
-    if (!viewActive) return;
-    accounts.value = nextAccounts;
+    const result = await getAccountPage({
+      limit: ACCOUNT_OPTION_LIMIT,
+      offset: 0,
+      query: normalizedQuery,
+    });
+    if (!viewActive || !accountLoadGate.isCurrent(ticket, normalizedQuery)) {
+      return;
+    }
+    const nextAccounts = Array.isArray(result?.items) ? result.items : [];
+    const selected = accounts.value.find(
+      (account) => String(account.id) === String(filters.accountId),
+    );
+    accounts.value =
+      selected &&
+      !nextAccounts.some(
+        (account) => String(account.id) === String(selected.id),
+      )
+        ? [selected, ...nextAccounts]
+        : nextAccounts;
   } catch (error) {
-    if (viewActive) accountsLoadError.value = error;
+    if (viewActive && accountLoadGate.isCurrent(ticket, normalizedQuery)) {
+      accountsLoadError.value = error;
+    }
   } finally {
-    if (viewActive) accountsLoading.value = false;
+    if (accountLoadGate.isCurrent(ticket, normalizedQuery)) {
+      accountsLoading.value = false;
+    }
   }
 }
 
-function currentRequestOptions(beforeId = "") {
+function searchAccounts(query) {
+  if (accountSearchTimer !== null) {
+    window.clearTimeout(accountSearchTimer);
+  }
+  accountSearchTimer = window.setTimeout(() => {
+    accountSearchTimer = null;
+    void loadAccounts({ query });
+  }, query ? 220 : 0);
+}
+
+function currentRequestOptions(page = currentPage.value) {
   return {
     level: filters.level,
     query: appliedKeyword.value,
     accountId: filters.accountId,
     limit: PAGE_SIZE,
-    beforeId,
+    offset: (page - 1) * PAGE_SIZE,
   };
 }
 
 function loadLatestLogs({ silent = false, force = false } = {}) {
   const filterKey = currentFilterKey.value;
-  if (!force && latestRequest && latestRequestKey === filterKey) {
+  const page = currentPage.value;
+  const requestKey = `${filterKey}\u0000${page}`;
+  if (!force && latestRequest && latestRequestKey === requestKey) {
     return latestRequest;
   }
-  if (loadingMore.value) return Promise.resolve(false);
 
-  const ticket = logRequestGate.begin(filterKey);
+  const ticket = logRequestGate.begin(requestKey);
   if (!silent) {
     loading.value = true;
     loadError.value = null;
@@ -385,16 +423,40 @@ function loadLatestLogs({ silent = false, force = false } = {}) {
 
   const request = (async () => {
     try {
-      const result = await getRuntimeLogs(currentRequestOptions());
-      if (!logRequestGate.isCurrent(ticket, currentFilterKey.value)) return false;
+      const result = await getRuntimeLogs(currentRequestOptions(page));
+      if (
+        !logRequestGate.isCurrent(
+          ticket,
+          `${currentFilterKey.value}\u0000${currentPage.value}`,
+        )
+      ) {
+        return false;
+      }
 
-      logs.value = result.items.slice(0, MAX_VISIBLE_LOGS);
-      hasMore.value = Boolean(result.hasMore && result.nextBeforeId != null);
-      nextBeforeId.value = result.nextBeforeId;
+      const items = Array.isArray(result?.items) ? result.items : [];
+      const reportedTotal = Number(result?.total);
+      const nextTotal = Number.isFinite(reportedTotal)
+        ? Math.max(0, reportedTotal)
+        : (page - 1) * PAGE_SIZE + items.length + (result?.hasMore ? 1 : 0);
+      const lastPage = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE));
+      if (page > lastPage) {
+        currentPage.value = lastPage;
+        logs.value = [];
+        total.value = nextTotal;
+        void loadLatestLogs({ force: true });
+        return false;
+      }
+      logs.value = items;
+      total.value = nextTotal;
       loadError.value = null;
       return true;
     } catch (error) {
-      if (logRequestGate.isCurrent(ticket, currentFilterKey.value)) {
+      if (
+        logRequestGate.isCurrent(
+          ticket,
+          `${currentFilterKey.value}\u0000${currentPage.value}`,
+        )
+      ) {
         loadError.value = error;
       }
       return false;
@@ -403,58 +465,20 @@ function loadLatestLogs({ silent = false, force = false } = {}) {
         latestRequest = null;
         latestRequestKey = "";
       }
-      if (!silent && logRequestGate.isCurrent(ticket, currentFilterKey.value)) {
+      if (
+        logRequestGate.isCurrent(
+          ticket,
+          `${currentFilterKey.value}\u0000${currentPage.value}`,
+        )
+      ) {
         loading.value = false;
       }
     }
   })();
 
   latestRequest = request;
-  latestRequestKey = filterKey;
+  latestRequestKey = requestKey;
   return request;
-}
-
-async function loadMoreLogs() {
-  if (
-    loadingMore.value ||
-    loading.value ||
-    latestRequest ||
-    !hasMore.value ||
-    nextBeforeId.value == null
-  ) {
-    return;
-  }
-
-  if (autoRefreshEnabled.value) {
-    autoRefreshEnabled.value = false;
-  }
-
-  const filterKey = currentFilterKey.value;
-  const cursor = nextBeforeId.value;
-  const ticket = logRequestGate.begin(filterKey);
-  const generation = ++loadMoreGeneration;
-  loadingMore.value = true;
-  try {
-    const result = await getRuntimeLogs(currentRequestOptions(cursor));
-    if (!logRequestGate.isCurrent(ticket, currentFilterKey.value)) return;
-    const nextPage = appendRuntimeLogPage(
-      logs.value,
-      result,
-      MAX_VISIBLE_LOGS,
-    );
-    logs.value = nextPage.items;
-    hasMore.value = nextPage.hasMore;
-    nextBeforeId.value = nextPage.nextBeforeId;
-    loadError.value = null;
-  } catch (error) {
-    if (logRequestGate.isCurrent(ticket, currentFilterKey.value)) {
-      loadError.value = error;
-    }
-  } finally {
-    if (generation === loadMoreGeneration) {
-      loadingMore.value = false;
-    }
-  }
 }
 
 function updateRouteQuery() {
@@ -467,11 +491,9 @@ function updateRouteQuery() {
 
 function reloadForFilters({ updateRoute = true } = {}) {
   logRequestGate.invalidate();
-  loadMoreGeneration += 1;
-  loadingMore.value = false;
-  hasMore.value = false;
-  nextBeforeId.value = null;
+  currentPage.value = 1;
   logs.value = [];
+  total.value = 0;
   loadError.value = null;
   if (updateRoute) updateRouteQuery();
   void loadLatestLogs({ force: true });
@@ -479,6 +501,19 @@ function reloadForFilters({ updateRoute = true } = {}) {
 
 function refreshLatestLogs() {
   return loadLatestLogs({ force: true });
+}
+
+function handlePageChange(page) {
+  const nextPage = Math.max(1, Number(page) || 1);
+  if (nextPage === currentPage.value) return;
+  if (nextPage > 1 && autoRefreshEnabled.value) {
+    autoRefreshEnabled.value = false;
+  }
+  currentPage.value = nextPage;
+  logs.value = [];
+  total.value = 0;
+  loadError.value = null;
+  void loadLatestLogs({ force: true });
 }
 
 function applyFilters() {
@@ -561,8 +596,6 @@ const liveRefresh = createLiveRefresh(() => loadLatestLogs({ silent: true }));
 watch(autoRefreshEnabled, (enabled) => {
   if (enabled) {
     logRequestGate.invalidate();
-    loadMoreGeneration += 1;
-    loadingMore.value = false;
     void loadLatestLogs({ force: true });
     void liveRefresh.start({ immediate: false });
   } else {
@@ -607,7 +640,12 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   viewActive = false;
+  if (accountSearchTimer !== null) {
+    window.clearTimeout(accountSearchTimer);
+    accountSearchTimer = null;
+  }
   logRequestGate.deactivate();
+  accountLoadGate.deactivate();
   detailFlowAbortController?.abort();
   detailRequestGate.deactivate();
   liveRefresh.stop();

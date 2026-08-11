@@ -8,8 +8,12 @@ import {
   getAliasAutoCreationKeys,
   getAutoCreateLogRun,
   getAccount,
+  getAccountPage,
   getAccounts,
+  getAliasPage,
+  getAllAliases,
   getAliases,
+  getAuditLogs,
   getRuntimeLogRun,
   getRuntimeLogs,
   loginAppleSession,
@@ -65,6 +69,42 @@ test("account list normalizes sync progress and detailed error logs", async () =
   assert.equal(accounts[1].syncProgress, null);
   assert.equal(accounts[1].lastSyncErrorLog, "");
   assert.equal(accounts[2].syncProgress, null);
+});
+
+test("account pages send server-side search and normalize pagination metadata", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      items: [{ id: 12, email: "owner@icloud.com", alias_count: 7 }],
+      pagination: { total: 73, limit: 50, offset: 50, has_more: false },
+    });
+  };
+
+  const page = await getAccountPage({
+    limit: 50,
+    offset: 50,
+    query: " owner ",
+  });
+  const url = new URL(request.url, "https://admin.invalid");
+
+  assert.equal(url.pathname, "/admin/api/v1/accounts");
+  assert.deepEqual(Object.fromEntries(url.searchParams), {
+    limit: "50",
+    offset: "50",
+    query: "owner",
+  });
+  assert.equal(request.options.method, "GET");
+  assert.deepEqual(
+    {
+      ids: page.items.map((account) => account.id),
+      total: page.total,
+      limit: page.limit,
+      offset: page.offset,
+      hasMore: page.hasMore,
+    },
+    { ids: [12], total: 73, limit: 50, offset: 50, hasMore: false },
+  );
 });
 
 test("account detail accepts camelCase progress and falls back to the sync error", async () => {
@@ -423,6 +463,91 @@ test("alias directory forwards the optional primary-account filter", async () =>
   assert.equal(all[0].address, "private@icloud.com");
 });
 
+test("alias pages apply the primary-account filter before server pagination", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      items: [
+        {
+          id: 8,
+          account_id: 12,
+          address: "private@icloud.com",
+          enabled: true,
+        },
+      ],
+      pagination: { total: 81, limit: 50, offset: 50, has_more: false },
+    });
+  };
+
+  const page = await getAliasPage(12, { limit: 50, offset: 50 });
+  const url = new URL(request.url, "https://admin.invalid");
+
+  assert.deepEqual(Object.fromEntries(url.searchParams), {
+    limit: "50",
+    offset: "50",
+    account_id: "12",
+  });
+  assert.equal(page.items[0].accountId, 12);
+  assert.deepEqual(
+    { total: page.total, limit: page.limit, offset: page.offset, hasMore: page.hasMore },
+    { total: 81, limit: 50, offset: 50, hasMore: false },
+  );
+});
+
+test("full alias export follows every server page for the selected account", async () => {
+  const requests = [];
+  const pages = [
+    {
+      items: [{ id: 2, account_id: 12, address: "second@icloud.com" }],
+      pagination: { total: 2, limit: 200, offset: 0, has_more: true },
+    },
+    {
+      items: [{ id: 1, account_id: 12, address: "first@icloud.com" }],
+      pagination: { total: 2, limit: 200, offset: 1, has_more: false },
+    },
+  ];
+  globalThis.fetch = async (url) => {
+    requests.push(new URL(url, "https://admin.invalid"));
+    return jsonResponse(pages.shift());
+  };
+
+  const aliases = await getAllAliases(12);
+
+  assert.deepEqual(aliases.map((alias) => alias.id), [2, 1]);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].searchParams.get("offset"), "0");
+  assert.equal(requests[1].searchParams.get("offset"), "1");
+  for (const request of requests) {
+    assert.equal(request.searchParams.get("limit"), "200");
+    assert.equal(request.searchParams.get("account_id"), "12");
+  }
+});
+
+test("audit pages preserve total, limit, offset, and has-more metadata", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      items: [{ id: 31, action: "update", created_at: "2026-08-09T08:00:00Z" }],
+      pagination: { total: 131, limit: 50, offset: 100, has_more: true },
+    });
+  };
+
+  const page = await getAuditLogs({ limit: 50, offset: 100 });
+  const url = new URL(request.url, "https://admin.invalid");
+
+  assert.deepEqual(Object.fromEntries(url.searchParams), {
+    limit: "50",
+    offset: "100",
+  });
+  assert.equal(page.items[0].createdAt, "2026-08-09T08:00:00Z");
+  assert.deepEqual(
+    { total: page.total, limit: page.limit, offset: page.offset, hasMore: page.hasMore },
+    { total: 131, limit: 50, offset: 100, hasMore: true },
+  );
+});
+
 test("pending mail sync accepts HTTP 202 and exposes continuation state", async () => {
   let request;
   globalThis.fetch = async (url, options) => {
@@ -610,7 +735,7 @@ test("alias directory sync normalizes its summary and one-time keys", async () =
   });
 });
 
-test("runtime logs use filter and cursor parameters and normalize the response", async () => {
+test("runtime log pages use offset filters and normalize pagination metadata", async () => {
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
@@ -643,8 +768,7 @@ test("runtime logs use filter and cursor parameters and normalize the response",
           },
         },
       ],
-      has_more: true,
-      next_before_id: 81,
+      pagination: { total: 481, limit: 50, offset: 100, has_more: true },
     });
   };
 
@@ -654,7 +778,7 @@ test("runtime logs use filter and cursor parameters and normalize the response",
     accountId: 12,
     autoCreateRunId: "auto-run-1",
     limit: 50,
-    beforeId: 90,
+    offset: 100,
   });
   const url = new URL(request.url, "https://admin.invalid");
 
@@ -665,7 +789,7 @@ test("runtime logs use filter and cursor parameters and normalize the response",
     account_id: "12",
     auto_create_run_id: "auto-run-1",
     limit: "50",
-    before_id: "90",
+    offset: "100",
   });
   assert.equal(request.options.method, "GET");
   assert.equal(result.items[0].time, "2026-08-09T08:00:00Z");
@@ -687,7 +811,10 @@ test("runtime logs use filter and cursor parameters and normalize the response",
   assert.equal(result.items[0].elapsedMs, 3821);
   assert.equal(result.items[0].scheduleAction, "continue");
   assert.equal(result.hasMore, true);
-  assert.equal(result.nextBeforeId, 81);
+  assert.equal(result.nextBeforeId, null);
+  assert.equal(result.total, 481);
+  assert.equal(result.limit, 50);
+  assert.equal(result.offset, 100);
 });
 
 test("sync run logs follow every cursor without inheriting list filters", async () => {

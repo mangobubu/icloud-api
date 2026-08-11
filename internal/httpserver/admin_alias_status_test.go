@@ -126,6 +126,25 @@ func TestAdminAliasPagesRenderPerAliasSyncStatus(t *testing.T) {
 	}
 }
 
+func TestLegacySyncPollingAcceptsPaginatedListPayloads(t *testing.T) {
+	t.Parallel()
+
+	asset, err := webAssets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatalf("read embedded admin script: %v", err)
+	}
+	source := string(asset)
+	for _, fragment := range []string{
+		"function syncListItems(data)",
+		"data && Array.isArray(data.items)",
+		"return syncListItems(data).map",
+	} {
+		if !strings.Contains(source, fragment) {
+			t.Fatalf("legacy sync polling is missing paginated-list support %q", fragment)
+		}
+	}
+}
+
 func TestLegacyPendingAliasIsLockedUntilDirectoryConfirmation(t *testing.T) {
 	env := newHTTPTestEnv(t)
 	account := env.createAccount(t, "Pending Confirmation", "pending-confirmation@icloud.com", "encrypted")

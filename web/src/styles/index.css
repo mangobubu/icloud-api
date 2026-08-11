@@ -424,6 +424,25 @@ code {
   background: rgb(255 255 255 / 52%);
 }
 
+.list-pagination {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.list-pagination__summary {
+  color: var(--text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.list-pagination .el-pagination {
+  margin: 0;
+}
+
 .load-failed {
   display: flex;
   align-items: flex-start;

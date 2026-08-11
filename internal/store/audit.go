@@ -21,6 +21,11 @@ type AuditLogFilter struct {
 	Offset       int
 }
 
+type AuditLogPage struct {
+	Items []domain.AuditLog
+	Total int
+}
+
 func (s *Store) CreateAuditLog(ctx context.Context, log domain.AuditLog) (domain.AuditLog, error) {
 	log.Username = truncate(log.Username, 128)
 	log.Action = truncate(log.Action, 64)
@@ -71,7 +76,55 @@ func (s *Store) ListAuditLogs(ctx context.Context, limit, offset int) ([]domain.
 	return s.ListAuditLogsFiltered(ctx, AuditLogFilter{Limit: limit, Offset: offset})
 }
 
+// ListAuditLogsPage returns one page and the total number of rows matching the
+// filters. The count deliberately uses the same predicates as the page query
+// so callers can render stable page controls without loading the history.
+func (s *Store) ListAuditLogsPage(ctx context.Context, filter AuditLogFilter) (AuditLogPage, error) {
+	filter = normalizeAuditLogFilter(filter)
+	where, filterArgs := auditLogWhere(filter)
+
+	var total int
+	if err := s.queryRowContext(ctx, `SELECT COUNT(*) FROM audit_logs`+where, filterArgs...).Scan(&total); err != nil {
+		return AuditLogPage{}, fmt.Errorf("count audit logs: %w", err)
+	}
+
+	query := `SELECT
+		id, admin_id, username, action, resource_type, resource_id,
+		result, ip, request_id, detail, created_at
+		FROM audit_logs` + where + ` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+	args := append(append([]any{}, filterArgs...), filter.Limit, filter.Offset)
+	rows, err := s.queryContext(ctx, query, args...)
+	if err != nil {
+		return AuditLogPage{}, fmt.Errorf("list audit logs page: %w", err)
+	}
+	defer rows.Close()
+
+	logs, err := scanAuditLogRows(rows, "iterate audit logs page")
+	if err != nil {
+		return AuditLogPage{}, err
+	}
+	return AuditLogPage{Items: logs, Total: total}, nil
+}
+
 func (s *Store) ListAuditLogsFiltered(ctx context.Context, filter AuditLogFilter) ([]domain.AuditLog, error) {
+	filter = normalizeAuditLogFilter(filter)
+	where, filterArgs := auditLogWhere(filter)
+	query := `SELECT
+		id, admin_id, username, action, resource_type, resource_id,
+		result, ip, request_id, detail, created_at
+		FROM audit_logs` + where + ` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`
+	args := append(append([]any{}, filterArgs...), filter.Limit, filter.Offset)
+
+	rows, err := s.queryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list audit logs: %w", err)
+	}
+	defer rows.Close()
+
+	return scanAuditLogRows(rows, "iterate audit logs")
+}
+
+func normalizeAuditLogFilter(filter AuditLogFilter) AuditLogFilter {
 	filter.Action = sanitizePostgresText(filter.Action)
 	filter.ResourceType = sanitizePostgresText(filter.ResourceType)
 	filter.Result = sanitizePostgresText(filter.Result)
@@ -84,12 +137,10 @@ func (s *Store) ListAuditLogsFiltered(ctx context.Context, filter AuditLogFilter
 	if filter.Offset < 0 {
 		filter.Offset = 0
 	}
+	return filter
+}
 
-	query := strings.Builder{}
-	query.WriteString(`SELECT
-		id, admin_id, username, action, resource_type, resource_id,
-		result, ip, request_id, detail, created_at
-		FROM audit_logs`)
+func auditLogWhere(filter AuditLogFilter) (string, []any) {
 	var conditions []string
 	var args []any
 	if filter.AdminID != nil {
@@ -116,19 +167,13 @@ func (s *Store) ListAuditLogsFiltered(ctx context.Context, filter AuditLogFilter
 		conditions = append(conditions, "created_at < ?")
 		args = append(args, timestamp(*filter.Until))
 	}
-	if len(conditions) > 0 {
-		query.WriteString(" WHERE ")
-		query.WriteString(strings.Join(conditions, " AND "))
+	if len(conditions) == 0 {
+		return "", args
 	}
-	query.WriteString(" ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?")
-	args = append(args, filter.Limit, filter.Offset)
+	return " WHERE " + strings.Join(conditions, " AND "), args
+}
 
-	rows, err := s.queryContext(ctx, query.String(), args...)
-	if err != nil {
-		return nil, fmt.Errorf("list audit logs: %w", err)
-	}
-	defer rows.Close()
-
+func scanAuditLogRows(rows *sql.Rows, iterateLabel string) ([]domain.AuditLog, error) {
 	var logs []domain.AuditLog
 	for rows.Next() {
 		var log domain.AuditLog
@@ -148,7 +193,7 @@ func (s *Store) ListAuditLogsFiltered(ctx context.Context, filter AuditLogFilter
 		logs = append(logs, log)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate audit logs: %w", err)
+		return nil, fmt.Errorf("%s: %w", iterateLabel, err)
 	}
 	return logs, nil
 }

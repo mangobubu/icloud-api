@@ -185,19 +185,18 @@
         </dl>
 
         <div class="data-panel batch-secret-table">
-          <el-table
+          <VirtualDataTable
+            :columns="batchSecretColumns"
             :data="batchSecrets"
-            :height="420"
             row-key="address"
-            style="width: 100%"
+            :height="420"
+            :row-height="64"
           >
-            <el-table-column label="隐私邮箱" min-width="220">
-              <template #default="{ row }">
+            <template #cell="{ column, rowData: row }">
+              <template v-if="column.key === 'address'">
                 <strong class="batch-secret-value">{{ row.address }}</strong>
               </template>
-            </el-table-column>
-            <el-table-column label="API Key" min-width="300">
-              <template #default="{ row }">
+              <template v-else-if="column.key === 'apiKey'">
                 <div class="batch-secret-copy">
                   <code>{{ row.apiKey }}</code>
                   <el-tooltip content="复制 API Key" placement="top">
@@ -210,9 +209,7 @@
                   </el-tooltip>
                 </div>
               </template>
-            </el-table-column>
-            <el-table-column label="邮件 API 直达链接" min-width="360">
-              <template #default="{ row }">
+              <template v-else-if="column.key === 'mailApiDirectLink'">
                 <div class="batch-secret-copy">
                   <code>{{ row.mailApiDirectLink }}</code>
                   <el-tooltip content="复制直达链接" placement="top">
@@ -225,8 +222,8 @@
                   </el-tooltip>
                 </div>
               </template>
-            </el-table-column>
-          </el-table>
+            </template>
+          </VirtualDataTable>
         </div>
 
         <template #footer>
@@ -469,25 +466,28 @@
         </div>
 
         <div v-if="aliases.length" class="data-panel desktop-data-table">
-          <el-table :data="aliases" row-key="id" style="width: 100%">
-            <el-table-column label="隐私邮箱" min-width="230">
-              <template #default="{ row }">
+          <VirtualDataTable
+            :columns="aliasColumns"
+            :data="aliases"
+            row-key="id"
+            :height="520"
+            :row-height="64"
+            :loading="loading"
+          >
+            <template #cell="{ column, rowData: row }">
+              <template v-if="column.key === 'address'">
                 <div class="primary-stack">
                   <strong>{{ row.address }}</strong>
                   <small>{{ row.label || "未填写用途备注" }}</small>
                 </div>
               </template>
-            </el-table-column>
-            <el-table-column label="API Key" min-width="126">
-              <template #default="{ row }">
+              <template v-else-if="column.key === 'apiKey'">
                 <code class="key-prefix">{{ keyPrefix(row) }}</code>
               </template>
-            </el-table-column>
-            <el-table-column label="最新邮件" min-width="170">
-              <template #default="{ row }">{{ formatTime(row.latestReceivedAt) }}</template>
-            </el-table-column>
-            <el-table-column label="同步状态" min-width="130">
-              <template #default="{ row }">
+              <template v-else-if="column.key === 'latestReceivedAt'">
+                {{ formatTime(row.latestReceivedAt) }}
+              </template>
+              <template v-else-if="column.key === 'syncStatus'">
                 <el-tag
                   v-if="isAliasConfirmationPending(row)"
                   type="warning"
@@ -498,9 +498,7 @@
                 </el-tag>
                 <SyncStatus v-else :item="row" details />
               </template>
-            </el-table-column>
-            <el-table-column label="启用" width="82" align="center">
-              <template #default="{ row }">
+              <template v-else-if="column.key === 'enabled'">
                 <el-switch
                   v-if="!isAliasConfirmationPending(row)"
                   :model-value="row.enabled"
@@ -510,9 +508,7 @@
                   @change="(enabled) => toggleAlias(row, enabled)"
                 />
               </template>
-            </el-table-column>
-            <el-table-column label="操作" width="144" align="right">
-              <template #default="{ row }">
+              <template v-else-if="column.key === 'actions'">
                 <div
                   v-if="!isAliasConfirmationPending(row)"
                   class="icon-action-row"
@@ -551,8 +547,8 @@
                   </el-tooltip>
                 </div>
               </template>
-            </el-table-column>
-          </el-table>
+            </template>
+          </VirtualDataTable>
         </div>
 
         <div v-if="aliases.length" class="mobile-record-list">
@@ -754,6 +750,7 @@ import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncErrorLogDialog from "../components/SyncErrorLogDialog.vue";
 import SyncStatus from "../components/SyncStatus.vue";
+import VirtualDataTable from "../components/VirtualDataTable.vue";
 import { useAuth } from "../stores/auth.js";
 import { setPageHeader } from "../stores/page.js";
 import {
@@ -843,6 +840,78 @@ const appleVerificationRules = {
     },
   ],
 };
+const batchSecretColumns = Object.freeze([
+  {
+    key: "address",
+    dataKey: "address",
+    title: "隐私邮箱",
+    width: 220,
+    minWidth: 220,
+    flexGrow: 1,
+  },
+  {
+    key: "apiKey",
+    dataKey: "apiKey",
+    title: "API Key",
+    width: 300,
+    minWidth: 300,
+    flexGrow: 1,
+  },
+  {
+    key: "mailApiDirectLink",
+    dataKey: "mailApiDirectLink",
+    title: "邮件 API 直达链接",
+    width: 360,
+    minWidth: 360,
+    flexGrow: 1,
+  },
+]);
+const aliasColumns = Object.freeze([
+  {
+    key: "address",
+    dataKey: "address",
+    title: "隐私邮箱",
+    width: 230,
+    minWidth: 230,
+    flexGrow: 1,
+  },
+  {
+    key: "apiKey",
+    title: "API Key",
+    width: 126,
+    minWidth: 126,
+  },
+  {
+    key: "latestReceivedAt",
+    dataKey: "latestReceivedAt",
+    title: "最新邮件",
+    width: 170,
+    minWidth: 170,
+    flexGrow: 1,
+  },
+  {
+    key: "syncStatus",
+    title: "同步状态",
+    width: 130,
+    minWidth: 130,
+    flexGrow: 1,
+  },
+  {
+    key: "enabled",
+    dataKey: "enabled",
+    title: "启用",
+    width: 82,
+    minWidth: 82,
+    align: "center",
+  },
+  {
+    key: "actions",
+    title: "操作",
+    width: 144,
+    minWidth: 144,
+    align: "right",
+  },
+]);
 const AUTO_CREATION_KEY_ACK_BATCH_SIZE = 1000;
 const appleSessionAuthenticated = computed(
   () => appleSession.value?.status === "authenticated",

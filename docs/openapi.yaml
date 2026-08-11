@@ -1071,8 +1071,9 @@ paths:
       description: |
         返回当前应用进程环形缓冲区中保留的最近最多 2000 条日志，按 `id` 从新到旧排列。
         环形缓冲区还受总字节数限制，较大的记录可能使更早日志在达到 2000 条前被覆盖。
-        可按级别、关键词、主号、`sync_run_id` 和 `auto_create_run_id` 筛选，并使用排他的
-        `before_id` 游标向更早的记录翻页。
+        可按级别、关键词、主号、`sync_run_id` 和 `auto_create_run_id` 筛选。使用排他的
+        `before_id` 游标向更早的记录翻页，或使用 `offset` 浏览筛选结果中的固定窗口；
+        `offset` 大于 0 时不能同时提供 `before_id`。
 
         邮件同步流程为每次逻辑同步分配一个 `sync_run_id`；同一次追平任务的多个批次继续使用同一值。
         每个被任务认领的自动创建计划槽分配一个 `auto_create_run_id`。两个运行标识都按结构化字段
@@ -1152,6 +1153,17 @@ paths:
           schema:
             type: integer
             minimum: 1
+        - name: offset
+          in: query
+          required: false
+          description: |
+            在筛选结果中跳过的日志数，默认 0，最大 1000000。`offset` 大于 0 时不能与
+            `before_id` 同时使用。
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+            default: 0
       responses:
         "200":
           description: 当前筛选条件下的一页应用日志
@@ -1165,7 +1177,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminApplicationLogListResponse"
         "400":
-          description: level、query、account_id、sync_run_id、auto_create_run_id、limit 或 before_id 参数无效
+          description: level、query、account_id、sync_run_id、auto_create_run_id、limit、offset 或 before_id 参数无效
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -2202,6 +2214,7 @@ components:
         - items
         - has_more
         - next_before_id
+        - pagination
       properties:
         items:
           type: array
@@ -2214,6 +2227,35 @@ components:
           type: integer
           minimum: 0
           description: 下一页请求使用的 before_id；没有下一页时为 0。
+        pagination:
+          $ref: "#/components/schemas/AdminApplicationLogPagination"
+
+    AdminApplicationLogPagination:
+      type: object
+      additionalProperties: false
+      required:
+        - limit
+        - offset
+        - total
+        - has_more
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 200
+          description: 当前请求的每页上限。
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: 当前请求跳过的筛选结果数。
+        total:
+          type: integer
+          minimum: 0
+          description: 不受 before_id 和 offset 影响的完整筛选结果数。
+        has_more:
+          type: boolean
+          description: 当前页之后是否仍有可返回的日志。
 
     AdminApplicationLog:
       type: object

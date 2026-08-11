@@ -53,8 +53,9 @@ type Entry struct {
 }
 
 // Filter selects entries from newest to oldest. BeforeID is exclusive; zero
-// starts at the newest retained entry. Level is empty for all levels or a slog
-// level name such as INFO, WARN, or ERROR.
+// starts at the newest retained entry. Offset skips matching entries after the
+// cursor is applied. Level is empty for all levels or a slog level name such as
+// INFO, WARN, or ERROR.
 type Filter struct {
 	Level           string
 	Query           string
@@ -62,14 +63,17 @@ type Filter struct {
 	SyncRunID       string
 	AutoCreateRunID string
 	BeforeID        uint64
+	Offset          int
 	Limit           int
 }
 
-// Page is one reverse-chronological cursor page.
+// Page is one reverse-chronological page. Total counts all retained entries
+// matching the non-pagination filters, independent of BeforeID and Offset.
 type Page struct {
 	Items        []Entry
 	HasMore      bool
 	NextBeforeID uint64
+	Total        int
 }
 
 type limits struct {
@@ -241,6 +245,10 @@ func (h *Handler) List(filter Filter) Page {
 	if limit > MaxListLimit {
 		limit = MaxListLimit
 	}
+	offset := filter.Offset
+	if offset < 0 {
+		offset = 0
+	}
 
 	level, levelSet, valid := parseLevel(filter.Level)
 	if !valid {
@@ -250,12 +258,10 @@ func (h *Handler) List(filter Filter) Page {
 
 	h.ring.mu.RLock()
 	defer h.ring.mu.RUnlock()
-	for offset := 0; offset < h.ring.count; offset++ {
-		index := (h.ring.head + h.ring.count - 1 - offset) % len(h.ring.entries)
+	eligible := 0
+	for ringOffset := 0; ringOffset < h.ring.count; ringOffset++ {
+		index := (h.ring.head + h.ring.count - 1 - ringOffset) % len(h.ring.entries)
 		candidate := h.ring.entries[index].entry
-		if filter.BeforeID != 0 && candidate.ID >= filter.BeforeID {
-			continue
-		}
 		if levelSet && !matchesLevel(candidate.Level, level) {
 			continue
 		}
@@ -271,12 +277,24 @@ func (h *Handler) List(filter Filter) Page {
 		if query != "" && !entryContains(candidate, query) {
 			continue
 		}
-		if len(page.Items) == limit {
+
+		page.Total++
+		if filter.BeforeID != 0 && candidate.ID >= filter.BeforeID {
+			continue
+		}
+		if eligible < offset {
+			eligible++
+			continue
+		}
+		eligible++
+		if len(page.Items) >= limit {
 			page.HasMore = true
-			page.NextBeforeID = page.Items[len(page.Items)-1].ID
-			break
+			continue
 		}
 		page.Items = append(page.Items, cloneEntry(candidate))
+	}
+	if page.HasMore && len(page.Items) > 0 {
+		page.NextBeforeID = page.Items[len(page.Items)-1].ID
 	}
 	return page
 }

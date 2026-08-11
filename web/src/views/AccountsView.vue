@@ -49,30 +49,29 @@
       />
 
       <div class="data-panel desktop-data-table" :aria-busy="loading">
-        <el-table :data="accounts" row-key="id" style="width: 100%">
-          <el-table-column label="主号" min-width="250">
-            <template #default="{ row }">
+        <VirtualDataTable
+          :columns="accountColumns"
+          :data="accounts"
+          row-key="id"
+          :loading="loading"
+        >
+          <template #cell="{ column, row }">
+            <template v-if="column.key === 'account'">
               <div class="primary-stack">
                 <strong>{{ row.email }}</strong>
                 <small>{{ row.name || "未填写备注" }}</small>
               </div>
             </template>
-          </el-table-column>
-          <el-table-column label="状态" min-width="120">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'status'">
               <SyncStatus :item="row" />
             </template>
-          </el-table-column>
-          <el-table-column label="隐私邮箱" width="112" align="center">
-            <template #default="{ row }">{{ row.aliasCount }}</template>
-          </el-table-column>
-          <el-table-column label="最近同步" min-width="170">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'aliasCount'">
+              {{ row.aliasCount }}
+            </template>
+            <template v-else-if="column.key === 'lastSyncedAt'">
               {{ formatTime(row.lastSyncedAt, { seconds: true }) }}
             </template>
-          </el-table-column>
-          <el-table-column label="操作" width="118" align="right">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'actions'">
               <el-button
                 link
                 type="primary"
@@ -82,9 +81,8 @@
                 管理
               </el-button>
             </template>
-          </el-table-column>
-        </el-table>
-        <div v-if="loading" class="table-loading-mask" aria-hidden="true"></div>
+          </template>
+        </VirtualDataTable>
       </div>
 
       <div class="mobile-record-list" :aria-busy="loading">
@@ -113,6 +111,15 @@
           </footer>
         </article>
       </div>
+
+      <ListPagination
+        :page="currentPage"
+        :page-size="PAGE_SIZE"
+        :total="total"
+        :loading="loading"
+        aria-label="主号列表分页"
+        @change="handlePageChange"
+      />
     </template>
   </section>
 </template>
@@ -122,43 +129,77 @@ import { Plus, Refresh, Setting } from "@element-plus/icons-vue";
 import { onBeforeUnmount, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 
-import { getAccounts } from "../api/admin.js";
+import { getAccountPage } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
+import ListPagination from "../components/ListPagination.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncStatus from "../components/SyncStatus.vue";
+import VirtualDataTable from "../components/VirtualDataTable.vue";
 import { formatTime } from "../utils/format.js";
+import { createLatestRequestGate } from "../utils/asyncState.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
 
 const router = useRouter();
+const PAGE_SIZE = 50;
+const accountColumns = [
+  { key: "account", title: "主号", width: 250, flexGrow: 3 },
+  { key: "status", title: "状态", width: 140, flexGrow: 1 },
+  { key: "aliasCount", title: "隐私邮箱", width: 112, align: "center" },
+  { key: "lastSyncedAt", title: "最近同步", width: 180, flexGrow: 1 },
+  { key: "actions", title: "操作", width: 118, align: "right", fixed: "right" },
+];
 const accounts = ref([]);
+const currentPage = ref(1);
+const total = ref(0);
 const loading = ref(false);
 const loadError = ref(null);
-let refreshInFlight = false;
+const loadGate = createLatestRequestGate();
 let viewActive = true;
 
 async function loadAccounts({ silent = false } = {}) {
-  if (refreshInFlight) return;
-  refreshInFlight = true;
+  const page = currentPage.value;
+  const ticket = loadGate.begin(page);
   if (!silent) {
     loading.value = true;
     loadError.value = null;
   }
   try {
-    const nextAccounts = await getAccounts();
-    if (!viewActive) return;
-    accounts.value = nextAccounts;
+    const result = await getAccountPage({
+      limit: PAGE_SIZE,
+      offset: (page - 1) * PAGE_SIZE,
+    });
+    if (!viewActive || !loadGate.isCurrent(ticket, currentPage.value)) return;
+    const nextTotal = Math.max(0, Number(result?.total) || 0);
+    const lastPage = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE));
+    if (page > lastPage) {
+      currentPage.value = lastPage;
+      accounts.value = [];
+      total.value = nextTotal;
+      void loadAccounts();
+      return;
+    }
+    accounts.value = Array.isArray(result?.items) ? result.items : [];
+    total.value = nextTotal;
     loadError.value = null;
   } catch (error) {
-    if (viewActive && !silent) {
+    if (viewActive && loadGate.isCurrent(ticket, currentPage.value) && !silent) {
       loadError.value = error;
     }
   } finally {
-    refreshInFlight = false;
-    if (!silent) {
+    if (loadGate.isCurrent(ticket, currentPage.value)) {
       loading.value = false;
     }
   }
+}
+
+function handlePageChange(page) {
+  const nextPage = Math.max(1, Number(page) || 1);
+  if (nextPage === currentPage.value) return;
+  currentPage.value = nextPage;
+  accounts.value = [];
+  loadError.value = null;
+  void loadAccounts();
 }
 
 const liveRefresh = createLiveRefresh(() => loadAccounts({ silent: true }));
@@ -178,6 +219,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   viewActive = false;
+  loadGate.deactivate();
   liveRefresh.stop();
 });
 </script>

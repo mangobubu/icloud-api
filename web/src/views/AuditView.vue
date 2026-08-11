@@ -2,7 +2,7 @@
   <section class="page-stack" aria-labelledby="audit-section-title">
     <SectionHeader
       id="audit-section-title"
-      title="最近操作"
+      title="操作记录"
       description="记录后台登录与配置变更，不包含密码、完整 Key 或邮件内容。"
     >
       <template #actions>
@@ -42,27 +42,26 @@
       />
 
       <div class="data-panel desktop-data-table" :aria-busy="loading">
-        <el-table :data="logs" row-key="id" style="width: 100%">
-          <el-table-column label="时间" min-width="176">
-            <template #default="{ row }">
+        <VirtualDataTable
+          :columns="auditColumns"
+          :data="logs"
+          row-key="id"
+          :loading="loading"
+        >
+          <template #cell="{ column, row }">
+            <template v-if="column.key === 'createdAt'">
               {{ formatTime(row.createdAt, { seconds: true }) }}
             </template>
-          </el-table-column>
-          <el-table-column label="管理员" min-width="130">
-            <template #default="{ row }">{{ row.username || "系统" }}</template>
-          </el-table-column>
-          <el-table-column label="操作" min-width="142">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'username'">
+              {{ row.username || "系统" }}
+            </template>
+            <template v-else-if="column.key === 'action'">
               <strong class="audit-action">{{ actionLabel(row.action) }}</strong>
             </template>
-          </el-table-column>
-          <el-table-column label="对象" min-width="150">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'resource'">
               {{ resourceLabel(row.resourceType, row.resourceId) }}
             </template>
-          </el-table-column>
-          <el-table-column label="结果" width="92">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'result'">
               <el-tag
                 class="audit-result"
                 :type="resultMeta(row.result).type"
@@ -72,14 +71,11 @@
                 {{ resultMeta(row.result).label }}
               </el-tag>
             </template>
-          </el-table-column>
-          <el-table-column label="请求编号" min-width="180">
-            <template #default="{ row }">
+            <template v-else-if="column.key === 'requestId'">
               <code class="audit-request-id">{{ row.requestId || "-" }}</code>
             </template>
-          </el-table-column>
-        </el-table>
-        <div v-if="loading" class="table-loading-mask" aria-hidden="true"></div>
+          </template>
+        </VirtualDataTable>
       </div>
 
       <div class="mobile-record-list" :aria-busy="loading">
@@ -114,18 +110,30 @@
           </dl>
         </article>
       </div>
+
+      <ListPagination
+        :page="currentPage"
+        :page-size="PAGE_SIZE"
+        :total="total"
+        :loading="loading"
+        aria-label="操作记录分页"
+        @change="handlePageChange"
+      />
     </template>
   </section>
 </template>
 
 <script setup>
 import { Refresh } from "@element-plus/icons-vue";
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 
 import { getAuditLogs } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
+import ListPagination from "../components/ListPagination.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
+import VirtualDataTable from "../components/VirtualDataTable.vue";
+import { createLatestRequestGate } from "../utils/asyncState.js";
 import { formatTime } from "../utils/format.js";
 
 const actionLabels = {
@@ -151,9 +159,22 @@ const resultLabels = {
   failed: { label: "失败", type: "danger" },
 };
 
+const PAGE_SIZE = 50;
+const auditColumns = [
+  { key: "createdAt", title: "时间", width: 176, flexGrow: 1 },
+  { key: "username", title: "管理员", width: 130, flexGrow: 1 },
+  { key: "action", title: "操作", width: 142, flexGrow: 1 },
+  { key: "resource", title: "对象", width: 150, flexGrow: 1 },
+  { key: "result", title: "结果", width: 92 },
+  { key: "requestId", title: "请求编号", width: 180, flexGrow: 1 },
+];
 const logs = ref([]);
+const currentPage = ref(1);
+const total = ref(0);
 const loading = ref(false);
 const loadError = ref(null);
+const loadGate = createLatestRequestGate();
+let viewActive = true;
 
 function actionLabel(action) {
   return actionLabels[action] || action || "未知操作";
@@ -172,19 +193,53 @@ function resultMeta(result) {
 }
 
 async function loadAuditLogs() {
-  if (loading.value) return;
+  const page = currentPage.value;
+  const ticket = loadGate.begin(page);
   loading.value = true;
   loadError.value = null;
   try {
-    logs.value = await getAuditLogs();
+    const result = await getAuditLogs({
+      limit: PAGE_SIZE,
+      offset: (page - 1) * PAGE_SIZE,
+    });
+    if (!viewActive || !loadGate.isCurrent(ticket, currentPage.value)) return;
+    const nextTotal = Math.max(0, Number(result?.total) || 0);
+    const lastPage = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE));
+    if (page > lastPage) {
+      currentPage.value = lastPage;
+      logs.value = [];
+      total.value = nextTotal;
+      void loadAuditLogs();
+      return;
+    }
+    logs.value = Array.isArray(result?.items) ? result.items : [];
+    total.value = nextTotal;
   } catch (error) {
-    loadError.value = error;
+    if (viewActive && loadGate.isCurrent(ticket, currentPage.value)) {
+      loadError.value = error;
+    }
   } finally {
-    loading.value = false;
+    if (loadGate.isCurrent(ticket, currentPage.value)) {
+      loading.value = false;
+    }
   }
 }
 
+function handlePageChange(page) {
+  const nextPage = Math.max(1, Number(page) || 1);
+  if (nextPage === currentPage.value) return;
+  currentPage.value = nextPage;
+  logs.value = [];
+  loadError.value = null;
+  void loadAuditLogs();
+}
+
 onMounted(loadAuditLogs);
+
+onBeforeUnmount(() => {
+  viewActive = false;
+  loadGate.deactivate();
+});
 </script>
 
 <style scoped>

@@ -123,7 +123,10 @@ test("all aliases view withholds pending confirmation links and exports", async 
   );
   assert.equal(isAliasExportable({ enabled: true, directLinkPath: "" }), false);
 
-  assert.match(source, /:selectable="isAliasExportable"/);
+  assert.match(source, /:disabled="!isAliasExportable\(row\)"/);
+  assert.match(source, /:model-value="allExportableAliasesSelected"/);
+  assert.match(source, /:indeterminate="someExportableAliasesSelected"/);
+  assert.match(source, /function setAllAliasesSelected/);
   assert.match(source, /:disabled="!isAliasExportable\(alias\)"/);
   assert.match(
     source,
@@ -141,8 +144,10 @@ test("all aliases view withholds pending confirmation links and exports", async 
   );
   assert.match(
     functionBody(source, "function exportAllAliases"),
-    /exportableAliases\.value/,
+    /getAllAliases\(selectedAccountId\.value\)/,
   );
+  assert.match(source, /:loading="exportingAll"/);
+  assert.match(source, /exportingAll\.value = true/);
   assert.match(
     functionBody(source, "async function copyAliasDirectLink"),
     /!isAliasExportable\(alias\)/,

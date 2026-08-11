@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -15,6 +16,17 @@ const accountColumns = `
 	a.password_ciphertext, a.enabled, a.last_sync_status, a.last_sync_error,
 	a.last_synced_at, a.created_at, a.updated_at,
 	(SELECT COUNT(*) FROM aliases al WHERE al.account_id = a.id) AS alias_count`
+
+type AccountListFilter struct {
+	Query  string
+	Limit  int
+	Offset int
+}
+
+type AccountPage struct {
+	Items []domain.Account
+	Total int
+}
 
 func (s *Store) CreateAccount(ctx context.Context, account domain.Account) (domain.Account, error) {
 	now := s.now()
@@ -173,6 +185,56 @@ func (s *Store) ListAccounts(ctx context.Context) ([]domain.Account, error) {
 	return s.listAccounts(ctx, false)
 }
 
+// ListAccountsPage returns one administrator-facing page and the total number
+// of accounts matching Query. Query is a case-insensitive literal substring
+// match against account email and name.
+func (s *Store) ListAccountsPage(ctx context.Context, filter AccountListFilter) (AccountPage, error) {
+	if err := validateListPage(filter.Limit, filter.Offset); err != nil {
+		return AccountPage{}, fmt.Errorf("list accounts page: %w", err)
+	}
+
+	predicate := ""
+	var filterArgs []any
+	if query := strings.TrimSpace(sanitizePostgresText(filter.Query)); query != "" {
+		pattern := "%" + escapeLikePattern(query) + "%"
+		predicate = ` WHERE (
+			LOWER(a.email) LIKE LOWER(?) ESCAPE '!'
+			OR LOWER(a.name) LIKE LOWER(?) ESCAPE '!'
+		)`
+		filterArgs = append(filterArgs, pattern, pattern)
+	}
+
+	var total int
+	if err := s.queryRowContext(ctx,
+		`SELECT COUNT(*) FROM accounts a`+predicate,
+		filterArgs...,
+	).Scan(&total); err != nil {
+		return AccountPage{}, fmt.Errorf("count accounts page: %w", err)
+	}
+
+	query := `SELECT ` + accountColumns + ` FROM accounts a` + predicate +
+		` ORDER BY a.email, a.id LIMIT ? OFFSET ?`
+	args := append(append([]any{}, filterArgs...), filter.Limit, filter.Offset)
+	rows, err := s.queryContext(ctx, query, args...)
+	if err != nil {
+		return AccountPage{}, fmt.Errorf("list accounts page: %w", err)
+	}
+	defer rows.Close()
+
+	accounts := make([]domain.Account, 0, filter.Limit)
+	for rows.Next() {
+		account, err := scanAccount(rows)
+		if err != nil {
+			return AccountPage{}, err
+		}
+		accounts = append(accounts, account)
+	}
+	if err := rows.Err(); err != nil {
+		return AccountPage{}, fmt.Errorf("iterate accounts page: %w", err)
+	}
+	return AccountPage{Items: accounts, Total: total}, nil
+}
+
 func (s *Store) ListEnabledAccounts(ctx context.Context) ([]domain.Account, error) {
 	return s.listAccounts(ctx, true)
 }
@@ -203,6 +265,24 @@ func (s *Store) listAccounts(ctx context.Context, enabledOnly bool) ([]domain.Ac
 		return nil, fmt.Errorf("iterate accounts: %w", err)
 	}
 	return accounts, nil
+}
+
+func validateListPage(limit, offset int) error {
+	if limit < 1 {
+		return errors.New("limit must be positive")
+	}
+	if offset < 0 {
+		return errors.New("offset must not be negative")
+	}
+	return nil
+}
+
+func escapeLikePattern(value string) string {
+	return strings.NewReplacer(
+		"!", "!!",
+		"%", "!%",
+		"_", "!_",
+	).Replace(value)
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id int64) error {

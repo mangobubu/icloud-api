@@ -27,6 +27,68 @@ function listFrom(data, ...keys) {
   return [];
 }
 
+function integerAtLeast(value, minimum, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= minimum
+    ? Math.trunc(number)
+    : fallback;
+}
+
+function normalizeListPage(data, normalizer, keys = [], options = {}) {
+  const rawItems = listFrom(data, ...keys);
+  const pagination =
+    data && !Array.isArray(data) && typeof data.pagination === "object"
+      ? data.pagination || {}
+      : {};
+  const offset = integerAtLeast(
+    firstDefined(pagination, "offset", "Offset") ??
+      firstDefined(data, "offset", "Offset"),
+    0,
+    integerAtLeast(options.offset, 0, 0),
+  );
+  const limit = integerAtLeast(
+    firstDefined(pagination, "limit", "Limit") ??
+      firstDefined(data, "limit", "Limit"),
+    1,
+    integerAtLeast(options.limit, 1, rawItems.length || 50),
+  );
+  const explicitTotal = Number(
+    firstDefined(pagination, "total", "Total") ??
+      firstDefined(data, "total", "Total"),
+  );
+  const explicitHasMore =
+    firstDefined(pagination, "has_more", "hasMore", "HasMore") ??
+    firstDefined(data, "has_more", "hasMore", "HasMore");
+  const total =
+    Number.isFinite(explicitTotal) && explicitTotal >= 0
+      ? Math.trunc(explicitTotal)
+      : offset + rawItems.length + (explicitHasMore ? 1 : 0);
+
+  return {
+    items: rawItems.map(normalizer),
+    total,
+    limit,
+    offset,
+    hasMore:
+      explicitHasMore === undefined
+        ? offset + rawItems.length < total
+        : Boolean(explicitHasMore),
+  };
+}
+
+function listQuery(options = {}, extra = {}) {
+  const parameters = new URLSearchParams();
+  const limit = Math.min(200, integerAtLeast(options.limit, 1, 50));
+  const offset = Math.min(1_000_000, integerAtLeast(options.offset, 0, 0));
+  parameters.set("limit", String(limit));
+  parameters.set("offset", String(offset));
+  for (const [key, rawValue] of Object.entries(extra)) {
+    const value = String(rawValue ?? "").trim();
+    if (value) parameters.set(key, value);
+  }
+  return parameters.toString();
+}
+
 export function normalizeAccount(raw = {}) {
   const lastSyncError =
     firstDefined(raw, "last_sync_error", "lastSyncError", "LastSyncError") ||
@@ -297,6 +359,12 @@ export function updatePassword(payload, csrfToken) {
 export async function getAccounts() {
   const data = await apiRequest("/accounts");
   return listFrom(data, "accounts", "items").map(normalizeAccount);
+}
+
+export async function getAccountPage(options = {}) {
+  const query = listQuery(options, { query: options.query });
+  const data = await apiRequest(`/accounts?${query}`);
+  return normalizeListPage(data, normalizeAccount, ["accounts", "items"], options);
 }
 
 export async function getAccount(id) {
@@ -577,6 +645,26 @@ export async function getAliases(accountId = "") {
   return listFrom(data, "aliases", "items").map(normalizeAlias);
 }
 
+export async function getAliasPage(accountId = "", options = {}) {
+  const query = listQuery(options, { account_id: accountId });
+  const data = await apiRequest(`/aliases?${query}`);
+  return normalizeListPage(data, normalizeAlias, ["aliases", "items"], options);
+}
+
+export async function getAllAliases(accountId = "") {
+  const pageSize = 200;
+  const aliases = [];
+  let offset = 0;
+
+  while (true) {
+    const page = await getAliasPage(accountId, { limit: pageSize, offset });
+    aliases.push(...page.items);
+    offset += page.items.length;
+    if (!page.hasMore || page.items.length === 0 || offset >= page.total) break;
+  }
+  return aliases;
+}
+
 export async function rotateAlias(id, csrfToken) {
   return aliasMutationResult(
     await apiRequest(`/aliases/${encodeURIComponent(id)}/rotate-key`, {
@@ -602,10 +690,14 @@ export function deleteAlias(id, csrfToken) {
   });
 }
 
-export async function getAuditLogs() {
-  const data = await apiRequest("/audit");
-  return listFrom(data, "audit", "audit_logs", "logs", "items").map(
+export async function getAuditLogs(options = {}) {
+  const query = listQuery(options);
+  const data = await apiRequest(`/audit?${query}`);
+  return normalizeListPage(
+    data,
     normalizeAuditLog,
+    ["audit", "audit_logs", "logs", "items"],
+    options,
   );
 }
 
