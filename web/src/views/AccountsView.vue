@@ -1,5 +1,8 @@
 <template>
-  <section class="page-stack" aria-labelledby="accounts-section-title">
+  <section
+    class="page-stack virtual-list-page"
+    aria-labelledby="accounts-section-title"
+  >
     <SectionHeader
       id="accounts-section-title"
       title="iCloud 主号"
@@ -49,7 +52,7 @@
       />
 
       <div
-        class="data-panel desktop-data-table"
+        class="data-panel desktop-data-table virtual-list-table"
         :class="{
           'desktop-data-table--force': pageSize > 100 || pageSize === ALL_PAGE_SIZE,
         }"
@@ -59,6 +62,7 @@
           :columns="accountColumns"
           :data="accounts"
           row-key="id"
+          fill-height
           :loading="loading"
         >
           <template #cell="{ column, row }">

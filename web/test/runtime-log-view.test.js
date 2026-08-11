@@ -43,7 +43,7 @@ test("all logs view supports filters, selectable pages, batched all-items loadin
   assert.match(source, /createLiveRefresh\(\(\) => loadLatestLogs\(\{ silent: true \}\)\)/);
   assert.match(source, /v-model="autoRefreshEnabled"/);
   assert.match(source, /@size-change="handlePageSizeChange"/);
-  assert.match(source, /class="data-panel desktop-data-table"/);
+  assert.match(source, /class="data-panel desktop-data-table virtual-list-table"/);
   assert.match(source, /class="mobile-record-list"/);
   assert.match(source, /<RuntimeLogDetailDialog/);
   assert.match(source, /getRuntimeLogRun\(syncRunId,\s*\{/);

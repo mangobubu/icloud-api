@@ -1,5 +1,8 @@
 <template>
-  <section class="page-stack" aria-labelledby="audit-section-title">
+  <section
+    class="page-stack virtual-list-page"
+    aria-labelledby="audit-section-title"
+  >
     <SectionHeader
       id="audit-section-title"
       title="操作记录"
@@ -42,7 +45,7 @@
       />
 
       <div
-        class="data-panel desktop-data-table"
+        class="data-panel desktop-data-table virtual-list-table"
         :class="{
           'desktop-data-table--force': pageSize > 100 || pageSize === ALL_PAGE_SIZE,
         }"
@@ -52,6 +55,7 @@
           :columns="auditColumns"
           :data="logs"
           row-key="id"
+          fill-height
           :loading="loading"
         >
           <template #cell="{ column, row }">

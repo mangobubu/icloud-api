@@ -189,7 +189,7 @@
             :columns="batchSecretColumns"
             :data="batchSecrets"
             row-key="address"
-            :height="420"
+            fill-height
             :row-height="64"
           >
             <template #cell="{ column, rowData: row }">
@@ -465,12 +465,15 @@
           </div>
         </div>
 
-        <div v-if="aliases.length" class="data-panel desktop-data-table">
+        <div
+          v-if="aliases.length"
+          class="data-panel desktop-data-table account-alias-table"
+        >
           <VirtualDataTable
             :columns="aliasColumns"
             :data="aliases"
             row-key="id"
-            :height="520"
+            fill-height
             :row-height="64"
             :loading="loading"
           >

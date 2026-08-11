@@ -6,32 +6,31 @@
     aria-live="polite"
   >
     <span class="list-pagination__summary">共 {{ total }} 条</span>
-    <div class="list-pagination__controls">
-      <el-select
-        class="list-pagination__size"
-        :model-value="pageSize"
-        :disabled="loading"
-        aria-label="每页条数"
-        @change="handleSizeChange"
-      >
-        <el-option
-          v-for="option in pageSizeOptions"
-          :key="option.value"
-          :label="option.label"
-          :value="option.value"
-        />
-      </el-select>
-      <el-pagination
-        v-if="pageSize > 0"
-        background
-        layout="prev, pager, next"
-        :current-page="page"
-        :page-size="pageSize"
-        :total="total"
-        :disabled="loading"
-        @current-change="emit('change', $event)"
+    <el-select
+      class="list-pagination__size"
+      :model-value="pageSize"
+      :disabled="loading"
+      aria-label="每页条数"
+      @change="handleSizeChange"
+    >
+      <el-option
+        v-for="option in pageSizeOptions"
+        :key="option.value"
+        :label="option.label"
+        :value="option.value"
       />
-    </div>
+    </el-select>
+    <el-pagination
+      v-if="pageSize > 0"
+      background
+      layout="prev, pager, next"
+      :pager-count="5"
+      :current-page="page"
+      :page-size="pageSize"
+      :total="total"
+      :disabled="loading"
+      @current-change="emit('change', $event)"
+    />
   </nav>
 </template>
 

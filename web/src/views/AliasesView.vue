@@ -1,5 +1,8 @@
 <template>
-  <section class="page-stack" aria-labelledby="aliases-section-title">
+  <section
+    class="page-stack virtual-list-page"
+    aria-labelledby="aliases-section-title"
+  >
     <SectionHeader
       id="aliases-section-title"
       title="全部隐私邮箱"
@@ -107,7 +110,7 @@
       />
 
       <div
-        class="data-panel desktop-data-table"
+        class="data-panel desktop-data-table virtual-list-table"
         :class="{
           'desktop-data-table--force': pageSize > 100 || pageSize === ALL_PAGE_SIZE,
         }"
@@ -117,7 +120,7 @@
           :columns="aliasColumns"
           :data="aliases"
           row-key="id"
-          :height="560"
+          fill-height
           :row-height="64"
           :loading="loading"
         >

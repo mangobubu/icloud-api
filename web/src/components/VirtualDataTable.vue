@@ -1,13 +1,14 @@
 <template>
   <div
     class="virtual-data-table"
-    :style="{ height: `${height}px` }"
+    :class="{ 'virtual-data-table--fill-height': fillHeight }"
+    :style="containerStyle"
     :aria-busy="loading"
   >
     <el-auto-resizer :on-resize="handleResize">
-      <template #default="{ width }">
+      <template #default="{ width, height: availableHeight }">
         <el-table-v2
-          v-if="width > 0"
+          v-if="width > 0 && availableHeight > 0"
           fixed
           :columns="resolvedColumns"
           :data="data"
@@ -15,7 +16,7 @@
           :row-height="rowHeight"
           :header-height="headerHeight"
           :width="Math.max(Math.floor(width), 1)"
-          :height="height"
+          :height="Math.max(Math.floor(availableHeight), 1)"
         >
           <template #cell="scope">
             <div
@@ -75,6 +76,7 @@ const props = defineProps({
   data: { type: Array, required: true },
   rowKey: { type: [String, Number, Symbol], default: "id" },
   height: { type: Number, default: 520 },
+  fillHeight: { type: Boolean, default: false },
   rowHeight: { type: Number, default: 56 },
   headerHeight: { type: Number, default: 48 },
   loading: { type: Boolean, default: false },
@@ -82,6 +84,10 @@ const props = defineProps({
 
 const measuredWidth = ref(0);
 const TABLE_SCROLLBAR_SIZE = 6;
+
+const containerStyle = computed(() => ({
+  height: props.fillHeight ? "100%" : `${props.height}px`,
+}));
 
 const resolvedColumns = computed(() => {
   const columns = props.columns.map((column, index) => ({
@@ -133,6 +139,10 @@ function handleResize({ width }) {
   min-width: 0;
   overflow: hidden;
   font-size: 13px;
+}
+
+.virtual-data-table--fill-height {
+  min-height: 0;
 }
 
 .virtual-data-table__cell {

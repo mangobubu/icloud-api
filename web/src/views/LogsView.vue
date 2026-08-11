@@ -1,5 +1,8 @@
 <template>
-  <section class="page-stack" aria-labelledby="logs-section-title">
+  <section
+    class="page-stack virtual-list-page"
+    aria-labelledby="logs-section-title"
+  >
     <SectionHeader
       id="logs-section-title"
       title="全部日志"
@@ -129,7 +132,7 @@
       />
 
       <div
-        class="data-panel desktop-data-table"
+        class="data-panel desktop-data-table virtual-list-table"
         :class="{
           'desktop-data-table--force': pageSize > 100 || pageSize === ALL_PAGE_SIZE,
         }"
@@ -139,7 +142,7 @@
           :columns="runtimeLogColumns"
           :data="logs"
           row-key="id"
-          :height="560"
+          fill-height
           :row-height="68"
           :loading="loading"
         >
@@ -218,17 +221,15 @@
         </article>
       </div>
 
-      <div class="runtime-log-pagination" aria-live="polite">
-        <ListPagination
-          :page="currentPage"
-          :page-size="pageSize"
-          :total="total"
-          :loading="loading"
-          aria-label="全部日志分页"
-          @change="handlePageChange"
-          @size-change="handlePageSizeChange"
-        />
-      </div>
+      <ListPagination
+        :page="currentPage"
+        :page-size="pageSize"
+        :total="total"
+        :loading="loading"
+        aria-label="全部日志分页"
+        @change="handlePageChange"
+        @size-change="handlePageSizeChange"
+      />
     </template>
 
     <RuntimeLogDetailDialog
@@ -773,17 +774,6 @@ onBeforeUnmount(() => {
   overflow-wrap: anywhere;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
-}
-
-.runtime-log-pagination {
-  display: flex;
-  min-height: 38px;
-  align-items: center;
-  justify-content: center;
-  flex-wrap: wrap;
-  gap: 12px;
-  color: var(--text-secondary);
-  font-size: 13px;
 }
 
 @media (max-width: 1080px) {

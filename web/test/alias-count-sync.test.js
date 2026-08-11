@@ -27,7 +27,7 @@ function autoCreationPanel(source) {
   const start = source.indexOf('class="auto-creation-panel"');
   assert.notEqual(start, -1, "missing automatic creation panel");
   const end = source.indexOf(
-    '<div v-if="aliases.length" class="data-panel desktop-data-table">',
+    'class="data-panel desktop-data-table account-alias-table"',
     start,
   );
   assert.ok(end > start, "missing alias table after automatic creation panel");

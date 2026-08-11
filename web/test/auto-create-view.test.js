@@ -124,7 +124,7 @@ test("account detail exposes automatic alias creation and safe key handling", as
   );
 
   const desktopStart = source.indexOf(
-    '<div v-if="aliases.length" class="data-panel desktop-data-table">',
+    'class="data-panel desktop-data-table account-alias-table"',
   );
   const mobileStart = source.indexOf(
     '<div v-if="aliases.length" class="mobile-record-list">',

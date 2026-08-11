@@ -18,6 +18,7 @@ const virtualTablePath = new URL(
   "../src/components/VirtualDataTable.vue",
   import.meta.url,
 );
+const stylesPath = new URL("../src/styles/index.css", import.meta.url);
 
 test("shared list pagination binds page, size, total, loading, and page changes", async () => {
   const source = await readFile(componentPath, "utf8");
@@ -39,6 +40,25 @@ test("shared list pagination binds page, size, total, loading, and page changes"
   assert.match(source, /defineEmits\(\["change", "size-change"\]\)/);
   assert.match(source, /emit\("size-change", nextPageSize\)/);
   assert.match(source, /v-if="pageSize > 0"/);
+  assert.match(source, /:pager-count="5"/);
+});
+
+test("pagination stays aligned on desktop and only reflows at the mobile breakpoint", async () => {
+  const styles = await readFile(stylesPath, "utf8");
+
+  assert.match(
+    styles,
+    /\.list-pagination\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*max-content 120px max-content;/,
+  );
+  assert.doesNotMatch(styles, /\.list-pagination__controls/);
+  assert.match(
+    styles,
+    /@media \(max-width: 720px\)[\s\S]*?\.list-pagination\s*\{[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\) 120px;/,
+  );
+  assert.match(
+    styles,
+    /@media \(max-width: 720px\)[\s\S]*?\.list-pagination \.el-pagination\s*\{[\s\S]*?grid-column:\s*1 \/ -1;/,
+  );
 });
 
 test("account management supports bounded pages and a batched all-items mode", async () => {
@@ -95,6 +115,10 @@ test("every desktop data table uses the shared virtual table", async () => {
 
   assert.match(component, /<el-table-v2/);
   assert.match(component, /<el-auto-resizer/);
+  assert.match(component, /height:\s*availableHeight/);
+  assert.match(component, /availableHeight > 0/);
+  assert.match(component, /fillHeight:\s*\{\s*type:\s*Boolean/);
+  assert.match(component, /props\.fillHeight \? "100%"/);
   assert.match(component, /#cell="scope"/);
   assert.match(component, /#header-cell="scope"/);
 
@@ -107,6 +131,17 @@ test("every desktop data table uses the shared virtual table", async () => {
   assert.equal(
     (accountDetail.match(/<VirtualDataTable/g) || []).length,
     2,
+  );
+  assert.equal(
+    [accounts, aliases, audit, logs]
+      .filter((source) => /class="page-stack virtual-list-page"/.test(source))
+      .length,
+    4,
+  );
+  assert.equal(
+    [accounts, aliases, audit, logs, accountDetail]
+      .reduce((count, source) => count + (source.match(/fill-height/g) || []).length, 0),
+    6,
   );
   assert.match(accountDetail, /row-key="address"/);
   assert.match(aliases, /someExportableAliasesSelected/);
