@@ -161,6 +161,79 @@ func TestListAliasesPageOrdersFiltersAndReportsTotal(t *testing.T) {
 	})
 }
 
+func TestListAliasesPageSearchesAddressAndLabelBeforePagination(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db := openTestStore(t)
+	first := createAccount(t, ctx, db, "First", "first-alias-search@icloud.com")
+	second := createAccount(t, ctx, db, "Second", "second-alias-search@icloud.com")
+
+	fixtures := []struct {
+		accountID int64
+		address   string
+		label     string
+	}{
+		{accountID: first.ID, address: "alpha-search@icloud.com", label: "Production Checkout"},
+		{accountID: first.ID, address: "literal-percent%@icloud.com", label: "Percent address"},
+		{accountID: first.ID, address: "literal_under@icloud.com", label: "Underscore address"},
+		{accountID: second.ID, address: "bravo-search@icloud.com", label: "Production Reports"},
+		{accountID: second.ID, address: "unrelated-search@icloud.com", label: "Personal"},
+	}
+	for index, fixture := range fixtures {
+		if _, err := db.CreateAlias(ctx, domain.Alias{
+			AccountID:    fixture.accountID,
+			Address:      fixture.address,
+			Label:        fixture.label,
+			APIKeyHash:   []byte(fmt.Sprintf("alias-search-hash-%d", index)),
+			APIKeyPrefix: "search",
+			Enabled:      true,
+		}); err != nil {
+			t.Fatalf("create searchable alias %q: %v", fixture.address, err)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		query     string
+		accountID *int64
+		offset    int
+		wantTotal int
+		want      []string
+	}{
+		{name: "address substring ignores case", query: "ALPHA-SEARCH", wantTotal: 1, want: []string{"alpha-search@icloud.com"}},
+		{name: "label substring ignores case", query: "PRODUCTION", wantTotal: 2, want: []string{"alpha-search@icloud.com", "bravo-search@icloud.com"}},
+		{name: "percent is literal", query: "%", wantTotal: 1, want: []string{"literal-percent%@icloud.com"}},
+		{name: "underscore is literal", query: "_", wantTotal: 1, want: []string{"literal_under@icloud.com"}},
+		{name: "account and query intersect", query: "production", accountID: &first.ID, wantTotal: 1, want: []string{"alpha-search@icloud.com"}},
+		{name: "filter runs before offset", query: "production", offset: 1, wantTotal: 2, want: []string{"bravo-search@icloud.com"}},
+		{name: "blank query is ignored", query: "  ", wantTotal: len(fixtures), want: []string{
+			"alpha-search@icloud.com",
+			"bravo-search@icloud.com",
+			"literal-percent%@icloud.com",
+			"literal_under@icloud.com",
+			"unrelated-search@icloud.com",
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			page, err := db.ListAliasesPage(ctx, store.AliasListFilter{
+				AccountID: test.accountID,
+				Query:     test.query,
+				Limit:     10,
+				Offset:    test.offset,
+			})
+			if err != nil {
+				t.Fatalf("search aliases for %q: %v", test.query, err)
+			}
+			if page.Total != test.wantTotal {
+				t.Fatalf("search aliases for %q total = %d, want %d", test.query, page.Total, test.wantTotal)
+			}
+			assertStringsEqual(t, aliasAddresses(page.Items), test.want)
+		})
+	}
+}
+
 func TestListPagesRejectInvalidBounds(t *testing.T) {
 	t.Parallel()
 

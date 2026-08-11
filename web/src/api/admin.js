@@ -691,7 +691,10 @@ export function getAliases(accountId = "", options = {}) {
 }
 
 export async function getAliasPage(accountId = "", options = {}) {
-  const query = listQuery(options, { account_id: accountId });
+  const query = listQuery(options, {
+    account_id: accountId,
+    query: options.query,
+  });
   const data = await apiRequest(`/aliases?${query}`, {
     signal: options.signal,
   });

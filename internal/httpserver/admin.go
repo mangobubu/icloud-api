@@ -242,12 +242,30 @@ func (s *Server) aliasesPage(c *gin.Context) {
 		s.renderPageError(c, err)
 		return
 	}
+	aliasQuery := strings.TrimSpace(c.Query("query"))
+	aliases = legacyAliasQueryFilter(aliases, aliasQuery)
 	data := s.pageData(c, "隐私邮箱", "aliases")
 	data.Subtitle = "查看每个地址的主号归属、Key 状态和最新收件时间"
 	data.Accounts = accounts
 	data.SelectedAccountID = selectedAccountID
+	data.AliasQuery = aliasQuery
 	data.Aliases = aliases
 	c.HTML(http.StatusOK, "aliases.html", data)
+}
+
+func legacyAliasQueryFilter(aliases []domain.Alias, raw string) []domain.Alias {
+	query := strings.ToLower(strings.TrimSpace(raw))
+	if query == "" {
+		return aliases
+	}
+	filtered := make([]domain.Alias, 0, len(aliases))
+	for _, alias := range aliases {
+		if strings.Contains(strings.ToLower(alias.Address), query) ||
+			strings.Contains(strings.ToLower(alias.Label), query) {
+			filtered = append(filtered, alias)
+		}
+	}
+	return filtered
 }
 
 // legacyAliasAccountFilter returns a positive account ID only when the query

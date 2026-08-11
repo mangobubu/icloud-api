@@ -1128,6 +1128,11 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 	if !ok {
 		return
 	}
+	query := strings.TrimSpace(c.Query("query"))
+	if len([]rune(query)) > adminAPIMaxListQueryRunes {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "query 参数不能超过 200 个字符")
+		return
+	}
 	var accountID *int64
 	if rawAccountID := strings.TrimSpace(c.Query("account_id")); rawAccountID != "" {
 		parsedID, parseErr := strconv.ParseInt(rawAccountID, 10, 64)
@@ -1139,6 +1144,7 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 	}
 	page, err := s.store.ListAliasesPage(c.Request.Context(), store.AliasListFilter{
 		AccountID: accountID,
+		Query:     query,
 		Limit:     limit,
 		Offset:    offset,
 	})

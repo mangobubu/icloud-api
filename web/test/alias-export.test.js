@@ -144,7 +144,7 @@ test("all aliases view withholds pending confirmation links and exports", async 
   );
   assert.match(
     functionBody(source, "function exportAllAliases"),
-    /getAllAliases\(selectedAccountId\.value\)/,
+    /getAllAliases\(selectedAccountId\.value,\s*\{[\s\S]*query:\s*appliedAliasQuery\.value/,
   );
   assert.match(source, /:loading="exportingAll"/);
   assert.match(source, /exportingAll\.value = true/);

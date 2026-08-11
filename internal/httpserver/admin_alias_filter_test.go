@@ -81,11 +81,47 @@ func TestLegacyAliasesPageFallsBackForInvalidAccountFilter(t *testing.T) {
 	}
 }
 
-func createLegacyFilterAlias(t *testing.T, env *httpTestEnv, accountID int64, address string) domain.Alias {
+func TestLegacyAliasesPageSearchesAddressAndLabel(t *testing.T) {
+	env := newHTTPTestEnv(t)
+	accountA := env.createAccount(t, "Primary A", "legacy-search-a@icloud.com", "encrypted-a")
+	accountB := env.createAccount(t, "Primary B", "legacy-search-b@icloud.com", "encrypted-b")
+	createLegacyFilterAlias(t, env, accountA.ID, "alpha-legacy-search@icloud.com", "Checkout Inbox")
+	createLegacyFilterAlias(t, env, accountB.ID, "bravo-legacy-search@icloud.com", "Personal")
+	session := env.createAdminSession(t)
+
+	labelSearch := env.request(t, http.MethodGet, "/admin/aliases?query=CHECKOUT", nil, []*http.Cookie{session})
+	if labelSearch.Code != http.StatusOK {
+		t.Fatalf("GET searched aliases status = %d, want %d; body=%s", labelSearch.Code, http.StatusOK, labelSearch.Body.String())
+	}
+	labelBody := labelSearch.Body.String()
+	assertLegacyAliasFilterFragment(t, labelBody, `name="query" value="CHECKOUT"`)
+	assertLegacyAliasFilterFragment(t, labelBody, `data-sync-poll-endpoint="/admin/api/v1/aliases?query=CHECKOUT"`)
+	assertLegacyAliasFilterFragment(t, labelBody, "alpha-legacy-search@icloud.com")
+	if strings.Contains(labelBody, "bravo-legacy-search@icloud.com") {
+		t.Fatalf("label search rendered an unrelated alias: %s", labelBody)
+	}
+
+	combinedTarget := fmt.Sprintf("/admin/aliases?account_id=%d&query=BRAVO", accountA.ID)
+	combined := env.request(t, http.MethodGet, combinedTarget, nil, []*http.Cookie{session})
+	if combined.Code != http.StatusOK {
+		t.Fatalf("GET combined alias filters status = %d, want %d; body=%s", combined.Code, http.StatusOK, combined.Body.String())
+	}
+	combinedBody := combined.Body.String()
+	assertLegacyAliasFilterFragment(t, combinedBody, "没有匹配的隐私邮箱")
+	assertLegacyAliasFilterFragment(t, combinedBody, fmt.Sprintf(`href="/admin/aliases?account_id=%d">清除搜索`, accountA.ID))
+	assertLegacyAliasFilterFragment(t, combinedBody, fmt.Sprintf(`data-sync-poll-endpoint="/admin/api/v1/aliases?account_id=%d&amp;query=BRAVO"`, accountA.ID))
+}
+
+func createLegacyFilterAlias(t *testing.T, env *httpTestEnv, accountID int64, address string, labels ...string) domain.Alias {
 	t.Helper()
+	label := ""
+	if len(labels) > 0 {
+		label = labels[0]
+	}
 	alias, err := env.store.CreateAlias(context.Background(), domain.Alias{
 		AccountID:    accountID,
 		Address:      address,
+		Label:        label,
 		APIKeyHash:   secure.HashToken(address + "-key"),
 		APIKeyPrefix: "legacy-filter-key",
 		Enabled:      true,

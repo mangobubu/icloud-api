@@ -769,6 +769,99 @@ func TestAdminAPIListAliasesFiltersByPrimaryAccount(t *testing.T) {
 	}
 }
 
+func TestAdminAPIListAliasesUsesServerPagingAndSearch(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, _, _ := env.createSession(t, "alias-search-admin", "alias search password")
+	first := adminAPITestCreateAccount(t, env, "first-alias-search@icloud.com")
+	second := adminAPITestCreateAccount(t, env, "second-alias-search@icloud.com")
+
+	for index, item := range []struct {
+		account domain.Account
+		address string
+		label   string
+	}{
+		{account: first, address: "alpha-api-search@icloud.com", label: "Checkout Inbox"},
+		{account: first, address: "unrelated-api-search@icloud.com", label: "Personal"},
+		{account: second, address: "bravo-api-search@icloud.com", label: "Checkout Receipts"},
+	} {
+		if _, err := env.store.CreateAlias(context.Background(), domain.Alias{
+			AccountID:    item.account.ID,
+			Address:      item.address,
+			Label:        item.label,
+			APIKeyHash:   secure.HashToken(fmt.Sprintf("alias-search-key-%d", index)),
+			APIKeyPrefix: fmt.Sprintf("search-%d", index),
+			Enabled:      true,
+		}); err != nil {
+			t.Fatalf("create searchable alias %q: %v", item.address, err)
+		}
+	}
+
+	response := env.request(
+		t,
+		http.MethodGet,
+		"/admin/api/v1/aliases?query=CHECKOUT&limit=1&offset=1",
+		nil,
+		"",
+		[]*http.Cookie{sessionCookie},
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("searched aliases status = %d; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Items      []adminAPIAliasDTO `json:"items"`
+			Pagination struct {
+				Limit   int  `json:"limit"`
+				Offset  int  `json:"offset"`
+				Total   int  `json:"total"`
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode searched aliases: %v; body=%s", err, response.Body.String())
+	}
+	if len(payload.Data.Items) != 1 || payload.Data.Items[0].Address != "bravo-api-search@icloud.com" {
+		t.Fatalf("searched aliases = %#v, want second sorted match", payload.Data.Items)
+	}
+	if pagination := payload.Data.Pagination; pagination.Limit != 1 || pagination.Offset != 1 || pagination.Total != 2 || pagination.HasMore {
+		t.Fatalf("searched aliases pagination = %#v", pagination)
+	}
+
+	combinedTarget := fmt.Sprintf(
+		"/admin/api/v1/aliases?account_id=%d&query=checkout",
+		first.ID,
+	)
+	combined := env.request(t, http.MethodGet, combinedTarget, nil, "", []*http.Cookie{sessionCookie}, "")
+	if combined.Code != http.StatusOK {
+		t.Fatalf("combined alias filters status = %d; body=%s", combined.Code, combined.Body.String())
+	}
+	payload = struct {
+		Data struct {
+			Items      []adminAPIAliasDTO `json:"items"`
+			Pagination struct {
+				Limit   int  `json:"limit"`
+				Offset  int  `json:"offset"`
+				Total   int  `json:"total"`
+				HasMore bool `json:"has_more"`
+			} `json:"pagination"`
+		} `json:"data"`
+	}{}
+	if err := json.Unmarshal(combined.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode combined alias filters: %v; body=%s", err, combined.Body.String())
+	}
+	if len(payload.Data.Items) != 1 || payload.Data.Items[0].AccountID != first.ID || payload.Data.Pagination.Total != 1 {
+		t.Fatalf("combined alias filters = %#v; pagination=%#v", payload.Data.Items, payload.Data.Pagination)
+	}
+
+	tooLong := "/admin/api/v1/aliases?query=" + url.QueryEscape(strings.Repeat("界", adminAPIMaxListQueryRunes+1))
+	invalid := env.request(t, http.MethodGet, tooLong, nil, "", []*http.Cookie{sessionCookie}, "")
+	if invalid.Code != http.StatusBadRequest || adminAPITestErrorCode(t, invalid) != "VALIDATION_FAILED" {
+		t.Fatalf("oversized alias query status = %d; body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
 func TestAdminAPIListAccountsUsesServerPagingAndSearch(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	sessionCookie, _, _ := env.createSession(t, "account-page-admin", "account page password")

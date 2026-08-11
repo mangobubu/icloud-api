@@ -9,38 +9,6 @@
       description="查看每个地址的主号归属、Key 状态和最近使用情况。"
     >
       <template #actions>
-        <div class="alias-filter" role="group" aria-label="按主号筛选">
-          <span class="alias-filter__label">所属主号</span>
-          <el-select
-            v-model="selectedAccountId"
-            class="alias-filter__select"
-            filterable
-            remote
-            reserve-keyword
-            clearable
-            :disabled="accountsLoading || accounts.length === 0"
-            :loading="accountsLoading"
-            :remote-method="searchAccounts"
-            placeholder="全部主号"
-            aria-label="按所属主号筛选"
-            no-data-text="暂无主号"
-            no-match-text="没有匹配的主号"
-            @change="handleAccountFilterChange"
-          >
-            <el-option label="全部主号" value="" />
-            <el-option
-              v-for="account in accounts"
-              :key="account.id"
-              :label="account.email"
-              :value="account.id"
-            >
-              <div class="primary-stack">
-                <strong>{{ account.email }}</strong>
-                <small>{{ account.name || "未填写备注" }}</small>
-              </div>
-            </el-option>
-          </el-select>
-        </div>
         <el-button
           :icon="Download"
           :disabled="selectedAliases.length === 0"
@@ -71,6 +39,66 @@
       </template>
     </SectionHeader>
 
+    <div class="alias-list-filters" role="search" aria-label="筛选全部隐私邮箱">
+      <label class="alias-list-filter alias-list-filter--query">
+        <span>关键词</span>
+        <el-input
+          v-model="keywordDraft"
+          clearable
+          maxlength="200"
+          :prefix-icon="Search"
+          aria-label="关键词：模糊搜索隐私邮箱"
+          placeholder="邮箱地址或用途备注"
+          @keyup.enter="applyAliasSearch"
+          @clear="applyAliasSearch"
+        />
+      </label>
+
+      <label class="alias-list-filter">
+        <span>所属主号</span>
+        <el-select
+          v-model="selectedAccountId"
+          filterable
+          remote
+          reserve-keyword
+          clearable
+          :loading="accountsLoading"
+          :remote-method="searchAccounts"
+          placeholder="全部主号"
+          aria-label="按所属主号筛选"
+          no-data-text="暂无主号"
+          no-match-text="没有匹配的主号"
+          @change="handleAccountFilterChange"
+        >
+          <el-option label="全部主号" value="" />
+          <el-option
+            v-for="account in accounts"
+            :key="account.id"
+            :label="account.email"
+            :value="account.id"
+          >
+            <div class="primary-stack">
+              <strong>{{ account.email }}</strong>
+              <small>{{ account.name || "未填写备注" }}</small>
+            </div>
+          </el-option>
+        </el-select>
+      </label>
+
+      <div class="alias-list-filter-actions">
+        <el-button type="primary" :icon="Search" @click="applyAliasSearch">
+          查询
+        </el-button>
+        <el-button
+          :icon="RefreshLeft"
+          :disabled="!hasActiveFilters && !hasAppliedFilters"
+          @click="resetAliasFilters"
+        >
+          重置
+        </el-button>
+      </div>
+    </div>
+
     <RequestAlert
       v-if="accountsLoadError"
       :error="accountsLoadError"
@@ -89,14 +117,29 @@
 
     <EmptyState
       v-else-if="aliases.length === 0"
-      :title="selectedAccountId ? '该主号暂无隐私邮箱' : '还没有隐私邮箱'"
+      :title="
+        appliedAliasQuery
+          ? '没有匹配的隐私邮箱'
+          : selectedAccountId
+            ? '该主号暂无隐私邮箱'
+            : '还没有隐私邮箱'
+      "
       :description="
-        selectedAccountId
-          ? '请选择其他主号，或进入该主号详情页添加地址。'
-          : '进入某个主号详情页添加地址。'
+        appliedAliasQuery
+          ? '请尝试其他关键词，或调整所属主号筛选。'
+          : selectedAccountId
+            ? '请选择其他主号，或进入该主号详情页添加地址。'
+            : '进入某个主号详情页添加地址。'
       "
     >
-      <el-button type="primary" :icon="Setting" @click="openAccounts">
+      <el-button
+        v-if="appliedAliasQuery"
+        :icon="RefreshLeft"
+        @click="resetAliasFilters"
+      >
+        重置筛选
+      </el-button>
+      <el-button v-else type="primary" :icon="Setting" @click="openAccounts">
         查看主号
       </el-button>
     </EmptyState>
@@ -293,6 +336,8 @@ import {
   CopyDocument,
   Download,
   Refresh,
+  RefreshLeft,
+  Search,
   Setting,
 } from "@element-plus/icons-vue";
 import { ElMessage } from "element-plus";
@@ -340,6 +385,8 @@ const aliasColumns = [
 const aliases = ref([]);
 const accounts = ref([]);
 const selectedAccountId = ref("");
+const keywordDraft = ref("");
+const appliedAliasQuery = ref("");
 const currentPage = ref(1);
 const total = ref(0);
 const selectedAliasIds = ref([]);
@@ -376,6 +423,14 @@ const someExportableAliasesSelected = computed(() => {
   ).length;
   return selectedCount > 0 && selectedCount < exportableAliases.value.length;
 });
+
+const hasActiveFilters = computed(() =>
+  Boolean(selectedAccountId.value || keywordDraft.value.trim()),
+);
+
+const hasAppliedFilters = computed(() =>
+  Boolean(selectedAccountId.value || appliedAliasQuery.value),
+);
 
 function isAliasConfirmationPending(alias) {
   return (
@@ -445,9 +500,10 @@ function searchAccounts(query) {
 
 async function loadAliases({ silent = false } = {}) {
   const accountId = selectedAccountId.value;
+  const query = appliedAliasQuery.value;
   const page = currentPage.value;
   const selectedPageSize = pageSize.value;
-  const requestKey = `${accountId}\u0000${page}\u0000${selectedPageSize}`;
+  const requestKey = `${accountId}\u0000${query}\u0000${page}\u0000${selectedPageSize}`;
   const ticket = aliasLoadGate.begin(requestKey);
   aliasAbortController?.abort();
   const abortController = new AbortController();
@@ -460,15 +516,17 @@ async function loadAliases({ silent = false } = {}) {
     const result = selectedPageSize === ALL_PAGE_SIZE
       ? {
           items: await getAllAliases(accountId, {
+            query,
             signal: abortController.signal,
           }),
         }
       : await getAliasPage(accountId, {
           limit: selectedPageSize,
           offset: (page - 1) * selectedPageSize,
+          query,
           signal: abortController.signal,
         });
-    const currentKey = `${selectedAccountId.value}\u0000${currentPage.value}\u0000${pageSize.value}`;
+    const currentKey = `${selectedAccountId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`;
     if (!aliasLoadGate.isCurrent(ticket, currentKey)) return;
     const nextTotal = Math.max(0, Number(result?.total) || 0);
     const nextAliases = Array.isArray(result?.items) ? result.items : [];
@@ -498,7 +556,7 @@ async function loadAliases({ silent = false } = {}) {
       error?.name !== "AbortError" &&
       aliasLoadGate.isCurrent(
         ticket,
-        `${selectedAccountId.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
+        `${selectedAccountId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
       ) &&
       !silent
     ) {
@@ -509,7 +567,7 @@ async function loadAliases({ silent = false } = {}) {
       aliasAbortController === abortController &&
       aliasLoadGate.isCurrent(
         ticket,
-        `${selectedAccountId.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
+        `${selectedAccountId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
       )
     ) {
       loading.value = false;
@@ -524,13 +582,34 @@ function clearAliasSelection() {
   selectedAliasIds.value = [];
 }
 
-function handleAccountFilterChange(value) {
-  selectedAccountId.value = value == null ? "" : value;
+function reloadAliasesForFilters() {
   currentPage.value = 1;
   clearAliasSelection();
   aliases.value = [];
   total.value = 0;
-  loadAliases();
+  loadError.value = null;
+  void loadAliases();
+}
+
+function applyAliasSearch() {
+  const query = keywordDraft.value.trim();
+  if (query === appliedAliasQuery.value) return;
+  appliedAliasQuery.value = query;
+  reloadAliasesForFilters();
+}
+
+function handleAccountFilterChange(value) {
+  selectedAccountId.value = value == null ? "" : value;
+  appliedAliasQuery.value = keywordDraft.value.trim();
+  reloadAliasesForFilters();
+}
+
+function resetAliasFilters() {
+  if (!hasActiveFilters.value && !hasAppliedFilters.value) return;
+  keywordDraft.value = "";
+  appliedAliasQuery.value = "";
+  selectedAccountId.value = "";
+  reloadAliasesForFilters();
 }
 
 function handlePageChange(page) {
@@ -620,7 +699,9 @@ function exportSelectedAliases() {
 function exportAllAliases() {
   if (exportingAll.value) return;
   exportingAll.value = true;
-  getAllAliases(selectedAccountId.value)
+  getAllAliases(selectedAccountId.value, {
+    query: appliedAliasQuery.value,
+  })
     .then((items) => {
       if (viewActive) {
         exportAliases(items, selectedAccountId.value || "all");
@@ -693,22 +774,33 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
-.alias-filter {
-  display: flex;
+.alias-list-filters {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.4fr) minmax(220px, 1fr) auto;
+  align-items: end;
+  gap: 14px;
+  padding: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.alias-list-filter {
+  display: grid;
   min-width: 0;
+  gap: 6px;
+}
+
+.alias-list-filter > span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.alias-list-filter-actions {
+  display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.alias-filter__label {
-  flex: 0 0 auto;
-  color: var(--text-secondary);
-  font-size: 13px;
-  white-space: nowrap;
-}
-
-.alias-filter__select {
-  width: min(280px, 30vw);
 }
 
 .account-link {
@@ -742,15 +834,30 @@ onBeforeUnmount(() => {
   margin-top: 1px;
 }
 
-@media (max-width: 720px) {
-  .alias-filter {
-    width: 100%;
+@media (max-width: 1080px) {
+  .alias-list-filters {
+    grid-template-columns: minmax(260px, 1.25fr) minmax(220px, 1fr);
   }
 
-  .alias-filter__select {
+  .alias-list-filter-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 720px) {
+  .alias-list-filters {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 14px;
+  }
+
+  .alias-list-filter-actions > .el-button {
     min-width: 0;
-    flex: 1 1 auto;
-    width: auto;
+    flex: 1 1 0;
+  }
+
+  .alias-list-filter-actions {
+    grid-column: auto;
   }
 }
 </style>

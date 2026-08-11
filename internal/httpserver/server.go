@@ -166,6 +166,7 @@ type PageData struct {
 	Account           domain.Account
 	Aliases           []domain.Alias
 	SelectedAccountID int64
+	AliasQuery        string
 	AuditLogs         []domain.AuditLog
 	Secret            string
 	FormAction        string

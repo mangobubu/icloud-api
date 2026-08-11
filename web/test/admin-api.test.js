@@ -511,7 +511,7 @@ test("alias directory forwards the optional primary-account filter", async () =>
   assert.equal(all[0].address, "private@icloud.com");
 });
 
-test("alias pages apply the primary-account filter before server pagination", async () => {
+test("alias pages apply search and primary-account filters before server pagination", async () => {
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
@@ -528,13 +528,18 @@ test("alias pages apply the primary-account filter before server pagination", as
     });
   };
 
-  const page = await getAliasPage(12, { limit: 50, offset: 50 });
+  const page = await getAliasPage(12, {
+    limit: 50,
+    offset: 50,
+    query: "  private+box  ",
+  });
   const url = new URL(request.url, "https://admin.invalid");
 
   assert.deepEqual(Object.fromEntries(url.searchParams), {
     limit: "50",
     offset: "50",
     account_id: "12",
+    query: "private+box",
   });
   assert.equal(page.items[0].accountId, 12);
   assert.deepEqual(
@@ -543,7 +548,7 @@ test("alias pages apply the primary-account filter before server pagination", as
   );
 });
 
-test("full alias export follows every server page for the selected account", async () => {
+test("full alias export preserves search across every server page", async () => {
   const requests = [];
   const pages = [
     {
@@ -560,7 +565,7 @@ test("full alias export follows every server page for the selected account", asy
     return jsonResponse(pages.shift());
   };
 
-  const aliases = await getAllAliases(12);
+  const aliases = await getAllAliases(12, { query: "receipt" });
 
   assert.deepEqual(aliases.map((alias) => alias.id), [2, 1]);
   assert.equal(requests.length, 2);
@@ -569,6 +574,7 @@ test("full alias export follows every server page for the selected account", asy
   for (const request of requests) {
     assert.equal(request.searchParams.get("limit"), "1000");
     assert.equal(request.searchParams.get("account_id"), "12");
+    assert.equal(request.searchParams.get("query"), "receipt");
   }
 });
 

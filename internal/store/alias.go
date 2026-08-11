@@ -24,6 +24,7 @@ const aliasJoins = `
 
 type AliasListFilter struct {
 	AccountID *int64
+	Query     string
 	Limit     int
 	Offset    int
 }
@@ -123,20 +124,33 @@ func (s *Store) ListAliases(ctx context.Context, accountIDs ...int64) ([]domain.
 }
 
 // ListAliasesPage returns one administrator-facing page and the total number
-// of aliases matching the optional primary-account filter.
+// of aliases matching the optional primary-account and literal substring
+// filters. Query matches alias address and label case-insensitively.
 func (s *Store) ListAliasesPage(ctx context.Context, filter AliasListFilter) (AliasPage, error) {
 	if err := validateListPage(filter.Limit, filter.Offset); err != nil {
 		return AliasPage{}, fmt.Errorf("list aliases page: %w", err)
 	}
 
-	predicate := ""
+	var predicates []string
 	var filterArgs []any
 	if filter.AccountID != nil {
 		if *filter.AccountID < 1 {
 			return AliasPage{}, errors.New("list aliases page: account ID must be positive")
 		}
-		predicate = ` WHERE al.account_id = ?`
+		predicates = append(predicates, `al.account_id = ?`)
 		filterArgs = append(filterArgs, *filter.AccountID)
+	}
+	if query := strings.TrimSpace(sanitizePostgresText(filter.Query)); query != "" {
+		pattern := "%" + escapeLikePattern(query) + "%"
+		predicates = append(predicates, `(
+			LOWER(al.address) LIKE LOWER(?) ESCAPE '!'
+			OR LOWER(al.label) LIKE LOWER(?) ESCAPE '!'
+		)`)
+		filterArgs = append(filterArgs, pattern, pattern)
+	}
+	predicate := ""
+	if len(predicates) > 0 {
+		predicate = ` WHERE ` + strings.Join(predicates, ` AND `)
 	}
 
 	var total int
