@@ -106,7 +106,13 @@
         @close="loadError = null"
       />
 
-      <div class="data-panel desktop-data-table" :aria-busy="loading">
+      <div
+        class="data-panel desktop-data-table"
+        :class="{
+          'desktop-data-table--force': pageSize > 100 || pageSize === ALL_PAGE_SIZE,
+        }"
+        :aria-busy="loading"
+      >
         <VirtualDataTable
           :columns="aliasColumns"
           :data="aliases"
@@ -200,7 +206,7 @@
         </VirtualDataTable>
       </div>
 
-      <div class="mobile-record-list" :aria-busy="loading">
+      <div v-if="pageSize <= 100" class="mobile-record-list" :aria-busy="loading">
         <article v-for="alias in aliases" :key="alias.id" class="mobile-record">
           <header class="mobile-record__header">
             <div class="mobile-alias-selection">
@@ -268,11 +274,12 @@
 
       <ListPagination
         :page="currentPage"
-        :page-size="PAGE_SIZE"
+        :page-size="pageSize"
         :total="total"
         :loading="loading"
         aria-label="隐私邮箱列表分页"
         @change="handlePageChange"
+        @size-change="handlePageSizeChange"
       />
     </template>
   </section>
@@ -308,9 +315,15 @@ import {
 import { showRequestError, successMessage } from "../utils/feedback.js";
 import { formatTime } from "../utils/format.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
+import {
+  ALL_PAGE_SIZE,
+  DEFAULT_PAGE_SIZE,
+  normalizePageSize,
+} from "../utils/pagination.js";
 
 const router = useRouter();
-const PAGE_SIZE = 50;
+const ACCOUNT_OPTION_LIMIT = 50;
+const pageSize = ref(DEFAULT_PAGE_SIZE);
 const aliasColumns = [
   { key: "selection", title: "", width: 52, align: "center", fixed: "left" },
   { key: "address", title: "隐私邮箱", width: 220, flexGrow: 2 },
@@ -337,6 +350,7 @@ const copyLock = createActionLock();
 const aliasLoadGate = createLatestRequestGate();
 const accountsLoadGate = createLatestRequestGate();
 let accountSearchTimer = null;
+let aliasAbortController = null;
 let viewActive = true;
 
 const selectedAliases = computed(() => {
@@ -385,7 +399,7 @@ async function loadAccounts({ silent = false, query = "" } = {}) {
   }
   try {
     const result = await getAccountPage({
-      limit: PAGE_SIZE,
+      limit: ACCOUNT_OPTION_LIMIT,
       offset: 0,
       query: normalizedQuery,
     });
@@ -429,31 +443,46 @@ function searchAccounts(query) {
 async function loadAliases({ silent = false } = {}) {
   const accountId = selectedAccountId.value;
   const page = currentPage.value;
-  const requestKey = `${accountId}\u0000${page}`;
+  const selectedPageSize = pageSize.value;
+  const requestKey = `${accountId}\u0000${page}\u0000${selectedPageSize}`;
   const ticket = aliasLoadGate.begin(requestKey);
+  aliasAbortController?.abort();
+  const abortController = new AbortController();
+  aliasAbortController = abortController;
   if (!silent) {
     loading.value = true;
     loadError.value = null;
   }
   try {
-    const result = await getAliasPage(accountId, {
-      limit: PAGE_SIZE,
-      offset: (page - 1) * PAGE_SIZE,
-    });
-    const currentKey = `${selectedAccountId.value}\u0000${currentPage.value}`;
+    const result = selectedPageSize === ALL_PAGE_SIZE
+      ? {
+          items: await getAllAliases(accountId, {
+            signal: abortController.signal,
+          }),
+        }
+      : await getAliasPage(accountId, {
+          limit: selectedPageSize,
+          offset: (page - 1) * selectedPageSize,
+          signal: abortController.signal,
+        });
+    const currentKey = `${selectedAccountId.value}\u0000${currentPage.value}\u0000${pageSize.value}`;
     if (!aliasLoadGate.isCurrent(ticket, currentKey)) return;
     const nextTotal = Math.max(0, Number(result?.total) || 0);
-    const lastPage = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE));
-    if (page > lastPage) {
+    const nextAliases = Array.isArray(result?.items) ? result.items : [];
+    const allItems = selectedPageSize === ALL_PAGE_SIZE;
+    const resolvedTotal = allItems ? nextAliases.length : nextTotal;
+    const lastPage = allItems
+      ? 1
+      : Math.max(1, Math.ceil(resolvedTotal / selectedPageSize));
+    if (!allItems && page > lastPage) {
       currentPage.value = lastPage;
       aliases.value = [];
-      total.value = nextTotal;
+      total.value = resolvedTotal;
       void loadAliases();
       return;
     }
-    const nextAliases = Array.isArray(result?.items) ? result.items : [];
     aliases.value = nextAliases;
-    total.value = nextTotal;
+    total.value = resolvedTotal;
     const availableAliasIds = new Set(
       nextAliases.filter(isAliasExportable).map((alias) => alias.id),
     );
@@ -463,9 +492,10 @@ async function loadAliases({ silent = false } = {}) {
     loadError.value = null;
   } catch (error) {
     if (
+      error?.name !== "AbortError" &&
       aliasLoadGate.isCurrent(
         ticket,
-        `${selectedAccountId.value}\u0000${currentPage.value}`,
+        `${selectedAccountId.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
       ) &&
       !silent
     ) {
@@ -473,12 +503,16 @@ async function loadAliases({ silent = false } = {}) {
     }
   } finally {
     if (
+      aliasAbortController === abortController &&
       aliasLoadGate.isCurrent(
         ticket,
-        `${selectedAccountId.value}\u0000${currentPage.value}`,
+        `${selectedAccountId.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
       )
     ) {
       loading.value = false;
+    }
+    if (aliasAbortController === abortController) {
+      aliasAbortController = null;
     }
   }
 }
@@ -497,12 +531,26 @@ function handleAccountFilterChange(value) {
 }
 
 function handlePageChange(page) {
+  if (pageSize.value === ALL_PAGE_SIZE) return;
   const nextPage = Math.max(1, Number(page) || 1);
   if (nextPage === currentPage.value) return;
   currentPage.value = nextPage;
   clearAliasSelection();
   aliases.value = [];
   loadError.value = null;
+  void loadAliases();
+}
+
+function handlePageSizeChange(value) {
+  const nextPageSize = normalizePageSize(value);
+  if (nextPageSize === pageSize.value) return;
+  pageSize.value = nextPageSize;
+  currentPage.value = 1;
+  clearAliasSelection();
+  aliases.value = [];
+  total.value = 0;
+  loadError.value = null;
+  aliasLoadGate.invalidate();
   void loadAliases();
 }
 
@@ -636,6 +684,7 @@ onBeforeUnmount(() => {
   }
   aliasLoadGate.deactivate();
   accountsLoadGate.deactivate();
+  aliasAbortController?.abort();
   liveRefresh.stop();
 });
 </script>

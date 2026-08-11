@@ -21,7 +21,7 @@ test("all logs view is routed and exposed in admin navigation", async () => {
   assert.match(layout, /to:\s*"\/admin\/logs"[\s\S]{0,100}label:\s*"全部日志"/);
 });
 
-test("all logs view supports filters, server paging, live refresh, and responsive records", async () => {
+test("all logs view supports filters, selectable pages, batched all-items loading, live refresh, and responsive records", async () => {
   const source = await readFile(viewPath, "utf8");
 
   assert.match(source, /v-model="filters\.level"/);
@@ -30,17 +30,19 @@ test("all logs view supports filters, server paging, live refresh, and responsiv
   assert.match(source, /route\.query\.account_id/);
   assert.match(source, /route\.query\.level/);
   assert.match(source, /route\.query\.query/);
-  assert.match(source, /getRuntimeLogs\(currentRequestOptions\(page\)\)/);
-  assert.match(source, /offset:\s*\(page - 1\) \* PAGE_SIZE/);
+  assert.match(source, /getRuntimeLogs\(requestOptions\)/);
+  assert.match(source, /offset:\s*\(page - 1\) \* pageSize\.value/);
+  assert.match(source, /getAllRuntimeLogs\(requestOptions\)/);
   assert.match(source, /<ListPagination/);
   assert.match(source, /:page="currentPage"/);
   assert.match(source, /:total="total"/);
-  assert.match(source, /PAGE_SIZE\s*=\s*50/);
+  assert.match(source, /pageSize\s*=\s*ref\(DEFAULT_PAGE_SIZE\)/);
   assert.match(source, /getAccountPage\(\{/);
   assert.match(source, /:remote-method="searchAccounts"/);
   assert.doesNotMatch(source, /加载更多|MAX_VISIBLE_LOGS|appendRuntimeLogPage/);
   assert.match(source, /createLiveRefresh\(\(\) => loadLatestLogs\(\{ silent: true \}\)\)/);
   assert.match(source, /v-model="autoRefreshEnabled"/);
+  assert.match(source, /@size-change="handlePageSizeChange"/);
   assert.match(source, /class="data-panel desktop-data-table"/);
   assert.match(source, /class="mobile-record-list"/);
   assert.match(source, /<RuntimeLogDetailDialog/);

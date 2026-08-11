@@ -41,7 +41,13 @@
         @close="loadError = null"
       />
 
-      <div class="data-panel desktop-data-table" :aria-busy="loading">
+      <div
+        class="data-panel desktop-data-table"
+        :class="{
+          'desktop-data-table--force': pageSize > 100 || pageSize === ALL_PAGE_SIZE,
+        }"
+        :aria-busy="loading"
+      >
         <VirtualDataTable
           :columns="auditColumns"
           :data="logs"
@@ -78,7 +84,7 @@
         </VirtualDataTable>
       </div>
 
-      <div class="mobile-record-list" :aria-busy="loading">
+      <div v-if="pageSize <= 100" class="mobile-record-list" :aria-busy="loading">
         <article v-for="log in logs" :key="log.id" class="mobile-record">
           <header class="mobile-record__header">
             <div class="primary-stack">
@@ -113,11 +119,12 @@
 
       <ListPagination
         :page="currentPage"
-        :page-size="PAGE_SIZE"
+        :page-size="pageSize"
         :total="total"
         :loading="loading"
         aria-label="操作记录分页"
         @change="handlePageChange"
+        @size-change="handlePageSizeChange"
       />
     </template>
   </section>
@@ -127,7 +134,7 @@
 import { Refresh } from "@element-plus/icons-vue";
 import { onBeforeUnmount, onMounted, ref } from "vue";
 
-import { getAuditLogs } from "../api/admin.js";
+import { getAllAuditLogs, getAuditLogs } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
 import ListPagination from "../components/ListPagination.vue";
 import RequestAlert from "../components/RequestAlert.vue";
@@ -135,6 +142,11 @@ import SectionHeader from "../components/SectionHeader.vue";
 import VirtualDataTable from "../components/VirtualDataTable.vue";
 import { createLatestRequestGate } from "../utils/asyncState.js";
 import { formatTime } from "../utils/format.js";
+import {
+  ALL_PAGE_SIZE,
+  DEFAULT_PAGE_SIZE,
+  normalizePageSize,
+} from "../utils/pagination.js";
 
 const actionLabels = {
   login: "登录后台",
@@ -159,7 +171,7 @@ const resultLabels = {
   failed: { label: "失败", type: "danger" },
 };
 
-const PAGE_SIZE = 50;
+const pageSize = ref(DEFAULT_PAGE_SIZE);
 const auditColumns = [
   { key: "createdAt", title: "时间", width: 176, flexGrow: 1 },
   { key: "username", title: "管理员", width: 130, flexGrow: 1 },
@@ -174,6 +186,7 @@ const total = ref(0);
 const loading = ref(false);
 const loadError = ref(null);
 const loadGate = createLatestRequestGate();
+let listAbortController = null;
 let viewActive = true;
 
 function actionLabel(action) {
@@ -194,38 +207,63 @@ function resultMeta(result) {
 
 async function loadAuditLogs() {
   const page = currentPage.value;
-  const ticket = loadGate.begin(page);
+  const selectedPageSize = pageSize.value;
+  const requestKey = `${page}\u0000${selectedPageSize}`;
+  const ticket = loadGate.begin(requestKey);
+  listAbortController?.abort();
+  const abortController = new AbortController();
+  listAbortController = abortController;
   loading.value = true;
   loadError.value = null;
   try {
-    const result = await getAuditLogs({
-      limit: PAGE_SIZE,
-      offset: (page - 1) * PAGE_SIZE,
-    });
-    if (!viewActive || !loadGate.isCurrent(ticket, currentPage.value)) return;
+    const result = selectedPageSize === ALL_PAGE_SIZE
+      ? { items: await getAllAuditLogs({ signal: abortController.signal }) }
+      : await getAuditLogs({
+          limit: selectedPageSize,
+          offset: (page - 1) * selectedPageSize,
+          signal: abortController.signal,
+        });
+    if (
+      !viewActive ||
+      !loadGate.isCurrent(ticket, `${currentPage.value}\u0000${pageSize.value}`)
+    ) return;
     const nextTotal = Math.max(0, Number(result?.total) || 0);
-    const lastPage = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE));
-    if (page > lastPage) {
+    const nextItems = Array.isArray(result?.items) ? result.items : [];
+    const allItems = selectedPageSize === ALL_PAGE_SIZE;
+    const resolvedTotal = allItems ? nextItems.length : nextTotal;
+    const lastPage = allItems
+      ? 1
+      : Math.max(1, Math.ceil(resolvedTotal / selectedPageSize));
+    if (!allItems && page > lastPage) {
       currentPage.value = lastPage;
       logs.value = [];
-      total.value = nextTotal;
+      total.value = resolvedTotal;
       void loadAuditLogs();
       return;
     }
-    logs.value = Array.isArray(result?.items) ? result.items : [];
-    total.value = nextTotal;
+    logs.value = nextItems;
+    total.value = resolvedTotal;
   } catch (error) {
-    if (viewActive && loadGate.isCurrent(ticket, currentPage.value)) {
+    if (
+      error?.name !== "AbortError" &&
+      viewActive &&
+      loadGate.isCurrent(ticket, `${currentPage.value}\u0000${pageSize.value}`)
+    ) {
       loadError.value = error;
     }
   } finally {
-    if (loadGate.isCurrent(ticket, currentPage.value)) {
+    if (
+      listAbortController === abortController &&
+      loadGate.isCurrent(ticket, `${currentPage.value}\u0000${pageSize.value}`)
+    ) {
       loading.value = false;
     }
+    if (listAbortController === abortController) listAbortController = null;
   }
 }
 
 function handlePageChange(page) {
+  if (pageSize.value === ALL_PAGE_SIZE) return;
   const nextPage = Math.max(1, Number(page) || 1);
   if (nextPage === currentPage.value) return;
   currentPage.value = nextPage;
@@ -234,11 +272,24 @@ function handlePageChange(page) {
   void loadAuditLogs();
 }
 
+function handlePageSizeChange(value) {
+  const nextPageSize = normalizePageSize(value);
+  if (nextPageSize === pageSize.value) return;
+  pageSize.value = nextPageSize;
+  currentPage.value = 1;
+  logs.value = [];
+  total.value = 0;
+  loadError.value = null;
+  loadGate.invalidate();
+  void loadAuditLogs();
+}
+
 onMounted(loadAuditLogs);
 
 onBeforeUnmount(() => {
   viewActive = false;
   loadGate.deactivate();
+  listAbortController?.abort();
 });
 </script>
 

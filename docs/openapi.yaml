@@ -1075,6 +1075,9 @@ paths:
         `before_id` 游标向更早的记录翻页，或使用 `offset` 浏览筛选结果中的固定窗口；
         `offset` 大于 0 时不能同时提供 `before_id`。
 
+        每页默认返回 20 条，单次请求最多返回 1000 条。管理界面的“全部显示”会使用
+        `limit=1000` 和递增的 `offset` 分批读取当前筛选结果，不接受无限制的单次请求。
+
         邮件同步流程为每次逻辑同步分配一个 `sync_run_id`；同一次追平任务的多个批次继续使用同一值。
         每个被任务认领的自动创建计划槽分配一个 `auto_create_run_id`。两个运行标识都按结构化字段
         完整值精确匹配，前端据此读取当前环形窗口内同一轮流程的全部分页，再按时间从早到晚组成
@@ -1140,12 +1143,12 @@ paths:
         - name: limit
           in: query
           required: false
-          description: 本页最多返回的日志数。
+          description: 本页最多返回的日志数；管理端界面预设 20、50、100、500 和 1000 五档。
           schema:
             type: integer
             minimum: 1
-            maximum: 200
-            default: 100
+            maximum: 1000
+            default: 20
         - name: before_id
           in: query
           required: false
@@ -2242,7 +2245,7 @@ components:
         limit:
           type: integer
           minimum: 1
-          maximum: 200
+          maximum: 1000
           description: 当前请求的每页上限。
         offset:
           type: integer

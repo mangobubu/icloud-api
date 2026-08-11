@@ -9,9 +9,12 @@ import {
   getAutoCreateLogRun,
   getAccount,
   getAccountPage,
+  getAllAccounts,
+  getAllAuditLogs,
   getAccounts,
   getAliasPage,
   getAllAliases,
+  getAllRuntimeLogs,
   getAliases,
   getAuditLogs,
   getRuntimeLogRun,
@@ -105,6 +108,43 @@ test("account pages send server-side search and normalize pagination metadata", 
     },
     { ids: [12], total: 73, limit: 50, offset: 50, hasMore: false },
   );
+});
+
+test("full account lists follow bounded offset pages and forward abort signals", async () => {
+  const requests = [];
+  const controller = new AbortController();
+  const pages = [
+    {
+      items: [
+        { id: 12, email: "one@icloud.com" },
+        { id: 13, email: "two@icloud.com" },
+      ],
+      pagination: { total: 3, limit: 1000, offset: 0, has_more: true },
+    },
+    {
+      items: [{ id: 14, email: "three@icloud.com" }],
+      pagination: { total: 3, limit: 1000, offset: 2, has_more: false },
+    },
+  ];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url, "https://admin.invalid"), options });
+    return jsonResponse(pages.shift());
+  };
+
+  const accounts = await getAllAccounts({
+    query: "owner",
+    signal: controller.signal,
+  });
+
+  assert.deepEqual(accounts.map((account) => account.id), [12, 13, 14]);
+  assert.equal(requests.length, 2);
+  for (const { url, options } of requests) {
+    assert.equal(url.searchParams.get("limit"), "1000");
+    assert.equal(url.searchParams.get("query"), "owner");
+    assert.equal(options.signal, controller.signal);
+  }
+  assert.equal(requests[0].url.searchParams.get("offset"), "0");
+  assert.equal(requests[1].url.searchParams.get("offset"), "2");
 });
 
 test("account detail accepts camelCase progress and falls back to the sync error", async () => {
@@ -452,8 +492,16 @@ test("alias directory forwards the optional primary-account filter", async () =>
   const filtered = await getAliases(12);
   const all = await getAliases();
 
-  assert.equal(requests[0].url, "/admin/api/v1/aliases?account_id=12");
-  assert.equal(requests[1].url, "/admin/api/v1/aliases");
+  const filteredURL = new URL(requests[0].url, "https://admin.invalid");
+  const allURL = new URL(requests[1].url, "https://admin.invalid");
+  assert.equal(filteredURL.pathname, "/admin/api/v1/aliases");
+  assert.equal(filteredURL.searchParams.get("account_id"), "12");
+  assert.equal(filteredURL.searchParams.get("limit"), "1000");
+  assert.equal(filteredURL.searchParams.get("offset"), "0");
+  assert.equal(allURL.pathname, "/admin/api/v1/aliases");
+  assert.equal(allURL.searchParams.has("account_id"), false);
+  assert.equal(allURL.searchParams.get("limit"), "1000");
+  assert.equal(allURL.searchParams.get("offset"), "0");
   assert.equal(filtered[0].accountId, 12);
   assert.equal(
     filtered[0].lastSyncErrorLog,
@@ -519,7 +567,7 @@ test("full alias export follows every server page for the selected account", asy
   assert.equal(requests[0].searchParams.get("offset"), "0");
   assert.equal(requests[1].searchParams.get("offset"), "1");
   for (const request of requests) {
-    assert.equal(request.searchParams.get("limit"), "200");
+    assert.equal(request.searchParams.get("limit"), "1000");
     assert.equal(request.searchParams.get("account_id"), "12");
   }
 });
@@ -546,6 +594,42 @@ test("audit pages preserve total, limit, offset, and has-more metadata", async (
     { total: page.total, limit: page.limit, offset: page.offset, hasMore: page.hasMore },
     { total: 131, limit: 50, offset: 100, hasMore: true },
   );
+});
+
+test("full audit and runtime log lists use 1000-row batches", async () => {
+  const controller = new AbortController();
+  const requests = [];
+  const responses = [
+    jsonResponse({
+      items: [{ id: 31, action: "update" }],
+      pagination: { total: 1, limit: 1000, offset: 0, has_more: false },
+    }),
+    jsonResponse({
+      items: [{ id: 41, message: "first" }],
+      pagination: { total: 1, limit: 1000, offset: 0, has_more: false },
+    }),
+  ];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url, "https://admin.invalid"), options });
+    return responses.shift();
+  };
+
+  const audit = await getAllAuditLogs({ signal: controller.signal });
+  const runtime = await getAllRuntimeLogs({
+    level: "error",
+    accountId: 12,
+    signal: controller.signal,
+  });
+
+  assert.equal(audit[0].id, 31);
+  assert.equal(runtime[0].id, 41);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].url.searchParams.get("limit"), "1000");
+  assert.equal(requests[1].url.searchParams.get("limit"), "1000");
+  assert.equal(requests[1].url.searchParams.get("level"), "error");
+  assert.equal(requests[1].url.searchParams.get("account_id"), "12");
+  assert.equal(requests[0].options.signal, controller.signal);
+  assert.equal(requests[1].options.signal, controller.signal);
 });
 
 test("pending mail sync accepts HTTP 202 and exposes continuation state", async () => {
@@ -860,7 +944,7 @@ test("sync run logs follow every cursor without inheriting list filters", async 
   assert.deepEqual(Object.fromEntries(requests[0].searchParams), {
     account_id: "12",
     sync_run_id: "run-42",
-    limit: "200",
+    limit: "1000",
   });
   assert.equal(requests[1].searchParams.get("before_id"), "5");
   assert.equal(requests[2].searchParams.get("before_id"), "3");
@@ -935,7 +1019,7 @@ test("automatic creation run logs follow every cursor with their own run filter"
   assert.deepEqual(Object.fromEntries(requests[0].searchParams), {
     account_id: "12",
     auto_create_run_id: "auto-run-42",
-    limit: "200",
+    limit: "1000",
   });
   assert.equal(requests[1].searchParams.get("before_id"), "3");
   for (const request of requests) {

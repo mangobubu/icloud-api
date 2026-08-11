@@ -439,6 +439,19 @@ code {
   white-space: nowrap;
 }
 
+.list-pagination__controls {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.list-pagination__size {
+  width: 120px;
+}
+
 .list-pagination .el-pagination {
   margin: 0;
 }
@@ -1511,6 +1524,10 @@ code {
 
   .desktop-data-table {
     display: none;
+  }
+
+  .desktop-data-table.desktop-data-table--force {
+    display: block;
   }
 
   .mobile-record-list {

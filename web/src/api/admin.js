@@ -5,6 +5,10 @@ import {
   mergeRuntimeLogs,
   normalizeRuntimeLogPage,
 } from "../utils/runtimeLogs.js";
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+} from "../utils/pagination.js";
 
 function firstDefined(object, ...keys) {
   for (const key of keys) {
@@ -50,7 +54,7 @@ function normalizeListPage(data, normalizer, keys = [], options = {}) {
     firstDefined(pagination, "limit", "Limit") ??
       firstDefined(data, "limit", "Limit"),
     1,
-    integerAtLeast(options.limit, 1, rawItems.length || 50),
+    integerAtLeast(options.limit, 1, rawItems.length || DEFAULT_PAGE_SIZE),
   );
   const explicitTotal = Number(
     firstDefined(pagination, "total", "Total") ??
@@ -78,7 +82,10 @@ function normalizeListPage(data, normalizer, keys = [], options = {}) {
 
 function listQuery(options = {}, extra = {}) {
   const parameters = new URLSearchParams();
-  const limit = Math.min(200, integerAtLeast(options.limit, 1, 50));
+  const limit = Math.min(
+    MAX_PAGE_SIZE,
+    integerAtLeast(options.limit, 1, DEFAULT_PAGE_SIZE),
+  );
   const offset = Math.min(1_000_000, integerAtLeast(options.offset, 0, 0));
   parameters.set("limit", String(limit));
   parameters.set("offset", String(offset));
@@ -356,15 +363,58 @@ export function updatePassword(payload, csrfToken) {
   });
 }
 
-export async function getAccounts() {
-  const data = await apiRequest("/accounts");
-  return listFrom(data, "accounts", "items").map(normalizeAccount);
+export function getAccounts(options = {}) {
+  return getAllAccounts(options);
 }
 
 export async function getAccountPage(options = {}) {
   const query = listQuery(options, { query: options.query });
-  const data = await apiRequest(`/accounts?${query}`);
+  const data = await apiRequest(`/accounts?${query}`, {
+    signal: options.signal,
+  });
   return normalizeListPage(data, normalizeAccount, ["accounts", "items"], options);
+}
+
+async function collectOffsetPages(fetchPage, options = {}) {
+  const items = [];
+  let offset = 0;
+  let total = 0;
+  const maximumPages = 10000;
+
+  for (let pageNumber = 0; pageNumber < maximumPages; pageNumber += 1) {
+    const page = await fetchPage({
+      ...options,
+      limit: MAX_PAGE_SIZE,
+      offset,
+    });
+    const pageItems = Array.isArray(page?.items) ? page.items : [];
+    items.push(...pageItems);
+    const reportedTotal = Number(page?.total);
+    if (Number.isFinite(reportedTotal) && reportedTotal >= 0) {
+      total = Math.trunc(reportedTotal);
+    }
+
+    const pageOffset = Number(page?.offset);
+    const nextOffset =
+      Number.isFinite(pageOffset) && pageOffset >= 0
+        ? Math.trunc(pageOffset) + pageItems.length
+        : offset + pageItems.length;
+    if (
+      !page?.hasMore ||
+      pageItems.length === 0 ||
+      nextOffset <= offset ||
+      (total > 0 && nextOffset >= total)
+    ) {
+      break;
+    }
+    offset = nextOffset;
+  }
+
+  return items;
+}
+
+export function getAllAccounts(options = {}) {
+  return collectOffsetPages(getAccountPage, options);
 }
 
 export async function getAccount(id) {
@@ -636,33 +686,23 @@ export async function createAlias(accountId, payload, csrfToken) {
   );
 }
 
-export async function getAliases(accountId = "") {
-  const normalizedAccountId = String(accountId ?? "").trim();
-  const query = normalizedAccountId
-    ? `?account_id=${encodeURIComponent(normalizedAccountId)}`
-    : "";
-  const data = await apiRequest(`/aliases${query}`);
-  return listFrom(data, "aliases", "items").map(normalizeAlias);
+export function getAliases(accountId = "", options = {}) {
+  return getAllAliases(accountId, options);
 }
 
 export async function getAliasPage(accountId = "", options = {}) {
   const query = listQuery(options, { account_id: accountId });
-  const data = await apiRequest(`/aliases?${query}`);
+  const data = await apiRequest(`/aliases?${query}`, {
+    signal: options.signal,
+  });
   return normalizeListPage(data, normalizeAlias, ["aliases", "items"], options);
 }
 
-export async function getAllAliases(accountId = "") {
-  const pageSize = 200;
-  const aliases = [];
-  let offset = 0;
-
-  while (true) {
-    const page = await getAliasPage(accountId, { limit: pageSize, offset });
-    aliases.push(...page.items);
-    offset += page.items.length;
-    if (!page.hasMore || page.items.length === 0 || offset >= page.total) break;
-  }
-  return aliases;
+export function getAllAliases(accountId = "", options = {}) {
+  return collectOffsetPages(
+    (pageOptions) => getAliasPage(accountId, pageOptions),
+    options,
+  );
 }
 
 export async function rotateAlias(id, csrfToken) {
@@ -692,7 +732,9 @@ export function deleteAlias(id, csrfToken) {
 
 export async function getAuditLogs(options = {}) {
   const query = listQuery(options);
-  const data = await apiRequest(`/audit?${query}`);
+  const data = await apiRequest(`/audit?${query}`, {
+    signal: options.signal,
+  });
   return normalizeListPage(
     data,
     normalizeAuditLog,
@@ -701,12 +743,23 @@ export async function getAuditLogs(options = {}) {
   );
 }
 
+export function getAllAuditLogs(options = {}) {
+  return collectOffsetPages(getAuditLogs, options);
+}
+
 export async function getRuntimeLogs(options = {}) {
   const query = buildRuntimeLogQuery(options);
   const data = await apiRequest(`/logs${query ? `?${query}` : ""}`, {
     signal: options.signal,
   });
   return normalizeRuntimeLogPage(data || {});
+}
+
+export function getAllRuntimeLogs(options = {}) {
+  return collectOffsetPages(
+    (pageOptions) => getRuntimeLogs({ ...options, ...pageOptions }),
+    options,
+  );
 }
 
 async function getRuntimeLogFlow(runFilter, options = {}) {
@@ -720,7 +773,7 @@ async function getRuntimeLogFlow(runFilter, options = {}) {
     const page = await getRuntimeLogs({
       accountId: options.accountId,
       beforeId,
-      limit: 200,
+      limit: MAX_PAGE_SIZE,
       signal: options.signal,
       ...runFilter,
     });

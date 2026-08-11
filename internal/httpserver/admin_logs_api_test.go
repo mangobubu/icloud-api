@@ -130,7 +130,7 @@ func TestAdminAPIApplicationLogsKeywordCompatibilityAndEmptySource(t *testing.T)
 
 	env.server.SetApplicationLogSource(nil)
 	response = env.request(t, http.MethodGet, "/admin/api/v1/logs", nil, "", []*http.Cookie{sessionCookie}, "")
-	if response.Code != http.StatusOK || response.Body.String() != `{"data":{"has_more":false,"items":[],"next_before_id":0,"pagination":{"has_more":false,"limit":100,"offset":0,"total":0}}}` {
+	if response.Code != http.StatusOK || response.Body.String() != `{"data":{"has_more":false,"items":[],"next_before_id":0,"pagination":{"has_more":false,"limit":20,"offset":0,"total":0}}}` {
 		t.Fatalf("unconfigured application logs response = %d; body=%s", response.Code, response.Body.String())
 	}
 }
@@ -171,6 +171,21 @@ func TestAdminAPIApplicationLogsMapsOffsetPagination(t *testing.T) {
 	}
 }
 
+func TestAdminAPIApplicationLogsAcceptMaximumPageLimit(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, _, _ := env.createSession(t, "maximum-log-page-admin", "unused-password")
+	source := &stubApplicationLogSource{page: applog.Page{Items: []applog.Entry{}, Total: 1001, HasMore: true}}
+	env.server.SetApplicationLogSource(source)
+
+	response := env.request(t, http.MethodGet, adminAPIApplicationLogsPath+"?limit=1000", nil, "", []*http.Cookie{sessionCookie}, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("maximum application log page status = %d; body=%s", response.Code, response.Body.String())
+	}
+	if source.filter.Limit != adminAPIMaxLogLimit {
+		t.Fatalf("maximum application log limit = %d, want %d", source.filter.Limit, adminAPIMaxLogLimit)
+	}
+}
+
 func TestAdminAPIApplicationLogsRequireSession(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	source := &stubApplicationLogSource{}
@@ -199,7 +214,7 @@ func TestAdminAPIApplicationLogsRejectInvalidFilters(t *testing.T) {
 		"before_id=0",
 		"before_id=not-an-id",
 		"limit=0",
-		"limit=201",
+		"limit=1001",
 		"offset=-1",
 		"offset=1000001",
 		"offset=not-an-offset",

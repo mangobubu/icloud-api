@@ -32,8 +32,8 @@ const (
 	// MaxFields bounds the number of structured fields retained per entry.
 	MaxFields = 64
 
-	DefaultListLimit = 100
-	MaxListLimit     = 200
+	DefaultListLimit = 20
+	MaxListLimit     = 1000
 
 	maxSourceBytes = 512
 	fieldOverhead  = 16

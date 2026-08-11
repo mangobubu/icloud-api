@@ -23,47 +23,63 @@ test("shared list pagination binds page, size, total, loading, and page changes"
   const source = await readFile(componentPath, "utf8");
 
   assert.match(source, /<el-pagination/);
+  assert.match(source, /<el-select/);
   assert.match(source, /:current-page="page"/);
   assert.match(source, /:page-size="pageSize"/);
   assert.match(source, /:total="total"/);
   assert.match(source, /:disabled="loading"/);
   assert.match(source, /@current-change="emit\('change', \$event\)"/);
+  assert.match(source, /pageSize:\s*\{\s*type:\s*Number,\s*default:\s*20\s*\}/);
+  assert.match(source, /\{ label: "20 条\/页", value: 20 \}/);
+  assert.match(source, /\{ label: "50 条\/页", value: 50 \}/);
+  assert.match(source, /\{ label: "100 条\/页", value: 100 \}/);
+  assert.match(source, /\{ label: "500 条\/页", value: 500 \}/);
+  assert.match(source, /\{ label: "1000 条\/页", value: 1000 \}/);
+  assert.match(source, /\{ label: "全部显示", value: 0 \}/);
+  assert.match(source, /defineEmits\(\["change", "size-change"\]\)/);
+  assert.match(source, /emit\("size-change", nextPageSize\)/);
+  assert.match(source, /v-if="pageSize > 0"/);
 });
 
-test("account management requests and renders only the current server page", async () => {
+test("account management supports bounded pages and a batched all-items mode", async () => {
   const source = await readFile(accountsPath, "utf8");
 
-  assert.match(source, /PAGE_SIZE\s*=\s*50/);
+  assert.match(source, /pageSize\s*=\s*ref\(DEFAULT_PAGE_SIZE\)/);
   assert.match(source, /getAccountPage\(\{/);
-  assert.match(source, /offset:\s*\(page - 1\) \* PAGE_SIZE/);
-  assert.match(source, /accounts\.value = Array\.isArray\(result\?\.items\)/);
+  assert.match(source, /offset:\s*\(page - 1\) \* selectedPageSize/);
+  assert.match(source, /accounts\.value = nextItems/);
+  assert.match(source, /getAllAccounts\(/);
   assert.match(source, /<ListPagination/);
   assert.match(source, /@change="handlePageChange"/);
+  assert.match(source, /@size-change="handlePageSizeChange"/);
 });
 
-test("alias paging resets on filters and keeps full export independent", async () => {
+test("alias paging resets on filters and supports full batched display/export", async () => {
   const source = await readFile(aliasesPath, "utf8");
 
   assert.match(source, /getAliasPage\(accountId,\s*\{/);
-  assert.match(source, /offset:\s*\(page - 1\) \* PAGE_SIZE/);
+  assert.match(source, /offset:\s*\(page - 1\) \* selectedPageSize/);
   assert.match(
     source,
     /function handleAccountFilterChange[\s\S]{0,180}currentPage\.value = 1/,
   );
   assert.match(source, /:remote-method="searchAccounts"/);
   assert.match(source, /getAccountPage\(\{/);
-  assert.match(source, /getAllAliases\(selectedAccountId\.value\)/);
+  assert.match(source, /getAllAliases\(accountId,/);
   assert.match(source, /<ListPagination/);
+  assert.match(source, /@size-change="handlePageSizeChange"/);
 });
 
-test("audit records pass page offsets to the server and replace visible rows", async () => {
+test("audit records pass page offsets and support full batched display", async () => {
   const source = await readFile(auditPath, "utf8");
 
   assert.match(source, /getAuditLogs\(\{/);
-  assert.match(source, /limit:\s*PAGE_SIZE/);
-  assert.match(source, /offset:\s*\(page - 1\) \* PAGE_SIZE/);
-  assert.match(source, /logs\.value = Array\.isArray\(result\?\.items\)/);
+  assert.match(source, /limit:\s*selectedPageSize/);
+  assert.match(source, /offset:\s*\(page - 1\) \* selectedPageSize/);
+  assert.match(source, /logs\.value = nextItems/);
+  assert.match(source, /getAllAuditLogs\(/);
   assert.match(source, /<ListPagination/);
+  assert.match(source, /@size-change="handlePageSizeChange"/);
 });
 
 test("every desktop data table uses the shared virtual table", async () => {

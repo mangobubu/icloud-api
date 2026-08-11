@@ -13,8 +13,8 @@ import (
 
 const (
 	adminAPIApplicationLogsPath = "/admin/api/v1/logs"
-	adminAPIDefaultLogLimit     = 100
-	adminAPIMaxLogLimit         = 200
+	adminAPIDefaultLogLimit     = applog.DefaultListLimit
+	adminAPIMaxLogLimit         = applog.MaxListLimit
 	adminAPIMaxLogQueryRunes    = 200
 	adminAPIMaxSyncRunIDRunes   = 128
 )

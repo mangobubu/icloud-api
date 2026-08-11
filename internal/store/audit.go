@@ -10,6 +10,11 @@ import (
 	"icloud-api/internal/domain"
 )
 
+const (
+	defaultAuditLogLimit = 20
+	maxAuditLogLimit     = 1000
+)
+
 type AuditLogFilter struct {
 	AdminID      *int64
 	Action       string
@@ -129,10 +134,10 @@ func normalizeAuditLogFilter(filter AuditLogFilter) AuditLogFilter {
 	filter.ResourceType = sanitizePostgresText(filter.ResourceType)
 	filter.Result = sanitizePostgresText(filter.Result)
 	if filter.Limit <= 0 {
-		filter.Limit = 100
+		filter.Limit = defaultAuditLogLimit
 	}
-	if filter.Limit > 1000 {
-		filter.Limit = 1000
+	if filter.Limit > maxAuditLogLimit {
+		filter.Limit = maxAuditLogLimit
 	}
 	if filter.Offset < 0 {
 		filter.Offset = 0

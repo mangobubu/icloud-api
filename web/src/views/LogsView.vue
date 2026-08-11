@@ -128,7 +128,13 @@
         @close="loadError = null"
       />
 
-      <div class="data-panel desktop-data-table" :aria-busy="loading">
+      <div
+        class="data-panel desktop-data-table"
+        :class="{
+          'desktop-data-table--force': pageSize > 100 || pageSize === ALL_PAGE_SIZE,
+        }"
+        :aria-busy="loading"
+      >
         <VirtualDataTable
           :columns="runtimeLogColumns"
           :data="logs"
@@ -177,7 +183,7 @@
         </VirtualDataTable>
       </div>
 
-      <div class="mobile-record-list" :aria-busy="loading">
+      <div v-if="pageSize <= 100" class="mobile-record-list" :aria-busy="loading">
         <article v-for="log in logs" :key="log.id" class="mobile-record">
           <header class="mobile-record__header">
             <div class="primary-stack">
@@ -215,11 +221,12 @@
       <div class="runtime-log-pagination" aria-live="polite">
         <ListPagination
           :page="currentPage"
-          :page-size="PAGE_SIZE"
+          :page-size="pageSize"
           :total="total"
           :loading="loading"
           aria-label="全部日志分页"
           @change="handlePageChange"
+          @size-change="handlePageSizeChange"
         />
       </div>
     </template>
@@ -256,6 +263,7 @@ import { useRoute, useRouter } from "vue-router";
 import {
   getAutoCreateLogRun,
   getAccountPage,
+  getAllRuntimeLogs,
   getRuntimeLogRun,
   getRuntimeLogs,
 } from "../api/admin.js";
@@ -272,8 +280,12 @@ import {
   normalizeRuntimeLogLevel,
   runtimeLogLevelMeta,
 } from "../utils/runtimeLogs.js";
+import {
+  ALL_PAGE_SIZE,
+  DEFAULT_PAGE_SIZE,
+  normalizePageSize,
+} from "../utils/pagination.js";
 
-const PAGE_SIZE = 50;
 const ACCOUNT_OPTION_LIMIT = 50;
 const runtimeLogColumns = [
   { key: "time", title: "时间", width: 178, flexGrow: 1 },
@@ -317,6 +329,7 @@ const loadError = ref(null);
 const accountsLoading = ref(false);
 const accountsLoadError = ref(null);
 const currentPage = ref(1);
+const pageSize = ref(DEFAULT_PAGE_SIZE);
 const total = ref(0);
 const autoRefreshEnabled = ref(true);
 const detailVisible = ref(false);
@@ -329,6 +342,7 @@ const detailRequestGate = createLatestRequestGate();
 const accountLoadGate = createLatestRequestGate();
 let latestRequest = null;
 let latestRequestKey = "";
+let listAbortController = null;
 let accountSearchTimer = null;
 let detailFlowAbortController = null;
 let viewActive = true;
@@ -402,20 +416,24 @@ function currentRequestOptions(page = currentPage.value) {
     level: filters.level,
     query: appliedKeyword.value,
     accountId: filters.accountId,
-    limit: PAGE_SIZE,
-    offset: (page - 1) * PAGE_SIZE,
+    limit: pageSize.value,
+    offset: (page - 1) * pageSize.value,
   };
 }
 
 function loadLatestLogs({ silent = false, force = false } = {}) {
   const filterKey = currentFilterKey.value;
   const page = currentPage.value;
-  const requestKey = `${filterKey}\u0000${page}`;
+  const selectedPageSize = pageSize.value;
+  const requestKey = `${filterKey}\u0000${page}\u0000${selectedPageSize}`;
   if (!force && latestRequest && latestRequestKey === requestKey) {
     return latestRequest;
   }
 
   const ticket = logRequestGate.begin(requestKey);
+  listAbortController?.abort();
+  const abortController = new AbortController();
+  listAbortController = abortController;
   if (!silent) {
     loading.value = true;
     loadError.value = null;
@@ -423,11 +441,19 @@ function loadLatestLogs({ silent = false, force = false } = {}) {
 
   const request = (async () => {
     try {
-      const result = await getRuntimeLogs(currentRequestOptions(page));
+      const requestOptions = {
+        ...currentRequestOptions(page),
+        signal: abortController.signal,
+      };
+      const result = selectedPageSize === ALL_PAGE_SIZE
+        ? {
+            items: await getAllRuntimeLogs(requestOptions),
+          }
+        : await getRuntimeLogs(requestOptions);
       if (
         !logRequestGate.isCurrent(
           ticket,
-          `${currentFilterKey.value}\u0000${currentPage.value}`,
+          `${currentFilterKey.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
         )
       ) {
         return false;
@@ -435,11 +461,16 @@ function loadLatestLogs({ silent = false, force = false } = {}) {
 
       const items = Array.isArray(result?.items) ? result.items : [];
       const reportedTotal = Number(result?.total);
-      const nextTotal = Number.isFinite(reportedTotal)
-        ? Math.max(0, reportedTotal)
-        : (page - 1) * PAGE_SIZE + items.length + (result?.hasMore ? 1 : 0);
-      const lastPage = Math.max(1, Math.ceil(nextTotal / PAGE_SIZE));
-      if (page > lastPage) {
+      const allItems = selectedPageSize === ALL_PAGE_SIZE;
+      const nextTotal = allItems
+        ? items.length
+        : Number.isFinite(reportedTotal)
+          ? Math.max(0, reportedTotal)
+          : (page - 1) * selectedPageSize + items.length + (result?.hasMore ? 1 : 0);
+      const lastPage = allItems
+        ? 1
+        : Math.max(1, Math.ceil(nextTotal / selectedPageSize));
+      if (!allItems && page > lastPage) {
         currentPage.value = lastPage;
         logs.value = [];
         total.value = nextTotal;
@@ -452,9 +483,10 @@ function loadLatestLogs({ silent = false, force = false } = {}) {
       return true;
     } catch (error) {
       if (
+        error?.name !== "AbortError" &&
         logRequestGate.isCurrent(
           ticket,
-          `${currentFilterKey.value}\u0000${currentPage.value}`,
+          `${currentFilterKey.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
         )
       ) {
         loadError.value = error;
@@ -466,12 +498,16 @@ function loadLatestLogs({ silent = false, force = false } = {}) {
         latestRequestKey = "";
       }
       if (
+        listAbortController === abortController &&
         logRequestGate.isCurrent(
           ticket,
-          `${currentFilterKey.value}\u0000${currentPage.value}`,
+          `${currentFilterKey.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
         )
       ) {
         loading.value = false;
+      }
+      if (listAbortController === abortController) {
+        listAbortController = null;
       }
     }
   })();
@@ -504,6 +540,7 @@ function refreshLatestLogs() {
 }
 
 function handlePageChange(page) {
+  if (pageSize.value === ALL_PAGE_SIZE) return;
   const nextPage = Math.max(1, Number(page) || 1);
   if (nextPage === currentPage.value) return;
   if (nextPage > 1 && autoRefreshEnabled.value) {
@@ -513,6 +550,18 @@ function handlePageChange(page) {
   logs.value = [];
   total.value = 0;
   loadError.value = null;
+  void loadLatestLogs({ force: true });
+}
+
+function handlePageSizeChange(value) {
+  const nextPageSize = normalizePageSize(value);
+  if (nextPageSize === pageSize.value) return;
+  pageSize.value = nextPageSize;
+  currentPage.value = 1;
+  logs.value = [];
+  total.value = 0;
+  loadError.value = null;
+  logRequestGate.invalidate();
   void loadLatestLogs({ force: true });
 }
 
@@ -645,6 +694,7 @@ onBeforeUnmount(() => {
     accountSearchTimer = null;
   }
   logRequestGate.deactivate();
+  listAbortController?.abort();
   accountLoadGate.deactivate();
   detailFlowAbortController?.abort();
   detailRequestGate.deactivate();

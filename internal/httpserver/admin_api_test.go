@@ -815,7 +815,7 @@ func TestAdminAPIListAccountsUsesServerPagingAndSearch(t *testing.T) {
 
 	invalidTargets := []string{
 		"/admin/api/v1/accounts?limit=0",
-		"/admin/api/v1/accounts?limit=201",
+		"/admin/api/v1/accounts?limit=1001",
 		"/admin/api/v1/accounts?offset=-1",
 		"/admin/api/v1/accounts?offset=1000001",
 		"/admin/api/v1/accounts?query=" + url.QueryEscape(strings.Repeat("界", adminAPIMaxListQueryRunes+1)),
@@ -824,6 +824,48 @@ func TestAdminAPIListAccountsUsesServerPagingAndSearch(t *testing.T) {
 		invalid := env.request(t, http.MethodGet, target, nil, "", []*http.Cookie{sessionCookie}, "")
 		if invalid.Code != http.StatusBadRequest || adminAPITestErrorCode(t, invalid) != "VALIDATION_FAILED" {
 			t.Fatalf("invalid account page %q = %d; body=%s", target, invalid.Code, invalid.Body.String())
+		}
+	}
+}
+
+func TestAdminAPIListEndpointsAcceptConfiguredPageSizes(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, _, _ := env.createSession(t, "page-size-admin", "page size password")
+
+	for _, endpoint := range []string{
+		"/admin/api/v1/accounts",
+		"/admin/api/v1/aliases",
+		"/admin/api/v1/audit",
+	} {
+		assertLimit := func(target string, want int) {
+			t.Helper()
+			response := env.request(t, http.MethodGet, target, nil, "", []*http.Cookie{sessionCookie}, "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("GET %s status = %d; body=%s", target, response.Code, response.Body.String())
+			}
+			var payload struct {
+				Data struct {
+					Pagination struct {
+						Limit int `json:"limit"`
+					} `json:"pagination"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode GET %s: %v; body=%s", target, err, response.Body.String())
+			}
+			if payload.Data.Pagination.Limit != want {
+				t.Fatalf("GET %s pagination limit = %d, want %d", target, payload.Data.Pagination.Limit, want)
+			}
+		}
+
+		assertLimit(endpoint, adminAPIDefaultPageLimit)
+		for _, limit := range []int{20, 50, 100, 500, 1000} {
+			assertLimit(fmt.Sprintf("%s?limit=%d", endpoint, limit), limit)
+		}
+
+		response := env.request(t, http.MethodGet, endpoint+"?limit=1001", nil, "", []*http.Cookie{sessionCookie}, "")
+		if response.Code != http.StatusBadRequest || adminAPITestErrorCode(t, response) != "VALIDATION_FAILED" {
+			t.Fatalf("GET %s with an oversized page = %d; body=%s", endpoint, response.Code, response.Body.String())
 		}
 	}
 }

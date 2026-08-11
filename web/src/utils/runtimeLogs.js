@@ -1,3 +1,8 @@
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+} from "./pagination.js";
+
 const LEVEL_ALIASES = {
   warning: "warn",
   fatal: "error",
@@ -776,7 +781,7 @@ export function normalizeRuntimeLogPage(data = {}) {
   );
   const limit = Number.isFinite(rawLimit) && rawLimit > 0
     ? Math.trunc(rawLimit)
-    : rawItems.length || 50;
+    : rawItems.length || DEFAULT_PAGE_SIZE;
   const rawOffset = Number(
     firstDefined(pagination, "offset", "Offset") ??
       firstDefined(data, "offset", "Offset"),
@@ -809,8 +814,8 @@ export function buildRuntimeLogQuery(options = {}) {
   const accountId = String(options.accountId ?? "").trim();
   const rawLimit = Number(options.limit);
   const limit = Number.isFinite(rawLimit)
-    ? Math.min(200, Math.max(1, Math.trunc(rawLimit)))
-    : 50;
+    ? Math.min(MAX_PAGE_SIZE, Math.max(1, Math.trunc(rawLimit)))
+    : DEFAULT_PAGE_SIZE;
   const rawOffset = Number(options.offset);
   const offset = Number.isFinite(rawOffset)
     ? Math.min(1_000_000, Math.max(0, Math.trunc(rawOffset)))

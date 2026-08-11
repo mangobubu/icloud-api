@@ -172,12 +172,18 @@ func TestListPagesRejectInvalidBounds(t *testing.T) {
 	if _, err := db.ListAccountsPage(ctx, store.AccountListFilter{Limit: 1, Offset: -1}); err == nil {
 		t.Fatal("account page accepted a negative offset")
 	}
+	if _, err := db.ListAccountsPage(ctx, store.AccountListFilter{Limit: 1001}); err == nil {
+		t.Fatal("account page accepted a limit above the bounded page size")
+	}
 	invalidAccountID := int64(0)
 	if _, err := db.ListAliasesPage(ctx, store.AliasListFilter{
 		AccountID: &invalidAccountID,
 		Limit:     1,
 	}); err == nil {
 		t.Fatal("alias page accepted a non-positive account ID")
+	}
+	if _, err := db.ListAliasesPage(ctx, store.AliasListFilter{Limit: 1001}); err == nil {
+		t.Fatal("alias page accepted a limit above the bounded page size")
 	}
 }
 

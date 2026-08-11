@@ -124,6 +124,24 @@ func TestListOffsetPaginationCountsAllFilteredEntries(t *testing.T) {
 	}
 }
 
+func TestListAppliesDefaultAndMaximumLimits(t *testing.T) {
+	handler := New(MaxListLimit + 1)
+	logger := slog.New(handler)
+	for index := 0; index < MaxListLimit+1; index++ {
+		logger.Info("bounded page", "index", index)
+	}
+
+	defaultPage := handler.List(Filter{})
+	if len(defaultPage.Items) != DefaultListLimit || !defaultPage.HasMore {
+		t.Fatalf("default page length/has-more = %d/%t, want %d/true", len(defaultPage.Items), defaultPage.HasMore, DefaultListLimit)
+	}
+
+	maximumPage := handler.List(Filter{Limit: MaxListLimit + 1})
+	if len(maximumPage.Items) != MaxListLimit || !maximumPage.HasMore {
+		t.Fatalf("maximum page length/has-more = %d/%t, want %d/true", len(maximumPage.Items), maximumPage.HasMore, MaxListLimit)
+	}
+}
+
 func TestListFiltersSyncRunIDExactly(t *testing.T) {
 	handler := New(10)
 	logger := slog.New(handler)
@@ -406,6 +424,7 @@ func TestHandlerConcurrentWritesRemainBounded(t *testing.T) {
 		workers   = 10
 		perWorker = 100
 		capacity  = 500
+		pageLimit = 200
 	)
 	handler := New(capacity)
 	logger := slog.New(handler)
@@ -422,8 +441,8 @@ func TestHandlerConcurrentWritesRemainBounded(t *testing.T) {
 	}
 	group.Wait()
 
-	page := handler.List(Filter{Limit: MaxListLimit})
-	if len(page.Items) != MaxListLimit || !page.HasMore {
+	page := handler.List(Filter{Limit: pageLimit})
+	if len(page.Items) != pageLimit || !page.HasMore {
 		t.Fatalf("page length/has-more = %d/%t", len(page.Items), page.HasMore)
 	}
 	handler.ring.mu.RLock()

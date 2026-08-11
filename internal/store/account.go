@@ -28,6 +28,8 @@ type AccountPage struct {
 	Total int
 }
 
+const maxListPageLimit = 1000
+
 func (s *Store) CreateAccount(ctx context.Context, account domain.Account) (domain.Account, error) {
 	now := s.now()
 	status := strings.TrimSpace(sanitizePostgresText(account.LastSyncStatus))
@@ -270,6 +272,9 @@ func (s *Store) listAccounts(ctx context.Context, enabledOnly bool) ([]domain.Ac
 func validateListPage(limit, offset int) error {
 	if limit < 1 {
 		return errors.New("limit must be positive")
+	}
+	if limit > maxListPageLimit {
+		return fmt.Errorf("limit must not exceed %d", maxListPageLimit)
 	}
 	if offset < 0 {
 		return errors.New("offset must not be negative")

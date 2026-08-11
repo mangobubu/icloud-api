@@ -30,8 +30,8 @@ const (
 	adminAPILoginCSRFPath     = "/admin/api/v1/auth"
 	adminAPICSRFHeader        = "X-CSRF-Token"
 	adminAPIMaxJSONBytes      = 64 << 10
-	adminAPIDefaultPageLimit  = 50
-	adminAPIMaxPageLimit      = 200
+	adminAPIDefaultPageLimit  = 20
+	adminAPIMaxPageLimit      = 1000
 	adminAPIMaxPageOffset     = 1_000_000
 	adminAPIMaxListQueryRunes = 200
 )
@@ -1296,11 +1296,7 @@ func (s *Server) adminAPIDeleteAlias(c *gin.Context) {
 }
 
 func (s *Server) adminAPIListAuditLogs(c *gin.Context) {
-	limit, ok := adminAPIQueryInt(c, "limit", adminAPIDefaultPageLimit, 1, adminAPIMaxPageLimit)
-	if !ok {
-		return
-	}
-	offset, ok := adminAPIQueryInt(c, "offset", 0, 0, adminAPIMaxPageOffset)
+	limit, offset, ok := adminAPIListPage(c)
 	if !ok {
 		return
 	}

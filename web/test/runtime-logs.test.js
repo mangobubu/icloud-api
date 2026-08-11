@@ -170,11 +170,11 @@ test("runtime log queries trim filters, encode values, and clamp limits", () => 
     account_id: "12",
     sync_run_id: "sync-run-7",
     auto_create_run_id: "auto-run-7",
-    limit: "200",
+    limit: "500",
     offset: "175",
     before_id: "91",
   });
-  assert.equal(buildRuntimeLogQuery({ limit: "invalid" }), "limit=50");
+  assert.equal(buildRuntimeLogQuery({ limit: "invalid" }), "limit=20");
 });
 
 test("sync flow fields normalize from structured attributes", () => {
