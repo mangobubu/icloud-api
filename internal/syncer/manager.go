@@ -42,6 +42,8 @@ var ErrSyncPending = errors.New("mailbox sync batch committed; more messages rem
 // equivalent request for the same account is already queued.
 var ErrSyncQueued = errors.New("mailbox sync queued")
 
+var errRetryWindowElapsed = errors.New("automatic mailbox retry window elapsed")
+
 const (
 	maxPersistedSyncErrorRunes = 8000
 	// The default sync budget is 70s. Keep transient recovery within a 15s
@@ -178,11 +180,13 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 	defer clearRetryCycle()
 	for {
-		roundCtx := ctx
+		workCtx := ctx
 		if retryCtx != nil {
-			roundCtx = retryCtx
+			workCtx = retryCtx
 		}
-		result := m.syncAllRoundDetailed(roundCtx, continuations)
+		// The worker context owns resource-wait timeouts. A short retry context
+		// can stop a queued retry early and bounds mailbox recovery work.
+		result := m.syncAllRoundDetailedWithContexts(ctx, workCtx, retryCtx, continuations)
 		if ctx.Err() != nil {
 			if cancelRetry != nil {
 				cancelRetry()
@@ -190,15 +194,19 @@ func (m *Manager) Run(ctx context.Context) {
 			return
 		}
 		retryQueue = mergeAccountIDSets(retryQueue, result.retryable)
-		if len(result.pending) > 0 && (retryCtx == nil || retryCtx.Err() == nil) {
+		retryWindowDone := retryCtx != nil && retryWindowExpiredFromContext(retryCtx)
+		if len(result.pending) > 0 && !retryWindowDone {
 			continuations = result.pending
 			continue
 		}
+		if retryWindowDone {
+			m.deferContinuations(ctx, result.pending, "continue_batch")
+		}
 		continuations = nil
 
-		if len(retryQueue) > 0 && retryAttempt < len(m.retryDelays) {
+		if !retryWindowDone && len(retryQueue) > 0 && retryAttempt < len(m.retryDelays) {
 			if retryCtx == nil {
-				retryCtx, cancelRetry = context.WithTimeout(ctx, m.retryBudget)
+				retryCtx, cancelRetry = context.WithTimeoutCause(ctx, m.retryBudget, errRetryWindowElapsed)
 			}
 			delay := m.retryDelays[retryAttempt]
 			m.logger.Info(
@@ -228,6 +236,26 @@ func (m *Manager) Run(ctx context.Context) {
 			}
 			return
 		}
+	}
+}
+
+func (m *Manager) deferContinuations(ctx context.Context, continuations accountIDSet, operation string) {
+	for accountID := range continuations {
+		flow := m.ensureProgress(
+			accountID,
+			domain.MailboxSyncTriggerAutomatic,
+			domain.MailboxSyncPhaseWaiting,
+			2,
+			m.newSyncFlowSeed(),
+		)
+		m.logSyncDeferred(
+			ctx,
+			accountID,
+			domain.MailboxSyncTriggerAutomatic,
+			flow,
+			operation,
+		)
+		m.finishProgress(accountID, domain.MailboxSyncTriggerAutomatic)
 	}
 }
 
@@ -492,6 +520,32 @@ func mergeAccountIDSets(destination, source accountIDSet) accountIDSet {
 	return destination
 }
 
+func retryWindowExpired(queueCtx context.Context, err error) bool {
+	return queueCtx.Err() == nil && errors.Is(err, errRetryWindowElapsed)
+}
+
+func resourceWaitExpired(queueCtx context.Context, err error) bool {
+	return queueCtx.Err() == nil && errors.Is(err, context.DeadlineExceeded)
+}
+
+func retryWindowExpiredFromQueue(queueCtx, workCtx context.Context) bool {
+	return queueCtx.Err() == nil && workCtx != nil &&
+		errors.Is(context.Cause(workCtx), errRetryWindowElapsed)
+}
+
+func retryWindowExpiredFromContext(ctx context.Context) bool {
+	return ctx != nil && errors.Is(context.Cause(ctx), errRetryWindowElapsed)
+}
+
+func retryWindowInterrupted(ctx context.Context, err error) bool {
+	if !retryWindowExpiredFromContext(ctx) {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, errRetryWindowElapsed)
+}
+
 // syncAllRound processes at most one batch per eligible account. A previous
 // continuation waits for its account lock with a bounded budget so manual and
 // seen work neither lose the continuation nor cause a busy retry loop.
@@ -500,17 +554,34 @@ func (m *Manager) syncAllRound(ctx context.Context, continuations accountIDSet) 
 }
 
 func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accountIDSet) syncAllRoundResult {
+	return m.syncAllRoundDetailedWithContexts(ctx, ctx, nil, continuations)
+}
+
+// syncAllRoundDetailedWithContexts keeps resource queueing separate from the
+// context that bounds mailbox work. retryCtx is also used as an early-stop
+// signal for a fast retry that is still waiting for a resource; that attempt
+// is deferred to the normal poll instead of being reported as a sync failure.
+func (m *Manager) syncAllRoundDetailedWithContexts(
+	queueCtx context.Context,
+	workCtx context.Context,
+	retryCtx context.Context,
+	continuations accountIDSet,
+) syncAllRoundResult {
 	result := syncAllRoundResult{
 		pending:   make(accountIDSet),
 		retryable: make(accountIDSet),
 	}
-	accounts, err := m.repo.ListEnabledAccounts(ctx)
+	accounts, err := m.repo.ListEnabledAccounts(workCtx)
 	if err != nil {
+		if queueCtx.Err() == nil && retryWindowInterrupted(workCtx, err) {
+			m.deferContinuations(queueCtx, continuations, "list_enabled_accounts")
+			return result
+		}
 		m.logger.Error("读取待同步主号失败", "error", err)
 		for accountID := range continuations {
 			if flow, ok := m.currentSyncFlow(accountID, domain.MailboxSyncTriggerAutomatic); ok {
 				m.logSyncFailure(
-					ctx,
+					queueCtx,
 					accountID,
 					domain.MailboxSyncTriggerAutomatic,
 					flow,
@@ -522,6 +593,7 @@ func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accoun
 		}
 		return result
 	}
+	ctx := queueCtx
 	if continuations != nil {
 		enabled := make(accountIDSet, len(accounts))
 		for _, account := range accounts {
@@ -592,9 +664,9 @@ func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accoun
 					waiting,
 					slog.String("wait_for", "account_lock"),
 				)
-				lockCtx, cancelLock := m.withTimeout(ctx, m.syncTimeout)
+				lockCtx, cancelLock := m.withTimeout(queueCtx, m.syncTimeout)
 				var err error
-				release, err = m.acquireAccount(lockCtx, account.ID)
+				release, err = m.acquireAccountUntil(lockCtx, retryCtx, account.ID)
 				if err == nil {
 					err = lockCtx.Err()
 				}
@@ -602,6 +674,29 @@ func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accoun
 				if err != nil {
 					if release != nil {
 						release()
+					}
+					if retryWindowExpired(queueCtx, err) {
+						m.logSyncDeferred(
+							ctx,
+							account.ID,
+							domain.MailboxSyncTriggerAutomatic,
+							waiting,
+							"wait_account_lock",
+						)
+						m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
+						return
+					}
+					if resourceWaitExpired(queueCtx, err) {
+						m.logSyncDeferredWithReason(
+							ctx,
+							account.ID,
+							domain.MailboxSyncTriggerAutomatic,
+							waiting,
+							"wait_account_lock",
+							"resource_wait_timeout",
+						)
+						m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
+						return
 					}
 					m.logSyncFailure(
 						ctx,
@@ -640,10 +735,33 @@ func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accoun
 				slog.String("wait_for", "global_imap_slot"),
 			)
 
-			waitCtx, cancelWait := m.withTimeout(ctx, m.syncTimeout)
+			waitCtx, cancelWait := m.withTimeout(queueCtx, m.syncTimeout)
 			defer cancelWait()
-			releaseSlot, err := m.acquireSyncSlot(waitCtx)
+			releaseSlot, err := m.acquireSyncSlotUntil(waitCtx, retryCtx)
 			if err != nil {
+				if retryWindowExpired(queueCtx, err) {
+					m.logSyncDeferred(
+						ctx,
+						account.ID,
+						domain.MailboxSyncTriggerAutomatic,
+						waiting,
+						"wait_global_imap_slot",
+					)
+					m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
+					return
+				}
+				if resourceWaitExpired(queueCtx, err) {
+					m.logSyncDeferredWithReason(
+						ctx,
+						account.ID,
+						domain.MailboxSyncTriggerAutomatic,
+						waiting,
+						"wait_global_imap_slot",
+						"resource_wait_timeout",
+					)
+					m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
+					return
+				}
 				m.logSyncFailure(
 					ctx,
 					account.ID,
@@ -658,6 +776,18 @@ func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accoun
 			}
 			defer releaseSlot()
 			if err := waitCtx.Err(); err != nil {
+				if resourceWaitExpired(queueCtx, err) {
+					m.logSyncDeferredWithReason(
+						ctx,
+						account.ID,
+						domain.MailboxSyncTriggerAutomatic,
+						waiting,
+						"wait_global_imap_slot",
+						"resource_wait_timeout",
+					)
+					m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
+					return
+				}
 				m.logSyncFailure(
 					ctx,
 					account.ID,
@@ -671,6 +801,30 @@ func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accoun
 				return
 			}
 			cancelWait()
+			if err := workCtx.Err(); err != nil {
+				if retryWindowExpiredFromQueue(queueCtx, workCtx) {
+					m.logSyncDeferred(
+						ctx,
+						account.ID,
+						domain.MailboxSyncTriggerAutomatic,
+						waiting,
+						"start_retry_sync",
+					)
+					m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
+					return
+				}
+				m.logSyncFailure(
+					ctx,
+					account.ID,
+					domain.MailboxSyncTriggerAutomatic,
+					waiting,
+					"start_sync",
+					err,
+				)
+				m.finishProgress(account.ID, domain.MailboxSyncTriggerAutomatic)
+				markResult(account.ID, err)
+				return
+			}
 
 			flow := m.beginProgress(
 				account.ID,
@@ -680,7 +834,7 @@ func (m *Manager) syncAllRoundDetailed(ctx context.Context, continuations accoun
 				seed,
 			)
 			m.logSyncBatchStarted(ctx, account.ID, domain.MailboxSyncTriggerAutomatic, flow)
-			syncCtx, cancelSync := m.withTimeout(ctx, m.syncTimeout)
+			syncCtx, cancelSync := m.withTimeout(workCtx, m.syncTimeout)
 			defer cancelSync()
 			syncErr := m.syncAccountLocked(syncCtx, account.ID, domain.MailboxSyncTriggerAutomatic, flow)
 			markResult(account.ID, syncErr)
@@ -939,6 +1093,11 @@ func (m *Manager) syncAccountLocked(
 	failedOperation := "check_context"
 	sensitiveValues := make([]string, 0, 4)
 	defer func() {
+		if syncErr != nil && !errors.Is(syncErr, ErrSyncPending) &&
+			retryWindowInterrupted(ctx, syncErr) {
+			m.logSyncDeferred(ctx, accountID, trigger, flow, failedOperation)
+			return
+		}
 		m.logSyncFailure(ctx, accountID, trigger, flow, failedOperation, syncErr, sensitiveValues...)
 	}()
 	if err := ctx.Err(); err != nil {
@@ -967,7 +1126,8 @@ func (m *Manager) syncAccountLocked(
 	failures := newFailureRecorder(m, ctx, accountID, account.UpdatedAt)
 	defer failures.close()
 	defer func() {
-		if syncErr != nil && !errors.Is(syncErr, ErrSyncPending) {
+		if syncErr != nil && !errors.Is(syncErr, ErrSyncPending) &&
+			!retryWindowInterrupted(ctx, syncErr) {
 			failures.record(syncErr)
 		}
 	}()
@@ -1242,6 +1402,10 @@ func (r *failureRecorder) record(syncErr error) {
 }
 
 func (m *Manager) acquireAccount(ctx context.Context, accountID int64) (func(), error) {
+	return m.acquireAccountUntil(ctx, nil, accountID)
+}
+
+func (m *Manager) acquireAccountUntil(ctx, stopCtx context.Context, accountID int64) (func(), error) {
 	m.locksMu.Lock()
 	lock, ok := m.locks[accountID]
 	if !ok {
@@ -1250,12 +1414,22 @@ func (m *Manager) acquireAccount(ctx context.Context, accountID int64) (func(), 
 	}
 	lock.refs++
 	m.locksMu.Unlock()
+	var stopDone <-chan struct{}
+	if stopCtx != nil {
+		stopDone = stopCtx.Done()
+	}
 	select {
 	case lock.token <- struct{}{}:
 		return m.accountLockRelease(accountID, lock), nil
 	case <-ctx.Done():
 		m.releaseAccountLock(accountID, lock)
-		return nil, ctx.Err()
+		return nil, contextTerminationError(ctx)
+	case <-stopDone:
+		m.releaseAccountLock(accountID, lock)
+		if ctx.Err() != nil {
+			return nil, contextTerminationError(ctx)
+		}
+		return nil, contextTerminationError(stopCtx)
 	}
 }
 
@@ -1286,6 +1460,14 @@ func (m *Manager) accountLockRelease(accountID int64, lock *accountLock) func() 
 }
 
 func (m *Manager) acquireSyncSlot(ctx context.Context) (func(), error) {
+	return m.acquireSyncSlotUntil(ctx, nil)
+}
+
+func (m *Manager) acquireSyncSlotUntil(ctx, stopCtx context.Context) (func(), error) {
+	var stopDone <-chan struct{}
+	if stopCtx != nil {
+		stopDone = stopCtx.Done()
+	}
 	select {
 	case m.syncSlots <- struct{}{}:
 		var once sync.Once
@@ -1293,8 +1475,20 @@ func (m *Manager) acquireSyncSlot(ctx context.Context) (func(), error) {
 			once.Do(func() { <-m.syncSlots })
 		}, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, contextTerminationError(ctx)
+	case <-stopDone:
+		if ctx.Err() != nil {
+			return nil, contextTerminationError(ctx)
+		}
+		return nil, contextTerminationError(stopCtx)
 	}
+}
+
+func contextTerminationError(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), errRetryWindowElapsed) {
+		return errRetryWindowElapsed
+	}
+	return ctx.Err()
 }
 
 func (m *Manager) releaseAccountLock(accountID int64, lock *accountLock) {

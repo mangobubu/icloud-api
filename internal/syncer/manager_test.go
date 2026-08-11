@@ -42,6 +42,7 @@ type fakeRepo struct {
 	states     map[int64]domain.IMAPSyncState
 	stateErrs  map[int64]error
 	getErrs    map[int64]error
+	listFn     func(context.Context) ([]domain.Account, error)
 	applyErr   error
 	failureErr error
 	failureFn  func(context.Context, int64, time.Time, string, time.Time) error
@@ -60,10 +61,15 @@ func newFakeRepo(accounts ...domain.Account) *fakeRepo {
 	}
 }
 
-func (f *fakeRepo) ListEnabledAccounts(context.Context) ([]domain.Account, error) {
+func (f *fakeRepo) ListEnabledAccounts(ctx context.Context) ([]domain.Account, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]domain.Account(nil), f.accounts...), nil
+	listFn := f.listFn
+	accounts := append([]domain.Account(nil), f.accounts...)
+	f.mu.Unlock()
+	if listFn != nil {
+		return listFn(ctx)
+	}
+	return accounts, nil
 }
 
 func (f *fakeRepo) GetAccount(_ context.Context, accountID int64) (domain.Account, error) {
@@ -346,7 +352,7 @@ func TestAutomaticSyncLogsOneRunAcrossPendingBatches(t *testing.T) {
 	}
 }
 
-func TestAutomaticContinuationWaitFailureKeepsRunID(t *testing.T) {
+func TestAutomaticContinuationWaitTimeoutDefersWithSameRunID(t *testing.T) {
 	account := domain.Account{ID: 44, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	fetcher := fetcherFunc(func(
@@ -390,19 +396,81 @@ func TestAutomaticContinuationWaitFailureKeepsRunID(t *testing.T) {
 	release()
 
 	entries := logs.List(applog.Filter{AccountID: &account.ID, SyncRunID: runID, Limit: 100}).Items
-	var failed *applog.Entry
+	var deferred *applog.Entry
 	for index := range entries {
-		if entries[index].Fields["sync_event"] == "run_failed" {
-			failed = &entries[index]
+		if entries[index].Fields["sync_event"] == "run_deferred" {
+			deferred = &entries[index]
 			break
 		}
 	}
-	if failed == nil {
-		t.Fatalf("automatic wait failure missing for run %q: %#v", runID, entries)
+	if deferred == nil {
+		t.Fatalf("automatic wait deferral missing for run %q: %#v", runID, entries)
 	}
-	if failed.Fields["sync_run_id"] != runID || failed.Fields["failed_stage"] != "waiting" ||
-		failed.Fields["failed_operation"] != "wait_account_lock" || failed.Fields["sync_batch"] != "2" {
-		t.Fatalf("automatic wait failure = %#v", failed.Fields)
+	if deferred.Fields["sync_run_id"] != runID || deferred.Fields["deferred_stage"] != "waiting" ||
+		deferred.Fields["deferred_operation"] != "wait_account_lock" ||
+		deferred.Fields["deferred_reason"] != "resource_wait_timeout" || deferred.Fields["sync_batch"] != "2" {
+		t.Fatalf("automatic wait deferral = %#v", deferred.Fields)
+	}
+}
+
+func TestAutomaticContinuationSlotTimeoutDefersWithSameRunID(t *testing.T) {
+	account := domain.Account{ID: 46, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	fetcher := fetcherFunc(func(
+		context.Context,
+		domain.Account,
+		string,
+		[]domain.Alias,
+		*domain.IMAPSyncState,
+		map[int64]domain.MailboxSnapshotPosition,
+	) (domain.MailboxSyncResult, error) {
+		return domain.MailboxSyncResult{
+			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 11, LastUID: 50},
+			TargetUID: 100,
+			HasMore:   true,
+		}, nil
+	})
+	logs := applog.New(100)
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Hour, 1)
+	pending := manager.syncAllRound(context.Background(), nil)
+	if _, ok := pending[account.ID]; !ok {
+		t.Fatalf("first automatic round pending = %#v", pending)
+	}
+	firstEntries := logs.List(applog.Filter{AccountID: &account.ID, Limit: 100}).Items
+	var runID string
+	for _, entry := range firstEntries {
+		if entry.Fields["sync_event"] == "run_started" {
+			runID = entry.Fields["sync_run_id"]
+			break
+		}
+	}
+	if runID == "" {
+		t.Fatalf("first automatic run ID missing: %#v", firstEntries)
+	}
+
+	release, err := manager.acquireSyncSlot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.SetSyncTimeout(10 * time.Millisecond)
+	manager.syncAllRound(context.Background(), pending)
+	release()
+
+	entries := logs.List(applog.Filter{AccountID: &account.ID, SyncRunID: runID, Limit: 100}).Items
+	var deferred *applog.Entry
+	for index := range entries {
+		if entries[index].Fields["sync_event"] == "run_deferred" {
+			deferred = &entries[index]
+			break
+		}
+	}
+	if deferred == nil {
+		t.Fatalf("automatic slot wait deferral missing for run %q: %#v", runID, entries)
+	}
+	if deferred.Fields["sync_run_id"] != runID || deferred.Fields["deferred_stage"] != "waiting" ||
+		deferred.Fields["deferred_operation"] != "wait_global_imap_slot" ||
+		deferred.Fields["deferred_reason"] != "resource_wait_timeout" || deferred.Fields["sync_batch"] != "2" {
+		t.Fatalf("automatic slot wait deferral = %#v", deferred.Fields)
 	}
 }
 
@@ -1910,6 +1978,273 @@ func TestRunRetriesTransientIMAPFailureBeforePollInterval(t *testing.T) {
 	}
 	if !reflect.DeepEqual(waits, []time.Duration{time.Second, time.Hour}) {
 		t.Fatalf("wait intervals = %v, want 1s retry then normal poll", waits)
+	}
+}
+
+func TestRunDefersRetryWhenAccountLockRemainsBusy(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	logs := applog.New(100)
+	fetchCalls := 0
+	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetchCalls++
+		if fetchCalls == 1 {
+			return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
+		}
+		return domain.MailboxSyncResult{
+			State: domain.IMAPSyncState{AccountID: got.ID, UIDValidity: 1, LastUID: 1},
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Hour, 1)
+	manager.retryBudget = 40 * time.Millisecond
+	manager.retryDelays = []time.Duration{0}
+
+	var releaseBusy func()
+	waitCalls := 0
+	manager.waitInterval = func(_ context.Context, interval time.Duration) bool {
+		waitCalls++
+		if waitCalls == 1 {
+			var err error
+			releaseBusy, err = manager.acquireAccount(context.Background(), account.ID)
+			if err != nil {
+				t.Fatalf("occupy account lock for retry: %v", err)
+			}
+			return true
+		}
+		if releaseBusy != nil {
+			releaseBusy()
+			releaseBusy = nil
+		}
+		return false
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retry deferral did not finish")
+	}
+	if releaseBusy != nil {
+		releaseBusy()
+	}
+
+	if fetchCalls != 1 {
+		t.Fatalf("fetch calls after busy retry = %d, want one initial attempt", fetchCalls)
+	}
+	if waitCalls != 2 {
+		t.Fatalf("wait intervals after deferred retry = %d, want retry and normal poll", waitCalls)
+	}
+	failures := repo.failureCalls()
+	if len(failures) != 1 || !strings.Contains(failures[0].message, "connection closed") {
+		t.Fatalf("persisted failures after deferred retry = %#v, want only initial transport failure", failures)
+	}
+	entries := chronologicalLogEntries(logs.List(applog.Filter{AccountID: &account.ID, Limit: 100}).Items)
+	for _, entry := range entries {
+		if entry.Fields["sync_event"] == "run_failed" && entry.Fields["failed_operation"] == "wait_account_lock" {
+			t.Fatalf("busy retry produced account-lock failure log: %#v", entry.Fields)
+		}
+	}
+	var deferred bool
+	for _, entry := range entries {
+		if entry.Fields["sync_event"] == "run_deferred" && entry.Fields["deferred_operation"] == "wait_account_lock" {
+			deferred = true
+			break
+		}
+	}
+	if !deferred {
+		t.Fatalf("deferred retry log missing: %#v", entries)
+	}
+}
+
+func TestRunDefersRetryWhenAccountListingExceedsRetryWindow(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	listCalls := 0
+	listStarted := make(chan struct{})
+	repo.listFn = func(ctx context.Context) ([]domain.Account, error) {
+		listCalls++
+		if listCalls == 1 {
+			return []domain.Account{account}, nil
+		}
+		close(listStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	logs := applog.New(100)
+	fetchCalls := 0
+	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetchCalls++
+		return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Hour, 1)
+	manager.retryBudget = 200 * time.Millisecond
+	manager.retryDelays = []time.Duration{0}
+	waitCalls := 0
+	manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+		waitCalls++
+		return waitCalls == 1
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-listStarted:
+	case <-time.After(time.Second):
+		t.Fatal("retry account listing did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retry account listing did not finish")
+	}
+
+	if listCalls != 2 || fetchCalls != 1 {
+		t.Fatalf("retry calls = list %d, fetch %d; want list 2 and fetch 1", listCalls, fetchCalls)
+	}
+	if _, ok := manager.AccountProgress(account.ID); ok {
+		t.Fatal("account listing deferral left an active progress record")
+	}
+	entries := chronologicalLogEntries(logs.List(applog.Filter{AccountID: &account.ID, Limit: 100}).Items)
+	var deferred bool
+	for _, entry := range entries {
+		if entry.Fields["sync_event"] == "run_deferred" && entry.Fields["deferred_operation"] == "list_enabled_accounts" {
+			deferred = true
+			break
+		}
+	}
+	if !deferred {
+		t.Fatalf("account listing deferral log missing: %#v", entries)
+	}
+}
+
+func TestRunDefersRetryWhenRetryWindowExpiresDuringMailboxWork(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	logs := applog.New(100)
+	fetchCalls := 0
+	retryStarted := make(chan struct{})
+	fetcher := fetcherFunc(func(ctx context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetchCalls++
+		if fetchCalls == 1 {
+			return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
+		}
+		close(retryStarted)
+		<-ctx.Done()
+		return domain.MailboxSyncResult{}, ctx.Err()
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Hour, 1)
+	manager.retryBudget = 200 * time.Millisecond
+	manager.retryDelays = []time.Duration{0}
+	waitCalls := 0
+	manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+		waitCalls++
+		return waitCalls == 1
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("retry mailbox work did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("retry work deadline did not finish")
+	}
+
+	if fetchCalls != 2 {
+		t.Fatalf("fetch calls after retry work deadline = %d, want two attempts", fetchCalls)
+	}
+	if failures := repo.failureCalls(); len(failures) != 1 {
+		t.Fatalf("persisted failures after retry work deadline = %#v, want only initial failure", failures)
+	}
+	entries := chronologicalLogEntries(logs.List(applog.Filter{AccountID: &account.ID, Limit: 100}).Items)
+	deferredCount := 0
+	for _, entry := range entries {
+		if entry.Fields["sync_event"] == "run_deferred" && entry.Fields["deferred_operation"] == "fetch_incremental" {
+			deferredCount++
+		}
+		if entry.Fields["sync_event"] == "run_failed" && entry.Fields["failed_operation"] == "fetch_incremental" &&
+			entry.Fields["error"] == context.DeadlineExceeded.Error() {
+			t.Fatalf("retry window deadline was logged as mailbox failure: %#v", entry.Fields)
+		}
+	}
+	if deferredCount != 1 {
+		t.Fatalf("retry work deferral logs = %d, want exactly one: %#v", deferredCount, entries)
+	}
+}
+
+func TestRunFinishesPendingProgressWhenRetryWindowEnds(t *testing.T) {
+	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
+	repo := newFakeRepo(account)
+	logs := applog.New(100)
+	fetchCalls := 0
+	retryStarted := make(chan struct{})
+	fetcher := fetcherFunc(func(ctx context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetchCalls++
+		if fetchCalls == 1 {
+			return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
+		}
+		close(retryStarted)
+		<-ctx.Done()
+		return domain.MailboxSyncResult{
+			State:   domain.IMAPSyncState{AccountID: got.ID, UIDValidity: 1, LastUID: 1},
+			HasMore: true,
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, slog.New(logs), time.Hour, 1)
+	manager.retryBudget = 200 * time.Millisecond
+	manager.retryDelays = []time.Duration{0}
+	waitCalls := 0
+	manager.waitInterval = func(_ context.Context, _ time.Duration) bool {
+		waitCalls++
+		return waitCalls == 1
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.Run(context.Background())
+		close(done)
+	}()
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatal("pending retry did not start")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("pending retry did not finish")
+	}
+
+	if fetchCalls != 2 {
+		t.Fatalf("fetch calls after pending retry = %d, want two attempts", fetchCalls)
+	}
+	if _, ok := manager.AccountProgress(account.ID); ok {
+		t.Fatal("pending retry left an active progress record after deferral")
+	}
+	entries := chronologicalLogEntries(logs.List(applog.Filter{AccountID: &account.ID, Limit: 100}).Items)
+	var deferred bool
+	for _, entry := range entries {
+		if entry.Fields["sync_event"] == "run_deferred" && entry.Fields["deferred_operation"] == "continue_batch" {
+			deferred = true
+			break
+		}
+	}
+	if !deferred {
+		t.Fatalf("pending retry deferral log missing: %#v", entries)
 	}
 }
 

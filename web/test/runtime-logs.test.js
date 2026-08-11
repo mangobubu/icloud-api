@@ -377,6 +377,10 @@ test("runtime diagnostic aliases use non-empty attribute fallbacks and hide came
   assert.match(runtimeLogFlowContextText(literalDot), /literal-dot-context/);
 });
 
+test("deferred sync runs have a stable stage label", () => {
+  assert.equal(runtimeLogSyncStageLabel("deferred"), "等待下一轮同步");
+});
+
 test("runtime log pages merge in order without duplicate IDs", () => {
   const latest = [{ id: 4 }, { id: 3 }];
   const existing = [{ id: 3, stale: true }, { id: 2 }, { id: 1 }];

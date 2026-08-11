@@ -112,6 +112,12 @@ test("runtime log details show loadable, copyable sync and automatic creation ti
   assert.match(source, /操作位置：[\s\S]{0,100}entry\.failedOperation/);
   assert.match(source, /当前仅展示日志缓冲区内保留的部分流程/);
   assert.match(source, /\["started", "run_started", "run_queued"\]/);
+  assert.match(source, /firstEvent === "run_deferred"/);
+  assert.match(source, /flowStage\(firstEntry\) === "deferred"/);
+  assert.match(source, /"run_deferred"/);
+  assert.match(source, /\["completed", "deferred", "failed", "cancelled"\]/);
+  assert.match(source, /runtime-log-flow__item--deferred/);
+  assert.match(source, /function isDeferredFlowEntry\(entry\)/);
   assert.match(source, /v-else-if="flowIsRunning"/);
   assert.match(source, /该次同步尚未结束/);
   assert.match(source, /该次自动创建尚未结束/);

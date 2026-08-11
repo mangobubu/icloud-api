@@ -131,6 +131,7 @@
               :class="{
                 'runtime-log-flow__item--failed': isFailedFlowEntry(entry),
                 'runtime-log-flow__item--completed': isCompletedFlowEntry(entry),
+                'runtime-log-flow__item--deferred': isDeferredFlowEntry(entry),
               }"
             >
               <span class="runtime-log-flow__marker" aria-hidden="true"></span>
@@ -465,9 +466,12 @@ const flowSummary = computed(() => {
 });
 const flowIsPartial = computed(() => {
   if (props.flowError || !orderedFlowLogs.value.length) return false;
-  const firstEvent = flowEvent(orderedFlowLogs.value[0]);
+  const firstEntry = orderedFlowLogs.value[0];
+  const firstEvent = flowEvent(firstEntry);
   const hasStart = ["started", "run_started", "run_queued"].includes(firstEvent);
-  return !hasStart;
+  const isDeferredOnlyStart =
+    firstEvent === "run_deferred" || flowStage(firstEntry) === "deferred";
+  return !hasStart && !isDeferredOnlyStart;
 });
 const flowIsRunning = computed(() => {
   if (props.flowError || flowIsPartial.value || !orderedFlowLogs.value.length) return false;
@@ -477,11 +481,12 @@ const flowIsRunning = computed(() => {
     "completed",
     "run_completed",
     "run_completed_with_warning",
+    "run_deferred",
     "failed",
     "run_failed",
     "cancelled",
     "run_cancelled",
-  ].includes(lastEvent) || ["completed", "failed", "cancelled"].includes(flowStage(lastEntry));
+  ].includes(lastEvent) || ["completed", "deferred", "failed", "cancelled"].includes(flowStage(lastEntry));
   return !hasTerminal;
 });
 
@@ -802,6 +807,10 @@ function isCompletedFlowEntry(entry) {
   );
 }
 
+function isDeferredFlowEntry(entry) {
+  return flowEvent(entry) === "run_deferred" || flowStage(entry) === "deferred";
+}
+
 function flowLogText() {
   const lines = hasAutoCreateFlow.value
     ? [
@@ -1070,6 +1079,10 @@ onBeforeUnmount(() => {
 
 .runtime-log-flow__item--completed .runtime-log-flow__marker {
   border-color: var(--success);
+}
+
+.runtime-log-flow__item--deferred .runtime-log-flow__marker {
+  border-color: var(--warning);
 }
 
 .runtime-log-flow__content {

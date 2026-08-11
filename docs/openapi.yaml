@@ -2385,6 +2385,7 @@ components:
           description: 当前追平批次，从 1 开始。
         sync_stage:
           type: string
+          description: 当前邮件同步阶段；deferred 表示恢复窗口结束或资源等待超时，后续轮询会继续。
           enum:
             - queued
             - waiting
@@ -2396,6 +2397,7 @@ components:
             - validating
             - saving
             - completed
+            - deferred
             - failed
             - cancelled
         sync_percent:
@@ -2404,6 +2406,7 @@ components:
           description: 当前进度百分比，范围 0 至 100。
         sync_event:
           type: string
+          description: 当前邮件同步流程事件；run_deferred 表示本次恢复因窗口或资源等待结束而延后，后续轮询会继续。
           enum:
             - run_queued
             - waiting
@@ -2415,6 +2418,7 @@ components:
             - batch_saved
             - batch_completed
             - run_completed
+            - run_deferred
             - run_failed
             - run_cancelled
         elapsed_ms:

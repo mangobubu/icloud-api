@@ -21,6 +21,7 @@ const SYNC_STAGE_LABELS = Object.freeze({
   validating: "核对邮件状态",
   saving: "保存同步结果",
   completed: "同步完成",
+  deferred: "等待下一轮同步",
   failed: "同步失败",
   cancelled: "同步已取消",
 });

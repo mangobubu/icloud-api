@@ -128,6 +128,52 @@ func (m *Manager) logSyncFailure(
 	)
 }
 
+func (m *Manager) logSyncDeferred(
+	ctx context.Context,
+	accountID int64,
+	trigger domain.MailboxSyncTrigger,
+	fallback syncFlowSnapshot,
+	deferredOperation string,
+) {
+	m.logSyncDeferredWithReason(
+		ctx,
+		accountID,
+		trigger,
+		fallback,
+		deferredOperation,
+		"retry_window_elapsed",
+	)
+}
+
+func (m *Manager) logSyncDeferredWithReason(
+	ctx context.Context,
+	accountID int64,
+	trigger domain.MailboxSyncTrigger,
+	fallback syncFlowSnapshot,
+	deferredOperation string,
+	deferredReason string,
+) {
+	flow, ok := m.currentSyncFlow(accountID, trigger)
+	if !ok || fallback.batch > flow.batch {
+		flow = fallback
+	}
+	previousStage := flow.stage
+	flow.stage = domain.MailboxSyncPhase("deferred")
+	m.logSyncFlow(
+		ctx,
+		slog.LevelInfo,
+		"邮件同步已延后",
+		accountID,
+		trigger,
+		"run_deferred",
+		flow,
+		slog.String("deferred_stage", string(previousStage)),
+		slog.String("deferred_operation", deferredOperation),
+		slog.String("deferred_reason", deferredReason),
+		slog.String("next_action", "normal_poll"),
+	)
+}
+
 func (m *Manager) logSyncCancellation(
 	ctx context.Context,
 	accountID int64,
