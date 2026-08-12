@@ -17,7 +17,8 @@ info:
 
     管理端 Apple 接口使用 Apple 账户密码和双重认证建立受信任 Web 会话，并通过
     `/v2/hme/list` 读取完整 Hide My Email 目录；账户密码和验证码不落库，仅加密保存会话。
-    该会话不参与邮件获取。邮件同步通过 `imap.mail.me.com:993` 与 App 专用密码执行主号级
+    该会话不参与邮件获取。邮件同步通过每个主号保存的隐式 TLS IMAP 服务（创建时默认
+    `imap.mail.me.com:993`）与 App 专用密码执行主号级
     `UNSEEN` 发现，再用 `BODY.PEEK` 读取未读候选的邮件头和正文。首次同步、游标重置或 UIDVALIDITY
     变化时只先确定最近最多 1024 封邮件的窗口边界，后续仍仅分批处理窗口内的 `UNSEEN`；
     不读取已读邮件正文，也不恢复各隐私邮箱的历史 IMAP 快照。部署前提是没有其他邮件客户端或外部流程
@@ -431,6 +432,141 @@ paths:
                       message: 数据库暂不可用
                       request_id: 6oe7j0x3x3pJv9Dv
 
+  /admin/api/v1/accounts:
+    get:
+      tags:
+        - Admin Accounts
+      operationId: listAdminAccounts
+      summary: 查询主号列表
+      description: |
+        按主号邮箱、ID 升序返回分页列表。`query` 会先去除首尾空白，再对主号邮箱和备注执行
+        不区分大小写的字面量子串匹配；空查询返回全部主号。响应中的 `pagination.total` 是当前
+        查询条件下的主号总数，`has_more` 表示当前页之后是否还有结果。
+      security:
+        - adminSession: []
+      parameters:
+        - name: query
+          in: query
+          required: false
+          description: 主号邮箱或备注的搜索词；服务会先去除首尾空白，处理后的值最多 200 个字符。
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: 本页最多返回的主号数。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          description: 在当前查询结果中跳过的主号数。
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+            default: 0
+      responses:
+        "200":
+          description: 当前查询条件下的一页主号
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAccountListResponse"
+        "400":
+          description: query、limit 或 offset 参数无效
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+              examples:
+                invalidLimit:
+                  value:
+                    error:
+                      code: VALIDATION_FAILED
+                      message: limit 参数无效
+                      request_id: 6oe7j0x3x3pJv9Dv
+                queryTooLong:
+                  value:
+                    error:
+                      code: VALIDATION_FAILED
+                      message: query 参数不能超过 200 个字符
+                      request_id: 6oe7j0x3x3pJv9Dv
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+    post:
+      tags:
+        - Admin Accounts
+      operationId: createAdminAccount
+      summary: 添加主号
+      description: |
+        添加用于主号级邮件同步的账户。`imap_host` 和 `imap_port` 可分别指定隐式 TLS
+        IMAP 服务；省略时分别使用 `imap.mail.me.com` 和 `993`，显式传入 `null` 则返回 400。
+        App 专用密码只会加密保存，不会出现在响应或日志中。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminCreateAccountRequest"
+            example:
+              name: 个人主号
+              email: owner@icloud.com
+              imap_host: imap.mail.me.com
+              imap_port: 993
+              imap_username: owner@icloud.com
+              imap_password: APP_SPECIFIC_PASSWORD
+      responses:
+        "201":
+          description: 主号创建成功
+          headers:
+            Location:
+              description: 新主号的管理 API 相对路径。
+              schema:
+                type: string
+                format: uri-reference
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAccountResponse"
+        "400":
+          $ref: "#/components/responses/AdminAccountBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "409":
+          $ref: "#/components/responses/AdminAccountConflict"
+        "413":
+          $ref: "#/components/responses/AdminJSONTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
   /admin/api/v1/accounts/{id}:
     get:
       tags:
@@ -456,6 +592,95 @@ paths:
                 $ref: "#/components/schemas/AdminAccountDetailResponse"
         "401":
           $ref: "#/components/responses/AdminAuthUnauthorized"
+        "404":
+          $ref: "#/components/responses/AdminAccountNotFound"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+    put:
+      tags:
+        - Admin Accounts
+      operationId: updateAdminAccount
+      summary: 更新主号
+      description: |
+        更新主号配置。省略 `imap_host` 或 `imap_port` 时分别保留当前值，显式传入 `null` 则
+        返回 400。规范化后的 IMAP 主机或端口实际发生变化后，服务会清除该主号的同步游标、
+        邮件快照、消费历史和待处理 `\Seen` 任务，并在下次同步确认前把相关同步状态重置为
+        `pending`。修改 IMAP 用户名或 App 专用密码也会重置同步状态；`imap_password` 省略、
+        传 `null` 或传空字符串时均保留当前密码。
+        已有隐私邮箱后，主号邮箱和 IMAP 用户名不可修改，但 IMAP 服务仍可修改。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminUpdateAccountRequest"
+            example:
+              name: 个人主号
+              email: owner@icloud.com
+              imap_host: imap.example.com
+              imap_port: 993
+              imap_username: owner@icloud.com
+              imap_password: ""
+              enabled: true
+      responses:
+        "200":
+          description: 主号配置已更新
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAccountResponse"
+        "400":
+          $ref: "#/components/responses/AdminAccountBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAccountNotFound"
+        "409":
+          $ref: "#/components/responses/AdminAccountConflict"
+        "413":
+          $ref: "#/components/responses/AdminJSONTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+    delete:
+      tags:
+        - Admin Accounts
+      operationId: deleteAdminAccount
+      summary: 删除主号
+      description: |
+        永久删除本地主号及其所属隐私邮箱、API Key、邮件快照、消费历史、待处理 `\Seen` 任务、
+        IMAP 同步游标、Apple Web 会话和自动创建计划。该操作只清理本地数据，不会删除 Apple
+        Hide My Email 中的远端地址。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      responses:
+        "204":
+          description: 本地主号及其关联数据已删除
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
         "404":
           $ref: "#/components/responses/AdminAccountNotFound"
         "500":
@@ -960,7 +1185,8 @@ paths:
         新地址以幂等方式导入并生成只显示一次的独立邮件 API Key；已有地址保留原 ID、Key、
         本地启停状态、邮件快照、消费历史和待处理 `\Seen` 任务。Apple 已停用的地址以本地 `disabled` 状态导入；达到本地 1000 个启用地址容量后，
         其余地址仍会导入并标记为 `disabled`。邮件内容不会经过本接口获取，后续仍由
-        `imap.mail.me.com:993` 与 App 专用密码同步。会话过期时返回 `APPLE_SESSION_EXPIRED`，
+        当前主号保存的隐式 TLS IMAP 服务（创建时默认 `imap.mail.me.com:993`）与 App 专用密码同步。
+        会话过期时返回 `APPLE_SESSION_EXPIRED`，
         调用方应重新完成 Apple 登录与双重认证。
       security:
         - adminSession: []
@@ -1334,6 +1560,74 @@ components:
       example: no-store, private
 
   responses:
+    AdminAccountBadRequest:
+      description: JSON 格式错误、含有未知字段，或主号字段校验失败
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          examples:
+            invalidJSON:
+              value:
+                error:
+                  code: INVALID_JSON
+                  message: JSON 请求体格式错误或包含未知字段
+                  request_id: 6oe7j0x3x3pJv9Dv
+            invalidIMAPHost:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: "IMAP 服务地址无效: invalid imap DNS label"
+                  request_id: 6oe7j0x3x3pJv9Dv
+            invalidIMAPPort:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: "IMAP 服务地址无效: imap port must be between 1 and 65535"
+                  request_id: 6oe7j0x3x3pJv9Dv
+            nullIMAPHost:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: IMAP 主机不能为 null
+                  request_id: 6oe7j0x3x3pJv9Dv
+            nullIMAPPort:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: IMAP 端口不能为 null
+                  request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminAccountConflict:
+      description: 主号邮箱已存在，或已有隐私邮箱后尝试修改主号身份字段
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          examples:
+            accountExists:
+              value:
+                error:
+                  code: ACCOUNT_EXISTS
+                  message: 这个主号已经存在
+                  request_id: 6oe7j0x3x3pJv9Dv
+            identityLocked:
+              value:
+                error:
+                  code: ACCOUNT_IDENTITY_LOCKED
+                  message: 已有隐私邮箱时不能修改主号邮箱或 IMAP 用户名
+                  request_id: 6oe7j0x3x3pJv9Dv
+
     AdminAliasNotFound:
       description: 指定的本地隐私邮箱不存在
       headers:
@@ -1929,6 +2223,151 @@ components:
               request_id: 6oe7j0x3x3pJv9Dv
 
   schemas:
+    AdminCreateAccountRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - imap_username
+        - imap_password
+      properties:
+        name:
+          type: string
+          maxLength: 80
+          description: 可选备注；服务会去除首尾空白。
+        email:
+          type: string
+          format: email
+          description: iCloud 主号邮箱；保存前会规范化大小写和首尾空白。
+        imap_host:
+          type: string
+          minLength: 1
+          default: imap.mail.me.com
+          description: |
+            隐式 TLS IMAP 主机名或 IP 地址，省略时使用 `imap.mail.me.com`；显式 `null` 无效。
+            服务会先去除首尾空白，之后在去除末尾根点前要求值最多 253 字节，并拒绝主机内部
+            空白；IPv6 地址必须不带方括号。服务不接受 URL scheme、用户信息、端口、路径、查询
+            或 fragment；DNS 标签只能包含字母、数字和连字符，且不能以连字符开头或结尾。DNS
+            主机会去除末尾根点并规范化为小写，IP 地址会规范化。
+        imap_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          default: 993
+          description: 隐式 TLS IMAP 端口；省略时使用 993，显式 `null` 无效。
+        imap_username:
+          type: string
+          minLength: 1
+          description: IMAP 登录用户名；服务会去除首尾空白。
+        imap_password:
+          type: string
+          minLength: 1
+          writeOnly: true
+          description: App 专用密码；服务会去除首尾空白并加密保存，不会在响应中返回。
+
+    AdminUpdateAccountRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - email
+        - imap_username
+        - enabled
+      properties:
+        name:
+          type: string
+          maxLength: 80
+          description: 可选备注；服务会去除首尾空白。
+        email:
+          type: string
+          format: email
+          description: iCloud 主号邮箱；已有隐私邮箱时必须与当前值一致。
+        imap_host:
+          type: string
+          minLength: 1
+          description: |
+            新的隐式 TLS IMAP 主机名或 IP 地址；省略时保留当前主机，显式 `null` 无效。服务会
+            先去除首尾空白，之后在去除末尾根点前要求值最多 253 字节，并拒绝主机内部空白；
+            IPv6 地址必须不带方括号。显式空字符串也无效。不接受 URL scheme、用户信息、端口、
+            路径、查询或 fragment；DNS 标签只能包含字母、数字和连字符，且不能以连字符开头或
+            结尾。DNS 主机会去除末尾根点并规范化为小写，IP 地址会规范化。
+        imap_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: 新的隐式 TLS IMAP 端口；省略时保留当前端口，显式 `null` 无效。
+        imap_username:
+          type: string
+          minLength: 1
+          description: IMAP 登录用户名；已有隐私邮箱时必须与当前值一致。
+        imap_password:
+          type:
+            - string
+            - "null"
+          writeOnly: true
+          description: 新 App 专用密码；省略、传 `null` 或传空字符串时保留当前密码。
+        enabled:
+          type: boolean
+          description: 是否启用该主号的邮件同步和所属隐私邮箱 Key。
+
+    AdminAccountResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAccount"
+
+    AdminAccountListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAccountPage"
+
+    AdminAccountPage:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+        - pagination
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminAccount"
+        pagination:
+          $ref: "#/components/schemas/AdminAccountPagination"
+
+    AdminAccountPagination:
+      type: object
+      additionalProperties: false
+      required:
+        - limit
+        - offset
+        - total
+        - has_more
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: 当前请求的每页上限。
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: 当前请求跳过的主号数。
+        total:
+          type: integer
+          minimum: 0
+          description: 当前查询条件下的主号总数。
+        has_more:
+          type: boolean
+          description: 当前页之后是否仍有可返回的主号。
+
     AdminAppleAuthRequest:
       type: object
       additionalProperties: false
@@ -2578,10 +3017,14 @@ components:
           format: email
         imap_host:
           type: string
-          description: 邮件同步固定使用 imap.mail.me.com。
+          minLength: 1
+          maxLength: 253
+          description: 该主号实际使用的隐式 TLS IMAP 主机名或 IP 地址。
         imap_port:
           type: integer
-          description: 邮件同步固定使用 993/TLS。
+          minimum: 1
+          maximum: 65535
+          description: 该主号实际使用的隐式 TLS IMAP 端口。
         imap_username:
           type: string
         enabled:
@@ -2852,6 +3295,10 @@ components:
             - AUTH_REQUIRED
             - SESSION_EXPIRED
             - CSRF_INVALID
+            - INVALID_CREDENTIALS
+            - CURRENT_PASSWORD_INVALID
+            - CREDENTIALS_CHANGED
+            - RATE_LIMITED
             - NOT_FOUND
             - INVALID_JSON
             - VALIDATION_FAILED
@@ -2867,10 +3314,14 @@ components:
             - APPLE_UPSTREAM_ERROR
             - AUTO_CREATION_UNAVAILABLE
             - ACCOUNT_DISABLED
+            - ACCOUNT_EXISTS
+            - ACCOUNT_IDENTITY_LOCKED
             - APPLE_ACCOUNT_MISMATCH
             - ACCOUNT_CHANGED
             - ALIAS_OWNERSHIP_CONFLICT
             - ALIAS_CONFIRMATION_PENDING
+            - ALIAS_EXISTS
+            - ALIAS_LIMIT_REACHED
             - SYNC_FAILED
             - INTERNAL_ERROR
           description: |

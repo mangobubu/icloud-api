@@ -10,7 +10,9 @@ import (
 	"net"
 	stdmail "net/mail"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -20,8 +22,6 @@ import (
 )
 
 const (
-	defaultIMAPHost                 = "imap.mail.me.com"
-	defaultIMAPPort                 = 993
 	defaultIMAPTimeout              = 8 * time.Second
 	defaultMaxAliases               = domain.MaxEnabledAliasesPerAccount
 	defaultMaxCandidates            = 1024
@@ -712,19 +712,16 @@ func validatePublishUIDs(
 }
 
 func accountEndpoint(account domain.Account) (host, address, username string, err error) {
-	host = strings.TrimSpace(account.IMAPHost)
-	if host == "" {
-		host = defaultIMAPHost
+	if strings.TrimSpace(account.IMAPHost) == "" {
+		account.IMAPHost = domain.DefaultIMAPHost
 	}
-	if !strings.EqualFold(strings.TrimSuffix(host, "."), defaultIMAPHost) {
-		return "", "", "", fmt.Errorf("%w: IMAP host must be %s", ErrInvalidIMAPConfig, defaultIMAPHost)
+	if account.IMAPPort == 0 {
+		account.IMAPPort = domain.DefaultIMAPPort
 	}
-	port := account.IMAPPort
-	if port == 0 {
-		port = defaultIMAPPort
-	}
-	if port != defaultIMAPPort {
-		return "", "", "", fmt.Errorf("%w: IMAP port must be %d", ErrInvalidIMAPConfig, defaultIMAPPort)
+	var port int
+	host, port, err = domain.NormalizeIMAPEndpoint(account.IMAPHost, account.IMAPPort)
+	if err != nil {
+		return "", "", "", fmt.Errorf("%w: %v", ErrInvalidIMAPConfig, err)
 	}
 	username = strings.TrimSpace(account.IMAPUsername)
 	if username == "" {
@@ -733,7 +730,7 @@ func accountEndpoint(account domain.Account) (host, address, username string, er
 	if username == "" {
 		return "", "", "", fmt.Errorf("%w: empty username", ErrInvalidIMAPConfig)
 	}
-	return defaultIMAPHost, "imap.mail.me.com:993", username, nil
+	return host, net.JoinHostPort(host, strconv.Itoa(port)), username, nil
 }
 
 func validateIMAPAccount(account domain.Account, password string) error {
@@ -1421,8 +1418,98 @@ func mapKeys(values map[uint32][]int64) []uint32 {
 	return keys
 }
 
+// imapInitializationConn prevents go-imap from clearing the connection
+// deadline while New performs its implicit CAPABILITY request.
+type imapInitializationConn struct {
+	net.Conn
+
+	mu       sync.Mutex
+	deadline time.Time
+	finished bool
+}
+
+func (c *imapInitializationConn) SetDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.SetDeadline(c.boundDeadline(deadline))
+}
+
+func (c *imapInitializationConn) SetReadDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.SetReadDeadline(c.boundDeadline(deadline))
+}
+
+func (c *imapInitializationConn) SetWriteDeadline(deadline time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.Conn.SetWriteDeadline(c.boundDeadline(deadline))
+}
+
+func (c *imapInitializationConn) boundDeadline(deadline time.Time) time.Time {
+	if c.finished || c.deadline.IsZero() {
+		return deadline
+	}
+	if deadline.IsZero() || deadline.After(c.deadline) {
+		return c.deadline
+	}
+	return deadline
+}
+
+func (c *imapInitializationConn) finish() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.finished = true
+	return c.Conn.SetDeadline(time.Time{})
+}
+
+func initializeIMAPClient(connection net.Conn, deadline time.Time) (*imapclient.Client, error) {
+	boundedConnection := &imapInitializationConn{
+		Conn:     connection,
+		deadline: deadline,
+	}
+	if err := boundedConnection.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	session, err := imapclient.New(boundedConnection)
+	if err != nil {
+		_ = boundedConnection.Close()
+		return nil, err
+	}
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		_ = session.Terminate()
+		return nil, fmt.Errorf("initialize IMAP client: %w", context.DeadlineExceeded)
+	}
+	select {
+	case <-session.LoggedOut():
+		_ = session.Terminate()
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("initialize IMAP client: %w", context.DeadlineExceeded)
+		}
+		return nil, errors.New("initialize IMAP client: connection closed")
+	default:
+	}
+	if err := boundedConnection.finish(); err != nil {
+		_ = session.Terminate()
+		return nil, err
+	}
+	return session, nil
+}
+
+func imapInitializationDeadline(ctx context.Context, timeout time.Duration) time.Time {
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	if contextDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || contextDeadline.Before(deadline)) {
+		deadline = contextDeadline
+	}
+	return deadline
+}
+
 func dialIMAPTLS(ctx context.Context, address, serverName string, timeout time.Duration) (imapSession, error) {
-	dialer := &net.Dialer{Timeout: timeout}
+	initializationDeadline := imapInitializationDeadline(ctx, timeout)
+	dialer := &net.Dialer{Deadline: initializationDeadline}
 	connection, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, err
@@ -1442,23 +1529,26 @@ func dialIMAPTLS(ctx context.Context, address, serverName string, timeout time.D
 		ServerName: serverName,
 		MinVersion: tls.VersionTLS12,
 	})
-	handshakeContext, cancel := context.WithTimeout(ctx, timeout)
+	if err := tlsConnection.SetDeadline(initializationDeadline); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	handshakeContext := ctx
+	cancel := func() {}
+	if !initializationDeadline.IsZero() {
+		handshakeContext, cancel = context.WithDeadline(ctx, initializationDeadline)
+	}
 	defer cancel()
 	if err := tlsConnection.HandshakeContext(handshakeContext); err != nil {
 		_ = connection.Close()
 		return nil, err
 	}
-	if err := tlsConnection.SetDeadline(time.Now().Add(timeout)); err != nil {
-		_ = connection.Close()
-		return nil, err
-	}
-	session, err := imapclient.New(tlsConnection)
+	session, err := initializeIMAPClient(tlsConnection, initializationDeadline)
 	if err != nil {
 		_ = connection.Close()
-		return nil, err
-	}
-	if err := tlsConnection.SetDeadline(time.Time{}); err != nil {
-		_ = session.Terminate()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	session.Timeout = timeout

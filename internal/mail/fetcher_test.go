@@ -1,10 +1,12 @@
 package mail
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"sort"
 	"strings"
@@ -2075,14 +2077,38 @@ func TestAccountEndpointDefaultsToICloudTLSPort(t *testing.T) {
 	}
 }
 
-func TestAccountEndpointRejectsOtherServer(t *testing.T) {
-	_, _, _, err := accountEndpoint(domain.Account{
-		Email:    "owner@icloud.com",
-		IMAPHost: "internal.example.test",
-		IMAPPort: 143,
+func TestAccountEndpointUsesConfiguredTLSServer(t *testing.T) {
+	host, address, username, err := accountEndpoint(domain.Account{
+		Email:        "owner@icloud.com",
+		IMAPHost:     "Mail.Example.Test.",
+		IMAPPort:     1993,
+		IMAPUsername: "login@example.test",
 	})
-	if !errors.Is(err, ErrInvalidIMAPConfig) {
-		t.Fatalf("error = %v, want ErrInvalidIMAPConfig", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "mail.example.test" || address != "mail.example.test:1993" || username != "login@example.test" {
+		t.Fatalf("endpoint = %q %q %q", host, address, username)
+	}
+}
+
+func TestAccountEndpointFormatsIPv6AndRejectsInvalidServer(t *testing.T) {
+	host, address, _, err := accountEndpoint(domain.Account{Email: "owner@icloud.com", IMAPHost: "2001:db8::1", IMAPPort: 993})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "2001:db8::1" || address != "[2001:db8::1]:993" {
+		t.Fatalf("IPv6 endpoint = %q %q", host, address)
+	}
+
+	for _, account := range []domain.Account{
+		{Email: "owner@icloud.com", IMAPHost: "https://mail.example.test", IMAPPort: 993},
+		{Email: "owner@icloud.com", IMAPHost: "mail.example.test:993", IMAPPort: 993},
+		{Email: "owner@icloud.com", IMAPHost: "mail.example.test", IMAPPort: 65536},
+	} {
+		if _, _, _, err := accountEndpoint(account); !errors.Is(err, ErrInvalidIMAPConfig) {
+			t.Fatalf("accountEndpoint(%#v) error = %v, want ErrInvalidIMAPConfig", account, err)
+		}
 	}
 }
 
@@ -2458,6 +2484,56 @@ func TestFetchMailboxSequenceRangeRejectsOversizedResponse(t *testing.T) {
 	}
 	if calls := session.calls(); len(calls) != 0 {
 		t.Fatalf("oversized sequence range FETCH calls = %#v, want rejection before FETCH", calls)
+	}
+}
+
+func TestInitializeIMAPClientBoundsSilentCapability(t *testing.T) {
+	clientConnection, serverConnection := net.Pipe()
+	serverDone := make(chan struct{})
+	capabilityCommand := make(chan string, 1)
+	go func() {
+		defer close(serverDone)
+		defer serverConnection.Close()
+		if _, err := fmt.Fprint(serverConnection, "* OK IMAP server ready\r\n"); err != nil {
+			return
+		}
+		line, err := bufio.NewReader(serverConnection).ReadString('\n')
+		if err != nil {
+			return
+		}
+		capabilityCommand <- line
+
+		// Consume until the client-side deadline closes the initialization path,
+		// but never send a CAPABILITY response.
+		var buffer [1]byte
+		_, _ = serverConnection.Read(buffer[:])
+	}()
+
+	const timeout = 100 * time.Millisecond
+	startedAt := time.Now()
+	session, err := initializeIMAPClient(clientConnection, startedAt.Add(timeout))
+	_ = clientConnection.Close()
+	if session != nil {
+		_ = session.Terminate()
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("silent CAPABILITY error = %v, want context deadline exceeded", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("silent CAPABILITY took %v, want at most 1s", elapsed)
+	}
+	select {
+	case command := <-capabilityCommand:
+		if !strings.Contains(command, " CAPABILITY") {
+			t.Fatalf("initialization command = %q, want CAPABILITY", command)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not receive CAPABILITY")
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("silent IMAP server did not stop")
 	}
 }
 

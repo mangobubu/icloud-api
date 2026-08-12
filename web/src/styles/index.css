@@ -667,6 +667,31 @@ code {
   gap: 4px 20px;
 }
 
+.imap-service-fields {
+  display: grid;
+  width: 100%;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 0.32fr);
+  gap: 12px;
+}
+
+.imap-service-fields .el-form-item {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+/* Keep endpoint validation in the normal flow so it cannot cover the hint. */
+.imap-service-fields .el-form-item__error {
+  position: static;
+  flex: 0 0 100%;
+  width: 100%;
+  box-sizing: border-box;
+  line-height: 1.2;
+}
+
+.imap-service-field__port .el-input-number {
+  width: 100%;
+}
+
 .form-span {
   grid-column: 1 / -1;
 }
@@ -1547,6 +1572,10 @@ code {
   .form-grid,
   .inline-alias-form {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .imap-service-fields {
+    grid-template-columns: minmax(0, 1fr) minmax(120px, 0.45fr);
   }
 
   .form-span {

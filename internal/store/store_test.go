@@ -483,15 +483,21 @@ func TestAliasEnableUpdatesResetOnlyOnDisabledToEnabledTransition(t *testing.T) 
 	assertAliasSnapshotReset(t, ctx, db, alias.ID, true)
 }
 
-func TestUpdateAccountInvalidatesCursorButPreservesSnapshotsAfterSourceChange(t *testing.T) {
+func TestUpdateAccountInvalidatesMailboxStateAfterSourceChange(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name   string
-		update func(*testing.T, context.Context, *store.Store, domain.Account)
+		name                 string
+		wantSnapshots        bool
+		wantConsumptionCount int
+		wantSeenTaskCount    int
+		update               func(*testing.T, context.Context, *store.Store, domain.Account)
 	}{
 		{
-			name: "re-enable account",
+			name:                 "re-enable account",
+			wantSnapshots:        true,
+			wantConsumptionCount: 2,
+			wantSeenTaskCount:    1,
 			update: func(t *testing.T, ctx context.Context, db *store.Store, account domain.Account) {
 				account.Enabled = false
 				if _, err := db.UpdateAccount(ctx, account); err != nil {
@@ -504,7 +510,10 @@ func TestUpdateAccountInvalidatesCursorButPreservesSnapshotsAfterSourceChange(t 
 			},
 		},
 		{
-			name: "update IMAP password",
+			name:                 "update IMAP password",
+			wantSnapshots:        true,
+			wantConsumptionCount: 2,
+			wantSeenTaskCount:    1,
 			update: func(t *testing.T, ctx context.Context, db *store.Store, account domain.Account) {
 				account.PasswordCiphertext = "new-encrypted-password"
 				updated, err := db.UpdateAccount(ctx, account)
@@ -513,6 +522,23 @@ func TestUpdateAccountInvalidatesCursorButPreservesSnapshotsAfterSourceChange(t 
 				}
 				if updated.PasswordCiphertext != account.PasswordCiphertext {
 					t.Fatalf("password ciphertext = %q, want updated value", updated.PasswordCiphertext)
+				}
+			},
+		},
+		{
+			name:                 "update IMAP endpoint",
+			wantSnapshots:        false,
+			wantConsumptionCount: 0,
+			wantSeenTaskCount:    0,
+			update: func(t *testing.T, ctx context.Context, db *store.Store, account domain.Account) {
+				account.IMAPHost = "mail.example.test"
+				account.IMAPPort = 1993
+				updated, err := db.UpdateAccount(ctx, account)
+				if err != nil {
+					t.Fatalf("update IMAP endpoint: %v", err)
+				}
+				if updated.IMAPHost != account.IMAPHost || updated.IMAPPort != account.IMAPPort {
+					t.Fatalf("IMAP endpoint = %q:%d, want %q:%d", updated.IMAPHost, updated.IMAPPort, account.IMAPHost, account.IMAPPort)
 				}
 			},
 		},
@@ -535,12 +561,27 @@ func TestUpdateAccountInvalidatesCursorButPreservesSnapshotsAfterSourceChange(t 
 					AliasID: alias.ID, UIDValidity: 20, UID: uint32(index + 1),
 					Subject: "snapshot", InternalDate: syncedAt, SyncedAt: syncedAt,
 				})
+				if _, err := db.DB().ExecContext(ctx, `
+					INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
+					VALUES(?, ?, ?, ?)`, alias.ID, 20, index+1, syncedAt.UTC().UnixNano()); err != nil {
+					t.Fatalf("seed alias %d consumption history: %v", alias.ID, err)
+				}
 				if err := db.UpdateAliasSyncStatus(ctx, alias.ID, domain.SyncStatusError, "old failure", &syncedAt); err != nil {
 					t.Fatalf("set alias %d sync state: %v", alias.ID, err)
 				}
 			}
 			if err := db.UpdateAccountSyncStatus(ctx, account.ID, domain.SyncStatusError, "old failure", &syncedAt); err != nil {
 				t.Fatalf("set account sync state: %v", err)
+			}
+			if _, err := db.DB().ExecContext(ctx, `
+				INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
+				VALUES(?, ?, ?, ?)`, account.ID, 20, 99, syncedAt.UTC().UnixNano()); err != nil {
+				t.Fatalf("seed account IMAP seen task: %v", err)
+			}
+			if _, err := db.DB().ExecContext(ctx, `
+				INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
+				VALUES(?, ?, ?, ?)`, otherAccount.ID, 20, 100, syncedAt.UTC().UnixNano()); err != nil {
+				t.Fatalf("seed unrelated account IMAP seen task: %v", err)
 			}
 			if err := db.SetAliasEnabled(ctx, aliasTwo.ID, false); err != nil {
 				t.Fatalf("disable second alias: %v", err)
@@ -574,10 +615,32 @@ func TestUpdateAccountInvalidatesCursorButPreservesSnapshotsAfterSourceChange(t 
 					stored.LastSyncError != "" || stored.LastSyncedAt != nil {
 					t.Fatalf("invalidated alias state = %#v", stored)
 				}
-				assertLatestSubject(t, ctx, db, expected.alias.ID, "snapshot", 20, expected.uid)
+				if tt.wantSnapshots {
+					assertLatestSubject(t, ctx, db, expected.alias.ID, "snapshot", 20, expected.uid)
+				} else if _, err := db.GetLatestMessage(ctx, expected.alias.ID); !errors.Is(err, store.ErrNotFound) {
+					t.Fatalf("latest message after %s error = %v, want ErrNotFound", tt.name, err)
+				}
 			}
 			if _, err := db.GetIMAPSyncState(ctx, account.ID); !errors.Is(err, store.ErrNotFound) {
 				t.Fatalf("cursor after source change error = %v, want ErrNotFound", err)
+			}
+			var seenTaskCount int
+			if err := db.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM imap_seen_tasks WHERE account_id = ?`, account.ID).Scan(&seenTaskCount); err != nil {
+				t.Fatalf("count account IMAP seen tasks: %v", err)
+			}
+			if seenTaskCount != tt.wantSeenTaskCount {
+				t.Fatalf("account IMAP seen tasks after %s = %d, want %d", tt.name, seenTaskCount, tt.wantSeenTaskCount)
+			}
+			var consumptionCount int
+			if err := db.DB().QueryRowContext(ctx, `
+				SELECT COUNT(*)
+				FROM consumed_messages c
+				JOIN aliases a ON a.id = c.alias_id
+				WHERE a.account_id = ?`, account.ID).Scan(&consumptionCount); err != nil {
+				t.Fatalf("count account consumption history: %v", err)
+			}
+			if consumptionCount != tt.wantConsumptionCount {
+				t.Fatalf("account consumption history after %s = %d, want %d", tt.name, consumptionCount, tt.wantConsumptionCount)
 			}
 			updatedAccount, err := db.GetAccount(ctx, account.ID)
 			if err != nil {
@@ -595,6 +658,20 @@ func TestUpdateAccountInvalidatesCursorButPreservesSnapshotsAfterSourceChange(t 
 				t.Fatalf("unrelated alias state changed: %#v", other)
 			}
 			assertLatestSubject(t, ctx, db, otherAlias.ID, "snapshot", 20, 3)
+			var otherConsumptionCount, otherSeenTaskCount int
+			if err := db.DB().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM consumed_messages WHERE alias_id = ?`, otherAlias.ID,
+			).Scan(&otherConsumptionCount); err != nil {
+				t.Fatalf("count unrelated consumption history: %v", err)
+			}
+			if err := db.DB().QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM imap_seen_tasks WHERE account_id = ?`, otherAccount.ID,
+			).Scan(&otherSeenTaskCount); err != nil {
+				t.Fatalf("count unrelated IMAP seen tasks: %v", err)
+			}
+			if otherConsumptionCount != 1 || otherSeenTaskCount != 1 {
+				t.Fatalf("unrelated mailbox state changed: consumption=%d seen=%d", otherConsumptionCount, otherSeenTaskCount)
+			}
 		})
 	}
 }
@@ -629,6 +706,71 @@ func TestUpdateAccountRollsBackCredentialWhenSnapshotResetFails(t *testing.T) {
 		t.Fatalf("credential changed despite rollback: %q", stored.PasswordCiphertext)
 	}
 	assertLatestSubject(t, ctx, db, alias.ID, "retained snapshot", 30, 40)
+}
+
+func TestUpdateAccountRollsBackEndpointAndMailboxStateWhenStatusResetFails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Primary", "endpoint-rollback@icloud.com")
+	alias := createAlias(t, ctx, db, account.ID, "endpoint-rollback-relay@icloud.com", []byte("endpoint-rollback-hash"))
+	syncedAt := time.Date(2026, 8, 6, 16, 30, 0, 0, time.UTC)
+	mustUpsert(t, ctx, db, domain.LatestMessage{
+		AliasID: alias.ID, UIDValidity: 31, UID: 41, Subject: "retained endpoint snapshot",
+		InternalDate: syncedAt, SyncedAt: syncedAt,
+	})
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
+		VALUES(?, 31, 41, ?)`, alias.ID, syncedAt.UTC().UnixNano()); err != nil {
+		t.Fatalf("seed consumption history: %v", err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
+		VALUES(?, 31, 41, ?)`, account.ID, syncedAt.UTC().UnixNano()); err != nil {
+		t.Fatalf("seed seen task: %v", err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO imap_sync_states(account_id, uid_validity, last_uid, updated_at)
+		VALUES(?, 31, 41, ?)`, account.ID, syncedAt.UTC().UnixNano()); err != nil {
+		t.Fatalf("seed sync state: %v", err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_endpoint_alias_status_reset
+		BEFORE UPDATE OF last_sync_status ON aliases
+		BEGIN SELECT RAISE(ABORT, 'forced endpoint reset failure'); END`); err != nil {
+		t.Fatalf("create endpoint reset failure trigger: %v", err)
+	}
+
+	account.IMAPHost = "mail.example.test"
+	account.IMAPPort = 1993
+	if _, err := db.UpdateAccount(ctx, account); err == nil {
+		t.Fatal("endpoint update unexpectedly succeeded")
+	}
+	stored, err := db.GetAccount(ctx, account.ID)
+	if err != nil {
+		t.Fatalf("get rolled back account: %v", err)
+	}
+	if stored.IMAPHost != "imap.mail.me.com" || stored.IMAPPort != 993 {
+		t.Fatalf("endpoint changed despite rollback: %q:%d", stored.IMAPHost, stored.IMAPPort)
+	}
+	assertLatestSubject(t, ctx, db, alias.ID, "retained endpoint snapshot", 31, 41)
+	for label, query := range map[string]string{
+		"consumption history": `SELECT COUNT(*) FROM consumed_messages WHERE alias_id = ?`,
+		"seen task":           `SELECT COUNT(*) FROM imap_seen_tasks WHERE account_id = ?`,
+		"sync state":          `SELECT COUNT(*) FROM imap_sync_states WHERE account_id = ?`,
+	} {
+		id := account.ID
+		if label == "consumption history" {
+			id = alias.ID
+		}
+		var count int
+		if err := db.DB().QueryRowContext(ctx, query, id).Scan(&count); err != nil {
+			t.Fatalf("count rolled back %s: %v", label, err)
+		}
+		if count != 1 {
+			t.Fatalf("rolled back %s rows = %d, want 1", label, count)
+		}
+	}
 }
 
 func TestUpdateAccountIdentityChangeResetsAccountStatus(t *testing.T) {

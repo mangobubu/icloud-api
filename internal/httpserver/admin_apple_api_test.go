@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -377,80 +376,6 @@ func TestAdminAPIDeleteMissingAliasReturnsNotFoundBeforeAppleService(t *testing.
 	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/999999", nil, "", []*http.Cookie{sessionCookie}, csrf)
 	if response.Code != http.StatusNotFound || adminAPITestErrorCode(t, response) != "NOT_FOUND" {
 		t.Fatalf("delete missing alias = %d; body=%s", response.Code, response.Body.String())
-	}
-}
-
-func TestLegacyAdminDeleteAliasUsesAppleServiceAndRedirects(t *testing.T) {
-	env := newHTTPTestEnv(t)
-	fixture := env.createMailboxFixture(t)
-	cookie := env.createAdminSession(t)
-	deleteCalls := 0
-	env.server.SetHMESyncService(&fakeHMESyncService{
-		deleteAlias: func(ctx context.Context, aliasID int64) error {
-			deleteCalls++
-			if aliasID != fixture.aliasA.ID {
-				t.Fatalf("delete alias ID = %d, want %d", aliasID, fixture.aliasA.ID)
-			}
-			return env.store.DeleteAlias(ctx, aliasID)
-		},
-	})
-
-	target := fmt.Sprintf("/admin/aliases/%d/delete", fixture.aliasA.ID)
-	response := env.request(t, http.MethodPost, target, url.Values{"csrf_token": {testSessionCSRF}}, []*http.Cookie{cookie})
-	wantLocation := fmt.Sprintf("/admin/accounts/%d?notice=alias_deleted", fixture.accountA.ID)
-	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != wantLocation {
-		t.Fatalf("legacy delete = %d Location=%q; body=%s", response.Code, response.Header().Get("Location"), response.Body.String())
-	}
-	if deleteCalls != 1 {
-		t.Fatalf("Apple delete calls = %d, want 1", deleteCalls)
-	}
-	if _, err := env.store.GetAlias(context.Background(), fixture.aliasA.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("legacy deleted alias lookup error = %v, want not found", err)
-	}
-	assertAdminAliasDeleteAudit(t, env.store, fixture.aliasA.ID, "success", "")
-}
-
-func TestLegacyAdminDeleteAliasClassifiesFailuresAndKeepsLocalRecord(t *testing.T) {
-	tests := []struct {
-		name       string
-		serviceErr error
-		wantStatus int
-		wantCode   string
-	}{
-		{name: "service unavailable", wantStatus: http.StatusServiceUnavailable, wantCode: "INTERNAL_ERROR"},
-		{
-			name:       "login required wrapping missing session",
-			serviceErr: fmt.Errorf("load Apple session: %w: %w", hmesync.ErrLoginRequired, store.ErrNotFound),
-			wantStatus: http.StatusConflict,
-			wantCode:   hmesync.CodeLoginRequired,
-		},
-		{name: "rate limited", serviceErr: hmesync.ErrRateLimited, wantStatus: http.StatusTooManyRequests, wantCode: hmesync.CodeRateLimited},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			env := newHTTPTestEnv(t)
-			fixture := env.createMailboxFixture(t)
-			cookie := env.createAdminSession(t)
-			if test.serviceErr != nil {
-				env.server.SetHMESyncService(&fakeHMESyncService{
-					deleteAlias: func(context.Context, int64) error { return test.serviceErr },
-				})
-			}
-
-			target := fmt.Sprintf("/admin/aliases/%d/delete", fixture.aliasA.ID)
-			response := env.request(t, http.MethodPost, target, url.Values{"csrf_token": {testSessionCSRF}}, []*http.Cookie{cookie})
-			if response.Code != test.wantStatus {
-				t.Fatalf("legacy delete failure = %d; body=%s; want %d", response.Code, response.Body.String(), test.wantStatus)
-			}
-			if !strings.Contains(response.Body.String(), "本地记录已保留") {
-				t.Fatalf("legacy delete failure omitted local-retention notice: %s", response.Body.String())
-			}
-			if _, err := env.store.GetAlias(context.Background(), fixture.aliasA.ID); err != nil {
-				t.Fatalf("legacy failed delete removed local alias: %v", err)
-			}
-			assertAdminAliasDeleteAudit(t, env.store, fixture.aliasA.ID, "failed", test.wantCode)
-		})
 	}
 }
 

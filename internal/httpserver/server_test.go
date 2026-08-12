@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,12 +13,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/bcrypt"
 
 	"icloud-api/internal/config"
 	"icloud-api/internal/domain"
@@ -148,15 +144,65 @@ func TestAdminSPARequiresCompleteBuild(t *testing.T) {
 	}
 }
 
-func TestAdminWithoutSessionRedirectsToLogin(t *testing.T) {
+func TestRouterWithoutWebRootIsAPIOnly(t *testing.T) {
 	env := newHTTPTestEnv(t)
 
-	response := env.request(t, http.MethodGet, "/admin", nil, nil)
-	if response.Code != http.StatusFound {
-		t.Fatalf("GET /admin status = %d, want %d", response.Code, http.StatusFound)
+	legacyRoutes := []struct {
+		method string
+		target string
+	}{
+		{http.MethodGet, "/"},
+		{http.MethodHead, "/"},
+		{http.MethodGet, "/admin"},
+		{http.MethodHead, "/admin"},
+		{http.MethodGet, "/admin/"},
+		{http.MethodHead, "/admin/"},
+		{http.MethodGet, "/admin/login"},
+		{http.MethodPost, "/admin/login"},
+		{http.MethodGet, "/admin/accounts/new"},
+		{http.MethodPost, "/admin/accounts"},
+		{http.MethodGet, "/admin/accounts/42"},
+		{http.MethodPost, "/admin/accounts/42"},
+		{http.MethodPost, "/admin/accounts/42/sync"},
+		{http.MethodPost, "/admin/accounts/42/delete"},
+		{http.MethodPost, "/admin/accounts/42/aliases"},
+		{http.MethodGet, "/admin/aliases"},
+		{http.MethodPost, "/admin/aliases/42/rotate"},
+		{http.MethodPost, "/admin/aliases/42/toggle"},
+		{http.MethodPost, "/admin/aliases/42/delete"},
+		{http.MethodGet, "/admin/audit"},
+		{http.MethodGet, "/admin/security"},
+		{http.MethodPost, "/admin/security/password"},
+		{http.MethodGet, "/admin/assets"},
+		{http.MethodGet, "/admin/assets/"},
+		{http.MethodGet, "/admin/assets/app.js"},
+		{http.MethodGet, "/assets/app.css"},
+		{http.MethodGet, "/assets/app.js"},
 	}
-	if location := response.Header().Get("Location"); location != "/admin/login" {
-		t.Fatalf("GET /admin Location = %q, want %q", location, "/admin/login")
+	for _, route := range legacyRoutes {
+		route := route
+		t.Run(route.method+" "+route.target, func(t *testing.T) {
+			response := env.request(t, route.method, route.target, nil, nil)
+			if response.Code != http.StatusNotFound {
+				t.Fatalf("%s %s = %d, want %d; body=%s", route.method, route.target, response.Code, http.StatusNotFound, response.Body.String())
+			}
+			if got := response.Header().Get("Content-Type"); strings.HasPrefix(got, "text/html") {
+				t.Fatalf("%s %s Content-Type = %q, want no server-rendered HTML", route.method, route.target, got)
+			}
+		})
+	}
+
+	for _, target := range []string{"/api", "/api/v1/not-found", "/admin/api", "/admin/api/v1/not-found"} {
+		response := env.request(t, http.MethodGet, target, nil, nil)
+		assertAPIError(t, response, http.StatusNotFound, "NOT_FOUND")
+		if got := response.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+			t.Fatalf("GET %s Cache-Control = %q, want no-store", target, got)
+		}
+	}
+
+	api := env.request(t, http.MethodGet, "/admin/api/v1/auth/csrf", nil, nil)
+	if api.Code != http.StatusOK || !strings.HasPrefix(api.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("admin JSON API status/type = %d %q; body=%s", api.Code, api.Header().Get("Content-Type"), api.Body.String())
 	}
 }
 
@@ -172,239 +218,6 @@ func TestRouterMountsAdminJSONAPI(t *testing.T) {
 	}
 	if cookie := requireResponseCookie(t, response, adminAPILoginCSRFCookie); cookie.Path != adminAPILoginCSRFPath {
 		t.Fatalf("admin API CSRF cookie Path = %q, want %q", cookie.Path, adminAPILoginCSRFPath)
-	}
-}
-
-func TestAdminLoginRequiresCSRFAndCorrectPassword(t *testing.T) {
-	env := newHTTPTestEnv(t)
-	const (
-		username = "admin"
-		password = "correct horse battery staple"
-	)
-	env.createAdmin(t, username, password)
-
-	t.Run("missing csrf", func(t *testing.T) {
-		csrfCookie := env.loginCSRFCookie(t)
-		response := env.request(t, http.MethodPost, "/admin/login", url.Values{
-			"username": {username},
-			"password": {password},
-		}, []*http.Cookie{csrfCookie})
-		if response.Code != http.StatusForbidden {
-			t.Fatalf("login without CSRF status = %d, want %d", response.Code, http.StatusForbidden)
-		}
-		assertNoResponseCookie(t, response, sessionCookie)
-	})
-
-	t.Run("wrong password", func(t *testing.T) {
-		csrfCookie := env.loginCSRFCookie(t)
-		response := env.request(t, http.MethodPost, "/admin/login", url.Values{
-			"csrf_token": {csrfCookie.Value},
-			"username":   {username},
-			"password":   {"not-the-password"},
-		}, []*http.Cookie{csrfCookie})
-		if response.Code != http.StatusUnauthorized {
-			t.Fatalf("login with wrong password status = %d, want %d", response.Code, http.StatusUnauthorized)
-		}
-		assertNoResponseCookie(t, response, sessionCookie)
-	})
-
-	t.Run("valid credentials", func(t *testing.T) {
-		csrfCookie := env.loginCSRFCookie(t)
-		response := env.request(t, http.MethodPost, "/admin/login", url.Values{
-			"csrf_token": {csrfCookie.Value},
-			"username":   {username},
-			"password":   {password},
-		}, []*http.Cookie{csrfCookie})
-		if response.Code != http.StatusFound {
-			t.Fatalf("valid login status = %d, want %d", response.Code, http.StatusFound)
-		}
-		if location := response.Header().Get("Location"); location != "/admin" {
-			t.Fatalf("valid login Location = %q, want %q", location, "/admin")
-		}
-		cookie := requireResponseCookie(t, response, sessionCookie)
-		if cookie.Value == "" || !cookie.HttpOnly || cookie.Path != "/admin" {
-			t.Fatalf("session cookie has unexpected attributes: %#v", cookie)
-		}
-	})
-}
-
-func TestLoginCSRFFailureReason(t *testing.T) {
-	const token = "matching-login-csrf-token"
-	tests := []struct {
-		name      string
-		provided  string
-		cookie    string
-		host      string
-		origin    string
-		fetchSite string
-		want      string
-	}{
-		{name: "missing cookie", provided: token, want: "cookie_missing"},
-		{name: "missing form token", cookie: token, want: "form_token_missing"},
-		{name: "token mismatch", provided: "Matching-login-csrf-token", cookie: token, want: "token_mismatch"},
-		{name: "cross-site fetch", provided: token, cookie: token, fetchSite: "cross-site", want: "fetch_site_cross_site"},
-		{name: "invalid origin", provided: token, cookie: token, origin: "null", want: "origin_invalid"},
-		{name: "origin with path", provided: token, cookie: token, origin: "https://example.com/path", want: "origin_invalid"},
-		{name: "origin with user info", provided: token, cookie: token, origin: "https://user@example.com", want: "origin_invalid"},
-		{name: "origin with query", provided: token, cookie: token, origin: "https://example.com?query", want: "origin_invalid"},
-		{name: "non-http origin", provided: token, cookie: token, origin: "ftp://example.com", want: "origin_invalid"},
-		{name: "origin host mismatch", provided: token, cookie: token, host: "internal:8080", origin: "https://admin.example.com", want: "origin_host_mismatch"},
-		{name: "same origin", provided: token, cookie: token, host: "admin.example.com", origin: "https://admin.example.com"},
-		{name: "missing origin", provided: token, cookie: token},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			host := test.host
-			if host == "" {
-				host = "example.com"
-			}
-			request := httptest.NewRequest(http.MethodPost, "http://"+host+"/admin/login", nil)
-			if test.cookie != "" {
-				request.AddCookie(&http.Cookie{Name: loginCSRFCookie, Value: test.cookie})
-			}
-			if test.origin != "" {
-				request.Header.Set("Origin", test.origin)
-			}
-			if test.fetchSite != "" {
-				request.Header.Set("Sec-Fetch-Site", test.fetchSite)
-			}
-			if got := loginCSRFFailureReason(request, test.provided); got != test.want {
-				t.Fatalf("loginCSRFFailureReason() = %q, want %q", got, test.want)
-			}
-		})
-	}
-}
-
-func TestLoginCSRFFailureLogExcludesSecrets(t *testing.T) {
-	const (
-		username = "diagnostic-admin-secret"
-		password = "diagnostic-password-secret"
-	)
-	tests := []struct {
-		name        string
-		cookie      string
-		formToken   string
-		host        string
-		origin      string
-		wantReason  string
-		wantCookies float64
-	}{
-		{
-			name:       "missing cookie",
-			formToken:  "missing-cookie-form-token-secret",
-			wantReason: loginCSRFCookieMissing,
-		},
-		{
-			name:        "token mismatch",
-			cookie:      "mismatch-cookie-token-secret",
-			formToken:   "mismatch-form-token-secret--",
-			wantReason:  loginCSRFTokenMismatch,
-			wantCookies: 1,
-		},
-		{
-			name:        "origin host mismatch",
-			cookie:      "origin-cookie-token-secret",
-			formToken:   "origin-cookie-token-secret",
-			host:        "internal-host-secret:8080",
-			origin:      "https://public-origin-secret.example",
-			wantReason:  loginCSRFOriginHostMismatch,
-			wantCookies: 1,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			env := newHTTPTestEnv(t)
-			var logs bytes.Buffer
-			env.server.logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-			host := test.host
-			if host == "" {
-				host = "login-host-secret.example"
-			}
-			form := url.Values{
-				"csrf_token": {test.formToken},
-				"username":   {username},
-				"password":   {password},
-			}
-			request := httptest.NewRequest(http.MethodPost, "http://"+host+"/admin/login", strings.NewReader(form.Encode()))
-			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-			if test.cookie != "" {
-				request.AddCookie(&http.Cookie{Name: loginCSRFCookie, Value: test.cookie})
-			}
-			if test.origin != "" {
-				request.Header.Set("Origin", test.origin)
-			}
-			response := httptest.NewRecorder()
-			env.router.ServeHTTP(response, request)
-			if response.Code != http.StatusForbidden {
-				t.Fatalf("login CSRF failure status = %d, want %d", response.Code, http.StatusForbidden)
-			}
-
-			var entry map[string]any
-			if err := json.Unmarshal(logs.Bytes(), &entry); err != nil {
-				t.Fatalf("parse login CSRF log: %v; output=%s", err, logs.String())
-			}
-			if got := entry["reason"]; got != test.wantReason {
-				t.Fatalf("login CSRF log reason = %#v, want %q", got, test.wantReason)
-			}
-			if got := entry["cookie_count"]; got != test.wantCookies {
-				t.Fatalf("login CSRF log cookie_count = %#v, want %.0f", got, test.wantCookies)
-			}
-			if got, want := entry["request_id"], response.Header().Get("X-Request-ID"); got != want {
-				t.Fatalf("login CSRF log request_id = %#v, want %q", got, want)
-			}
-
-			output := logs.String()
-			for _, secret := range []string{username, password, test.formToken, test.cookie, host, test.origin} {
-				if secret != "" && strings.Contains(output, secret) {
-					t.Fatalf("login CSRF log exposed secret %q: %s", secret, output)
-				}
-			}
-			if strings.Contains(response.Body.String(), test.wantReason) {
-				t.Fatal("login CSRF response exposed internal failure reason")
-			}
-		})
-	}
-}
-
-func TestSuccessfulLoginDeletesExpiredSessions(t *testing.T) {
-	env := newHTTPTestEnv(t)
-	const (
-		username = "cleanup-admin"
-		password = "correct horse battery staple"
-	)
-	admin := env.createAdmin(t, username, password)
-	expiredHash := secure.HashToken("expired-session")
-	if err := env.store.CreateSession(context.Background(), expiredHash, domain.Session{
-		AdminID:         admin.ID,
-		Username:        admin.Username,
-		PasswordVersion: admin.PasswordVersion,
-		CSRF:            "expired-csrf",
-		ExpiresAt:       time.Now().UTC().Add(-time.Hour),
-	}); err != nil {
-		t.Fatalf("create expired session: %v", err)
-	}
-
-	csrfCookie := env.loginCSRFCookie(t)
-	response := env.request(t, http.MethodPost, "/admin/login", url.Values{
-		"csrf_token": {csrfCookie.Value},
-		"username":   {username},
-		"password":   {password},
-	}, []*http.Cookie{csrfCookie})
-	if response.Code != http.StatusFound {
-		t.Fatalf("valid login status = %d, want %d", response.Code, http.StatusFound)
-	}
-
-	var count int
-	if err := env.store.DB().QueryRowContext(context.Background(),
-		`SELECT COUNT(*) FROM admin_sessions WHERE token_hash = ?`, expiredHash,
-	).Scan(&count); err != nil {
-		t.Fatalf("count expired sessions: %v", err)
-	}
-	if count != 0 {
-		t.Fatalf("expired session count = %d, want 0", count)
 	}
 }
 
@@ -613,143 +426,12 @@ func TestWindowLimiterBoundsHighCardinalityKeys(t *testing.T) {
 	}
 }
 
-func TestReenablingAliasClearsSnapshotAndSetsPending(t *testing.T) {
-	env := newHTTPTestEnv(t)
-	mailboxes := env.createMailboxFixture(t)
-	cookie := env.createAdminSession(t)
-	target := fmt.Sprintf("/admin/aliases/%d/toggle", mailboxes.aliasA.ID)
-	form := url.Values{"csrf_token": {testSessionCSRF}}
-
-	response := env.request(t, http.MethodPost, target, form, []*http.Cookie{cookie})
-	if response.Code != http.StatusSeeOther {
-		t.Fatalf("disable alias status = %d, want %d; body=%s", response.Code, http.StatusSeeOther, response.Body.String())
-	}
-	response = env.request(t, http.MethodPost, target, form, []*http.Cookie{cookie})
-	if response.Code != http.StatusSeeOther {
-		t.Fatalf("re-enable alias status = %d, want %d; body=%s", response.Code, http.StatusSeeOther, response.Body.String())
-	}
-
-	alias, err := env.store.GetAlias(context.Background(), mailboxes.aliasA.ID)
-	if err != nil {
-		t.Fatalf("reload re-enabled alias: %v", err)
-	}
-	if !alias.Enabled || alias.LastSyncStatus != domain.SyncStatusPending || alias.LastSyncError != "" || alias.LastSyncedAt != nil {
-		t.Fatalf("re-enabled alias state = %#v, want enabled pending with no previous sync metadata", alias)
-	}
-	if _, err := env.store.GetLatestMessage(context.Background(), mailboxes.aliasA.ID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("re-enabled alias retained old snapshot: %v", err)
-	}
-	apiResponse := env.apiRequest(t, "/api/v1/mail/latest", mailboxes.keyA)
-	assertAPIError(t, apiResponse, http.StatusServiceUnavailable, "SYNC_UNAVAILABLE")
-	if strings.Contains(apiResponse.Body.String(), "A newest subject") {
-		t.Fatal("re-enabled alias API exposed its cleared snapshot")
-	}
-}
-
-func TestUpdatingIMAPPasswordSetsEveryAliasPending(t *testing.T) {
-	env := newHTTPTestEnv(t)
-	mailboxes := env.createSiblingMailboxFixture(t)
-	cookie := env.createAdminSession(t)
-	const newPassword = "new-imap-app-password"
-	response := env.request(t, http.MethodPost,
-		fmt.Sprintf("/admin/accounts/%d", mailboxes.accountA.ID),
-		url.Values{
-			"csrf_token":    {testSessionCSRF},
-			"name":          {mailboxes.accountA.Name},
-			"email":         {mailboxes.accountA.Email},
-			"imap_username": {mailboxes.accountA.IMAPUsername},
-			"imap_password": {newPassword},
-			"enabled":       {"1"},
-		}, []*http.Cookie{cookie})
-	if response.Code != http.StatusSeeOther {
-		t.Fatalf("update IMAP password status = %d, want %d; body=%s", response.Code, http.StatusSeeOther, response.Body.String())
-	}
-
-	aliases, err := env.store.ListAliasesByAccount(context.Background(), mailboxes.accountA.ID)
-	if err != nil {
-		t.Fatalf("list aliases after password update: %v", err)
-	}
-	if len(aliases) != 2 {
-		t.Fatalf("alias count after password update = %d, want 2", len(aliases))
-	}
-	for _, alias := range aliases {
-		if alias.LastSyncStatus != domain.SyncStatusPending || alias.LastSyncError != "" || alias.LastSyncedAt != nil {
-			t.Errorf("alias %q state after password update = %#v, want pending", alias.Address, alias)
-		}
-		if _, err := env.store.GetLatestMessage(context.Background(), alias.ID); err != nil {
-			t.Errorf("alias %q lost its pending same-generation snapshot after password update: %v", alias.Address, err)
-		}
-	}
-	account, err := env.store.GetAccount(context.Background(), mailboxes.accountA.ID)
-	if err != nil {
-		t.Fatalf("reload account after password update: %v", err)
-	}
-	if account.LastSyncStatus != domain.SyncStatusPending || account.LastSyncError != "" || account.LastSyncedAt != nil {
-		t.Fatalf("account sync state after password update = %#v, want pending", account)
-	}
-	decrypted, err := env.cipher.Decrypt(account.PasswordCiphertext)
-	if err != nil {
-		t.Fatalf("decrypt updated IMAP password: %v", err)
-	}
-	if decrypted != newPassword {
-		t.Fatalf("updated IMAP password = %q, want %q", decrypted, newPassword)
-	}
-	for _, key := range []string{mailboxes.keyA, mailboxes.keyB} {
-		apiResponse := env.apiRequest(t, "/api/v1/mail/latest", key)
-		assertAPIError(t, apiResponse, http.StatusServiceUnavailable, "SYNC_UNAVAILABLE")
-		if strings.Contains(apiResponse.Body.String(), "snapshot") {
-			t.Fatal("API exposed a retained internal snapshot while IMAP resync was pending")
-		}
-	}
-}
-
-func TestAdminPagesDoNotEchoIMAPPassword(t *testing.T) {
-	env := newHTTPTestEnv(t)
-	const plaintext = "imap-app-password-must-stay-secret"
-	ciphertext, err := env.cipher.Encrypt(plaintext)
-	if err != nil {
-		t.Fatalf("encrypt fixture password: %v", err)
-	}
-	account := env.createAccount(t, "Primary", "primary@icloud.com", ciphertext)
-	sessionCookie := env.createAdminSession(t)
-
-	for _, target := range []string{
-		fmt.Sprintf("/admin/accounts/%d", account.ID),
-		fmt.Sprintf("/admin/accounts/%d/edit", account.ID),
-	} {
-		t.Run(target, func(t *testing.T) {
-			response := env.request(t, http.MethodGet, target, nil, []*http.Cookie{sessionCookie})
-			if response.Code != http.StatusOK {
-				t.Fatalf("GET %s status = %d, want %d; body=%s", target, response.Code, http.StatusOK, response.Body.String())
-			}
-			body := response.Body.String()
-			if strings.Contains(body, plaintext) {
-				t.Fatalf("GET %s echoed plaintext IMAP password", target)
-			}
-			if strings.Contains(body, ciphertext) {
-				t.Fatalf("GET %s echoed stored IMAP credential", target)
-			}
-			if strings.HasSuffix(target, "/edit") {
-				passwordInput := regexp.MustCompile(`<input[^>]*name="imap_password"[^>]*>`).FindString(body)
-				if passwordInput == "" {
-					t.Fatalf("GET %s did not render the password input", target)
-				}
-				if regexp.MustCompile(`\svalue\s*=`).MatchString(passwordInput) {
-					t.Fatalf("GET %s prefilled the password input: %s", target, passwordInput)
-				}
-			}
-		})
-	}
-}
-
 type httpTestEnv struct {
 	store  *store.Store
 	cipher *secure.Cipher
 	server *Server
 	router http.Handler
 }
-
-const testSessionCSRF = "test-session-csrf"
 
 func newHTTPTestEnv(t *testing.T) *httpTestEnv {
 	return newHTTPTestEnvWithWebRoot(t, "")
@@ -839,44 +521,6 @@ func (e *httpTestEnv) apiRequest(t *testing.T, target, key string) *httptest.Res
 	response := httptest.NewRecorder()
 	e.router.ServeHTTP(response, request)
 	return response
-}
-
-func (e *httpTestEnv) createAdmin(t *testing.T, username, password string) domain.Admin {
-	t.Helper()
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.MinCost)
-	if err != nil {
-		t.Fatalf("hash admin password: %v", err)
-	}
-	admin, err := e.store.CreateAdmin(context.Background(), username, string(hash))
-	if err != nil {
-		t.Fatalf("create admin: %v", err)
-	}
-	return admin
-}
-
-func (e *httpTestEnv) loginCSRFCookie(t *testing.T) *http.Cookie {
-	t.Helper()
-	response := e.request(t, http.MethodGet, "/admin/login", nil, nil)
-	if response.Code != http.StatusOK {
-		t.Fatalf("GET /admin/login status = %d, want %d", response.Code, http.StatusOK)
-	}
-	return requireResponseCookie(t, response, loginCSRFCookie)
-}
-
-func (e *httpTestEnv) createAdminSession(t *testing.T) *http.Cookie {
-	t.Helper()
-	admin := e.createAdmin(t, "page-admin", "unused-test-password")
-	const rawToken = "test-admin-session-token"
-	if err := e.store.CreateSession(context.Background(), secure.HashToken(rawToken), domain.Session{
-		AdminID:         admin.ID,
-		Username:        admin.Username,
-		PasswordVersion: admin.PasswordVersion,
-		CSRF:            testSessionCSRF,
-		ExpiresAt:       time.Now().UTC().Add(time.Hour),
-	}); err != nil {
-		t.Fatalf("create admin session: %v", err)
-	}
-	return &http.Cookie{Name: sessionCookie, Value: rawToken, Path: "/admin"}
 }
 
 func (e *httpTestEnv) createAccount(t *testing.T, name, email, ciphertext string) domain.Account {
@@ -1042,15 +686,6 @@ func requireResponseCookie(t *testing.T, response *httptest.ResponseRecorder, na
 	}
 	t.Fatalf("response did not set cookie %q", name)
 	return nil
-}
-
-func assertNoResponseCookie(t *testing.T, response *httptest.ResponseRecorder, name string) {
-	t.Helper()
-	for _, cookie := range response.Result().Cookies() {
-		if cookie.Name == name && cookie.Value != "" {
-			t.Fatalf("response unexpectedly set cookie %q", name)
-		}
-	}
 }
 
 func decodeObjectField(t *testing.T, body []byte, field string) map[string]json.RawMessage {

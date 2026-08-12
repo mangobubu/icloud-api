@@ -9,6 +9,7 @@ import {
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
 } from "../utils/pagination.js";
+import { normalizeIMAPEndpoint } from "../utils/imap.js";
 
 function firstDefined(object, ...keys) {
   for (const key of keys) {
@@ -107,14 +108,17 @@ export function normalizeAccount(raw = {}) {
     "LastSyncErrorLog",
   );
 
+  const imapEndpoint = normalizeIMAPEndpoint(
+    firstDefined(raw, "imap_host", "imapHost", "IMAPHost"),
+    firstDefined(raw, "imap_port", "imapPort", "IMAPPort"),
+  );
+
   return {
     id: firstDefined(raw, "id", "ID"),
     name: firstDefined(raw, "name", "Name") || "",
     email: firstDefined(raw, "email", "Email") || "",
-    imapHost:
-      firstDefined(raw, "imap_host", "imapHost", "IMAPHost") ||
-      "imap.mail.me.com",
-    imapPort: firstDefined(raw, "imap_port", "imapPort", "IMAPPort") || 993,
+    imapHost: imapEndpoint.host,
+    imapPort: imapEndpoint.port,
     imapUsername:
       firstDefined(raw, "imap_username", "imapUsername", "IMAPUsername") ||
       "",

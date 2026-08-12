@@ -65,8 +65,26 @@
           </p>
         </el-form-item>
 
-        <el-form-item label="IMAP 服务">
-          <el-input model-value="imap.mail.me.com:993（TLS）" readonly />
+        <el-form-item class="form-span imap-service-field" label="IMAP 服务">
+          <div class="imap-service-fields">
+            <el-form-item prop="imapHost" label="主机" class="imap-service-field__host">
+              <el-input
+                v-model="form.imapHost"
+                placeholder="imap.mail.me.com"
+                autocomplete="off"
+                aria-label="IMAP 主机"
+              />
+            </el-form-item>
+            <el-form-item prop="imapPort" label="端口" class="imap-service-field__port">
+              <el-input-number
+                v-model="form.imapPort"
+                :step="1"
+                :controls="false"
+                aria-label="IMAP 端口"
+              />
+            </el-form-item>
+          </div>
+          <p class="field-help">默认使用 imap.mail.me.com:993（TLS）。</p>
         </el-form-item>
 
         <el-form-item class="form-span" label="App 专用密码" prop="imapPassword">
@@ -129,6 +147,13 @@ import {
   createLatestRequestGate,
 } from "../utils/asyncState.js";
 import { successMessage } from "../utils/feedback.js";
+import {
+  DEFAULT_IMAP_HOST,
+  DEFAULT_IMAP_PORT,
+  normalizeIMAPEndpoint,
+  validateIMAPHost as validateIMAPHostValue,
+  validateIMAPPort as validateIMAPPortValue,
+} from "../utils/imap.js";
 
 const route = useRoute();
 const router = useRouter();
@@ -149,6 +174,8 @@ const identityLocked = computed(() => isEdit.value && aliasCount.value > 0);
 const form = reactive({
   name: "",
   email: "",
+  imapHost: DEFAULT_IMAP_HOST,
+  imapPort: DEFAULT_IMAP_PORT,
   imapUsername: "",
   imapPassword: "",
   enabled: true,
@@ -191,9 +218,29 @@ function validatePassword(_, value, callback) {
   callback();
 }
 
+function validateIMAPHost(_, value, callback) {
+  const message = validateIMAPHostValue(value);
+  if (message) {
+    callback(new Error(message));
+    return;
+  }
+  callback();
+}
+
+function validateIMAPPort(_, value, callback) {
+  const message = validateIMAPPortValue(value);
+  if (message) {
+    callback(new Error(message));
+    return;
+  }
+  callback();
+}
+
 const rules = {
   name: [{ validator: validateName, trigger: "blur" }],
   email: [{ validator: validateEmail, trigger: ["blur", "change"] }],
+  imapHost: [{ validator: validateIMAPHost, trigger: ["blur", "change"] }],
+  imapPort: [{ validator: validateIMAPPort, trigger: ["blur", "change"] }],
   imapUsername: [
     { required: true, message: "请填写 IMAP 用户名", trigger: "blur" },
   ],
@@ -204,6 +251,8 @@ function resetForm() {
   Object.assign(form, {
     name: "",
     email: "",
+    imapHost: DEFAULT_IMAP_HOST,
+    imapPort: DEFAULT_IMAP_PORT,
     imapUsername: "",
     imapPassword: "",
     enabled: true,
@@ -223,9 +272,15 @@ async function loadAccount() {
   try {
     const { account } = await getAccount(accountId);
     if (!loadGate.isCurrent(ticket, routeKey())) return;
+    const imapEndpoint = normalizeIMAPEndpoint(
+      account.imapHost,
+      account.imapPort,
+    );
     Object.assign(form, {
       name: account.name,
       email: account.email,
+      imapHost: imapEndpoint.host,
+      imapPort: imapEndpoint.port,
       imapUsername: account.imapUsername,
       imapPassword: "",
       enabled: account.enabled,
@@ -251,9 +306,12 @@ async function submit() {
     const valid = await formRef.value?.validate().catch(() => false);
     if (!valid || submittedRouteKey !== routeKey()) return;
 
+    const imapEndpoint = normalizeIMAPEndpoint(form.imapHost, form.imapPort);
     const payload = {
       name: form.name.trim(),
       email: form.email.trim(),
+      imap_host: imapEndpoint.host,
+      imap_port: imapEndpoint.port,
       imap_username: form.imapUsername.trim(),
       imap_password: form.imapPassword.trim(),
     };

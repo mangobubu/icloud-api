@@ -268,7 +268,7 @@
         <SectionHeader
           id="connection-title"
           title="IMAP 邮件同步"
-          :description="`${account.imapUsername} · ${account.imapHost}:${account.imapPort}`"
+          :description="`${account.imapUsername} · ${formatIMAPEndpoint(account)}`"
         >
           <template #actions>
             <el-button
@@ -771,6 +771,7 @@ import {
   successMessage,
 } from "../utils/feedback.js";
 import { formatTime } from "../utils/format.js";
+import { formatIMAPEndpoint } from "../utils/imap.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
 
 const route = useRoute();

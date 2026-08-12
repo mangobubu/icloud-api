@@ -494,6 +494,9 @@ func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T
 	if err := json.Unmarshal(createAccount.Body.Bytes(), &accountPayload); err != nil || accountPayload.Data.ID < 1 {
 		t.Fatalf("decode created account: %v; body=%s", err, createAccount.Body.String())
 	}
+	if accountPayload.Data.IMAPHost != domain.DefaultIMAPHost || accountPayload.Data.IMAPPort != domain.DefaultIMAPPort {
+		t.Fatalf("default IMAP endpoint = %q:%d", accountPayload.Data.IMAPHost, accountPayload.Data.IMAPPort)
+	}
 	for _, forbidden := range []string{appPassword, "PasswordCiphertext", "password_ciphertext"} {
 		if strings.Contains(createAccount.Body.String(), forbidden) {
 			t.Fatalf("account response exposed %q: %s", forbidden, createAccount.Body.String())
@@ -501,6 +504,39 @@ func TestAdminAPIAccountAndAliasLifecycleDoesNotExposeStoredSecrets(t *testing.T
 	}
 
 	accountPath := "/admin/api/v1/accounts/" + strconvFormatInt(accountPayload.Data.ID)
+	updatedAccount := env.request(t, http.MethodPut, accountPath, adminAPITestJSON(t, gin.H{
+		"name":          "API Account",
+		"email":         "api-account@icloud.com",
+		"imap_host":     "IMAP.Example.Test.",
+		"imap_port":     1993,
+		"imap_username": "api-account@icloud.com",
+		"imap_password": "",
+		"enabled":       true,
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if updatedAccount.Code != http.StatusOK {
+		t.Fatalf("update account status = %d; body=%s", updatedAccount.Code, updatedAccount.Body.String())
+	}
+	if err := json.Unmarshal(updatedAccount.Body.Bytes(), &accountPayload); err != nil {
+		t.Fatalf("decode updated account: %v; body=%s", err, updatedAccount.Body.String())
+	}
+	if accountPayload.Data.IMAPHost != "imap.example.test" || accountPayload.Data.IMAPPort != 1993 {
+		t.Fatalf("updated IMAP endpoint = %q:%d", accountPayload.Data.IMAPHost, accountPayload.Data.IMAPPort)
+	}
+
+	preservedEndpoint := env.request(t, http.MethodPut, accountPath, adminAPITestJSON(t, gin.H{
+		"name":          "API Account",
+		"email":         "api-account@icloud.com",
+		"imap_username": "api-account@icloud.com",
+		"imap_password": "",
+		"enabled":       true,
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if preservedEndpoint.Code != http.StatusOK {
+		t.Fatalf("update account without endpoint status = %d; body=%s", preservedEndpoint.Code, preservedEndpoint.Body.String())
+	}
+	if err := json.Unmarshal(preservedEndpoint.Body.Bytes(), &accountPayload); err != nil || accountPayload.Data.IMAPHost != "imap.example.test" || accountPayload.Data.IMAPPort != 1993 {
+		t.Fatalf("omitted endpoint was not preserved: err=%v body=%s", err, preservedEndpoint.Body.String())
+	}
+
 	createAlias := env.request(t, http.MethodPost, accountPath+"/aliases", adminAPITestJSON(t, gin.H{
 		"address": "relay-api@icloud.com",
 		"label":   "API Alias",
@@ -1004,6 +1040,38 @@ func TestAdminAPIStrictJSONAndPasswordRevocation(t *testing.T) {
 	updated, err := env.store.GetAdminByID(context.Background(), admin.ID)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(updated.PasswordHash), []byte(newPassword)) != nil {
 		t.Fatalf("new password was not persisted: lookup=%v", err)
+	}
+}
+
+func TestAdminAPIAccountInputValidatesAndDefaultsIMAPEndpoint(t *testing.T) {
+	account, _, message := adminAPIAccountInput(
+		"Primary", "owner@icloud.com", "owner@icloud.com", "app-password", nil, nil,
+		domain.Account{Enabled: true},
+	)
+	if message != "" {
+		t.Fatalf("default endpoint validation message = %q", message)
+	}
+	if account.IMAPHost != domain.DefaultIMAPHost || account.IMAPPort != domain.DefaultIMAPPort {
+		t.Fatalf("default endpoint = %q:%d", account.IMAPHost, account.IMAPPort)
+	}
+
+	host := " IMAP.Example.Test. "
+	port := 1993
+	account, _, message = adminAPIAccountInput(
+		"Primary", "owner@icloud.com", "owner@icloud.com", "app-password", &host, &port,
+		domain.Account{Enabled: true},
+	)
+	if message != "" || account.IMAPHost != "imap.example.test" || account.IMAPPort != 1993 {
+		t.Fatalf("custom endpoint = %#v, message=%q", account, message)
+	}
+
+	invalidHost := "https://imap.example.test"
+	account, _, message = adminAPIAccountInput(
+		"Primary", "owner@icloud.com", "owner@icloud.com", "app-password", &invalidHost, nil,
+		domain.Account{Enabled: true},
+	)
+	if message == "" {
+		t.Fatalf("invalid endpoint was accepted: %#v", account)
 	}
 }
 

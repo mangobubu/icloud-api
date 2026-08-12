@@ -37,8 +37,8 @@ const (
 )
 
 // registerAdminAPIRoutes attaches the JSON admin API to a group whose base
-// path is /admin/api/v1. The HTML admin routes deliberately use separate
-// authentication, body parsing, and CSRF middleware.
+// path is /admin/api/v1. Authentication, request limits, and CSRF checks are
+// applied to the API endpoints below.
 func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	auth := api.Group("/auth")
 	auth.GET("/csrf", s.adminAPILoginCSRF)
@@ -193,19 +193,73 @@ type adminAPIPasswordRequest struct {
 	ConfirmPassword string `json:"confirm_password"`
 }
 
+// These optional fields retain the distinction between an omitted JSON member
+// and an explicitly supplied null; pointers alone map both forms to nil.
+type adminAPIOptionalString struct {
+	Value   string
+	Present bool
+	Null    bool
+}
+
+func (v *adminAPIOptionalString) UnmarshalJSON(data []byte) error {
+	*v = adminAPIOptionalString{Present: true}
+	if strings.TrimSpace(string(data)) == "null" {
+		v.Null = true
+		return nil
+	}
+	return json.Unmarshal(data, &v.Value)
+}
+
+type adminAPIOptionalInt struct {
+	Value   int
+	Present bool
+	Null    bool
+}
+
+func (v *adminAPIOptionalInt) UnmarshalJSON(data []byte) error {
+	*v = adminAPIOptionalInt{Present: true}
+	if strings.TrimSpace(string(data)) == "null" {
+		v.Null = true
+		return nil
+	}
+	return json.Unmarshal(data, &v.Value)
+}
+
+func adminAPIIMAPEndpointInput(host adminAPIOptionalString, port adminAPIOptionalInt) (*string, *int, string) {
+	if host.Null {
+		return nil, nil, "IMAP 主机不能为 null"
+	}
+	if port.Null {
+		return nil, nil, "IMAP 端口不能为 null"
+	}
+	var hostValue *string
+	if host.Present {
+		hostValue = &host.Value
+	}
+	var portValue *int
+	if port.Present {
+		portValue = &port.Value
+	}
+	return hostValue, portValue, ""
+}
+
 type adminAPICreateAccountRequest struct {
-	Name         string `json:"name"`
-	Email        string `json:"email"`
-	IMAPUsername string `json:"imap_username"`
-	IMAPPassword string `json:"imap_password"`
+	Name         string                 `json:"name"`
+	Email        string                 `json:"email"`
+	IMAPUsername string                 `json:"imap_username"`
+	IMAPPassword string                 `json:"imap_password"`
+	IMAPHost     adminAPIOptionalString `json:"imap_host"`
+	IMAPPort     adminAPIOptionalInt    `json:"imap_port"`
 }
 
 type adminAPIUpdateAccountRequest struct {
-	Name         string `json:"name"`
-	Email        string `json:"email"`
-	IMAPUsername string `json:"imap_username"`
-	IMAPPassword string `json:"imap_password"`
-	Enabled      *bool  `json:"enabled"`
+	Name         string                 `json:"name"`
+	Email        string                 `json:"email"`
+	IMAPUsername string                 `json:"imap_username"`
+	IMAPPassword string                 `json:"imap_password"`
+	IMAPHost     adminAPIOptionalString `json:"imap_host"`
+	IMAPPort     adminAPIOptionalInt    `json:"imap_port"`
+	Enabled      *bool                  `json:"enabled"`
 }
 
 type adminAPICreateAliasRequest struct {
@@ -670,7 +724,12 @@ func (s *Server) adminAPICreateAccount(c *gin.Context) {
 	if !decodeAdminAPIJSON(c, &input) {
 		return
 	}
-	account, password, message := adminAPIAccountInput(input.Name, input.Email, input.IMAPUsername, input.IMAPPassword, domain.Account{Enabled: true})
+	host, port, message := adminAPIIMAPEndpointInput(input.IMAPHost, input.IMAPPort)
+	if message != "" {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
+		return
+	}
+	account, password, message := adminAPIAccountInput(input.Name, input.Email, input.IMAPUsername, input.IMAPPassword, host, port, domain.Account{Enabled: true})
 	if message != "" {
 		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
 		return
@@ -722,33 +781,39 @@ func (s *Server) adminAPIUpdateAccount(c *gin.Context) {
 		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "请明确指定主号是否启用")
 		return
 	}
-	existing, err := s.store.GetAccount(c.Request.Context(), id)
-	if err != nil {
-		s.writeAdminAPIStoreReadError(c, err)
-		return
-	}
-	account, password, message := adminAPIAccountInput(input.Name, input.Email, input.IMAPUsername, input.IMAPPassword, existing)
-	account.ID = id
-	account.Enabled = *input.Enabled
-	if existing.AliasCount > 0 && (account.Email != existing.Email || account.IMAPUsername != existing.IMAPUsername) {
-		writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_IDENTITY_LOCKED", "已有隐私邮箱时不能修改主号邮箱或 IMAP 用户名")
-		return
-	}
+	host, port, message := adminAPIIMAPEndpointInput(input.IMAPHost, input.IMAPPort)
 	if message != "" {
 		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
 		return
 	}
-	if password != "" {
-		account.PasswordCiphertext, err = s.cipher.Encrypt(password)
-		if err != nil {
-			s.writeAdminAPIInternalError(c, err)
-			return
-		}
-	} else {
-		account.PasswordCiphertext = ""
-	}
 	var updated domain.Account
-	err = s.withAccountLock(c.Request.Context(), id, func() error {
+	var validationMessage string
+	err := s.withAccountLock(c.Request.Context(), id, func() error {
+		existing, readErr := s.store.GetAccount(c.Request.Context(), id)
+		if readErr != nil {
+			return readErr
+		}
+		account, password, message := adminAPIAccountInput(
+			input.Name, input.Email, input.IMAPUsername, input.IMAPPassword,
+			host, port, existing,
+		)
+		account.ID = id
+		account.Enabled = *input.Enabled
+		if existing.AliasCount > 0 && (account.Email != existing.Email || account.IMAPUsername != existing.IMAPUsername) {
+			return store.ErrAccountIdentityLocked
+		}
+		if message != "" {
+			validationMessage = message
+			return nil
+		}
+		if password != "" {
+			account.PasswordCiphertext, readErr = s.cipher.Encrypt(password)
+			if readErr != nil {
+				return readErr
+			}
+		} else {
+			account.PasswordCiphertext = ""
+		}
 		var updateErr error
 		updated, updateErr = s.store.UpdateAccount(c.Request.Context(), account)
 		return updateErr
@@ -766,17 +831,37 @@ func (s *Server) adminAPIUpdateAccount(c *gin.Context) {
 		}
 		return
 	}
+	if validationMessage != "" {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", validationMessage)
+		return
+	}
 	session := mustSession(c)
 	s.audit(c, &session.AdminID, session.Username, "update", "account", strconv.FormatInt(id, 10), "success", "")
 	writeAdminAPIData(c, http.StatusOK, adminAPIAccountFromDomain(updated))
 }
 
-func adminAPIAccountInput(name, email, username, password string, base domain.Account) (domain.Account, string, string) {
+func adminAPIAccountInput(name, email, username, password string, host *string, port *int, base domain.Account) (domain.Account, string, string) {
 	base.Name = strings.TrimSpace(name)
 	base.Email = domain.NormalizeEmail(email)
 	base.IMAPUsername = strings.TrimSpace(username)
-	base.IMAPHost, base.IMAPPort = "imap.mail.me.com", 993
+	if host != nil {
+		if strings.TrimSpace(*host) == "" {
+			return base, strings.TrimSpace(password), "IMAP 主机不能为空"
+		}
+		base.IMAPHost = *host
+	} else if strings.TrimSpace(base.IMAPHost) == "" {
+		base.IMAPHost = domain.DefaultIMAPHost
+	}
+	if port != nil {
+		base.IMAPPort = *port
+	} else if base.IMAPPort == 0 {
+		base.IMAPPort = domain.DefaultIMAPPort
+	}
 	password = strings.TrimSpace(password)
+	normalizedHost, normalizedPort, endpointErr := domain.NormalizeIMAPEndpoint(base.IMAPHost, base.IMAPPort)
+	if endpointErr == nil {
+		base.IMAPHost, base.IMAPPort = normalizedHost, normalizedPort
+	}
 	switch {
 	case utf8.RuneCountInString(base.Name) > 80:
 		return base, password, "备注不能超过 80 个字符"
@@ -784,6 +869,8 @@ func adminAPIAccountInput(name, email, username, password string, base domain.Ac
 		return base, password, "主号邮箱格式不正确"
 	case base.IMAPUsername == "":
 		return base, password, "请填写 IMAP 用户名"
+	case endpointErr != nil:
+		return base, password, "IMAP 服务地址无效: " + endpointErr.Error()
 	case base.PasswordCiphertext == "" && password == "":
 		return base, password, "请填写 App 专用密码"
 	default:

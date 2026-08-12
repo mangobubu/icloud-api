@@ -2,10 +2,8 @@ package httpserver
 
 import (
 	"context"
-	"embed"
 	"errors"
 	"fmt"
-	"html/template"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -22,9 +20,6 @@ import (
 	"icloud-api/internal/store"
 	"icloud-api/internal/syncer"
 )
-
-//go:embed templates/*.html static/*
-var webAssets embed.FS
 
 type Server struct {
 	store                *store.Store
@@ -152,27 +147,6 @@ func (s *Server) recovery() gin.HandlerFunc {
 	})
 }
 
-type PageData struct {
-	Title             string
-	Subtitle          string
-	Active            string
-	AdminUsername     string
-	CSRF              string
-	Flash             string
-	FlashKind         string
-	RequestID         string
-	LoginUsername     string
-	Accounts          []domain.Account
-	Account           domain.Account
-	Aliases           []domain.Alias
-	SelectedAccountID int64
-	AliasQuery        string
-	AuditLogs         []domain.AuditLog
-	Secret            string
-	FormAction        string
-	IsEdit            bool
-}
-
 func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog.Logger, syncFn func(int64) error) (*Server, error) {
 	if st == nil {
 		return nil, fmt.Errorf("数据存储未配置")
@@ -249,15 +223,6 @@ func (s *Server) Router() (*gin.Engine, error) {
 	router.Use(s.requestContext(), s.securityHeaders(), s.recovery())
 
 	router.GET("/healthz", s.health)
-	rootRedirect := func(c *gin.Context) {
-		target := "/admin"
-		if s.adminSPA != nil {
-			target = "/admin/"
-		}
-		c.Redirect(http.StatusFound, target)
-	}
-	router.GET("/", rootRedirect)
-	router.HEAD("/", rootRedirect)
 
 	api := router.Group("/api/v1")
 	api.GET("/mail/latest", s.apiKeyAuth(), s.latestMail)
@@ -271,11 +236,7 @@ func (s *Server) Router() (*gin.Engine, error) {
 	adminAPI := router.Group("/admin/api/v1")
 	s.registerAdminAPIRoutes(adminAPI)
 
-	if s.adminSPA == nil {
-		if err := s.registerLegacyAdmin(router); err != nil {
-			return nil, err
-		}
-	} else {
+	if s.adminSPA != nil {
 		s.registerAdminSPA(router)
 	}
 
@@ -283,54 +244,15 @@ func (s *Server) Router() (*gin.Engine, error) {
 	return router, nil
 }
 
-func (s *Server) registerLegacyAdmin(router *gin.Engine) error {
-	tmpl, err := template.New("").Funcs(template.FuncMap{
-		"timefmt":          formatOptionalTime,
-		"timevalue":        func(value time.Time) string { return value.Local().Format("2006-01-02 15:04:05") },
-		"compactSyncError": compactSyncError,
-	}).ParseFS(webAssets, "templates/*.html")
-	if err != nil {
-		return fmt.Errorf("解析后台模板: %w", err)
-	}
-	router.SetHTMLTemplate(tmpl)
-	staticRoot, err := fs.Sub(webAssets, "static")
-	if err != nil {
-		return fmt.Errorf("读取静态资源: %w", err)
-	}
-	router.GET("/assets/*filepath", func(c *gin.Context) {
-		c.Header("Cache-Control", "public, max-age=3600")
-		http.StripPrefix("/assets", http.FileServer(http.FS(staticRoot))).ServeHTTP(c.Writer, c.Request)
-	})
-
-	router.GET("/admin/login", s.loginPage)
-	router.POST("/admin/login", s.loginRequestGate(), s.parseAdminForm(), s.login)
-
-	admin := router.Group("/admin")
-	admin.Use(s.adminAuth(), s.parseAdminForm(), s.csrfGuard())
-	admin.POST("/logout", s.logout)
-	admin.GET("", s.accountsPage)
-	admin.GET("/accounts/new", s.newAccountPage)
-	admin.POST("/accounts", s.createAccount)
-	admin.GET("/accounts/:id", s.accountPage)
-	admin.GET("/accounts/:id/edit", s.editAccountPage)
-	admin.POST("/accounts/:id", s.updateAccount)
-	admin.POST("/accounts/:id/sync", s.syncAccount)
-	admin.POST("/accounts/:id/delete", s.deleteAccount)
-	admin.POST("/accounts/:id/aliases", s.createAlias)
-	admin.GET("/aliases", s.aliasesPage)
-	admin.POST("/aliases/:id/rotate", s.rotateAliasKey)
-	admin.POST("/aliases/:id/toggle", s.toggleAlias)
-	admin.POST("/aliases/:id/delete", s.deleteAlias)
-	admin.GET("/audit", s.auditPage)
-	admin.GET("/security", s.securityPage)
-	admin.POST("/security/password", s.changePassword)
-	return nil
-}
-
 func (s *Server) registerAdminSPA(router *gin.Engine) {
+	rootRedirect := func(c *gin.Context) {
+		c.Redirect(http.StatusFound, "/admin/")
+	}
 	redirect := func(c *gin.Context) {
 		c.Redirect(http.StatusPermanentRedirect, "/admin/")
 	}
+	router.GET("/", rootRedirect)
+	router.HEAD("/", rootRedirect)
 	router.GET("/admin", redirect)
 	router.HEAD("/admin", redirect)
 	router.GET("/admin/", s.serveAdminIndex)
@@ -404,29 +326,4 @@ func (s *Server) health(c *gin.Context) {
 	}
 	c.Header("Cache-Control", "no-store")
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
-}
-
-func formatOptionalTime(value any) string {
-	var t *time.Time
-	switch typed := value.(type) {
-	case *time.Time:
-		t = typed
-	case time.Time:
-		t = &typed
-	}
-	if t == nil || t.IsZero() {
-		return "-"
-	}
-	return t.Local().Format("2006-01-02 15:04")
-}
-
-func compactSyncError(value string) string {
-	const maxRunes = 80
-
-	normalized := strings.Join(strings.Fields(value), " ")
-	runes := []rune(normalized)
-	if len(runes) <= maxRunes {
-		return normalized
-	}
-	return string(runes[:maxRunes-1]) + "…"
 }

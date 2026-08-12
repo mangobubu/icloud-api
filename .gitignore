@@ -15,5 +15,5 @@
 /.gocache-review/
 /.review-cache/
 /.tmp-gocache*/
-/.tmp-go-cache/
+/.tmp-go-cache*/
 **/.gocache/
