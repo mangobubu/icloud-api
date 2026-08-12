@@ -542,6 +542,22 @@ func TestUpdateAccountInvalidatesMailboxStateAfterSourceChange(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:                 "update IMAP username",
+			wantSnapshots:        false,
+			wantConsumptionCount: 0,
+			wantSeenTaskCount:    0,
+			update: func(t *testing.T, ctx context.Context, db *store.Store, account domain.Account) {
+				account.IMAPUsername = "mailbox-login@example.test"
+				updated, err := db.UpdateAccount(ctx, account)
+				if err != nil {
+					t.Fatalf("update IMAP username: %v", err)
+				}
+				if updated.IMAPUsername != account.IMAPUsername {
+					t.Fatalf("IMAP username = %q, want %q", updated.IMAPUsername, account.IMAPUsername)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -773,6 +789,70 @@ func TestUpdateAccountRollsBackEndpointAndMailboxStateWhenStatusResetFails(t *te
 	}
 }
 
+func TestUpdateAccountRollsBackUsernameAndMailboxStateWhenStatusResetFails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openTestStore(t)
+	account := createAccount(t, ctx, db, "Primary", "username-rollback@icloud.com")
+	alias := createAlias(t, ctx, db, account.ID, "username-rollback-relay@icloud.com", []byte("username-rollback-hash"))
+	syncedAt := time.Date(2026, 8, 6, 16, 45, 0, 0, time.UTC)
+	mustUpsert(t, ctx, db, domain.LatestMessage{
+		AliasID: alias.ID, UIDValidity: 32, UID: 42, Subject: "retained username snapshot",
+		InternalDate: syncedAt, SyncedAt: syncedAt,
+	})
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
+		VALUES(?, 32, 42, ?)`, alias.ID, syncedAt.UTC().UnixNano()); err != nil {
+		t.Fatalf("seed consumption history: %v", err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
+		VALUES(?, 32, 42, ?)`, account.ID, syncedAt.UTC().UnixNano()); err != nil {
+		t.Fatalf("seed seen task: %v", err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		INSERT INTO imap_sync_states(account_id, uid_validity, last_uid, updated_at)
+		VALUES(?, 32, 42, ?)`, account.ID, syncedAt.UTC().UnixNano()); err != nil {
+		t.Fatalf("seed sync state: %v", err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		CREATE TRIGGER reject_username_alias_status_reset
+		BEFORE UPDATE OF last_sync_status ON aliases
+		BEGIN SELECT RAISE(ABORT, 'forced username reset failure'); END`); err != nil {
+		t.Fatalf("create username reset failure trigger: %v", err)
+	}
+
+	account.IMAPUsername = "replacement-login@example.test"
+	if _, err := db.UpdateAccount(ctx, account); err == nil {
+		t.Fatal("username update unexpectedly succeeded")
+	}
+	stored, err := db.GetAccount(ctx, account.ID)
+	if err != nil {
+		t.Fatalf("get rolled back account: %v", err)
+	}
+	if stored.IMAPUsername != "username-rollback@icloud.com" {
+		t.Fatalf("username changed despite rollback: %q", stored.IMAPUsername)
+	}
+	assertLatestSubject(t, ctx, db, alias.ID, "retained username snapshot", 32, 42)
+	for label, query := range map[string]string{
+		"consumption history": `SELECT COUNT(*) FROM consumed_messages WHERE alias_id = ?`,
+		"seen task":           `SELECT COUNT(*) FROM imap_seen_tasks WHERE account_id = ?`,
+		"sync state":          `SELECT COUNT(*) FROM imap_sync_states WHERE account_id = ?`,
+	} {
+		id := account.ID
+		if label == "consumption history" {
+			id = alias.ID
+		}
+		var count int
+		if err := db.DB().QueryRowContext(ctx, query, id).Scan(&count); err != nil {
+			t.Fatalf("count rolled back %s: %v", label, err)
+		}
+		if count != 1 {
+			t.Fatalf("rolled back %s rows = %d, want 1", label, count)
+		}
+	}
+}
+
 func TestUpdateAccountIdentityChangeResetsAccountStatus(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -797,7 +877,7 @@ func TestUpdateAccountIdentityChangeResetsAccountStatus(t *testing.T) {
 	}
 }
 
-func TestUpdateAccountRejectsIdentityChangeAfterAliasCreation(t *testing.T) {
+func TestUpdateAccountRejectsEmailChangeAfterAliasCreation(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db := openTestStore(t)
@@ -806,9 +886,8 @@ func TestUpdateAccountRejectsIdentityChangeAfterAliasCreation(t *testing.T) {
 
 	account.Name = "must roll back too"
 	account.Email = "replacement@icloud.com"
-	account.IMAPUsername = "replacement@icloud.com"
 	if _, err := db.UpdateAccount(ctx, account); !errors.Is(err, store.ErrAccountIdentityLocked) {
-		t.Fatalf("identity update error = %v, want ErrAccountIdentityLocked", err)
+		t.Fatalf("email update error = %v, want ErrAccountIdentityLocked", err)
 	}
 	stored, err := db.GetAccount(ctx, account.ID)
 	if err != nil {

@@ -13,6 +13,21 @@ const stylesPath = new URL("../src/styles/index.css", import.meta.url);
 test("account form exposes editable IMAP host and port with iCloud defaults", async () => {
   const source = await readFile(viewPath, "utf8");
 
+  const emailField = source.match(
+    /<el-form-item label="iCloud 主号邮箱" prop="email">([\s\S]*?)<\/el-form-item>/,
+  )?.[1];
+  const imapUsernameField = source.match(
+    /<el-form-item label="IMAP 用户名" prop="imapUsername">([\s\S]*?)<\/el-form-item>/,
+  )?.[1];
+  assert.ok(emailField, "email form item should be present");
+  assert.ok(imapUsernameField, "IMAP username form item should be present");
+  assert.match(emailField, /v-model="form\.email"/);
+  assert.match(emailField, /:readonly="emailLocked"/);
+  assert.match(emailField, /已有隐私邮箱后，主号邮箱不能修改。/);
+  assert.match(imapUsernameField, /v-model="form\.imapUsername"/);
+  assert.doesNotMatch(imapUsernameField, /:readonly=/);
+  assert.doesNotMatch(imapUsernameField, /已有隐私邮箱后，主号邮箱不能修改。/);
+  assert.doesNotMatch(source, /主号邮箱和 IMAP 用户名不能修改/);
   assert.match(source, /v-model="form\.imapHost"/);
   assert.match(source, /v-model="form\.imapPort"/);
   assert.match(source, /DEFAULT_IMAP_HOST/);

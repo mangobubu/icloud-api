@@ -799,7 +799,7 @@ func (s *Server) adminAPIUpdateAccount(c *gin.Context) {
 		)
 		account.ID = id
 		account.Enabled = *input.Enabled
-		if existing.AliasCount > 0 && (account.Email != existing.Email || account.IMAPUsername != existing.IMAPUsername) {
+		if existing.AliasCount > 0 && account.Email != existing.Email {
 			return store.ErrAccountIdentityLocked
 		}
 		if message != "" {
@@ -823,7 +823,7 @@ func (s *Server) adminAPIUpdateAccount(c *gin.Context) {
 		case errors.Is(err, store.ErrNotFound):
 			writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "主号不存在")
 		case errors.Is(err, store.ErrAccountIdentityLocked):
-			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_IDENTITY_LOCKED", "已有隐私邮箱时不能修改主号邮箱或 IMAP 用户名")
+			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_IDENTITY_LOCKED", "已有隐私邮箱时不能修改主号邮箱")
 		case adminAPIUniqueConstraint(err):
 			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_EXISTS", "这个主号已经存在")
 		default:

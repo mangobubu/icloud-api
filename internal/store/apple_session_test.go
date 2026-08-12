@@ -155,37 +155,62 @@ func TestDeleteAccountCascadesAppleWebSession(t *testing.T) {
 func TestUpdateAccountAppleWebSessionLifecycle(t *testing.T) {
 	t.Parallel()
 
-	t.Run("identity changes delete session without aliases", func(t *testing.T) {
-		for name, changeIdentity := range map[string]func(*domain.Account){
-			"email": func(account *domain.Account) {
-				account.Email = "replacement@icloud.com"
-			},
-			"imap username": func(account *domain.Account) {
-				account.IMAPUsername = "replacement@icloud.com"
-			},
-		} {
-			t.Run(name, func(t *testing.T) {
-				ctx := context.Background()
-				db := openTestStore(t)
-				account := createAccount(t, ctx, db, "Primary", "primary@icloud.com")
-				if _, err := db.UpsertAppleWebSession(ctx, domain.AppleWebSession{
-					AccountID:     account.ID,
-					Ciphertext:    "identity-session",
-					AppleID:       account.Email,
-					Region:        "CHN",
-					Authenticated: true,
-				}); err != nil {
-					t.Fatalf("upsert apple web session: %v", err)
-				}
+	t.Run("primary email change deletes session without aliases", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestStore(t)
+		account := createAccount(t, ctx, db, "Primary", "primary@icloud.com")
+		if _, err := db.UpsertAppleWebSession(ctx, domain.AppleWebSession{
+			AccountID:     account.ID,
+			Ciphertext:    "identity-session",
+			AppleID:       account.Email,
+			Region:        "CHN",
+			Authenticated: true,
+		}); err != nil {
+			t.Fatalf("upsert apple web session: %v", err)
+		}
 
-				changeIdentity(&account)
-				if _, err := db.UpdateAccount(ctx, account); err != nil {
-					t.Fatalf("update account identity: %v", err)
-				}
-				if _, err := db.GetAppleWebSession(ctx, account.ID); !errors.Is(err, store.ErrNotFound) {
-					t.Fatalf("session after identity change error = %v, want ErrNotFound", err)
-				}
-			})
+		account.Email = "replacement@icloud.com"
+		if _, err := db.UpdateAccount(ctx, account); err != nil {
+			t.Fatalf("update account email: %v", err)
+		}
+		if _, err := db.GetAppleWebSession(ctx, account.ID); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("session after primary email change error = %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("imap username change preserves complete session", func(t *testing.T) {
+		ctx := context.Background()
+		db := openTestStore(t)
+		account := createAccount(t, ctx, db, "Primary", "primary-username-session@icloud.com")
+		lastValidatedAt := time.Date(2026, 8, 7, 12, 15, 45, 123456789, time.UTC)
+		before, err := db.UpsertAppleWebSession(ctx, domain.AppleWebSession{
+			AccountID:       account.ID,
+			Ciphertext:      "username-session",
+			AppleID:         account.Email,
+			Region:          "CHN",
+			Authenticated:   true,
+			LastValidatedAt: &lastValidatedAt,
+		})
+		if err != nil {
+			t.Fatalf("upsert apple web session: %v", err)
+		}
+
+		account.IMAPUsername = "replacement-login@example.test"
+		updated, err := db.UpdateAccount(ctx, account)
+		if err != nil {
+			t.Fatalf("update account IMAP username: %v", err)
+		}
+		if updated.IMAPUsername != account.IMAPUsername {
+			t.Fatalf("updated IMAP username = %q, want %q", updated.IMAPUsername, account.IMAPUsername)
+		}
+		after, err := db.GetAppleWebSession(ctx, account.ID)
+		if err != nil {
+			t.Fatalf("get session after IMAP username change: %v", err)
+		}
+		assertAppleWebSessionFields(t, after, before)
+		if !after.CreatedAt.Equal(before.CreatedAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+			t.Fatalf("session timestamps changed after IMAP username change: before=(%v, %v) after=(%v, %v)",
+				before.CreatedAt, before.UpdatedAt, after.CreatedAt, after.UpdatedAt)
 		}
 	})
 

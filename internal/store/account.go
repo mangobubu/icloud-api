@@ -57,8 +57,9 @@ func (s *Store) CreateAccount(ctx context.Context, account domain.Account) (doma
 
 // UpdateAccount updates administrator-editable IMAP settings. Rotating the
 // credential or re-enabling an account atomically withdraws every alias from
-// serving until the next confirmed sync. Changing the endpoint also discards
-// mailbox identity state because UIDs are meaningful only to that server.
+// serving until the next confirmed sync. Changing the mailbox source (the
+// endpoint or username) also discards mailbox identity state because UIDs are
+// meaningful only to that source.
 func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (domain.Account, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
@@ -86,8 +87,11 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 		return domain.Account{}, fmt.Errorf("read account before update: %w", err)
 	}
 	requestedEmail := domain.NormalizeEmail(sanitizePostgresText(account.Email))
+	requestedHost := strings.TrimSpace(sanitizePostgresText(account.IMAPHost))
 	requestedUsername := strings.TrimSpace(sanitizePostgresText(account.IMAPUsername))
-	if hasAliases && (requestedEmail != domain.NormalizeEmail(currentEmail) || requestedUsername != strings.TrimSpace(currentUsername)) {
+	emailChanged := requestedEmail != domain.NormalizeEmail(currentEmail)
+	usernameChanged := requestedUsername != strings.TrimSpace(currentUsername)
+	if hasAliases && emailChanged {
 		return domain.Account{}, ErrAccountIdentityLocked
 	}
 
@@ -102,13 +106,12 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 			email = CASE WHEN EXISTS(SELECT 1 FROM aliases WHERE account_id = ?) THEN email ELSE ? END,
 			imap_host = ?,
 			imap_port = ?,
-			imap_username = CASE WHEN EXISTS(SELECT 1 FROM aliases WHERE account_id = ?) THEN imap_username ELSE ? END,
+			imap_username = ?,
 			password_ciphertext = CASE WHEN ? = '' THEN password_ciphertext ELSE ? END,
 			enabled = ?, updated_at = ?
 		WHERE id = ? AND updated_at = ?`,
 		strings.TrimSpace(sanitizePostgresText(account.Name)), account.ID, requestedEmail,
-		strings.TrimSpace(sanitizePostgresText(account.IMAPHost)), account.IMAPPort,
-		account.ID, requestedUsername,
+		requestedHost, account.IMAPPort, requestedUsername,
 		account.PasswordCiphertext, account.PasswordCiphertext, account.Enabled,
 		nextAccountVersion, account.ID, accountVersion,
 	)
@@ -132,22 +135,22 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 
 	passwordChanged := account.PasswordCiphertext != "" && account.PasswordCiphertext != currentPassword
 	reenabled := !currentEnabled && account.Enabled
-	endpointChanged := strings.TrimSpace(account.IMAPHost) != strings.TrimSpace(currentHost) || account.IMAPPort != currentPort
-	identityChanged := !hasAliases && (requestedEmail != domain.NormalizeEmail(currentEmail) ||
-		requestedUsername != strings.TrimSpace(currentUsername))
-	if identityChanged {
+	endpointChanged := requestedHost != strings.TrimSpace(currentHost) || account.IMAPPort != currentPort
+	mailboxSourceChanged := endpointChanged || usernameChanged
+	if emailChanged {
 		if _, err := s.txExecContext(ctx, tx, `DELETE FROM apple_web_sessions WHERE account_id = ?`, account.ID); err != nil {
-			return domain.Account{}, fmt.Errorf("delete apple web session after account identity change: %w", err)
+			return domain.Account{}, fmt.Errorf("delete apple web session after account email change: %w", err)
 		}
 	}
-	if passwordChanged || reenabled || endpointChanged || identityChanged {
+	if passwordChanged || reenabled || mailboxSourceChanged || emailChanged {
 		if _, err := s.txExecContext(ctx, tx, `DELETE FROM imap_sync_states WHERE account_id = ?`, account.ID); err != nil {
 			return domain.Account{}, fmt.Errorf("delete account IMAP sync state: %w", err)
 		}
-		if endpointChanged {
-			// UIDVALIDITY and UID are scoped to one mailbox endpoint. Retaining
-			// either snapshots or consumption history across an endpoint change
-			// could expose old mail or suppress unrelated mail with matching UIDs.
+		if mailboxSourceChanged {
+			// UIDVALIDITY and UID are scoped to one mailbox source. Retaining
+			// snapshots or consumption history across an endpoint or username
+			// change could expose old mail or suppress unrelated mail with
+			// matching UIDs.
 			if _, err := s.txExecContext(ctx, tx, `
 				DELETE FROM latest_messages
 				WHERE alias_id IN (SELECT id FROM aliases WHERE account_id = ?)`, account.ID); err != nil {
@@ -158,7 +161,7 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 				WHERE alias_id IN (SELECT id FROM aliases WHERE account_id = ?)`, account.ID); err != nil {
 				return domain.Account{}, fmt.Errorf("delete account message consumption history: %w", err)
 			}
-			// Seen tasks contain UIDs from the old endpoint and must not be
+			// Seen tasks contain UIDs from the old mailbox source and must not be
 			// replayed against the newly configured mailbox.
 			if _, err := s.txExecContext(ctx, tx, `DELETE FROM imap_seen_tasks WHERE account_id = ?`, account.ID); err != nil {
 				return domain.Account{}, fmt.Errorf("delete account IMAP seen tasks: %w", err)

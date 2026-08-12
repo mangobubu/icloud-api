@@ -603,11 +603,11 @@ paths:
       summary: 更新主号
       description: |
         更新主号配置。省略 `imap_host` 或 `imap_port` 时分别保留当前值，显式传入 `null` 则
-        返回 400。规范化后的 IMAP 主机或端口实际发生变化后，服务会清除该主号的同步游标、
-        邮件快照、消费历史和待处理 `\Seen` 任务，并在下次同步确认前把相关同步状态重置为
-        `pending`。修改 IMAP 用户名或 App 专用密码也会重置同步状态；`imap_password` 省略、
-        传 `null` 或传空字符串时均保留当前密码。
-        已有隐私邮箱后，主号邮箱和 IMAP 用户名不可修改，但 IMAP 服务仍可修改。
+        返回 400。规范化后的 IMAP 主机、端口或用户名实际发生变化后，服务会清除该主号旧邮箱
+        来源的同步游标、邮件快照、消费历史和待处理 `\Seen` 任务，并在下次同步确认前把主号及
+        所属隐私邮箱的同步状态重置为 `pending`。修改 App 专用密码也会重置同步状态；
+        `imap_password` 省略、传 `null` 或传空字符串时均保留当前密码。
+        已有隐私邮箱后，仅主号邮箱不可修改；IMAP 主机、端口和用户名仍可修改。
       security:
         - adminSession: []
       parameters:
@@ -1604,7 +1604,7 @@ components:
                   request_id: 6oe7j0x3x3pJv9Dv
 
     AdminAccountConflict:
-      description: 主号邮箱已存在，或已有隐私邮箱后尝试修改主号身份字段
+      description: 主号邮箱已存在，或已有隐私邮箱后尝试修改主号邮箱
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestID"
@@ -1625,7 +1625,7 @@ components:
               value:
                 error:
                   code: ACCOUNT_IDENTITY_LOCKED
-                  message: 已有隐私邮箱时不能修改主号邮箱或 IMAP 用户名
+                  message: 已有隐私邮箱时不能修改主号邮箱
                   request_id: 6oe7j0x3x3pJv9Dv
 
     AdminAliasNotFound:
@@ -2298,7 +2298,9 @@ components:
         imap_username:
           type: string
           minLength: 1
-          description: IMAP 登录用户名；已有隐私邮箱时必须与当前值一致。
+          description: |
+            IMAP 登录用户名；服务会去除首尾空白，已有隐私邮箱时仍可修改。规范化后的值实际变化
+            会清理旧邮箱来源的同步游标、邮件快照、消费历史和待处理 `\Seen` 任务，并重置同步状态。
         imap_password:
           type:
             - string

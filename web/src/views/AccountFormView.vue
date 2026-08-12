@@ -49,8 +49,11 @@
             type="email"
             placeholder="name@icloud.com"
             autocomplete="email"
-            :readonly="identityLocked"
+            :readonly="emailLocked"
           />
+          <p v-if="emailLocked" class="field-help">
+            已有隐私邮箱后，主号邮箱不能修改。
+          </p>
         </el-form-item>
 
         <el-form-item label="IMAP 用户名" prop="imapUsername">
@@ -58,11 +61,7 @@
             v-model="form.imapUsername"
             placeholder="通常填写完整 iCloud 邮箱"
             autocomplete="username"
-            :readonly="identityLocked"
           />
-          <p v-if="identityLocked" class="field-help">
-            已有隐私邮箱后，主号邮箱和 IMAP 用户名不能修改。
-          </p>
         </el-form-item>
 
         <el-form-item class="form-span imap-service-field" label="IMAP 服务">
@@ -169,7 +168,7 @@ const submitLock = createActionLock();
 let viewActive = true;
 
 const isEdit = computed(() => route.name === "account-edit");
-const identityLocked = computed(() => isEdit.value && aliasCount.value > 0);
+const emailLocked = computed(() => isEdit.value && aliasCount.value > 0);
 
 const form = reactive({
   name: "",
