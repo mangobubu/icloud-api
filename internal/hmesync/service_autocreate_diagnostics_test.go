@@ -14,16 +14,14 @@ import (
 func TestCreateAutoAliasReportsPendingDirectoryReadAsReconciliation(t *testing.T) {
 	now := testAutoCreateDiagnosticNow()
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
-	repo.pending = &domain.PendingAliasAPIKey{
-		Alias: domain.Alias{
-			ID:             77,
-			AccountID:      3,
-			Address:        "pending@icloud.com",
-			Enabled:        false,
-			LastSyncError:  domain.AppleAliasConfirmationPending,
-			LastSyncStatus: domain.SyncStatusPending,
-		},
-		APIKeyCiphertext: "sealed-key",
+	repo.pending = &domain.Alias{
+		ID:                77,
+		AccountID:         3,
+		Address:           "pending@icloud.com",
+		Enabled:           false,
+		LastSyncError:     domain.AppleAliasConfirmationPending,
+		LastSyncStatus:    domain.SyncStatusPending,
+		CredentialVersion: 1,
 	}
 	client := &fakeAppleClient{
 		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {

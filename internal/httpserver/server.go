@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -21,31 +22,35 @@ import (
 	"icloud-api/internal/syncer"
 )
 
+//go:embed docs.html
+var publicDocsAssets embed.FS
+
 type Server struct {
-	store                *store.Store
-	cipher               *secure.Cipher
-	cfg                  config.Config
-	logger               *slog.Logger
-	applicationLogs      ApplicationLogSource
-	now                  func() time.Time
-	sync                 func(int64) error
-	syncProgress         func(int64) (domain.MailboxSyncProgress, bool)
-	hmeSync              HMESyncService
-	autoCreate           AliasAutoCreationService
-	lockAccount          func(context.Context, int64, func() error) error
-	seenNotify           func()
-	adminSPA             *adminSPA
-	oauthTokenHash       []byte
-	oauthTokenConfigured bool
+	store           *store.Store
+	cipher          *secure.Cipher
+	cfg             config.Config
+	logger          *slog.Logger
+	applicationLogs ApplicationLogSource
+	now             func() time.Time
+	sync            func(int64) error
+	syncProgress    func(int64) (domain.MailboxSyncProgress, bool)
+	hmeSync         HMESyncService
+	autoCreate      AliasAutoCreationService
+	lockAccount     func(context.Context, int64, func() error) error
+	seenNotify      func()
+	ready           func() bool
+	adminSPA        *adminSPA
 
 	mailSyncWakeMu sync.Mutex
 	mailSyncWake   map[int64]time.Time
 
-	loginLimiter        *windowLimiter
-	loginRequestLimiter *windowLimiter
-	apiLimiter          *windowLimiter
-	apiIPLimiter        *windowLimiter
-	externalAPILimiter  *windowLimiter
+	loginLimiter         *windowLimiter
+	loginRequestLimiter  *windowLimiter
+	apiLimiter           *windowLimiter
+	apiIPLimiter         *windowLimiter
+	externalAPILimiter   *windowLimiter
+	oauthTokenHash       []byte
+	oauthTokenConfigured bool
 }
 
 // SetHMESyncService configures Apple Hide My Email authentication and
@@ -84,8 +89,8 @@ func (s *Server) SetAccountLocker(locker func(context.Context, int64, func() err
 	s.lockAccount = locker
 }
 
-// SetSeenNotifier wakes the durable IMAP flag worker after a direct-link
-// request queues a message for marking as read.
+// SetSeenNotifier wakes the durable IMAP flag worker after a legacy direct
+// link consumes a message. It is optional for embedders without that worker.
 func (s *Server) SetSeenNotifier(notify func()) {
 	s.seenNotify = notify
 }
@@ -95,6 +100,12 @@ func (s *Server) SetSeenNotifier(notify func()) {
 // success and failure remain on the account record.
 func (s *Server) SetSyncProgressProvider(provider func(int64) (domain.MailboxSyncProgress, bool)) {
 	s.syncProgress = provider
+}
+
+// SetReadinessChecker adds process-level dependencies, such as the public
+// IMAPS listener, to /healthz. It must be configured before Router is served.
+func (s *Server) SetReadinessChecker(checker func() bool) {
+	s.ready = checker
 }
 
 func (s *Server) withAccountLock(ctx context.Context, accountID int64, operation func() error) error {
@@ -142,7 +153,7 @@ func (s *Server) recovery() gin.HandlerFunc {
 	// Gin's default recovery dumps the request line, which would expose a
 	// query-string API key. Keep diagnostics at path/request-ID granularity.
 	return gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, _ any) {
-		s.logger.Error("HTTP 请求异常", "path", c.Request.URL.Path, "request_id", requestID(c))
+		s.logger.Error("HTTP 请求异常", "path", s.redactedRequestPath(c.Request.URL.Path), "request_id", requestID(c))
 		c.AbortWithStatus(http.StatusInternalServerError)
 	})
 }
@@ -161,7 +172,16 @@ func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog
 	if err != nil {
 		return nil, err
 	}
-	oauthTokenConfigured := cfg.OAuthToken != ""
+	if strings.TrimSpace(cfg.AdminPath) == "" {
+		// Direct unit embedders do not run the process bootstrap. Production
+		// startup always replaces this fixture prefix from the keys volume.
+		cfg.AdminPath = "/00000000000000000000000000000000/admin"
+	}
+	cfg.AdminPath, err = secure.NormalizeAdminPath(cfg.AdminPath)
+	if err != nil {
+		return nil, fmt.Errorf("配置管理路径: %w", err)
+	}
+	oauthTokenConfigured := strings.TrimSpace(cfg.OAuthToken) != ""
 	oauthTokenHash := secure.HashToken(cfg.OAuthToken)
 	cfg.OAuthToken = ""
 	return &Server{
@@ -172,13 +192,13 @@ func New(st *store.Store, cipher *secure.Cipher, cfg config.Config, logger *slog
 		now:                  time.Now,
 		sync:                 syncFn,
 		adminSPA:             spa,
-		oauthTokenHash:       oauthTokenHash,
-		oauthTokenConfigured: oauthTokenConfigured,
 		loginLimiter:         newWindowLimiter(8, 10*time.Minute),
 		loginRequestLimiter:  newWindowLimiter(60, time.Minute),
 		apiLimiter:           newWindowLimiter(120, time.Minute),
 		apiIPLimiter:         newWindowLimiter(300, time.Minute),
 		externalAPILimiter:   newWindowLimiter(300, time.Minute),
+		oauthTokenHash:       oauthTokenHash,
+		oauthTokenConfigured: oauthTokenConfigured,
 	}, nil
 }
 
@@ -223,18 +243,30 @@ func (s *Server) Router() (*gin.Engine, error) {
 	router.Use(s.requestContext(), s.securityHeaders(), s.recovery())
 
 	router.GET("/healthz", s.health)
+	rootRedirect := func(c *gin.Context) { c.Redirect(http.StatusFound, "/docs/") }
+	router.GET("/", rootRedirect)
+	router.HEAD("/", rootRedirect)
+	router.GET("/docs", func(c *gin.Context) { c.Redirect(http.StatusPermanentRedirect, "/docs/") })
+	router.HEAD("/docs", func(c *gin.Context) { c.Redirect(http.StatusPermanentRedirect, "/docs/") })
+	router.GET("/docs/", s.publicDocs)
+	router.HEAD("/docs/", s.publicDocs)
 
-	api := router.Group("/api/v1")
-	api.GET("/mail/latest", s.apiKeyAuth(), s.latestMail)
+	router.GET("/api/v1/otp", s.otpHistory)
+	legacyAPI := router.Group("/api/v1")
+	legacyAPI.GET("/mail/latest", s.apiKeyAuth(), s.latestMail)
 	recentAuth := s.apiKeyQueryAuth()
-	api.GET("/mail/recent", recentAuth, s.recentMail)
-	api.GET("/mail/recent/", recentAuth, s.recentMail)
+	legacyAPI.GET("/mail/recent", recentAuth, s.recentMail)
+	legacyAPI.GET("/mail/recent/", recentAuth, s.recentMail)
 	externalAuth := s.oauthTokenAuth()
-	api.POST("/aliases", externalAuth, s.createExternalAlias)
-	api.POST("/aliases/", externalAuth, s.createExternalAlias)
+	legacyAPI.POST("/aliases", externalAuth, s.createExternalAlias)
+	legacyAPI.POST("/aliases/", externalAuth, s.createExternalAlias)
+	router.POST("/oauth2/v2.0/token", s.issueIMAPAccessToken)
 
-	adminAPI := router.Group("/admin/api/v1")
+	adminAPI := router.Group(s.cfg.AdminPath + "/api/v1")
 	s.registerAdminAPIRoutes(adminAPI)
+	if adminAPI.BasePath() != legacyAdminAPIBasePath {
+		s.registerAdminAPIRoutes(router.Group(legacyAdminAPIBasePath))
+	}
 
 	if s.adminSPA != nil {
 		s.registerAdminSPA(router)
@@ -245,22 +277,17 @@ func (s *Server) Router() (*gin.Engine, error) {
 }
 
 func (s *Server) registerAdminSPA(router *gin.Engine) {
-	rootRedirect := func(c *gin.Context) {
-		c.Redirect(http.StatusFound, "/admin/")
-	}
 	redirect := func(c *gin.Context) {
-		c.Redirect(http.StatusPermanentRedirect, "/admin/")
+		c.Redirect(http.StatusPermanentRedirect, s.cfg.AdminPath+"/")
 	}
-	router.GET("/", rootRedirect)
-	router.HEAD("/", rootRedirect)
-	router.GET("/admin", redirect)
-	router.HEAD("/admin", redirect)
-	router.GET("/admin/", s.serveAdminIndex)
-	router.HEAD("/admin/", s.serveAdminIndex)
-	router.GET("/admin/assets", s.pageNotFound)
-	router.HEAD("/admin/assets", s.pageNotFound)
-	router.GET("/admin/assets/*filepath", s.serveAdminAsset)
-	router.HEAD("/admin/assets/*filepath", s.serveAdminAsset)
+	router.GET(s.cfg.AdminPath, redirect)
+	router.HEAD(s.cfg.AdminPath, redirect)
+	router.GET(s.cfg.AdminPath+"/", s.serveAdminIndex)
+	router.HEAD(s.cfg.AdminPath+"/", s.serveAdminIndex)
+	router.GET(s.cfg.AdminPath+"/assets", s.pageNotFound)
+	router.HEAD(s.cfg.AdminPath+"/assets", s.pageNotFound)
+	router.GET(s.cfg.AdminPath+"/assets/*filepath", s.serveAdminAsset)
+	router.HEAD(s.cfg.AdminPath+"/assets/*filepath", s.serveAdminAsset)
 }
 
 func (s *Server) serveAdminIndex(c *gin.Context) {
@@ -270,7 +297,9 @@ func (s *Server) serveAdminIndex(c *gin.Context) {
 		c.Status(http.StatusOK)
 		return
 	}
-	c.Data(http.StatusOK, "text/html; charset=utf-8", s.adminSPA.index)
+	baseElement := `<base href="` + s.cfg.AdminPath + `/">`
+	index := strings.Replace(string(s.adminSPA.index), `<base href="./">`, baseElement, 1)
+	c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(index))
 }
 
 func (s *Server) serveAdminAsset(c *gin.Context) {
@@ -286,28 +315,55 @@ func (s *Server) serveAdminAsset(c *gin.Context) {
 	}
 	c.Writer.Header().Del("Pragma")
 	c.Header("Cache-Control", "public, max-age=31536000, immutable")
-	http.StripPrefix("/admin/assets", s.adminSPA.assetHandler).ServeHTTP(c.Writer, c.Request)
+	http.StripPrefix(s.cfg.AdminPath+"/assets", s.adminSPA.assetHandler).ServeHTTP(c.Writer, c.Request)
 }
 
 func (s *Server) notFound(c *gin.Context) {
 	requestPath := c.Request.URL.Path
-	if pathWithin(requestPath, "/api") || pathWithin(requestPath, "/admin/api") {
+	if pathWithin(requestPath, "/api") || pathWithin(requestPath, "/oauth2") ||
+		pathWithin(requestPath, s.cfg.AdminPath+"/api") ||
+		pathWithin(requestPath, legacyAdminAPIBasePath) {
 		c.Header("Cache-Control", "no-store")
 		s.writeAPIError(c, http.StatusNotFound, "NOT_FOUND", "接口不存在")
 		return
 	}
 	if s.adminSPA != nil &&
 		(c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) &&
-		strings.HasPrefix(requestPath, "/admin/") &&
-		!pathWithin(requestPath, "/admin/assets") {
+		strings.HasPrefix(requestPath, s.cfg.AdminPath+"/") &&
+		!pathWithin(requestPath, s.cfg.AdminPath+"/assets") {
 		s.serveAdminIndex(c)
 		return
 	}
 	s.pageNotFound(c)
 }
 
+func (s *Server) publicDocs(c *gin.Context) {
+	content, err := publicDocsAssets.ReadFile("docs.html")
+	if err != nil {
+		s.writeAPIError(c, http.StatusInternalServerError, "DOCS_UNAVAILABLE", "文档暂不可用")
+		return
+	}
+	c.Header("Cache-Control", "public, max-age=300")
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	if c.Request.Method == http.MethodHead {
+		c.Status(http.StatusOK)
+		return
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", content)
+}
+
 func pathWithin(requestPath, prefix string) bool {
 	return requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/")
+}
+
+func (s *Server) redactedRequestPath(requestPath string) string {
+	if s != nil && s.cfg.AdminPath != "" && pathWithin(requestPath, s.cfg.AdminPath) {
+		return "/<admin-prefix>/admin" + strings.TrimPrefix(requestPath, s.cfg.AdminPath)
+	}
+	if pathWithin(requestPath, legacyAdminAPIBasePath) {
+		return "/<legacy-admin-api>" + strings.TrimPrefix(requestPath, legacyAdminAPIBasePath)
+	}
+	return requestPath
 }
 
 func (s *Server) pageNotFound(c *gin.Context) {
@@ -322,6 +378,10 @@ func (s *Server) health(c *gin.Context) {
 	ctx := c.Request.Context()
 	if err := s.store.DB().PingContext(ctx); err != nil {
 		s.writeAPIError(c, http.StatusServiceUnavailable, "DATABASE_UNAVAILABLE", "数据库不可用")
+		return
+	}
+	if s.ready != nil && !s.ready() {
+		s.writeAPIError(c, http.StatusServiceUnavailable, "SERVICE_STARTING", "服务尚未就绪")
 		return
 	}
 	c.Header("Cache-Control", "no-store")

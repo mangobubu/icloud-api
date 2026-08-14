@@ -208,6 +208,63 @@ func parseMIMEMessageWithOptions(raw []byte, limits mimeLimits, allowPartial boo
 	return parsed, nil
 }
 
+// parseMIMEMessageReader extracts bounded metadata and readable text from a
+// complete MIME stream. Attachments are drained incrementally, so a message at
+// the 100 MiB hard limit is never materialized as one in-memory byte slice.
+func parseMIMEMessageReader(reader io.Reader, rawSize int64, limits mimeLimits) (parsedMessage, error) {
+	message, err := stdmail.ReadMessage(reader)
+	if err != nil {
+		return parsedMessage{}, fmt.Errorf("read message: %w", err)
+	}
+	rawMessageID := message.Header.Get("Message-ID")
+	messageID := ""
+	messageIDTruncated := len(rawMessageID) > limits.maxMessageIDBytes
+	if !messageIDTruncated {
+		messageID, messageIDTruncated = truncateUTF8(strings.TrimSpace(rawMessageID), limits.maxMessageIDBytes)
+	}
+	encodedSubjectLimit := min(maxEncodedSubjectBytes, max(limits.maxSubjectBytes*2, limits.maxSubjectBytes))
+	encodedSubject, encodedSubjectTruncated := truncateUTF8(message.Header.Get("Subject"), encodedSubjectLimit)
+	subject, subjectTruncated := truncateUTF8(decodeHeaderWord(encodedSubject), limits.maxSubjectBytes)
+	addressesRemaining := limits.maxAddresses
+	addressSourceRemaining := maxAddressHeaderSourceBytes
+	from, fromTruncated := parseMailAddressesLimited(message.Header, "From", &addressesRemaining, &addressSourceRemaining, maxFromAddresses)
+	to, toTruncated := parseMailAddressesLimited(message.Header, "To", &addressesRemaining, &addressSourceRemaining, maxToAddresses)
+	cc, ccTruncated := parseMailAddressesLimited(message.Header, "Cc", &addressesRemaining, &addressSourceRemaining, maxCCAddresses)
+	parsed := parsedMessage{
+		messageID:     messageID,
+		from:          from,
+		to:            to,
+		cc:            cc,
+		subject:       subject,
+		bodyTruncated: messageIDTruncated || encodedSubjectTruncated || subjectTruncated || fromTruncated || toTruncated || ccTruncated,
+	}
+	if value := strings.TrimSpace(message.Header.Get("Date")); value != "" {
+		if date, dateErr := stdmail.ParseDate(value); dateErr == nil {
+			parsed.headerDate = &date
+		}
+	}
+	budget := &mimeBudget{
+		body:                 bodyBudget{remaining: limits.maxBodyBytes},
+		partsRemaining:       maxMIMEParts,
+		attachmentsRemaining: max(limits.maxAttachments, 0),
+		limits:               limits,
+	}
+	if rawSize < 0 {
+		rawSize = 0
+	}
+	if err := walkMIME(textproto.MIMEHeader(message.Header), message.Body, &parsed, budget, rawSize, 0); err != nil {
+		if !errors.Is(err, errMIMEBudgetExhausted) {
+			return parsedMessage{}, fmt.Errorf("parse MIME body: %w", err)
+		}
+		parsed.bodyTruncated = true
+	}
+	parsed.textBody = strings.Clone(budget.textBody.String())
+	parsed.htmlBody = strings.Clone(budget.htmlBody.String())
+	parsed.bodyTruncated = parsed.bodyTruncated || budget.body.truncated
+	trimParsedMessageToBytes(&parsed, limits.maxResultBytes)
+	return parsed, nil
+}
+
 func walkMIME(header textproto.MIMEHeader, body io.Reader, parsed *parsedMessage, budget *mimeBudget, maxPartBytes int64, depth int) error {
 	if depth > maxMIMEDepth || budget.partsRemaining == 0 {
 		parsed.bodyTruncated = true

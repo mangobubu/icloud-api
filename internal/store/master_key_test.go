@@ -160,6 +160,53 @@ func TestVerifyMasterKeyValidatesExistingCiphertextsBeforeFirstBinding(t *testin
 	}
 }
 
+func TestVerifyMasterKeyValidatesPendingAliasAPIKeyBeforeFirstBinding(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, raw := openMasterKeyFixture(t, dialectPostgres)
+	correctKey := bytes.Repeat([]byte{0x63}, masterKeySize)
+	correctCipher, err := secure.NewCipher(correctKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingCiphertext, err := correctCipher.EncryptPendingAliasAPIKey("legacy-pending-api-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx,
+		`INSERT INTO aliases(id, credential_ciphertext) VALUES(?, '')`, 11,
+	); err != nil {
+		t.Fatalf("insert alias fixture: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx,
+		`INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext) VALUES(?, ?)`, 11, pendingCiphertext,
+	); err != nil {
+		t.Fatalf("insert pending API key fixture: %v", err)
+	}
+
+	wrongKey := bytes.Repeat([]byte{0x64}, masterKeySize)
+	wrongCipher, err := secure.NewCipher(wrongKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.VerifyMasterKeyWithValidator(ctx, wrongKey, wrongCipher); err == nil ||
+		!strings.Contains(err.Error(), "pending_alias_api_key") {
+		t.Fatalf("wrong pending API key validation error = %v", err)
+	}
+	var fingerprintCount int
+	if err := raw.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM app_metadata WHERE name = ?`, masterKeyFingerprintName,
+	).Scan(&fingerprintCount); err != nil {
+		t.Fatalf("count fingerprints after rejected pending API key: %v", err)
+	}
+	if fingerprintCount != 0 {
+		t.Fatal("key rejected by pending API key validation was permanently bound")
+	}
+	if err := db.VerifyMasterKeyWithValidator(ctx, correctKey, correctCipher); err != nil {
+		t.Fatalf("bind key after validating pending API key: %v", err)
+	}
+}
+
 func TestVerifyMasterKeyIsPostgresOnly(t *testing.T) {
 	t.Parallel()
 	raw, err := sql.Open("sqlite", ":memory:")
@@ -177,14 +224,14 @@ func TestVerifyMasterKeyIsPostgresOnly(t *testing.T) {
 
 func TestPostgresBootstrapAddsMetadataWithCurrentSchemaVersion(t *testing.T) {
 	t.Parallel()
-	if schemaVersion != 6 {
-		t.Fatalf("schema version = %d, want v6", schemaVersion)
+	if schemaVersion != 7 {
+		t.Fatalf("schema version = %d, want v7", schemaVersion)
 	}
 	bootstrap := strings.Join(postgresMigrationBootstrap, "\n")
 	if !strings.Contains(bootstrap, "CREATE TABLE IF NOT EXISTS app_metadata") {
 		t.Fatal("PostgreSQL bootstrap does not create app_metadata for existing databases")
 	}
-	if strings.Contains(strings.Join(schemaV6, "\n"), "app_metadata") {
+	if strings.Contains(strings.Join(schemaV7, "\n"), "app_metadata") {
 		t.Fatal("SQLite runtime schema unexpectedly contains master key metadata")
 	}
 }
@@ -220,11 +267,17 @@ func openMasterKeyFixture(t *testing.T, databaseDialect dialect) (*Store, *sql.D
 	)`); err != nil {
 		t.Fatalf("create Apple session fixture: %v", err)
 	}
+	if _, err := raw.Exec(`CREATE TABLE aliases (
+		id INTEGER PRIMARY KEY,
+		credential_ciphertext TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatalf("create alias credential fixture: %v", err)
+	}
 	if _, err := raw.Exec(`CREATE TABLE pending_alias_api_keys (
 		alias_id INTEGER PRIMARY KEY,
 		api_key_ciphertext TEXT NOT NULL
 	)`); err != nil {
-		t.Fatalf("create pending alias key fixture: %v", err)
+		t.Fatalf("create pending alias API key fixture: %v", err)
 	}
 	return newStore(raw, databaseDialect), raw
 }

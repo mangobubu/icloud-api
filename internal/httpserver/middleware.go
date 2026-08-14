@@ -80,17 +80,19 @@ func (s *Server) requestContext() gin.HandlerFunc {
 		started := time.Now()
 		c.Next()
 		if c.Request.Method == http.MethodGet &&
-			c.Request.URL.Path == adminAPIApplicationLogsPath &&
+			(c.Request.URL.Path == s.cfg.AdminPath+"/api/v1/logs" ||
+				c.Request.URL.Path == legacyAdminAPIBasePath+"/logs") &&
 			c.Writer.Status() >= http.StatusOK && c.Writer.Status() < http.StatusMultipleChoices {
 			return
 		}
-		s.logger.Info("HTTP 请求", "method", c.Request.Method, "path", c.Request.URL.Path, "status", c.Writer.Status(), "duration_ms", time.Since(started).Milliseconds(), "request_id", requestID)
+		s.logger.Info("HTTP 请求", "method", c.Request.Method, "path", s.redactedRequestPath(c.Request.URL.Path), "status", c.Writer.Status(), "duration_ms", time.Since(started).Milliseconds(), "request_id", requestID)
 	}
 }
 
 func (s *Server) securityHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if strings.HasPrefix(c.Request.URL.Path, "/admin") {
+		if pathWithin(c.Request.URL.Path, s.cfg.AdminPath) ||
+			pathWithin(c.Request.URL.Path, legacyAdminAPIBasePath) {
 			c.Header("Cache-Control", "no-store, private")
 			c.Header("Pragma", "no-cache")
 		}
@@ -98,7 +100,7 @@ func (s *Server) securityHeaders() gin.HandlerFunc {
 		c.Header("X-Frame-Options", "DENY")
 		c.Header("Referrer-Policy", "no-referrer")
 		c.Header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'")
 		c.Next()
 	}
 }
@@ -140,25 +142,28 @@ func validAPIKey(token string) bool {
 	return err == nil && len(decoded) == 32
 }
 
+// apiKeyAuth authenticates the original Bearer API Key contract. It is kept
+// separate from the v2 OTP parser so old clients retain their exact header
+// shape and error behavior.
 func (s *Server) apiKeyAuth() gin.HandlerFunc {
 	return s.apiKeyAuthWithToken(func(c *gin.Context) (string, bool) {
-		authorization := c.GetHeader("Authorization")
-		scheme, token, ok := strings.Cut(authorization, " ")
+		scheme, token, ok := strings.Cut(c.GetHeader("Authorization"), " ")
 		return token, ok && strings.EqualFold(scheme, "Bearer")
 	}, false)
 }
 
+// apiKeyQueryAuth accepts the legacy direct-link query parameter.
 func (s *Server) apiKeyQueryAuth() gin.HandlerFunc {
 	return s.apiKeyAuthWithToken(func(c *gin.Context) (string, bool) {
 		values, err := url.ParseQuery(c.Request.URL.RawQuery)
 		if err != nil {
 			return "", false
 		}
-		apiKeys, ok := values["api_key"]
-		if !ok || len(apiKeys) != 1 {
+		keys, ok := values["api_key"]
+		if !ok || len(keys) != 1 {
 			return "", false
 		}
-		return apiKeys[0], true
+		return keys[0], true
 	}, true)
 }
 
@@ -168,7 +173,7 @@ func (s *Server) apiKeyAuthWithToken(
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
-		if !s.apiIPLimiter.Allow(c.ClientIP()) {
+		if s.apiIPLimiter != nil && !s.apiIPLimiter.Allow(c.ClientIP()) {
 			s.writeAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁")
 			c.Abort()
 			return
@@ -180,7 +185,7 @@ func (s *Server) apiKeyAuthWithToken(
 			return
 		}
 		binding, err := s.mailboxBindingForToken(c, token, allowDirectLinkToken)
-		if errors.Is(err, store.ErrNotFound) || err == nil && (!binding.Alias.Enabled || !binding.Account.Enabled) {
+		if errors.Is(err, store.ErrNotFound) || (err == nil && (!binding.Alias.Enabled || !binding.Account.Enabled)) {
 			s.writeAPIError(c, http.StatusUnauthorized, "INVALID_API_KEY", "API Key 无效")
 			c.Abort()
 			return
@@ -191,7 +196,7 @@ func (s *Server) apiKeyAuthWithToken(
 			c.Abort()
 			return
 		}
-		if !s.apiLimiter.Allow(string(binding.Alias.APIKeyHash)) {
+		if s.apiLimiter != nil && !s.apiLimiter.Allow(string(binding.Alias.APIKeyHash)) {
 			s.writeAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁")
 			c.Abort()
 			return
@@ -201,16 +206,23 @@ func (s *Server) apiKeyAuthWithToken(
 	}
 }
 
-func (s *Server) mailboxBindingForToken(
-	c *gin.Context,
-	token string,
-	allowDirectLinkToken bool,
-) (domain.MailboxBinding, error) {
+func (s *Server) mailboxBindingForToken(c *gin.Context, token string, allowDirectLinkToken bool) (domain.MailboxBinding, error) {
 	if allowDirectLinkToken && s.cipher != nil {
+		if aliasID, candidate := secure.RecentMailTokenAliasID(token); candidate {
+			alias, err := s.store.GetAlias(c.Request.Context(), aliasID)
+			switch {
+			case err == nil && alias.CredentialMode == domain.AliasCredentialModeV2 &&
+				s.cipher.VerifyRecentMailToken(token, aliasID, alias.APIKeyHash):
+				return s.store.GetMailboxBindingByAPIKeyHash(c.Request.Context(), alias.APIKeyHash)
+			case err != nil && !errors.Is(err, store.ErrNotFound):
+				return domain.MailboxBinding{}, err
+			}
+		}
 		if aliasID, candidate := secure.DirectLinkTokenAliasID(token); candidate {
 			alias, err := s.store.GetAlias(c.Request.Context(), aliasID)
 			switch {
-			case err == nil && s.cipher.VerifyDirectLinkToken(token, aliasID, alias.APIKeyHash):
+			case err == nil && alias.CredentialMode == domain.AliasCredentialModeLegacy &&
+				s.cipher.VerifyDirectLinkToken(token, aliasID, alias.APIKeyHash):
 				return s.store.GetMailboxBindingByAPIKeyHash(c.Request.Context(), alias.APIKeyHash)
 			case err != nil && !errors.Is(err, store.ErrNotFound):
 				return domain.MailboxBinding{}, err

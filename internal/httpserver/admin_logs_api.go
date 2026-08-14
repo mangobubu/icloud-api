@@ -12,11 +12,10 @@ import (
 )
 
 const (
-	adminAPIApplicationLogsPath = "/admin/api/v1/logs"
-	adminAPIDefaultLogLimit     = applog.DefaultListLimit
-	adminAPIMaxLogLimit         = applog.MaxListLimit
-	adminAPIMaxLogQueryRunes    = 200
-	adminAPIMaxSyncRunIDRunes   = 128
+	adminAPIDefaultLogLimit   = applog.DefaultListLimit
+	adminAPIMaxLogLimit       = applog.MaxListLimit
+	adminAPIMaxLogQueryRunes  = 200
+	adminAPIMaxSyncRunIDRunes = 128
 )
 
 // ApplicationLogSource supplies the bounded in-memory application log history.

@@ -6,26 +6,43 @@
     <SectionHeader
       id="aliases-section-title"
       title="全部隐私邮箱"
-      description="查看每个地址的主号归属、Key 状态和最近使用情况。"
+      description="完整凭证常驻显示；复制结果一行一个邮箱且不含表头。"
     >
       <template #actions>
         <el-button
-          :icon="Download"
+          :icon="CopyDocument"
           :disabled="selectedAliases.length === 0"
-          @click="exportSelectedAliases"
+          @click="copySelectedAliases(ALIAS_EXPORT_OTP)"
         >
-          导出勾选<span v-if="selectedAliases.length">
+          勾选取码<span v-if="selectedAliases.length">
             （{{ selectedAliases.length }}）
           </span>
         </el-button>
         <el-button
+          :icon="CopyDocument"
+          :disabled="selectedAliases.length === 0"
+          @click="copySelectedAliases(ALIAS_EXPORT_IMAP)"
+        >
+          勾选 IMAP
+        </el-button>
+        <el-button
           type="primary"
-          :icon="Download"
+          :icon="CopyDocument"
           :loading="exportingAll"
           :disabled="total === 0 || exportingAll"
-          @click="exportAllAliases"
+          @click="copyAllAliases(ALIAS_EXPORT_OTP)"
         >
-          全部导出
+          全部取码
+        </el-button>
+        <el-button
+          type="primary"
+          plain
+          :icon="CopyDocument"
+          :loading="exportingAll"
+          :disabled="total === 0 || exportingAll"
+          @click="copyAllAliases(ALIAS_EXPORT_IMAP)"
+        >
+          全部 IMAP
         </el-button>
         <el-tooltip content="刷新隐私邮箱列表" placement="bottom">
           <el-button
@@ -203,7 +220,20 @@
               </el-button>
             </template>
             <template v-else-if="column.key === 'apiKey'">
-              <code class="key-prefix">{{ keyPrefix(row) }}</code>
+              <code v-if="row.apiKey" class="credential-value">{{ row.apiKey }}</code>
+              <code v-else class="credential-value">{{ row.apiKeyPrefix || "-" }}</code>
+            </template>
+            <template v-else-if="column.key === 'imapPassword'">
+              <code v-if="row.imapPassword" class="credential-value">{{ row.imapPassword }}</code>
+              <code v-else class="credential-value">-</code>
+            </template>
+            <template v-else-if="column.key === 'clientId'">
+              <code v-if="row.clientId" class="credential-value">{{ row.clientId }}</code>
+              <code v-else class="credential-value">-</code>
+            </template>
+            <template v-else-if="column.key === 'refreshToken'">
+              <code v-if="row.refreshToken" class="credential-value">{{ row.refreshToken }}</code>
+              <code v-else class="credential-value">-</code>
             </template>
             <template v-else-if="column.key === 'lastAccessedAt'">
               {{ formatTime(row.lastAccessedAt) }}
@@ -224,20 +254,27 @@
             </template>
             <template v-else-if="column.key === 'actions'">
               <div class="icon-action-row">
-                <el-tooltip
+                <el-button
                   v-if="isAliasExportable(row)"
-                  content="复制邮件 API 直达链接"
-                  placement="top"
-                >
-                  <el-button
-                    :icon="CopyDocument"
-                    circle
-                    :loading="Boolean(copyLoading[row.id])"
-                    :disabled="!row.directLinkPath"
-                    :aria-label="`复制 ${row.address} 的邮件 API 直达链接`"
-                    @click="copyAliasDirectLink(row)"
-                  />
-                </el-tooltip>
+                  size="small"
+                  :icon="CopyDocument"
+                  :loading="Boolean(copyLoading[`${row.id}:otp`])"
+                  @click="copyAliasLine(row, ALIAS_EXPORT_OTP)"
+                >取码</el-button>
+                <el-button
+                  v-if="isAliasExportable(row)"
+                  size="small"
+                  :icon="CopyDocument"
+                  :loading="Boolean(copyLoading[`${row.id}:imap`])"
+                  @click="copyAliasLine(row, ALIAS_EXPORT_IMAP)"
+                >IMAP</el-button>
+                <el-button
+                  v-else-if="isLegacyDirectLinkAvailable(row)"
+                  size="small"
+                  :icon="CopyDocument"
+                  :loading="Boolean(copyLoading[`${row.id}:legacy-link`])"
+                  @click="copyLegacyDirectLink(row)"
+                >旧直达</el-button>
                 <el-button
                   link
                   type="primary"
@@ -285,7 +322,31 @@
             </div>
             <div>
               <dt>API Key</dt>
-              <dd><code class="key-prefix">{{ keyPrefix(alias) }}</code></dd>
+              <dd>
+                <code v-if="alias.apiKey" class="credential-value">{{ alias.apiKey }}</code>
+                <code v-else class="credential-value">{{ alias.apiKeyPrefix || "-" }}</code>
+              </dd>
+            </div>
+            <div>
+              <dt>IMAP 密码</dt>
+              <dd>
+                <code v-if="alias.imapPassword" class="credential-value">{{ alias.imapPassword }}</code>
+                <code v-else class="credential-value">-</code>
+              </dd>
+            </div>
+            <div>
+              <dt>client ID</dt>
+              <dd>
+                <code v-if="alias.clientId" class="credential-value">{{ alias.clientId }}</code>
+                <code v-else class="credential-value">-</code>
+              </dd>
+            </div>
+            <div>
+              <dt>刷新令牌</dt>
+              <dd>
+                <code v-if="alias.refreshToken" class="credential-value">{{ alias.refreshToken }}</code>
+                <code v-else class="credential-value">-</code>
+              </dd>
             </div>
             <div>
               <dt>最近调用</dt>
@@ -300,12 +361,26 @@
             <el-button
               v-if="isAliasExportable(alias)"
               :icon="CopyDocument"
-              :loading="Boolean(copyLoading[alias.id])"
-              :disabled="!alias.directLinkPath"
-              :aria-label="`复制 ${alias.address} 的邮件 API 直达链接`"
-              @click="copyAliasDirectLink(alias)"
+              :loading="Boolean(copyLoading[`${alias.id}:otp`])"
+              @click="copyAliasLine(alias, ALIAS_EXPORT_OTP)"
             >
-              复制邮件 API 直达链接
+              复制取码格式
+            </el-button>
+            <el-button
+              v-if="isAliasExportable(alias)"
+              :icon="CopyDocument"
+              :loading="Boolean(copyLoading[`${alias.id}:imap`])"
+              @click="copyAliasLine(alias, ALIAS_EXPORT_IMAP)"
+            >
+              复制 IMAP 格式
+            </el-button>
+            <el-button
+              v-else-if="isLegacyDirectLinkAvailable(alias)"
+              :icon="CopyDocument"
+              :loading="Boolean(copyLoading[`${alias.id}:legacy-link`])"
+              @click="copyLegacyDirectLink(alias)"
+            >
+              复制旧直达链接
             </el-button>
             <el-button
               :icon="Setting"
@@ -334,7 +409,6 @@
 <script setup>
 import {
   CopyDocument,
-  Download,
   Refresh,
   RefreshLeft,
   Search,
@@ -355,11 +429,12 @@ import {
   createActionLock,
   createLatestRequestGate,
 } from "../utils/asyncState.js";
-import { buildAliasExportText } from "../utils/aliasExport.js";
 import {
-  buildRecentMailDirectLink,
-  copyText,
-} from "../utils/clipboard.js";
+  ALIAS_EXPORT_IMAP,
+  ALIAS_EXPORT_OTP,
+  buildAliasExportText,
+} from "../utils/aliasExport.js";
+import { buildRecentMailDirectLink, copyText } from "../utils/clipboard.js";
 import { showRequestError, successMessage } from "../utils/feedback.js";
 import { formatTime } from "../utils/format.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
@@ -376,11 +451,14 @@ const aliasColumns = [
   { key: "selection", title: "", width: 52, align: "center", fixed: "left" },
   { key: "address", title: "隐私邮箱", width: 220, flexGrow: 2 },
   { key: "account", title: "所属主号", width: 190, flexGrow: 1 },
-  { key: "apiKey", title: "API Key", width: 120 },
+  { key: "apiKey", title: "API Key", width: 260 },
+  { key: "imapPassword", title: "IMAP 密码", width: 260 },
+  { key: "clientId", title: "client ID", width: 190 },
+  { key: "refreshToken", title: "刷新令牌", width: 260 },
   { key: "lastAccessedAt", title: "最近调用", width: 150, flexGrow: 1 },
   { key: "latestReceivedAt", title: "最新邮件", width: 150, flexGrow: 1 },
   { key: "status", title: "状态", width: 134, flexGrow: 1 },
-  { key: "actions", title: "操作", width: 152, align: "right", fixed: "right" },
+  { key: "actions", title: "复制 / 管理", width: 260, align: "right", fixed: "right" },
 ];
 const aliases = ref([]);
 const accounts = ref([]);
@@ -441,11 +519,22 @@ function isAliasConfirmationPending(alias) {
 }
 
 function isAliasExportable(alias) {
-  return !isAliasConfirmationPending(alias) && Boolean(alias?.directLinkPath);
+  return Boolean(
+    alias?.address &&
+      alias?.apiKey &&
+      alias?.imapPassword &&
+      alias?.clientId &&
+      alias?.refreshToken &&
+      alias?.otpUrlPath,
+  );
 }
 
-function keyPrefix(alias) {
-  return alias.apiKeyPrefix ? `${alias.apiKeyPrefix}…` : "-";
+function isLegacyDirectLinkAvailable(alias) {
+  return Boolean(
+    !isAliasConfirmationPending(alias) &&
+      alias?.credentialMode === "legacy" &&
+      alias?.directLinkPath,
+  );
 }
 
 async function loadAccounts({ silent = false, query = "" } = {}) {
@@ -661,42 +750,30 @@ function setAllAliasesSelected(selected) {
     : [];
 }
 
-function exportAliases(items, scope) {
+async function copyAliases(items, format, scope) {
   const exportableItems = items.filter(isAliasExportable);
   if (!exportableItems.length) return;
 
-  let url = "";
-  let link = null;
   try {
-    const content = buildAliasExportText(exportableItems);
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    url = URL.createObjectURL(blob);
-    link = document.createElement("a");
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    link.href = url;
-    link.download = `icloud-aliases-${scope}-${timestamp}.txt`;
-    document.body.appendChild(link);
-    link.click();
-    successMessage(`已导出 ${exportableItems.length} 个邮箱。`);
+    const content = buildAliasExportText(exportableItems, format);
+    const copied = await copyText(content);
+    if (!copied) throw new Error("clipboard rejected copy");
+    const label = format === ALIAS_EXPORT_OTP ? "取码链接" : "IMAP/OAuth";
+    successMessage(`已复制${scope}${exportableItems.length} 个邮箱的${label}。`);
   } catch {
     ElMessage({
       type: "error",
-      message: "邮箱导出失败，请刷新页面后重试。",
+      message: "邮箱凭证复制失败，请检查浏览器剪切板权限后重试。",
       grouping: true,
     });
-  } finally {
-    link?.remove();
-    if (url) {
-      window.setTimeout(() => URL.revokeObjectURL(url), 0);
-    }
   }
 }
 
-function exportSelectedAliases() {
-  exportAliases(selectedAliases.value, "selected");
+function copySelectedAliases(format) {
+  return copyAliases(selectedAliases.value, format, "勾选的");
 }
 
-function exportAllAliases() {
+function copyAllAliases(format) {
   if (exportingAll.value) return;
   exportingAll.value = true;
   getAllAliases(selectedAccountId.value, {
@@ -704,12 +781,13 @@ function exportAllAliases() {
   })
     .then((items) => {
       if (viewActive) {
-        exportAliases(items, selectedAccountId.value || "all");
+        return copyAliases(items, format, "全部");
       }
+      return undefined;
     })
     .catch((error) => {
       if (viewActive) {
-        showRequestError(error, "导出隐私邮箱失败，请稍后重试。");
+        showRequestError(error, "复制隐私邮箱凭证失败，请稍后重试。");
       }
     })
     .finally(() => {
@@ -717,32 +795,56 @@ function exportAllAliases() {
     });
 }
 
-async function copyAliasDirectLink(alias) {
-  if (!isAliasExportable(alias) || !copyLock.acquire(alias.id)) return;
-  copyLoading[alias.id] = true;
+async function copyAliasLine(alias, format) {
+  const lockKey = `${alias?.id}:${format}`;
+  if (!isAliasExportable(alias) || !copyLock.acquire(lockKey)) return;
+  copyLoading[lockKey] = true;
   try {
-    const directLink = buildRecentMailDirectLink(alias.directLinkPath);
-    const copied = await copyText(directLink);
+    const copied = await copyText(buildAliasExportText([alias], format));
     if (!viewActive) return;
     if (!copied) {
       ElMessage({
         type: "error",
-        message: "直达链接复制失败，请检查浏览器剪切板权限后重试。",
+        message: "邮箱凭证复制失败，请检查浏览器剪切板权限后重试。",
         grouping: true,
       });
       return;
     }
-    successMessage("邮件 API 直达链接已复制。");
+    successMessage(format === ALIAS_EXPORT_OTP ? "取码链接格式已复制。" : "IMAP/OAuth 格式已复制。");
   } catch {
     if (!viewActive) return;
     ElMessage({
       type: "error",
-      message: "直达链接复制失败，请刷新页面后重试。",
+      message: "邮箱凭证复制失败，请刷新页面后重试。",
       grouping: true,
     });
   } finally {
-    delete copyLoading[alias.id];
-    copyLock.release(alias.id);
+    delete copyLoading[lockKey];
+    copyLock.release(lockKey);
+  }
+}
+
+async function copyLegacyDirectLink(alias) {
+  const lockKey = `${alias?.id}:legacy-link`;
+  if (!isLegacyDirectLinkAvailable(alias) || !copyLock.acquire(lockKey)) return;
+  copyLoading[lockKey] = true;
+  try {
+    const directLink = buildRecentMailDirectLink(alias.directLinkPath);
+    const copied = await copyText(directLink);
+    if (!viewActive) return;
+    if (!copied) throw new Error("clipboard rejected copy");
+    successMessage("旧邮件 API 直达链接已复制。");
+  } catch {
+    if (viewActive) {
+      ElMessage({
+        type: "error",
+        message: "旧直达链接复制失败，请刷新页面后重试。",
+        grouping: true,
+      });
+    }
+  } finally {
+    delete copyLoading[lockKey];
+    copyLock.release(lockKey);
   }
 }
 
@@ -812,6 +914,16 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.credential-value {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  color: var(--text-primary);
+  font-size: 12px;
+  white-space: nowrap;
+  user-select: all;
 }
 
 .mobile-alias-selection {

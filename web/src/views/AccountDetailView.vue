@@ -17,22 +17,6 @@
     </div>
 
     <template v-else-if="account">
-      <div v-if="apiKey" ref="secretRegion" class="secret-region">
-        <OneTimeSecret
-          :value="apiKey"
-          :direct-link-path="apiDirectLinkPath"
-        />
-        <el-tooltip content="关闭 Key 提示" placement="left">
-          <el-button
-            class="secret-region__close"
-            :icon="Close"
-            circle
-            aria-label="关闭 Key 提示"
-            @click="clearSecret"
-          />
-        </el-tooltip>
-      </div>
-
       <el-dialog
         v-model="appleAuthVisible"
         class="apple-auth-dialog"
@@ -134,129 +118,6 @@
         </template>
       </el-dialog>
 
-      <el-dialog
-        v-model="batchSecretsVisible"
-        class="batch-secrets-dialog"
-        :title="batchSecretsSource === 'auto' ? '保存自动创建隐私邮箱的 API Key' : '保存新隐私邮箱的 API Key'"
-        width="min(960px, calc(100vw - 28px))"
-        align-center
-        append-to-body
-        :close-on-click-modal="false"
-        :close-on-press-escape="false"
-        :before-close="confirmBatchSecretsClose"
-      >
-        <el-alert
-          :title="batchSecretsSource === 'auto'
-            ? '这些自动创建的完整 API Key 只显示这一次。保存后点击“我已保存，关闭”确认；取消或关闭仍可稍后再次领取。'
-            : '这些完整 API Key 只显示这一次，请下载 CSV 或逐项保存后再关闭。'"
-          type="warning"
-          :closable="false"
-          show-icon
-        />
-        <el-alert
-          v-if="batchSecretsSource === 'auto'"
-          title="自动创建队列会在确认保存后清空；离开此弹窗不会清空队列。"
-          type="info"
-          :closable="false"
-          show-icon
-        />
-        <el-alert
-          v-if="batchSummary.importedDisabledCount"
-          :title="`${batchSummary.importedDisabledCount} 个地址已导入，但因本地邮件处理容量暂未启用。`"
-          type="info"
-          :closable="false"
-          show-icon
-        />
-
-        <dl
-          v-if="batchSecretsSource === 'sync'"
-          class="sync-summary-grid"
-          aria-label="同步结果"
-        >
-          <div><dt>Apple 地址</dt><dd>{{ batchSummary.total }}</dd></div>
-          <div><dt>新建</dt><dd>{{ batchSummary.createdCount }}</dd></div>
-          <div><dt>已存在</dt><dd>{{ batchSummary.existingCount }}</dd></div>
-          <div><dt>Apple 已停用</dt><dd>{{ batchSummary.inactiveCount }}</dd></div>
-          <div>
-            <dt>因本地容量暂未启用</dt>
-            <dd>{{ batchSummary.importedDisabledCount }}</dd>
-          </div>
-          <div><dt>冲突</dt><dd>{{ batchSummary.conflictCount }}</dd></div>
-        </dl>
-
-        <div class="data-panel batch-secret-table">
-          <VirtualDataTable
-            :columns="batchSecretColumns"
-            :data="batchSecrets"
-            row-key="address"
-            fill-height
-            :row-height="64"
-          >
-            <template #cell="{ column, rowData: row }">
-              <template v-if="column.key === 'address'">
-                <strong class="batch-secret-value">{{ row.address }}</strong>
-              </template>
-              <template v-else-if="column.key === 'apiKey'">
-                <div class="batch-secret-copy">
-                  <code>{{ row.apiKey }}</code>
-                  <el-tooltip content="复制 API Key" placement="top">
-                    <el-button
-                      :icon="CopyDocument"
-                      circle
-                      :aria-label="`复制 ${row.address} 的 API Key`"
-                      @click="copyBatchSecret(row.apiKey, 'API Key')"
-                    />
-                  </el-tooltip>
-                </div>
-              </template>
-              <template v-else-if="column.key === 'mailApiDirectLink'">
-                <div class="batch-secret-copy">
-                  <code>{{ row.mailApiDirectLink }}</code>
-                  <el-tooltip content="复制直达链接" placement="top">
-                    <el-button
-                      :icon="CopyDocument"
-                      circle
-                      :aria-label="`复制 ${row.address} 的邮件 API 直达链接`"
-                      @click="copyBatchSecret(row.mailApiDirectLink, '直达链接')"
-                    />
-                  </el-tooltip>
-                </div>
-              </template>
-            </template>
-          </VirtualDataTable>
-        </div>
-
-        <template #footer>
-          <div class="dialog-actions dialog-actions--spread">
-            <div class="dialog-actions__group">
-              <el-button :icon="Download" @click="downloadBatchSecrets">
-                下载 CSV
-              </el-button>
-            </div>
-            <div class="dialog-actions__group">
-              <el-button
-                v-if="batchSecretsSource === 'auto'"
-                :disabled="pendingAutoKeysClearing"
-                @click="dismissBatchSecrets"
-              >
-                取消
-              </el-button>
-              <el-button
-                v-if="batchSecretsSource === 'auto'"
-                type="primary"
-                :loading="pendingAutoKeysClearing"
-                @click="acknowledgeAndCloseBatchSecrets"
-              >
-                我已保存，关闭
-              </el-button>
-              <el-button v-else type="primary" @click="closeBatchSecrets">
-                我已保存，关闭
-              </el-button>
-            </div>
-          </div>
-        </template>
-      </el-dialog>
-
       <RequestAlert
         v-if="loadError"
         :error="loadError"
@@ -318,7 +179,7 @@
         <SectionHeader
           id="aliases-title"
           title="隐私邮箱"
-          description="从 Apple 拉取 Hide My Email 地址目录；每个本地地址使用独立 API Key。"
+          description="从 Apple 拉取 Hide My Email 地址目录；每个本地地址使用独立的完整凭证包。"
         >
           <template #actions>
             <el-button
@@ -378,18 +239,9 @@
                 >
                   {{ autoCreationStatusLabel(autoCreation) }}
                 </el-tag>
-                <el-tag
-                  v-if="autoCreation.pendingKeyCount"
-                  type="warning"
-                  effect="plain"
-                  size="small"
-                >
-                  待领取 {{ autoCreation.pendingKeyCount }} 个 Key
-                </el-tag>
               </div>
               <p>
-                每小时 5 个 · 随机间隔 · 最短 5 分钟。自动创建的完整 API Key
-                会在领取后显示一次。
+                每小时 5 个 · 随机间隔 · 最短 5 分钟。签发后的完整凭证会常驻显示在邮箱列表中。
               </p>
             </div>
             <div class="auto-creation-panel__actions">
@@ -402,18 +254,6 @@
                 :aria-label="`${autoCreation.enabled ? '关闭' : '开启'}自动创建隐私邮箱`"
                 @change="toggleAutoCreation"
               />
-              <el-button
-                :icon="Key"
-                :loading="pendingAutoKeysLoading"
-                :disabled="pendingAutoKeysDisabled"
-                @click="openPendingAutoCreationKeys"
-              >
-                {{
-                  autoCreation.pendingKeyCount
-                    ? `领取 ${autoCreation.pendingKeyCount} 个 API Key`
-                    : "暂无待领取 Key"
-                }}
-              </el-button>
             </div>
           </div>
 
@@ -453,10 +293,6 @@
                 </small>
               </dd>
             </div>
-            <div>
-              <dt>待领取 Key</dt>
-              <dd>{{ autoCreation.pendingKeyCount }}</dd>
-            </div>
           </dl>
 
           <div v-if="autoCreation.lastError" class="auto-creation-error" role="status">
@@ -485,7 +321,20 @@
                 </div>
               </template>
               <template v-else-if="column.key === 'apiKey'">
-                <code class="key-prefix">{{ keyPrefix(row) }}</code>
+                <code v-if="row.apiKey" class="credential-value">{{ row.apiKey }}</code>
+                <code v-else class="credential-value">{{ row.apiKeyPrefix || "-" }}</code>
+              </template>
+              <template v-else-if="column.key === 'imapPassword'">
+                <code v-if="row.imapPassword" class="credential-value">{{ row.imapPassword }}</code>
+                <code v-else class="credential-value">-</code>
+              </template>
+              <template v-else-if="column.key === 'clientId'">
+                <code v-if="row.clientId" class="credential-value">{{ row.clientId }}</code>
+                <code v-else class="credential-value">-</code>
+              </template>
+              <template v-else-if="column.key === 'refreshToken'">
+                <code v-if="row.refreshToken" class="credential-value">{{ row.refreshToken }}</code>
+                <code v-else class="credential-value">-</code>
               </template>
               <template v-else-if="column.key === 'latestReceivedAt'">
                 {{ formatTime(row.latestReceivedAt) }}
@@ -506,7 +355,7 @@
                   v-if="!isAliasConfirmationPending(row)"
                   :model-value="row.enabled"
                   :loading="Boolean(toggleLoading[row.id])"
-                  :disabled="Boolean(copyLoading[row.id] || rotateLoading[row.id] || deleteLoading[row.id])"
+                  :disabled="Boolean(isCopying(row) || rotateLoading[row.id] || deleteLoading[row.id])"
                   :aria-label="`启用隐私邮箱 ${row.address}`"
                   @change="(enabled) => toggleAlias(row, enabled)"
                 />
@@ -516,23 +365,33 @@
                   v-if="!isAliasConfirmationPending(row)"
                   class="icon-action-row"
                 >
-                  <el-tooltip content="复制邮件 API 直达链接" placement="top">
-                    <el-button
-                      :icon="CopyDocument"
-                      circle
-                      :loading="Boolean(copyLoading[row.id])"
-                      :disabled="Boolean(!row.directLinkPath || toggleLoading[row.id] || rotateLoading[row.id] || deleteLoading[row.id])"
-                      :aria-label="`复制 ${row.address} 的邮件 API 直达链接`"
-                      @click="copyAliasDirectLink(row)"
-                    />
-                  </el-tooltip>
-                  <el-tooltip content="轮换 API Key" placement="top">
+                  <el-button
+                    size="small"
+                    :icon="CopyDocument"
+                    :loading="Boolean(copyLoading[`${row.id}:otp`])"
+                    @click="copyAliasCredentials(row, ALIAS_EXPORT_OTP)"
+                  >取码</el-button>
+                  <el-button
+                    size="small"
+                    :icon="CopyDocument"
+                    :loading="Boolean(copyLoading[`${row.id}:imap`])"
+                    @click="copyAliasCredentials(row, ALIAS_EXPORT_IMAP)"
+                    v-if="isAliasV2(row)"
+                  >IMAP</el-button>
+                  <el-button
+                    v-else-if="isLegacyDirectLinkAvailable(row)"
+                    size="small"
+                    :icon="CopyDocument"
+                    :loading="Boolean(copyLoading[`${row.id}:legacy-link`])"
+                    @click="copyLegacyDirectLink(row)"
+                  >旧直达</el-button>
+                  <el-tooltip :content="aliasRotationLabel(row)" placement="top">
                     <el-button
                       :icon="Key"
                       circle
                       :loading="Boolean(rotateLoading[row.id])"
-                      :disabled="Boolean(oneTimeSecretVisible || copyLoading[row.id] || toggleLoading[row.id] || deleteLoading[row.id])"
-                      :aria-label="`轮换 ${row.address} 的 API Key`"
+                      :disabled="Boolean(isCopying(row) || toggleLoading[row.id] || deleteLoading[row.id])"
+                      :aria-label="`${aliasRotationLabel(row)}：${row.address}`"
                       @click="rotateKey(row)"
                     />
                   </el-tooltip>
@@ -543,7 +402,7 @@
                       :icon="Delete"
                       circle
                       :loading="Boolean(deleteLoading[row.id])"
-                      :disabled="Boolean(copyLoading[row.id] || toggleLoading[row.id] || rotateLoading[row.id])"
+                      :disabled="Boolean(isCopying(row) || toggleLoading[row.id] || rotateLoading[row.id])"
                       :aria-label="`从 iCloud 永久删除隐私邮箱 ${row.address}`"
                       @click="removeAlias(row)"
                     />
@@ -574,7 +433,31 @@
             <dl class="mobile-kv-list">
               <div>
                 <dt>API Key</dt>
-                <dd><code class="key-prefix">{{ keyPrefix(alias) }}</code></dd>
+                <dd>
+                  <code v-if="alias.apiKey" class="credential-value">{{ alias.apiKey }}</code>
+                  <code v-else class="credential-value">{{ alias.apiKeyPrefix || "-" }}</code>
+                </dd>
+              </div>
+              <div>
+                <dt>IMAP 密码</dt>
+                <dd>
+                  <code v-if="alias.imapPassword" class="credential-value">{{ alias.imapPassword }}</code>
+                  <code v-else class="credential-value">-</code>
+                </dd>
+              </div>
+              <div>
+                <dt>client ID</dt>
+                <dd>
+                  <code v-if="alias.clientId" class="credential-value">{{ alias.clientId }}</code>
+                  <code v-else class="credential-value">-</code>
+                </dd>
+              </div>
+              <div>
+                <dt>刷新令牌</dt>
+                <dd>
+                  <code v-if="alias.refreshToken" class="credential-value">{{ alias.refreshToken }}</code>
+                  <code v-else class="credential-value">-</code>
+                </dd>
               </div>
               <div>
                 <dt>最新邮件</dt>
@@ -586,7 +469,7 @@
                   <el-switch
                     :model-value="alias.enabled"
                     :loading="Boolean(toggleLoading[alias.id])"
-                    :disabled="Boolean(copyLoading[alias.id] || rotateLoading[alias.id] || deleteLoading[alias.id])"
+                    :disabled="Boolean(isCopying(alias) || rotateLoading[alias.id] || deleteLoading[alias.id])"
                     :aria-label="`启用隐私邮箱 ${alias.address}`"
                     @change="(enabled) => toggleAlias(alias, enabled)"
                   />
@@ -599,27 +482,41 @@
             >
               <el-button
                 :icon="CopyDocument"
-                :loading="Boolean(copyLoading[alias.id])"
-                :disabled="Boolean(!alias.directLinkPath || toggleLoading[alias.id] || rotateLoading[alias.id] || deleteLoading[alias.id])"
-                :aria-label="`复制 ${alias.address} 的邮件 API 直达链接`"
-                @click="copyAliasDirectLink(alias)"
+                :loading="Boolean(copyLoading[`${alias.id}:otp`])"
+                @click="copyAliasCredentials(alias, ALIAS_EXPORT_OTP)"
               >
-                复制邮件 API 直达链接
+                复制取码格式
+              </el-button>
+              <el-button
+                :icon="CopyDocument"
+                :loading="Boolean(copyLoading[`${alias.id}:imap`])"
+                @click="copyAliasCredentials(alias, ALIAS_EXPORT_IMAP)"
+                v-if="isAliasV2(alias)"
+              >
+                复制 IMAP 格式
+              </el-button>
+              <el-button
+                v-else-if="isLegacyDirectLinkAvailable(alias)"
+                :icon="CopyDocument"
+                :loading="Boolean(copyLoading[`${alias.id}:legacy-link`])"
+                @click="copyLegacyDirectLink(alias)"
+              >
+                复制旧直达链接
               </el-button>
               <el-button
                 :icon="Key"
                 :loading="Boolean(rotateLoading[alias.id])"
-                :disabled="Boolean(oneTimeSecretVisible || copyLoading[alias.id] || toggleLoading[alias.id] || deleteLoading[alias.id])"
+                :disabled="Boolean(isCopying(alias) || toggleLoading[alias.id] || deleteLoading[alias.id])"
                 @click="rotateKey(alias)"
               >
-                轮换 Key
+                {{ aliasRotationLabel(alias) }}
               </el-button>
               <el-button
                 type="danger"
                 plain
                 :icon="Delete"
                 :loading="Boolean(deleteLoading[alias.id])"
-                :disabled="Boolean(copyLoading[alias.id] || toggleLoading[alias.id] || rotateLoading[alias.id])"
+                :disabled="Boolean(isCopying(alias) || toggleLoading[alias.id] || rotateLoading[alias.id])"
                 @click="removeAlias(alias)"
               >
                 永久删除
@@ -642,7 +539,7 @@
           :model="aliasForm"
           :rules="aliasRules"
           label-position="top"
-          :disabled="oneTimeSecretVisible || createLoading"
+          :disabled="createLoading"
           @submit.prevent="addAlias"
         >
           <RequestAlert
@@ -675,9 +572,8 @@
             type="primary"
             :icon="Plus"
             :loading="createLoading"
-            :disabled="oneTimeSecretVisible"
           >
-            添加并生成 Key
+            添加并签发整套凭证
           </el-button>
         </el-form>
       </section>
@@ -685,7 +581,7 @@
       <section class="danger-zone" aria-labelledby="delete-account-title">
         <div>
           <h2 id="delete-account-title">删除主号</h2>
-          <p>同时删除其隐私邮箱、API Key 与本地最新邮件。</p>
+          <p>同时删除其隐私邮箱、完整凭证与全部本地邮件归档。</p>
         </div>
         <el-button
           type="danger"
@@ -704,10 +600,8 @@
 <script setup>
 import {
   Back,
-  Close,
   CopyDocument,
   Delete,
-  Download,
   EditPen,
   Key,
   Plus,
@@ -725,19 +619,15 @@ import {
   watch,
 } from "vue";
 import {
-  onBeforeRouteLeave,
-  onBeforeRouteUpdate,
   useRoute,
   useRouter,
 } from "vue-router";
 
 import {
-  clearAliasAutoCreationKeys,
   createAlias,
   deleteAccount,
   deleteAlias,
   deleteAppleSession,
-  getAliasAutoCreationKeys,
   getAccount,
   loginAppleSession,
   rotateAlias,
@@ -748,7 +638,6 @@ import {
   verifyAppleSession,
 } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
-import OneTimeSecret from "../components/OneTimeSecret.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncErrorLogDialog from "../components/SyncErrorLogDialog.vue";
@@ -759,12 +648,13 @@ import { setPageHeader } from "../stores/page.js";
 import {
   createActionLock,
   createLatestRequestGate,
-  oneTimeSecretNavigationMode,
 } from "../utils/asyncState.js";
 import {
-  buildRecentMailDirectLink,
-  copyText,
-} from "../utils/clipboard.js";
+  ALIAS_EXPORT_IMAP,
+  ALIAS_EXPORT_OTP,
+  buildAliasExportText,
+} from "../utils/aliasExport.js";
+import { buildRecentMailDirectLink, copyText } from "../utils/clipboard.js";
 import {
   confirmationCancelled,
   showRequestError,
@@ -780,9 +670,6 @@ const auth = useAuth();
 const account = ref(null);
 const aliases = ref([]);
 const appleSession = ref(null);
-const apiKey = ref("");
-const apiDirectLinkPath = ref("");
-const secretRegion = ref(null);
 const loading = ref(false);
 const loadError = ref(null);
 const syncLoading = ref(false);
@@ -800,13 +687,7 @@ const appleLoginFormRef = ref(null);
 const appleVerificationFormRef = ref(null);
 const autoCreation = ref(null);
 const autoCreationLoading = ref(false);
-const pendingAutoKeysLoading = ref(false);
-const pendingAutoKeysClearing = ref(false);
 const aliasSyncSummary = ref(null);
-const batchSecretsVisible = ref(false);
-const batchSecrets = ref([]);
-const batchSummary = ref(emptySyncSummary());
-const batchSecretsSource = ref("sync");
 const copyLoading = reactive({});
 const toggleLoading = reactive({});
 const rotateLoading = reactive({});
@@ -817,8 +698,6 @@ const aliasActionLock = createActionLock();
 const accountDeleteLock = createActionLock();
 const appleDisconnectLock = createActionLock();
 const autoCreationLock = createActionLock();
-const pendingAutoKeysLock = createActionLock();
-const secretNavigationLock = createActionLock();
 let viewActive = true;
 let resumeAliasSyncAfterAuth = false;
 let resumeAutoCreationAfterAuth = false;
@@ -844,32 +723,6 @@ const appleVerificationRules = {
     },
   ],
 };
-const batchSecretColumns = Object.freeze([
-  {
-    key: "address",
-    dataKey: "address",
-    title: "隐私邮箱",
-    width: 220,
-    minWidth: 220,
-    flexGrow: 1,
-  },
-  {
-    key: "apiKey",
-    dataKey: "apiKey",
-    title: "API Key",
-    width: 300,
-    minWidth: 300,
-    flexGrow: 1,
-  },
-  {
-    key: "mailApiDirectLink",
-    dataKey: "mailApiDirectLink",
-    title: "邮件 API 直达链接",
-    width: 360,
-    minWidth: 360,
-    flexGrow: 1,
-  },
-]);
 const aliasColumns = Object.freeze([
   {
     key: "address",
@@ -882,8 +735,26 @@ const aliasColumns = Object.freeze([
   {
     key: "apiKey",
     title: "API Key",
-    width: 126,
-    minWidth: 126,
+    width: 260,
+    minWidth: 260,
+  },
+  {
+    key: "imapPassword",
+    title: "IMAP 密码",
+    width: 260,
+    minWidth: 260,
+  },
+  {
+    key: "clientId",
+    title: "client ID",
+    width: 190,
+    minWidth: 190,
+  },
+  {
+    key: "refreshToken",
+    title: "刷新令牌",
+    width: 260,
+    minWidth: 260,
   },
   {
     key: "latestReceivedAt",
@@ -910,13 +781,12 @@ const aliasColumns = Object.freeze([
   },
   {
     key: "actions",
-    title: "操作",
-    width: 144,
-    minWidth: 144,
+    title: "复制 / 操作",
+    width: 330,
+    minWidth: 330,
     align: "right",
   },
 ]);
-const AUTO_CREATION_KEY_ACK_BATCH_SIZE = 1000;
 const appleSessionAuthenticated = computed(
   () => appleSession.value?.status === "authenticated",
 );
@@ -925,18 +795,12 @@ function appleVerificationActionLabel() {
   if (resumeAliasSyncAfterAuth) return "验证并同步";
   return "验证";
 }
-const oneTimeSecretVisible = computed(
-  () => Boolean(apiKey.value || batchSecrets.value.length),
-);
 const autoCreationControlDisabled = computed(
   () =>
-    oneTimeSecretVisible.value ||
     autoCreationLoading.value ||
     aliasesSyncLoading.value ||
     appleDisconnectLoading.value ||
-    appleAuthLoading.value ||
-    pendingAutoKeysLoading.value ||
-    pendingAutoKeysClearing.value,
+    appleAuthLoading.value,
 );
 const autoCreationToggleDisabled = computed(
   () =>
@@ -945,28 +809,9 @@ const autoCreationToggleDisabled = computed(
 );
 const appleAliasControlsDisabled = computed(
   () =>
-    oneTimeSecretVisible.value ||
     autoCreationLoading.value ||
-    appleAuthLoading.value ||
-    pendingAutoKeysLoading.value ||
-    pendingAutoKeysClearing.value,
+    appleAuthLoading.value,
 );
-const pendingAutoKeysDisabled = computed(
-  () =>
-    autoCreationControlDisabled.value ||
-    !Number(autoCreation.value?.pendingKeyCount || 0),
-);
-
-function emptySyncSummary() {
-  return {
-    total: 0,
-    createdCount: 0,
-    existingCount: 0,
-    inactiveCount: 0,
-    importedDisabledCount: 0,
-    conflictCount: 0,
-  };
-}
 
 const AUTO_CREATION_ERROR_MESSAGES = Object.freeze({
   APPLE_LOGIN_REQUIRED:
@@ -1019,18 +864,26 @@ function isAliasConfirmationPending(item) {
   );
 }
 
-function aliasIDAcknowledgementBatches(aliasIds) {
-  const batches = [];
-  for (
-    let offset = 0;
-    offset < aliasIds.length;
-    offset += AUTO_CREATION_KEY_ACK_BATCH_SIZE
-  ) {
-    batches.push(
-      aliasIds.slice(offset, offset + AUTO_CREATION_KEY_ACK_BATCH_SIZE),
-    );
-  }
-  return batches;
+function isAliasV2(item) {
+  return Boolean(
+    item?.credentialMode !== "legacy" &&
+      item?.apiKey &&
+      item?.imapPassword &&
+      item?.clientId &&
+      item?.refreshToken,
+  );
+}
+
+function isLegacyDirectLinkAvailable(item) {
+  return Boolean(
+    !isAliasConfirmationPending(item) &&
+      item?.credentialMode === "legacy" &&
+      item?.directLinkPath,
+  );
+}
+
+function aliasRotationLabel(item) {
+  return item?.credentialMode === "v2" ? "轮换整套凭证" : "轮换 API Key";
 }
 
 function normalizedAutoCreationStatus(item) {
@@ -1115,31 +968,6 @@ function isCurrentAccount(accountId) {
   );
 }
 
-function hasPendingSecretRequest() {
-  return (
-    createLoading.value ||
-    aliasesSyncLoading.value ||
-    appleAuthLoading.value ||
-    autoCreationLoading.value ||
-    pendingAutoKeysLoading.value ||
-    pendingAutoKeysClearing.value ||
-    Object.keys(rotateLoading).length > 0 ||
-    autoCreationLock.hasAny() ||
-    pendingAutoKeysLock.hasAny()
-  );
-}
-
-function hasProtectedSecret() {
-  return secretNavigationMode() !== "allow";
-}
-
-function secretNavigationMode() {
-  return oneTimeSecretNavigationMode({
-    requestPending: hasPendingSecretRequest(),
-    keyVisible: oneTimeSecretVisible.value,
-  });
-}
-
 function isAppleSessionInvalid(error) {
   return (
     error?.code === "APPLE_LOGIN_REQUIRED" ||
@@ -1186,36 +1014,11 @@ const aliasRules = {
   label: [{ validator: validateAliasLabel, trigger: "blur" }],
 };
 
-function keyPrefix(alias) {
-  return alias.apiKeyPrefix ? `${alias.apiKeyPrefix}…` : "-";
-}
-
 function syncAccountAliasCount() {
   if (!account.value) return;
   const count = Array.isArray(aliases.value) ? aliases.value.length : 0;
   if (account.value.aliasCount === count) return;
   account.value = { ...account.value, aliasCount: count };
-}
-
-function aliasAddressOrder(left, right) {
-  return (
-    left.address.localeCompare(right.address) ||
-    Number(left.id || 0) - Number(right.id || 0)
-  );
-}
-
-function mergeAliases(items) {
-  const aliasesByID = new Map(
-    aliases.value
-      .filter((item) => item?.id !== undefined && item?.id !== null)
-      .map((item) => [Number(item.id), item]),
-  );
-  for (const item of Array.isArray(items) ? items : []) {
-    if (item?.id === undefined || item?.id === null) continue;
-    aliasesByID.set(Number(item.id), item);
-  }
-  aliases.value = [...aliasesByID.values()].sort(aliasAddressOrder);
-  syncAccountAliasCount();
 }
 
 function replaceAlias(updated) {
@@ -1231,13 +1034,10 @@ function detailMutationPending() {
     appleAuthLoading.value ||
     appleDisconnectLoading.value ||
     autoCreationLoading.value ||
-    pendingAutoKeysLoading.value ||
-    pendingAutoKeysClearing.value ||
     createLoading.value ||
     accountDeleteLoading.value ||
     aliasActionLock.hasAny() ||
-    autoCreationLock.hasAny() ||
-    pendingAutoKeysLock.hasAny()
+    autoCreationLock.hasAny()
   );
 }
 
@@ -1248,7 +1048,7 @@ function beginDetailMutation() {
 async function loadDetail({ silent = false } = {}) {
   if (
     silent &&
-    (loading.value || detailMutationPending() || oneTimeSecretVisible.value)
+    (loading.value || detailMutationPending())
   ) {
     return;
   }
@@ -1282,23 +1082,6 @@ async function loadDetail({ silent = false } = {}) {
 }
 
 const liveRefresh = createLiveRefresh(() => loadDetail({ silent: true }));
-
-async function revealKey(value, directLinkPath, accountId) {
-  if (!value || !directLinkPath || !isCurrentAccount(accountId)) return false;
-  apiKey.value = value;
-  apiDirectLinkPath.value = directLinkPath;
-  await nextTick();
-  if (!isCurrentAccount(accountId)) {
-    clearSecret();
-    return false;
-  }
-  const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  secretRegion.value?.scrollIntoView({
-    behavior: reduceMotion ? "auto" : "smooth",
-    block: "start",
-  });
-  return true;
-}
 
 async function syncNow() {
   if (syncLoading.value || syncActive.value) return;
@@ -1340,7 +1123,7 @@ function openAppleLogin({
   resumeSync = false,
   resumeAutoCreation = false,
 } = {}) {
-  if (!account.value || oneTimeSecretVisible.value) return;
+  if (!account.value) return;
   resumeAliasSyncAfterAuth = resumeSync;
   resumeAutoCreationAfterAuth = resumeAutoCreation;
   appleAuthStep.value = "login";
@@ -1558,144 +1341,10 @@ async function performSetAutoCreation(enabled) {
   }
 }
 
-async function openPendingAutoCreationKeys() {
-  if (
-    !account.value ||
-    pendingAutoKeysDisabled.value ||
-    !pendingAutoKeysLock.acquire()
-  ) {
-    return;
-  }
-  const accountId = account.value.id;
-  beginDetailMutation();
-  pendingAutoKeysLoading.value = true;
-  let refreshAfterRequest = false;
-  try {
-    const result = await getAliasAutoCreationKeys(accountId);
-    if (!isCurrentAccount(accountId)) return;
-    const created = (result?.created || [])
-      .filter((item) => item.apiKey)
-      .map((item) => ({
-        aliasId: item.alias?.id,
-        address: item.alias.address,
-        apiKey: item.apiKey,
-        mailApiDirectLink: batchDirectLink(item),
-      }));
-    mergeAliases(
-      (result?.created || [])
-        .map((item) => item.alias)
-        .filter((item) => item?.id),
-    );
-    if (!created.length) {
-      refreshAfterRequest = true;
-      if (autoCreation.value) {
-        autoCreation.value = {
-          ...autoCreation.value,
-          pendingKeyCount: 0,
-        };
-      }
-      ElMessage({
-        type: "info",
-        message: "当前没有待领取的自动创建 API Key。",
-        grouping: true,
-      });
-      return;
-    }
-    batchSecretsSource.value = "auto";
-    batchSummary.value = emptySyncSummary();
-    batchSecrets.value = created;
-    batchSecretsVisible.value = true;
-  } catch (error) {
-    if (!isCurrentAccount(accountId)) return;
-    showRequestError(error, "自动创建 API Key 领取失败，请稍后重试。");
-  } finally {
-    pendingAutoKeysLoading.value = false;
-    pendingAutoKeysLock.release();
-    if (refreshAfterRequest && isCurrentAccount(accountId)) {
-      void loadDetail({ silent: true });
-    }
-  }
-}
-
-async function acknowledgeAndCloseBatchSecrets() {
-  if (
-    batchSecretsSource.value !== "auto" ||
-    !batchSecrets.value.length ||
-    !account.value ||
-    !pendingAutoKeysLock.acquire()
-  ) {
-    return;
-  }
-  const accountId = account.value.id;
-  const aliasIds = [
-    ...new Set(
-      batchSecrets.value
-        .map((item) => Number(item.aliasId))
-        .filter((id) => Number.isInteger(id) && id > 0),
-    ),
-  ];
-  if (!aliasIds.length) {
-    ElMessage.error("待确认的自动创建 Key 缺少隐私邮箱标识，请刷新后重试。");
-    pendingAutoKeysLock.release();
-    return;
-  }
-  const aliasIDBatches = aliasIDAcknowledgementBatches(aliasIds);
-  beginDetailMutation();
-  pendingAutoKeysClearing.value = true;
-  let acknowledgedCount = 0;
-  let refreshAfterClose = false;
-  try {
-    for (const aliasIDBatch of aliasIDBatches) {
-      await clearAliasAutoCreationKeys(
-        accountId,
-        aliasIDBatch,
-        auth.state.csrfToken,
-      );
-      if (!isCurrentAccount(accountId)) return;
-
-      const acknowledgedIDs = new Set(aliasIDBatch);
-      batchSecrets.value = batchSecrets.value.filter(
-        (item) => !acknowledgedIDs.has(Number(item.aliasId)),
-      );
-      acknowledgedCount += aliasIDBatch.length;
-      if (autoCreation.value) {
-        autoCreation.value = {
-          ...autoCreation.value,
-          pendingKeyCount: Math.max(
-            0,
-            Number(autoCreation.value.pendingKeyCount || 0) -
-              aliasIDBatch.length,
-          ),
-        };
-      }
-    }
-    clearBatchSecrets();
-    refreshAfterClose = true;
-    successMessage("本次自动创建的 API Key 已确认保存。");
-  } catch (error) {
-    if (!isCurrentAccount(accountId)) return;
-    showRequestError(
-      error,
-      acknowledgedCount
-        ? `确认保存未完成，已确认 ${acknowledgedCount} 个 API Key；其余 Key 仍保留在待领取队列中。`
-        : "确认保存失败，API Key 仍保留在待领取队列中。",
-    );
-  } finally {
-    pendingAutoKeysClearing.value = false;
-    pendingAutoKeysLock.release();
-    if (refreshAfterClose && isCurrentAccount(accountId)) {
-      void loadDetail({ silent: true });
-    }
-  }
-}
-
 function syncAliasesFromApple() {
   if (
     aliasesSyncLoading.value ||
-    oneTimeSecretVisible.value ||
-    autoCreationLoading.value ||
-    pendingAutoKeysLoading.value ||
-    pendingAutoKeysClearing.value
+    autoCreationLoading.value
   ) {
     return;
   }
@@ -1706,23 +1355,10 @@ function syncAliasesFromApple() {
   performAliasesSync();
 }
 
-function batchDirectLink(item) {
-  const value = item.mailApiDirectLink || item.alias?.directLinkPath || "";
-  if (!value.startsWith("/")) return value;
-  try {
-    return buildRecentMailDirectLink(value);
-  } catch {
-    return value;
-  }
-}
-
 async function performAliasesSync() {
   if (
     aliasesSyncLoading.value ||
-    oneTimeSecretVisible.value ||
     autoCreationLoading.value ||
-    pendingAutoKeysLoading.value ||
-    pendingAutoKeysClearing.value ||
     !account.value
   ) {
     return;
@@ -1741,26 +1377,14 @@ async function performAliasesSync() {
       autoCreation.value = result.autoCreation;
     }
     aliasSyncSummary.value = result.summary;
-    const created = result.created
-      .filter((item) => item.apiKey)
-      .map((item) => ({
-        aliasId: item.alias?.id,
-        address: item.alias.address,
-        apiKey: item.apiKey,
-        mailApiDirectLink: batchDirectLink(item),
-      }));
-    if (created.length) {
-      batchSecretsSource.value = "sync";
-      batchSummary.value = result.summary;
-      batchSecrets.value = created;
-      batchSecretsVisible.value = true;
-      return;
-    }
     const capacityNotice = result.summary.importedDisabledCount
       ? `，其中 ${result.summary.importedDisabledCount} 个因本地容量暂未启用`
       : "";
+    const createdNotice = result.summary.createdCount
+      ? `，新增 ${result.summary.createdCount} 个，完整凭证已显示在列表中`
+      : "，没有新增地址";
     successMessage(
-      `隐私邮箱同步完成，Apple 共 ${result.summary.total} 个地址，没有新增地址${capacityNotice}。`,
+      `隐私邮箱同步完成，Apple 共 ${result.summary.total} 个地址${createdNotice}${capacityNotice}。`,
     );
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;
@@ -1781,8 +1405,6 @@ async function disconnectAppleSession() {
   if (
     !appleSessionAuthenticated.value ||
     autoCreationLoading.value ||
-    pendingAutoKeysLoading.value ||
-    pendingAutoKeysClearing.value ||
     !appleDisconnectLock.acquire() ||
     !account.value
   ) {
@@ -1818,101 +1440,8 @@ async function disconnectAppleSession() {
   }
 }
 
-async function copyBatchSecret(value, label) {
-  const copied = await copyText(value);
-  if (copied) {
-    successMessage(`${label} 已复制。`);
-    return;
-  }
-  ElMessage({
-    type: "error",
-    message: `${label} 复制失败，请检查浏览器剪切板权限后重试。`,
-    grouping: true,
-  });
-}
-
-function csvCell(value) {
-  let text = String(value ?? "");
-  if (/^[=+\-@\t\r]/.test(text)) {
-    text = `'${text}`;
-  }
-  return `"${text.replaceAll('"', '""')}"`;
-}
-
-function downloadBatchSecrets() {
-  if (!batchSecrets.value.length) return;
-  const rows = [
-    ["隐私邮箱", "API Key", "邮件 API 直达链接"],
-    ...batchSecrets.value.map((item) => [
-      item.address,
-      item.apiKey,
-      item.mailApiDirectLink,
-    ]),
-  ];
-  const csv = `\ufeff${rows.map((row) => row.map(csvCell).join(",")).join("\r\n")}`;
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  const accountName = String(account.value?.email || "icloud")
-    .replace(/[^a-zA-Z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  link.href = url;
-  link.download = `${accountName || "icloud"}-aliases-${timestamp}.csv`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-}
-
-function clearBatchSecrets() {
-  batchSecretsVisible.value = false;
-  batchSecrets.value = [];
-  batchSummary.value = emptySyncSummary();
-  batchSecretsSource.value = "sync";
-}
-
-function dismissBatchSecrets() {
-  const refreshAfterClose = batchSecretsSource.value === "auto";
-  clearBatchSecrets();
-  if (refreshAfterClose && account.value) {
-    void loadDetail({ silent: true });
-  }
-}
-
-function closeBatchSecrets() {
-  clearBatchSecrets();
-}
-
-async function confirmBatchSecretsClose(done) {
-  if (pendingAutoKeysClearing.value) return;
-  if (batchSecretsSource.value === "auto") {
-    dismissBatchSecrets();
-    done();
-    return;
-  }
-  try {
-    await ElMessageBox.confirm(
-      "关闭后完整 API Key 将从页面清除，且不能再次查看。确定已保存吗？",
-      "确认关闭",
-      {
-        type: "warning",
-        confirmButtonText: "已保存，关闭",
-        cancelButtonText: "继续查看",
-        autofocus: false,
-      },
-    );
-    clearBatchSecrets();
-    done();
-  } catch (error) {
-    if (!confirmationCancelled(error)) {
-      ElMessage.error("关闭确认失败，请稍后重试。");
-    }
-  }
-}
-
 async function addAlias() {
-  if (oneTimeSecretVisible.value || !createLock.acquire()) return;
+  if (!createLock.acquire()) return;
   beginDetailMutation();
   const accountId = account.value.id;
   let sessionInvalid = false;
@@ -1938,10 +1467,7 @@ async function addAlias() {
     syncAccountAliasCount();
     Object.assign(aliasForm, { address: "", label: "" });
     aliasFormRef.value?.resetFields();
-    if (!(await revealKey(result.apiKey, result.alias.directLinkPath, accountId))) {
-      return;
-    }
-    successMessage("隐私邮箱已添加。");
+    successMessage("隐私邮箱已添加，整套凭证已签发并常驻显示。");
   } catch (error) {
     sessionInvalid = isSessionInvalid(error);
     if (!isCurrentAccount(accountId)) return;
@@ -1956,7 +1482,6 @@ async function addAlias() {
 async function rotateKey(alias) {
   if (
     isAliasConfirmationPending(alias) ||
-    oneTimeSecretVisible.value ||
     !aliasActionLock.acquire(alias.id)
   ) {
     return;
@@ -1965,10 +1490,13 @@ async function rotateKey(alias) {
   const accountId = account.value.id;
   let sessionInvalid = false;
   rotateLoading[alias.id] = true;
+  const rotateCompleteBundle = alias?.credentialMode === "v2";
   try {
     await ElMessageBox.confirm(
-      "轮换后旧 Key 会立即失效。继续吗？",
-      `轮换 ${alias.address} 的 API Key`,
+      rotateCompleteBundle
+        ? "轮换后旧 API Key、取码链接、IMAP 密码、refresh token 和访问令牌会同时失效。继续吗？"
+        : "轮换后旧 API Key 和旧直达链接会失效；邮件消费状态和 IMAP 已读状态保持不变。新 Key 仅在当前页面显示，请立即保存。继续吗？",
+      `${aliasRotationLabel(alias)}：${alias.address}`,
       {
         type: "warning",
         confirmButtonText: "继续轮换",
@@ -1977,18 +1505,31 @@ async function rotateKey(alias) {
       },
     );
     if (!isCurrentAccount(accountId)) return;
-    const result = await rotateAlias(alias.id, auth.state.csrfToken);
+    const result = await rotateAlias(
+      alias.id,
+      auth.state.csrfToken,
+      alias.credentialMode,
+    );
     if (!isCurrentAccount(accountId)) return;
-    replaceAlias(result.alias);
-    if (!(await revealKey(result.apiKey, result.alias.directLinkPath, accountId))) {
-      return;
-    }
-    successMessage("API Key 已轮换，旧 Key 已失效。");
+    replaceAlias({
+      ...result.alias,
+      apiKey: result.apiKey || result.alias.apiKey,
+    });
+    successMessage(
+      rotateCompleteBundle
+        ? "整套凭证已轮换，所有旧凭证与访问令牌均已失效。"
+        : "API Key 已轮换，请立即保存页面中的新 Key；消费和邮件状态保持不变。",
+    );
   } catch (error) {
     if (confirmationCancelled(error)) return;
     sessionInvalid = isSessionInvalid(error);
     if (!isCurrentAccount(accountId)) return;
-    showRequestError(error, "API Key 轮换失败，请稍后重试。");
+    showRequestError(
+      error,
+      rotateCompleteBundle
+        ? "整套凭证轮换失败，请稍后重试。"
+        : "API Key 轮换失败，请稍后重试。",
+    );
   } finally {
     delete rotateLoading[alias.id];
     aliasActionLock.release(alias.id);
@@ -1996,38 +1537,75 @@ async function rotateKey(alias) {
   }
 }
 
-async function copyAliasDirectLink(alias) {
+function isCopying(alias) {
+  return Boolean(
+    copyLoading[`${alias?.id}:otp`] ||
+      copyLoading[`${alias?.id}:imap`] ||
+      copyLoading[`${alias?.id}:legacy-link`],
+  );
+}
+
+async function copyAliasCredentials(alias, format) {
+  const loadingKey = `${alias?.id}:${format}`;
   if (
     isAliasConfirmationPending(alias) ||
-    !alias.directLinkPath ||
     !aliasActionLock.acquire(alias.id)
   ) {
     return;
   }
   const accountId = account.value.id;
-  copyLoading[alias.id] = true;
+  copyLoading[loadingKey] = true;
   try {
-    const directLink = buildRecentMailDirectLink(alias.directLinkPath);
-    const copied = await copyText(directLink);
+    const copied = await copyText(buildAliasExportText([alias], format));
     if (!isCurrentAccount(accountId)) return;
     if (!copied) {
       ElMessage({
         type: "error",
-        message: "直达链接复制失败，请检查浏览器剪切板权限后重试。",
+        message: "邮箱凭证复制失败，请检查浏览器剪切板权限后重试。",
         grouping: true,
       });
       return;
     }
-    successMessage("邮件 API 直达链接已复制。");
+    successMessage(
+      format === ALIAS_EXPORT_OTP
+        ? "取码链接格式已复制。"
+        : "IMAP/OAuth 格式已复制。",
+    );
   } catch {
     if (!isCurrentAccount(accountId)) return;
     ElMessage({
       type: "error",
-      message: "直达链接复制失败，请刷新页面后重试。",
+      message: "邮箱凭证复制失败，请刷新页面后重试。",
       grouping: true,
     });
   } finally {
-    delete copyLoading[alias.id];
+    delete copyLoading[loadingKey];
+    aliasActionLock.release(alias.id);
+  }
+}
+
+async function copyLegacyDirectLink(alias) {
+  const lockKey = `${alias?.id}:legacy-link`;
+  if (!isLegacyDirectLinkAvailable(alias) || !aliasActionLock.acquire(alias.id)) {
+    return;
+  }
+  const accountId = account.value.id;
+  copyLoading[lockKey] = true;
+  try {
+    const directLink = buildRecentMailDirectLink(alias.directLinkPath);
+    const copied = await copyText(directLink);
+    if (!isCurrentAccount(accountId)) return;
+    if (!copied) throw new Error("clipboard rejected copy");
+    successMessage("旧邮件 API 直达链接已复制。");
+  } catch {
+    if (!isCurrentAccount(accountId)) return;
+    ElMessage({
+      type: "error",
+      message: "旧直达链接复制失败，请刷新页面后重试。",
+      grouping: true,
+    });
+  } finally {
+    delete copyLoading[lockKey];
     aliasActionLock.release(alias.id);
   }
 }
@@ -2073,7 +1651,7 @@ async function removeAlias(alias) {
   deleteLoading[alias.id] = true;
   try {
     await ElMessageBox.confirm(
-      "删除后，该隐私邮箱将从 iCloud 永久删除，同时清除本地 API Key、邮件快照及关联记录，且无法恢复。继续吗？",
+      "删除后，该隐私邮箱将从 iCloud 永久删除，同时清除本地完整凭证、邮件归档映射及关联记录，且无法恢复。继续吗？",
       `从 iCloud 永久删除 ${alias.address}`,
       {
         type: "warning",
@@ -2130,7 +1708,6 @@ async function removeAccount() {
     if (!isCurrentAccount(accountId)) return;
     await deleteAccount(accountId, auth.state.csrfToken);
     if (!isCurrentAccount(accountId)) return;
-    clearSecret();
     successMessage("主号及其全部数据已删除。");
     await router.replace({ name: "accounts" });
   } catch (error) {
@@ -2147,80 +1724,12 @@ function editAccount() {
   router.push({ name: "account-edit", params: { id: account.value.id } });
 }
 
-function clearSecret() {
-  apiKey.value = "";
-  apiDirectLinkPath.value = "";
-  clearBatchSecrets();
-}
-
-function pendingSecretRequestMessage() {
-  if (appleAuthLoading.value) {
-    return "正在验证 Apple 账户，请等待操作完成。";
-  }
-  if (pendingAutoKeysLoading.value || pendingAutoKeysClearing.value) {
-    return "正在处理自动创建 API Key，请等待操作完成。";
-  }
-  if (autoCreationLoading.value) {
-    return "正在更新自动创建设置，请等待操作完成。";
-  }
-  return "正在生成 API Key，请等待操作完成。";
-}
-
-async function confirmSecretNavigation() {
-  const mode = secretNavigationMode();
-  if (mode === "block") {
-    ElMessage({
-      type: "warning",
-      message: pendingSecretRequestMessage(),
-      grouping: true,
-    });
-    return false;
-  }
-  if (mode === "allow") {
-    clearSecret();
-    return true;
-  }
-  if (!secretNavigationLock.acquire()) return false;
-
-  try {
-    const queuedAutoKeys = batchSecretsSource.value === "auto";
-    await ElMessageBox.confirm(
-      queuedAutoKeys
-        ? "这些自动创建的完整 API Key 尚未确认保存。离开会清除页面显示，但服务端队列仍会保留，之后可再次领取。确定离开吗？"
-        : "完整 API Key 只显示这一次。离开后将无法再次查看，确定离开吗？",
-      "尚未保存 API Key",
-      {
-        type: "warning",
-        confirmButtonText: "仍要离开",
-        cancelButtonText: "留在此页",
-        autofocus: false,
-      },
-    );
-    clearSecret();
-    return true;
-  } catch (error) {
-    if (!confirmationCancelled(error)) {
-      ElMessage.error("无法确认页面导航，请稍后重试。");
-    }
-    return false;
-  } finally {
-    secretNavigationLock.release();
-  }
-}
-
-function protectSecretBeforeUnload(event) {
-  if (!hasProtectedSecret()) return;
-  event.preventDefault();
-  event.returnValue = "";
-}
-
 watch(
   () => route.params.id,
   (id, previousId) => {
     if (id && id !== previousId) {
       detailGate.invalidate();
       loading.value = false;
-      clearSecret();
       cancelAppleAuth();
       account.value = null;
       aliases.value = [];
@@ -2232,11 +1741,7 @@ watch(
   },
 );
 
-onBeforeRouteLeave(confirmSecretNavigation);
-onBeforeRouteUpdate(confirmSecretNavigation);
-
 onMounted(() => {
-  window.addEventListener("beforeunload", protectSecretBeforeUnload);
   loadDetail();
   liveRefresh.start({ immediate: false });
 });
@@ -2245,8 +1750,18 @@ onBeforeUnmount(() => {
   viewActive = false;
   liveRefresh.stop();
   detailGate.deactivate();
-  window.removeEventListener("beforeunload", protectSecretBeforeUnload);
-  clearSecret();
   autoCreation.value = null;
 });
 </script>
+
+<style scoped>
+.credential-value {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  color: var(--text-primary);
+  font-size: 12px;
+  white-space: nowrap;
+  user-select: all;
+}
+</style>

@@ -55,8 +55,8 @@ RUN sed -i "s#dl-cdn.alpinelinux.org#${ALPINE_MIRROR}#g" /etc/apk/repositories \
     && apk add --no-cache ca-certificates tzdata util-linux \
     && addgroup -S -g 10001 app \
     && adduser -S -D -H -u 10001 -G app app \
-    && mkdir -p /app/data /app/keys \
-    && chmod 700 /app/data /app/keys \
+    && mkdir -p /app/data /app/keys /app/mail-archive \
+    && chmod 700 /app/data /app/keys /app/mail-archive \
     && chown -R app:app /app
 
 WORKDIR /app
@@ -76,6 +76,6 @@ ENV ICLOUD_API_WEB_ROOT=/app/web
 
 USER app
 
-EXPOSE 8080
+EXPOSE 8080 1993
 
 ENTRYPOINT ["/usr/local/bin/icloud-api-entrypoint"]

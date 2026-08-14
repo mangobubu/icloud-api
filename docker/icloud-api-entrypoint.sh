@@ -452,8 +452,8 @@ load_or_generate_application_secrets() {
 		fi
 	fi
 	if has_text "${ICLOUD_API_OAUTH_TOKEN:-}"; then
-		# OAuth is consumed directly on every start, so an explicit value always
-		# becomes the durable source and supersedes any generated token file.
+		# An explicitly supplied token remains authoritative and is persisted as
+		# the deployment's durable legacy API credential.
 		write_secret "$oauth_source_marker" "environment"
 		rm -f "$oauth_token_file" || die "清理旧 OAuth Token 文件失败"
 		oauth_source="environment"

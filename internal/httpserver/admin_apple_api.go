@@ -189,9 +189,6 @@ func (s *Server) adminAPISyncAppleAliases(c *gin.Context) {
 		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "sync_hme_aliases", adminAPIAppleServiceUnavailable())
 		return
 	}
-	// Complete every required fallible read before the service can commit new API key
-	// hashes. After a successful import, the one-time keys must always reach
-	// the caller, even if optional direct-link rendering is unavailable.
 	detail, err := s.adminAPIAccountDetail(c.Request.Context(), accountID)
 	if err != nil {
 		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "sync_hme_aliases", classifyAdminAPIAppleError(err))
@@ -202,12 +199,10 @@ func (s *Server) adminAPISyncAppleAliases(c *gin.Context) {
 		s.adminAPIFinishAppleFailure(c, adminSession, accountID, "sync_hme_aliases", classifyAdminAPIAppleError(err))
 		return
 	}
-	created, directLinksOmitted := s.adminAPIAppleCreatedAliases(result.Created)
-	if directLinksOmitted > 0 {
-		s.logger.Warn("部分新隐私邮箱的派生直达链接生成失败",
-			"count", directLinksOmitted,
-			"request_id", requestID(c),
-		)
+	created, err := s.adminAPIAppleCreatedAliases(result.Created)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
 	}
 	if refreshed, refreshErr := s.adminAPIAccountDetail(c.Request.Context(), accountID); refreshErr == nil {
 		detail = refreshed
@@ -225,8 +220,7 @@ func (s *Server) adminAPISyncAppleAliases(c *gin.Context) {
 		" existing=" + strconv.Itoa(summary.ExistingCount) +
 		" inactive=" + strconv.Itoa(summary.InactiveCount) +
 		" imported_disabled=" + strconv.Itoa(summary.ImportedDisabledCount) +
-		" filtered=" + strconv.Itoa(summary.FilteredOutCount) +
-		" direct_links_omitted=" + strconv.Itoa(directLinksOmitted)
+		" filtered=" + strconv.Itoa(summary.FilteredOutCount)
 	s.audit(c, &adminSession.AdminID, adminSession.Username, "sync_hme_aliases", "account", strconv.FormatInt(accountID, 10), "success", auditDetail)
 	writeAdminAPIData(c, http.StatusOK, adminAPIAppleSyncResultDTO{
 		adminAPIAccountDetailDTO: detail,
@@ -318,37 +312,24 @@ func adminAPIAppleSyncSummary(summary hmesync.SyncSummary) adminAPIAppleSyncSumm
 	}
 }
 
-func (s *Server) adminAPIAppleCreatedAliases(created []hmesync.CreatedAlias) ([]adminAPIAppleCreatedAliasDTO, int) {
+func (s *Server) adminAPIAppleCreatedAliases(created []hmesync.CreatedAlias) ([]adminAPIAppleCreatedAliasDTO, error) {
 	result := make([]adminAPIAppleCreatedAliasDTO, 0, len(created))
-	directLinksOmitted := 0
 	for _, item := range created {
 		alias, err := s.adminAPIAliasFromDomain(item.Alias)
 		if err != nil {
-			directLinksOmitted++
-			alias = adminAPIAliasDTO{
-				ID:               item.Alias.ID,
-				AccountID:        item.Alias.AccountID,
-				AccountEmail:     item.Alias.AccountEmail,
-				Address:          item.Alias.Address,
-				Label:            item.Alias.Label,
-				APIKeyPrefix:     item.Alias.APIKeyPrefix,
-				Enabled:          item.Alias.Enabled,
-				LastSyncStatus:   item.Alias.LastSyncStatus,
-				LastSyncError:    item.Alias.LastSyncError,
-				LastSyncedAt:     adminAPIOptionalTime(item.Alias.LastSyncedAt),
-				LastAccessedAt:   adminAPIOptionalTime(item.Alias.LastAccessedAt),
-				LatestReceivedAt: adminAPIOptionalTime(item.Alias.LatestReceivedAt),
-				CreatedAt:        adminAPITime(item.Alias.CreatedAt),
-				UpdatedAt:        adminAPITime(item.Alias.UpdatedAt),
-			}
+			return nil, err
+		}
+		apiKey := strings.TrimSpace(item.APIKey)
+		if apiKey == "" {
+			apiKey = alias.APIKey
 		}
 		result = append(result, adminAPIAppleCreatedAliasDTO{
 			Alias:             alias,
-			APIKey:            item.APIKey,
+			APIKey:            apiKey,
 			MailAPIDirectLink: alias.DirectLinkPath,
 		})
 	}
-	return result, directLinksOmitted
+	return result, nil
 }
 
 func adminAPIMergeCreatedAliases(existing []adminAPIAliasDTO, created []adminAPIAppleCreatedAliasDTO) []adminAPIAliasDTO {

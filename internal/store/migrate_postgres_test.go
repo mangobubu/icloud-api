@@ -16,7 +16,7 @@ func TestPostgresAdminSessionAdminIDIndexMigrationStructure(t *testing.T) {
 	t.Parallel()
 
 	const freshIndex = "create index admin_sessions_admin_id_idx on admin_sessions(admin_id)"
-	if !containsNormalizedSQL(postgresSchemaV6, freshIndex) {
+	if !containsNormalizedSQL(postgresSchemaV7, freshIndex) {
 		t.Fatalf("fresh PostgreSQL schema is missing %q", freshIndex)
 	}
 
@@ -42,7 +42,7 @@ func TestPostgresQueryIndexesMigrationStructure(t *testing.T) {
 		statements  []string
 		ifNotExists bool
 	}{
-		{"fresh v6", postgresSchemaV6, false},
+		{"fresh v7", postgresSchemaV7, false},
 		{"v3 to v4", postgresMigrateV3ToV4, true},
 		{"v4 convergence", postgresSchemaConvergence, true},
 	}
@@ -64,36 +64,59 @@ func TestPostgresQueryIndexesMigrationStructure(t *testing.T) {
 	}
 }
 
-func TestPostgresSeenQueueMigrationStructure(t *testing.T) {
+func TestPostgresArchiveMigrationStructure(t *testing.T) {
 	t.Parallel()
 
 	for _, path := range []struct {
 		name       string
 		statements []string
 	}{
-		{"fresh v6", postgresSchemaV6},
-		{"v5 to v6", postgresMigrateV5ToV6},
+		{"fresh v7", postgresSchemaV7},
+		{"v6 to v7", postgresMigrateV6ToV7},
 	} {
 		t.Run(path.name, func(t *testing.T) {
 			t.Parallel()
 			joined := normalizeSQL(strings.Join(path.statements, " "))
 			for _, wanted := range []string{
-				"create table consumed_messages",
-				"alias_id bigint not null references aliases(id) on delete cascade",
-				"primary key(alias_id, uid_validity, uid)",
-				"create table imap_seen_tasks",
-				"primary key(account_id, uid_validity, uid)",
-				"imap_seen_tasks_account_created_idx",
+				"create table archived_messages",
+				"unique(account_id, uid_validity, upstream_uid)",
+				"create table alias_messages",
+				"primary key(alias_id, message_id)",
+				"unique(alias_id, mailbox_uid)",
 			} {
 				if !strings.Contains(joined, wanted) {
 					t.Errorf("%s is missing %q", path.name, wanted)
 				}
 			}
+			for _, destructive := range []string{
+				"drop table consumed_messages",
+				"drop table imap_seen_tasks",
+				"drop table pending_alias_api_keys",
+				"drop table latest_messages",
+				"alter table aliases drop column api_key_prefix",
+			} {
+				if strings.Contains(joined, destructive) {
+					t.Errorf("%s contains compatibility-breaking statement %q", path.name, destructive)
+				}
+			}
 		})
 	}
-	const convergenceIndex = `create index if not exists imap_seen_tasks_account_created_idx on imap_seen_tasks(account_id, created_at, uid_validity, uid)`
+
+	fresh := normalizeSQL(strings.Join(postgresSchemaV7, " "))
+	for _, wanted := range []string{
+		"api_key_prefix text not null",
+		"create table latest_messages",
+		"create table pending_alias_api_keys",
+		"create table consumed_messages",
+		"create table imap_seen_tasks",
+	} {
+		if !strings.Contains(fresh, wanted) {
+			t.Errorf("fresh v7 PostgreSQL schema is missing compatibility structure %q", wanted)
+		}
+	}
+	const convergenceIndex = `create index if not exists archived_messages_retention_idx on archived_messages(content_state, internal_date, id)`
 	if !containsNormalizedSQL(postgresSchemaConvergence, convergenceIndex) {
-		t.Fatalf("PostgreSQL v6 convergence is missing %q", convergenceIndex)
+		t.Fatalf("PostgreSQL v7 convergence is missing %q", convergenceIndex)
 	}
 }
 

@@ -61,6 +61,9 @@ func (s *Store) CreateAccount(ctx context.Context, account domain.Account) (doma
 // endpoint or username) also discards mailbox identity state because UIDs are
 // meaningful only to that source.
 func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (domain.Account, error) {
+	unlockArchive := s.lockMailArchiveAccount(account.ID)
+	defer unlockArchive()
+
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("begin account update: %w", err)
@@ -143,6 +146,9 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 		}
 	}
 	if passwordChanged || reenabled || mailboxSourceChanged || emailChanged {
+		// The next sync establishes a new no-backfill boundary. Password rotation
+		// and re-enabling preserve stored mail; changing the mailbox source clears
+		// every UID-scoped projection below.
 		if _, err := s.txExecContext(ctx, tx, `DELETE FROM imap_sync_states WHERE account_id = ?`, account.ID); err != nil {
 			return domain.Account{}, fmt.Errorf("delete account IMAP sync state: %w", err)
 		}
@@ -166,6 +172,23 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 			if _, err := s.txExecContext(ctx, tx, `DELETE FROM imap_seen_tasks WHERE account_id = ?`, account.ID); err != nil {
 				return domain.Account{}, fmt.Errorf("delete account IMAP seen tasks: %w", err)
 			}
+			// The normalized v2 archive uses the upstream UID identity as an
+			// account-scoped key. A different source may reuse the same values, so
+			// remove the old generation and invalidate every public IMAPS mailbox.
+			if _, err := s.txExecContext(ctx, tx, `DELETE FROM archived_messages WHERE account_id = ?`, account.ID); err != nil {
+				return domain.Account{}, fmt.Errorf("delete account archived messages: %w", err)
+			}
+			if _, err := s.txExecContext(ctx, tx, `
+				UPDATE aliases
+				SET mailbox_uid_validity = CASE
+						WHEN mailbox_uid_validity >= 4294967295 THEN 1
+						ELSE mailbox_uid_validity + 1
+					END,
+					mailbox_uid_next = 1,
+					updated_at = ?
+				WHERE account_id = ?`, timestamp(now), account.ID); err != nil {
+				return domain.Account{}, fmt.Errorf("reset alias mailbox generation: %w", err)
+			}
 		}
 		if _, err := s.txExecContext(ctx, tx, `
 			UPDATE aliases
@@ -184,9 +207,21 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 		}
 	}
 
+	quarantine := mailArchiveQuarantine{}
+	if mailboxSourceChanged {
+		quarantine, err = s.quarantineMailArchiveAccount(account.ID)
+		if err != nil {
+			return domain.Account{}, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
+		_ = tx.Rollback()
+		if restoreErr := quarantine.restore(); restoreErr != nil {
+			return domain.Account{}, fmt.Errorf("commit account update: %w", errors.Join(err, restoreErr))
+		}
 		return domain.Account{}, fmt.Errorf("commit account update: %w", err)
 	}
+	quarantine.discard()
 	return s.getAccountAfterWrite(account.ID)
 }
 
@@ -317,11 +352,27 @@ func escapeLikePattern(value string) string {
 }
 
 func (s *Store) DeleteAccount(ctx context.Context, id int64) error {
+	unlockArchive := s.lockMailArchiveAccount(id)
+	defer unlockArchive()
+	quarantine, err := s.quarantineMailArchiveAccount(id)
+	if err != nil {
+		return err
+	}
 	result, err := s.execContext(ctx, `DELETE FROM accounts WHERE id = ?`, id)
 	if err != nil {
+		if restoreErr := quarantine.restore(); restoreErr != nil {
+			return fmt.Errorf("delete account: %w", errors.Join(err, restoreErr))
+		}
 		return fmt.Errorf("delete account: %w", err)
 	}
-	return requireAffected(result, "account")
+	if err := requireAffected(result, "account"); err != nil {
+		if restoreErr := quarantine.restore(); restoreErr != nil {
+			return errors.Join(err, restoreErr)
+		}
+		return err
+	}
+	quarantine.discard()
+	return nil
 }
 
 func (s *Store) SetAccountSyncStatus(

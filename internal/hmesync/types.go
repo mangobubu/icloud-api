@@ -28,14 +28,30 @@ type Repository interface {
 	ImportAliases(context.Context, int64, []domain.AliasImportCandidate) (domain.AliasImportResult, error)
 }
 
-// AutoCreateRepository is the additional persistence surface used only by the
-// background creator. Keeping it separate preserves source compatibility for
-// callers that only implement interactive Apple directory sync.
+// CredentialImportRepository is an optional richer import surface used when
+// callers need the newly issued raw API keys in the sync response.
+type CredentialImportRepository interface {
+	ImportAliasesWithCredentials(context.Context, int64, []domain.AliasImportCandidate) (domain.AliasImportResult, []domain.AliasImportCredential, error)
+}
+
+// AutoCreateRepository is the original automatic-creation persistence
+// contract. Keep this interface source-compatible for existing embedders.
 type AutoCreateRepository interface {
 	Repository
 	CountEnabledAliasesByAccount(context.Context, int64) (int, error)
 	CreateAliasWithPendingAPIKey(context.Context, domain.AppleWebSession, domain.Alias, string) (domain.Alias, domain.AppleWebSession, error)
 	GetPendingAutoAliasConfirmation(context.Context, int64) (domain.PendingAliasAPIKey, error)
+	ConfirmPendingAutoAlias(context.Context, domain.AppleWebSession, int64) (domain.Alias, domain.AppleWebSession, error)
+}
+
+// ModernAutoCreateRepository is the transitional richer shape used by older
+// PR2 adapters. The service accepts both shapes so changing an adapter does not
+// turn automatic creation into a runtime-unavailable operation.
+type ModernAutoCreateRepository interface {
+	Repository
+	CountEnabledAliasesByAccount(context.Context, int64) (int, error)
+	CreateAutoAliasCandidate(context.Context, domain.AppleWebSession, domain.Alias) (domain.Alias, domain.AppleWebSession, error)
+	GetPendingAutoAliasConfirmation(context.Context, int64) (domain.Alias, error)
 	ConfirmPendingAutoAlias(context.Context, domain.AppleWebSession, int64) (domain.Alias, domain.AppleWebSession, error)
 }
 

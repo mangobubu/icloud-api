@@ -31,11 +31,25 @@ func requestCookieCount(r *http.Request, name string) int {
 }
 
 func (s *Server) setSessionCookie(c *gin.Context, token string) {
-	http.SetCookie(c.Writer, &http.Cookie{Name: sessionCookie, Value: token, Path: "/admin", MaxAge: int(s.cfg.SessionTTL.Seconds()), HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(c.Writer, &http.Cookie{Name: sessionCookie, Value: token, Path: s.cfg.AdminPath, MaxAge: int(s.cfg.SessionTTL.Seconds()), HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
+}
+
+func (s *Server) setSessionCookies(c *gin.Context, token string) {
+	s.setSessionCookie(c, token)
+	if s.cfg.AdminPath != "/admin" {
+		http.SetCookie(c.Writer, &http.Cookie{Name: sessionCookie, Value: token, Path: "/admin", MaxAge: int(s.cfg.SessionTTL.Seconds()), HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
+	}
 }
 
 func (s *Server) clearSessionCookie(c *gin.Context) {
-	http.SetCookie(c.Writer, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", MaxAge: -1, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(c.Writer, &http.Cookie{Name: sessionCookie, Value: "", Path: s.cfg.AdminPath, MaxAge: -1, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
+}
+
+func (s *Server) clearSessionCookies(c *gin.Context) {
+	s.clearSessionCookie(c)
+	if s.cfg.AdminPath != "/admin" {
+		http.SetCookie(c.Writer, &http.Cookie{Name: sessionCookie, Value: "", Path: "/admin", MaxAge: -1, HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
+	}
 }
 
 func (s *Server) audit(c *gin.Context, adminID *int64, username, action, resourceType, resourceID, result, detail string) {

@@ -1,438 +1,235 @@
 openapi: 3.1.0
 info:
-  title: iCloud 隐私邮箱 API
+  title: 隐私邮箱外部取件 API v2
   version: 2.0.0
   description: |
-    每个隐私邮箱使用独立的 API Key。服务端根据该 Key 绑定到唯一隐私邮箱，
-    只返回该隐私邮箱通过所属 iCloud 主号级 `UNSEEN` 同步写入的最新数据库快照。
-    邮件可用性按隐私邮箱自身的同步状态和同步时间独立判断，而不是直接使用主号的整体同步状态。
-    `/api/v1/aliases` 使用部署时配置的独立 OAuth Bearer 令牌，将已存在的隐私邮箱登记到现有主号；
-    管理端可按主号选择性开启 Apple Hide My Email 自动创建，每 60 分钟最多尝试 5 次，
-    每次间隔至少 5 分钟。自动创建的原始 API Key 进入加密的待领取队列，不会出现在日志中。
-    `/api/v1/mail/latest` 使用 Bearer Header，可重复返回已保存快照的完整 UTC 数据，
-    且不消费邮件或改变已读状态；`/api/v1/mail/recent` 使用 URL 查询参数，一次性消费
-    IMAP 收件时间位于最近一小时内的当前最新邮件，并返回按服务端 `TZ` 格式化的紧凑数据。
-    两个邮件查询接口在鉴权后都会非阻塞唤醒所属主号的后台同步；同一主号 10 秒内的重复唤醒会合并，
-    当前 HTTP 响应仍只读取 PostgreSQL 快照，不等待 IMAP 网络操作完成。
+    本文档主要描述外部接口，并记录升级所需的少量管理兼容接口。服务提供两种
+    取件能力：标准只读 IMAPS，以及使用 API Key 或派生取码 URL 读取验证码历史。
 
-    管理端 Apple 接口使用 Apple 账户密码和双重认证建立受信任 Web 会话，并通过
-    `/v2/hme/list` 读取完整 Hide My Email 目录；账户密码和验证码不落库，仅加密保存会话。
-    该会话不参与邮件获取。邮件同步通过每个主号保存的隐式 TLS IMAP 服务（创建时默认
-    `imap.mail.me.com:993`）与 App 专用密码执行主号级
-    `UNSEEN` 发现，再用 `BODY.PEEK` 读取未读候选的邮件头和正文。首次同步、游标重置或 UIDVALIDITY
-    变化时只先确定最近最多 1024 封邮件的窗口边界，后续仍仅分批处理窗口内的 `UNSEEN`；
-    不读取已读邮件正文，也不恢复各隐私邮箱的历史 IMAP 快照。部署前提是没有其他邮件客户端或外部流程
-    在服务同步前读取该 INBOX。直达接口只查询 PostgreSQL；成功消费后，后台按主号异步把对应 UID 标记为 `\Seen`。
+    管理端可为每个主号配置上游隐式 TLS IMAP 主机和端口；创建时默认使用
+    `imap.mail.me.com:993`。修改规范化后的主机、端口或用户名代表切换邮箱来源，会清理
+    旧来源的同步游标、兼容快照、消费历史、待处理 `\\Seen` 任务、v2 归档和 OTP 历史，
+    轮换公开 IMAPS 的 `UIDVALIDITY`，并将同步状态重置为 `pending`。
+
+    IMAPS 用户名是隐私邮箱地址。客户端可以使用本服务签发的 IMAP 密码登录，
+    或通过 `POST /oauth2/v2.0/token` 获取一小时访问令牌后使用 XOAUTH2。
+    邮箱只有只读 INBOX，支持 LIST、STATUS、SELECT/EXAMINE、SEARCH、
+    FETCH/UID FETCH 和 IDLE；所有写操作返回只读错误。
+
+    新 v2 alias 的 API Key、IMAP 密码、client ID、refresh token 与 access token
+    均由本服务签发。legacy alias 的兼容轮换只替换 API Key 和由其派生的旧直达链接，
+    保留消费记录、邮件快照和 IMAP Seen 状态；v2 凭证包轮换才会同时使旧 API Key、
+    取码 URL、IMAP 密码、refresh token 和尚未过期的 access token 失效。
+    v2 的只读 OTP URL 与消费 recent-mail URL 使用不同用途的派生 token，不能互换；
+    原 v1 直达 token 只继续授权 legacy alias 的 `/api/v1/mail/recent`。
+    迁移前已经领取的 legacy alias 不会因 schema 升级而轮换。兼容接口
+    `/api/v1/aliases`、`/api/v1/mail/latest` 和 `/api/v1/mail/recent`
+    保留原有路径、鉴权和响应语义。
+
+    迁移前已经领取的 alias 保持 `legacy` API Key；新 alias，以及迁移前尚未领取
+    pending Key 的 alias，才会补齐 v2 凭证。`latest_messages`、消费记录、IMAP `Seen`
+    任务、pending Key 和 `api_key_prefix` 在迁移中保留。
+
+    管理兼容接口同时挂载在安装级随机 `<admin-path>/api/v1` 和固定
+    `/admin/api/v1`。固定入口仅用于旧客户端兼容，不提供管理界面；两个入口执行
+    相同的登录限流、会话认证和 CSRF 校验。随机路径不是访问控制边界。
 servers:
-  - url: http://127.0.0.1:8080
-    description: 默认本地服务地址，可由 ICLOUD_API_ADDR 调整
-tags:
-  - name: Aliases
-    description: 供外部系统登记已存在的隐私邮箱
-  - name: Mail
-    description: 隐私邮箱收件接口
-  - name: Admin Accounts
-    description: 管理端主号与 IMAP 邮件同步
-  - name: Admin Apple
-    description: 管理端 Apple 受信任会话、完整隐私邮箱目录同步与远端永久删除
-  - name: Admin Logs
-    description: 管理端当前进程应用日志
-  - name: Health
-    description: 服务健康检查
-
+  - url: https://HOST
+  # Admin operations below override this server with the installation-specific
+  # path stored in the keys volume.
 paths:
   /api/v1/aliases:
     post:
       tags:
-        - Aliases
-      operationId: createAlias
-      summary: 将已存在的隐私邮箱登记到 iCloud 主号
+        - Legacy Compatibility
+      operationId: createLegacyAlias
+      summary: 兼容登记已存在的隐私邮箱
       description: |
-        使用部署时通过 `ICLOUD_API_OAUTH_TOKEN` 配置的独立 OAuth Bearer 令牌鉴权。
-        令牌必须包含 32 至 4096 个字符且不得包含空白；本接口不接受隐私邮箱自己的 `icm_` 邮件 API Key。
-
-        本接口只在本地登记已经由 Apple/iCloud 创建并启用的隐私邮箱，不会调用 Apple 创建地址；
-        Apple 地址的自动创建只通过管理端主号级开关触发。
-        `add_hide_my_eamil` 是兼容契约中保留的字段拼写，表示待登记的隐私邮箱；
-        `icloud` 表示已在管理端登记的所属 iCloud 主号邮箱。
-        隐私邮箱不能与任何已登记主号邮箱或所选主号的 IMAP 用户名相同。
-
-        推荐把两个字段放入 `application/x-www-form-urlencoded` 正文。为兼容已有调用方，
-        也可将字段放在 URL 查询串中；查询串会将邮箱暴露给代理日志、监控和浏览器历史。
-        每个字段在查询串与正文合计必须恰好出现一次，重复字段及未知字段均返回 400。
-        只要请求含有正文，其 Content-Type 就必须是 `application/x-www-form-urlencoded`。
-
-        成功响应中的 `api_key` 是新隐私邮箱仅显示一次的原始邮件 API Key；
-        `mail_api_direct_link` 是同源相对路径，其 `api_key` 查询参数是服务端生成的派生直达凭据，
-        不是原始 `api_key`。直达链接按当前 UID 一次性消费邮件并异步设置主号全局 `\Seen`；链接本身
-        在成功消费后仍有效，后续未消费的新 UID 到来时可再次使用。新地址初始为 `pending`，须等待
-        下一轮同步确认后才能按收件 API 规则使用。
-        所有成功及错误响应均包含 `Cache-Control: no-store`。
+        保留 v1 的字段拼写 `add_hide_my_eamil`、`icloud`。两个字段可放在 query、
+        `application/x-www-form-urlencoded` 正文，或分别放在两处；query 与正文合并后
+        每个字段必须恰好出现一次，且不能包含其他字段。正文为空时不要求
+        `Content-Type`。使用部署级 `ICLOUD_API_OAUTH_TOKEN` 的严格单一 Bearer 鉴权；
+        成功响应直接返回 `api_key` 和 `mail_api_direct_link`；v2 凭证随后仍可由
+        已认证管理端读取。该接口只登记 Apple 端已经存在的隐私邮箱，不负责创建
+        地址。query 与正文合计不得超过 4 KiB。
+      x-runtime-constraint:
+        query-form-merge: >-
+          OpenAPI 无法表达跨 query 与表单正文的联合必填约束；服务端合并两处参数后，
+          要求 add_hide_my_eamil 与 icloud 各恰好出现一次，并拒绝任何其他字段。
       security:
         - externalOAuthToken: []
       parameters:
         - name: add_hide_my_eamil
           in: query
           required: false
-          description: 兼容用法；待登记的隐私邮箱。推荐改用表单正文，且查询串与正文合计必须恰好出现一次。
+          description: 可替代表单字段；合并 query 与正文后必须恰好出现一次。
           schema:
             type: string
             format: email
         - name: icloud
           in: query
           required: false
-          description: 兼容用法；所属 iCloud 主号邮箱。推荐改用表单正文，且查询串与正文合计必须恰好出现一次。
+          description: 可替代表单字段；合并 query 与正文后必须恰好出现一次。
           schema:
             type: string
             format: email
       requestBody:
         required: false
-        description: |
-          推荐的参数传递方式。两个字段也可分别从查询串提供，但每个字段在查询串与正文合计必须恰好出现一次。
         content:
           application/x-www-form-urlencoded:
             schema:
-              type: object
-              additionalProperties: false
-              properties:
-                add_hide_my_eamil:
-                  type: string
-                  format: email
-                  description: 待登记的、已经由 Apple/iCloud 创建并启用的隐私邮箱。
-                icloud:
-                  type: string
-                  format: email
-                  description: 已在管理端登记的所属 iCloud 主号邮箱。
+              $ref: "#/components/schemas/LegacyAliasRequest"
             example:
               add_hide_my_eamil: alias@icloud.com
               icloud: primary@icloud.com
       responses:
         "201":
-          description: 隐私邮箱登记成功，并生成邮件 API Key 与派生直达链接
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
+          description: 登记成功并返回兼容 API Key 与直达链接
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CreateAliasResponse"
-              example:
-                data:
-                  alias: alias@icloud.com
-                  icloud: primary@icloud.com
-                  api_key: icm_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
-                  mail_api_direct_link: /api/v1/mail/recent?api_key=icm_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA
+                $ref: "#/components/schemas/LegacyAliasResponse"
         "400":
-          $ref: "#/components/responses/CreateAliasBadRequest"
+          $ref: "#/components/responses/InvalidRequest"
         "401":
-          $ref: "#/components/responses/CreateAliasUnauthorized"
+          $ref: "#/components/responses/InvalidOAuthToken"
         "404":
-          $ref: "#/components/responses/CreateAliasAccountNotFound"
+          $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/CreateAliasConflict"
+          $ref: "#/components/responses/Conflict"
         "413":
-          $ref: "#/components/responses/CreateAliasRequestTooLarge"
+          $ref: "#/components/responses/RequestTooLarge"
         "415":
-          $ref: "#/components/responses/CreateAliasUnsupportedMediaType"
+          $ref: "#/components/responses/UnsupportedMediaType"
         "429":
-          $ref: "#/components/responses/CreateAliasRateLimited"
+          $ref: "#/components/responses/RateLimited"
         "500":
-          $ref: "#/components/responses/CreateAliasInternalError"
+          $ref: "#/components/responses/InternalError"
         "503":
-          $ref: "#/components/responses/CreateAliasUnavailable"
+          $ref: "#/components/responses/Unavailable"
 
   /api/v1/mail/latest:
     get:
       tags:
-        - Mail
-      operationId: getLatestMail
-      summary: 可重复获取当前隐私邮箱的最新一封邮件
+        - Legacy Compatibility
+      operationId: getLegacyLatestMail
+      summary: 兼容读取当前最新完整邮件快照
       description: |
-        使用隐私邮箱自己的 API Key 鉴权。Key 只会解析到它绑定的隐私邮箱，
-        因此响应不会包含同一主号下其他隐私邮箱的邮件。
-
-        隐私邮箱的同步状态语义如下：
-        - `pending`：新建、重新启用、配置重置后尚待主号级未读同步，或仍在分批追平；
-        - `error`：最近一次主号级未读同步失败；
-        - `ok`：最近一次主号级未读同步已追平，可以按 PostgreSQL 当前快照作答；该状态不表示逐个扫描过隐私邮箱的全部 IMAP 历史。
-
-        只有状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过
-        `max(3*ICLOUD_API_POLL_INTERVAL, ICLOUD_API_SYNC_TIMEOUT+2*ICLOUD_API_POLL_INTERVAL)` 时，
-        才继续判断最新邮件快照。快照存在时返回 200，不额外限制邮件年龄；快照不存在时返回 404；
-        其他同步状态返回 503。
-
-        本接口不检查或写入一次性消费状态，不创建 IMAP `\Seen` 任务。重复请求同一个
-        `message.id` 仍可返回 200；即使同一 UID 已通过 `/api/v1/mail/recent` 消费，
-        本接口仍按上述快照与同步状态规则返回它。
-
-        成功响应保留完整邮件结构，所有时间字段统一使用 RFC 3339/UTC，不受服务端 `TZ` 影响。
+        使用原有 `Authorization: Bearer <API Key>`。请求可重复执行，不消费邮件，
+        不写入消费记录，也不改变 IMAP `Seen` 状态；已领取 legacy Key 和 v2 Key
+        均可按绑定 alias 读取。
       security:
-        - aliasApiKey: []
+        - aliasAPIKey: []
       responses:
         "200":
-          description: 当前隐私邮箱同步结果仍新鲜，且存在已保存的最新邮件快照；同一快照可重复读取且不触发消费或 `\Seen`
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
+          description: 当前最新邮件快照
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/LatestMailResponse"
-              examples:
-                latestMail:
-                  summary: 最新邮件
-                  value:
-                    data:
-                      alias: orders@example.icloud.com
-                      message:
-                        id: 9283641-1842
-                        message_id: "<message-1842@example.com>"
-                        received_at: "2026-08-06T12:30:45Z"
-                        sent_at: "2026-08-06T12:30:12Z"
-                        from:
-                          - name: Example Store
-                            email: notice@example.com
-                        to:
-                          - email: orders@example.icloud.com
-                        cc: []
-                        subject: 订单已确认
-                        text: 您的订单已确认。
-                        html: "<p>您的订单已确认。</p>"
-                        attachments: []
-                        has_attachments: false
-                        body_truncated: false
-                      synced_at: "2026-08-06T12:31:00Z"
-                      stale: false
+                $ref: "#/components/schemas/LegacyLatestMailResponse"
         "401":
-          description: Authorization 缺失、格式错误、Key 无效，或绑定的隐私邮箱/主号已停用
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error:
-                  code: INVALID_API_KEY
-                  message: API Key 无效
-                  request_id: 6oe7j0x3x3pJv9Dv
+          $ref: "#/components/responses/InvalidCredential"
         "404":
-          description: 当前隐私邮箱同步结果仍新鲜，但没有邮件快照
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error:
-                  code: MAIL_NOT_FOUND
-                  message: 尚未收到邮件
-                  request_id: 6oe7j0x3x3pJv9Dv
+          $ref: "#/components/responses/MailNotFound"
         "429":
-          description: 此隐私邮箱 API Key 在当前限流窗口内请求过多
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error:
-                  code: RATE_LIMITED
-                  message: 请求过于频繁
-                  request_id: 6oe7j0x3x3pJv9Dv
+          $ref: "#/components/responses/RateLimited"
         "503":
-          description: |
-            当前隐私邮箱状态不是 ok、从未完成同步、最后同步时间晚于当前时间，
-            或最后同步时间已超过 `max(3*poll_interval, sync_timeout+2*poll_interval)` 时返回 SYNC_UNAVAILABLE；
-            查询 Key 或最新邮件快照时数据库暂不可用则返回 DATABASE_UNAVAILABLE。
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              examples:
-                syncUnavailable:
-                  summary: 隐私邮箱同步状态不可用
-                  value:
-                    error:
-                      code: SYNC_UNAVAILABLE
-                      message: 邮箱同步暂不可用
-                      request_id: 6oe7j0x3x3pJv9Dv
-                databaseUnavailable:
-                  summary: 数据库查询暂不可用
-                  value:
-                    error:
-                      code: DATABASE_UNAVAILABLE
-                      message: 数据库暂不可用
-                      request_id: 6oe7j0x3x3pJv9Dv
+          $ref: "#/components/responses/Unavailable"
 
   /api/v1/mail/recent:
     get:
       tags:
-        - Mail
-      operationId: getRecentMail
-      summary: 通过可直接访问的链接一次性消费最近一小时内的最新邮件
+        - Legacy Compatibility
+      operationId: getLegacyRecentMail
+      summary: 兼容消费最近一小时内的当前邮件
       description: |
-        使用必填且只能出现一次的查询参数 `api_key` 鉴权；Bearer Header 不能替代该查询参数。
-        查询参数既接受隐私邮箱的原始 API Key，也接受管理端操作列复制的派生直达凭据。
-        两种凭据都只解析到它绑定的唯一隐私邮箱；接口不接受邮箱地址参数，也不会返回同一主号下其他隐私邮箱的邮件。
-        派生直达凭据不能用于 `/api/v1/mail/latest` 的 Bearer 鉴权，并会在隐私邮箱 API Key 轮换后失效。
-
-        只有该隐私邮箱状态为 `ok`、`last_synced_at` 存在、没有晚于当前时间且距今不超过
-        `max(3*ICLOUD_API_POLL_INTERVAL, ICLOUD_API_SYNC_TIMEOUT+2*ICLOUD_API_POLL_INTERVAL)`，
-        当前最新邮件快照的 IMAP INTERNALDATE 位于最近一小时内，并且该隐私邮箱从未消费当前
-        `UIDVALIDITY + UID` 时才返回 200。接口只检查当前最新快照，不会回退到次新邮件。
-
-        返回 200 前，服务会在同一个 PostgreSQL 事务中原子确认当前快照、记录该 UID 已消费，
-        并写入持久化的 IMAP `\Seen` 队列。对同一 UID 的并发请求中只有一个请求会成功；消费成功后，
-        同一 UID 的后续请求返回 404 `MAIL_NOT_FOUND`，直到同步到未消费的新 UID。服务按隐私邮箱保留
-        已消费 `(UIDVALIDITY, UID)` 的严格历史；数据库快照再次指向已消费 UID 时仍返回 404，
-        `UIDVALIDITY` 则隔离不同邮箱代际的相同 UID。iCloud 删除当前邮件不会触发历史扫描或次新邮件回退。
-        没有快照、快照在消费事务提交前发生变化、
-        最新邮件的 IMAP INTERNALDATE 缺失、为未来时间、不在最近一小时或已经消费时均返回 404；
-        同步状态不可用时返回 503。
-
-        `\Seen` 写回由后台按主号异步执行，不阻塞本接口。iCloud 已读状态可能短暂延迟；IMAP 操作失败时
-        持久任务会等待重试，已提交的消费不会回滚。`\Seen` 是主号 `INBOX` 中该邮件的全局状态，
-        Apple Mail、iCloud Mail 和其他 IMAP 客户端也会看到该邮件变为已读。
-
-        成功响应是仅包含 `data` 的顶层 JSON 对象；`data` 仅包含 `address`、`subject`、`snippet`
-        和 `sent_at`。`sent_at` 优先使用邮件 Date 头，缺失或无效时回退到 IMAP 收件时间，
-        并按服务端 `TZ` 对应时区输出 RFC 3339；例如 `TZ=Asia/Shanghai` 时包含 `+08:00` 偏移。
-        `snippet` 是单行纯文本，优先使用邮件声明的纯文本正文；纯文本为空时从 HTML 正文中
-        提取可读文字，并过滤结构标签、样式、脚本及常见的内联隐藏内容。两种来源中的换行、
-        制表符和连续空白都会压缩成一个普通空格。
-        只有收件时间处于 `[当前时间-1小时, 当前时间]` 区间的快照才会返回；时区转换只影响显示，
-        不改变最近一小时的绝对时间窗口。
-
-        消费事务在响应写出前提交，因此客户端超时、断线或未收到 200 时，邮件仍可能已经消费，
-        重试将得到 404；需要可恢复或可重复读取时应使用 `/api/v1/mail/latest`。
-
-        注意：这是具有一次性消费和异步已读副作用的 `GET`。浏览器预取、链接预览和安全扫描器
-        可能在实际访客之前访问并消费邮件，不要把直达链接交给会自动访问 URL 的系统。查询参数中的
-        Key 会出现在浏览器历史中，并可能被反向代理或外围监控记录、通过 Referer 泄露。本应用内置
-        HTTP 日志只记录 URL 路径，不记录查询字符串，但不能代替外围系统的脱敏配置。完整 URL 必须
-        按密钥保护，只能通过 HTTPS 使用，并应在代理层删除或脱敏查询字符串日志。能设置请求头的
-        客户端应优先使用可重复读取且不触发消费的 `/api/v1/mail/latest`；怀疑链接泄露后应立即轮换 Key。
+        使用原有 `api_key` 查询参数（只能出现一次），接受 API Key、legacy alias 的
+        原 v1 直达 token，或 v2 alias 的 recent-mail 专用 token。成功后原子记录消费
+        状态并异步写入主号 IMAP `Seen`；同一 UID 的后续请求继续返回
+        `MAIL_NOT_FOUND`。旧 legacy 直达链接保持路径和 token 不变；OTP 专用 token
+        不授权此接口。
       security:
-        - aliasApiKeyQuery: []
+        - aliasAPIKeyQuery: []
+      parameters:
+        - name: api_key
+          in: query
+          required: true
+          schema:
+            type: string
       responses:
         "200":
-          description: 当前隐私邮箱同步结果仍新鲜，当前最新邮件位于最近一小时内且从未消费；响应前已原子记录消费并持久化 `\Seen` 任务
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
+          description: 当前快照已消费并加入 IMAP Seen 队列
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RecentMailResponse"
-              example:
-                data:
-                  address: user@icloud.com
-                  subject: Your ChatGPT verification code
-                  snippet: Your code is 123456
-                  sent_at: "2026-08-07T12:30:00+08:00"
+                $ref: "#/components/schemas/LegacyRecentMailResponse"
         "401":
-          description: api_key 查询参数缺失、格式错误、凭据无效，或绑定的隐私邮箱/主号已停用
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error:
-                  code: INVALID_API_KEY
-                  message: API Key 无效
-                  request_id: 6oe7j0x3x3pJv9Dv
+          $ref: "#/components/responses/InvalidCredential"
         "404":
-          description: 当前隐私邮箱同步结果仍新鲜，但没有邮件快照、快照在消费前变化、当前最新邮件不在 [当前时间-1小时, 当前时间] 区间内，或该 (UIDVALIDITY, UID) 已在消费历史中；这些情况均返回 MAIL_NOT_FOUND
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error:
-                  code: MAIL_NOT_FOUND
-                  message: 最近一小时内没有邮件
-                  request_id: 6oe7j0x3x3pJv9Dv
+          $ref: "#/components/responses/MailNotFound"
         "429":
-          description: 此隐私邮箱 API Key 在当前限流窗口内请求过多
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error:
-                  code: RATE_LIMITED
-                  message: 请求过于频繁
-                  request_id: 6oe7j0x3x3pJv9Dv
+          $ref: "#/components/responses/RateLimited"
         "503":
-          description: |
-            当前隐私邮箱状态不是 ok、从未完成同步、最后同步时间晚于当前时间，
-            或最后同步时间已超过 `max(3*poll_interval, sync_timeout+2*poll_interval)` 时返回 SYNC_UNAVAILABLE；
-            查询 Key 或最新邮件快照、原子记录消费或持久化 `\Seen` 任务时数据库暂不可用，
-            则返回 DATABASE_UNAVAILABLE；消费记录与 `\Seen` 任务在同一事务中一起提交或一起回滚。
+          $ref: "#/components/responses/Unavailable"
+
+  /api/v1/otp:
+    get:
+      summary: 读取当前隐私邮箱的验证码历史
+      description: |
+        返回最新优先、持续累积的裸数组，每个邮箱最多 100 条。
+        重复读取不会消费验证码，也不会修改邮件已读状态。没有验证码时返回 `200 []`。
+        调用方必须二选一：使用 Bearer API Key，或传入管理端签发取码 URL 中的 OTP
+        专用派生 token。recent-mail token 和原 v1 直达 token 不授权此接口。
+      security:
+        - aliasAPIKey: []
+        - derivedToken: []
+      parameters:
+        - name: token
+          in: query
+          required: false
+          description: 取码 URL 中的 OTP 专用派生 token；使用时不得同时发送 Authorization。
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "200":
+          description: 验证码历史；没有记录时为一个空数组。
           headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
             Cache-Control:
-              $ref: "#/components/headers/NoStore"
+              schema:
+                type: string
+              example: no-store
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                type: array
+                maxItems: 100
+                items:
+                  $ref: "#/components/schemas/OTPRecord"
               examples:
-                syncUnavailable:
-                  summary: 隐私邮箱同步状态不可用
+                records:
                   value:
-                    error:
-                      code: SYNC_UNAVAILABLE
-                      message: 邮箱同步暂不可用
-                      request_id: 6oe7j0x3x3pJv9Dv
-                databaseUnavailable:
-                  summary: 数据库查询暂不可用
-                  value:
-                    error:
-                      code: DATABASE_UNAVAILABLE
-                      message: 数据库暂不可用
-                      request_id: 6oe7j0x3x3pJv9Dv
+                    - otp: "123456"
+                      time: "2026-08-11T12:00:00+08:00"
+                empty:
+                  value: []
+        "401":
+          $ref: "#/components/responses/InvalidCredential"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/Unavailable"
 
-  /admin/api/v1/accounts:
+  /api/v1/accounts:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
     get:
       tags:
         - Admin Accounts
@@ -567,7 +364,17 @@ paths:
         "500":
           $ref: "#/components/responses/AdminInternalError"
 
-  /admin/api/v1/accounts/{id}:
+
+  /api/v1/accounts/{id}:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
     get:
       tags:
         - Admin Accounts
@@ -604,9 +411,10 @@ paths:
       description: |
         更新主号配置。省略 `imap_host` 或 `imap_port` 时分别保留当前值，显式传入 `null` 则
         返回 400。规范化后的 IMAP 主机、端口或用户名实际发生变化后，服务会清除该主号旧邮箱
-        来源的同步游标、邮件快照、消费历史和待处理 `\Seen` 任务，并在下次同步确认前把主号及
-        所属隐私邮箱的同步状态重置为 `pending`。修改 App 专用密码也会重置同步状态；
-        `imap_password` 省略、传 `null` 或传空字符串时均保留当前密码。
+        来源的同步游标、兼容快照、消费历史、待处理 `\Seen` 任务、v2 归档和 OTP 历史，轮换
+        公开 IMAPS 的 `UIDVALIDITY`，并在下次同步确认前把主号及所属隐私邮箱的同步状态重置为
+        `pending`。修改 App 专用密码也会重置同步状态，但保留已有邮件；`imap_password` 省略、
+        传 `null` 或传空字符串时均保留当前密码。
         已有隐私邮箱后，仅主号邮箱不可修改；IMAP 主机、端口和用户名仍可修改。
       security:
         - adminSession: []
@@ -662,8 +470,8 @@ paths:
       summary: 删除主号
       description: |
         永久删除本地主号及其所属隐私邮箱、API Key、邮件快照、消费历史、待处理 `\Seen` 任务、
-        IMAP 同步游标、Apple Web 会话和自动创建计划。该操作只清理本地数据，不会删除 Apple
-        Hide My Email 中的远端地址。
+        v2 归档元数据和 MIME 文件、IMAP 同步游标、Apple Web 会话和自动创建计划。该操作只
+        清理本地数据，不会删除 Apple Hide My Email 中的远端地址。
       security:
         - adminSession: []
       parameters:
@@ -686,455 +494,93 @@ paths:
         "500":
           $ref: "#/components/responses/AdminInternalError"
 
-  /admin/api/v1/accounts/{id}/sync:
+
+  /oauth2/v2.0/token:
     post:
-      tags:
-        - Admin Accounts
-      operationId: syncAdminAccount
-      summary: 立即同步主号邮件
+      summary: 用 refresh token 换取 IMAPS XOAUTH2 访问令牌
       description: |
-        使用该主号的一条 IMAP 连接执行一个有界未读同步批次，并把邮件快照写入 PostgreSQL。
-        所有路径都按主号级游标只处理 `UNSEEN`，每批最多提交 256 封；已读 UID 只用于推进游标，
-        不进入邮件头或正文读取。首次同步、游标重置或 UIDVALIDITY 变化时，先用少量 sequence UID 查询
-        确定最近最多 1024 封邮件的窗口边界并提交该边界，后续批次再只处理窗口内的 `UNSEEN`。
-        确定边界不会读取邮件头或正文，也不会读取、校验或恢复每个隐私邮箱的历史 IMAP 快照。
-        因此部署时不要让其他客户端或外部流程在本服务同步前标记邮件已读。邮件头和正文通过
-        `BODY.PEEK` 读取，本操作本身不会改变 `\Seen`。隐私邮箱不会分别连接 iCloud，本接口也不等待
-        或执行直达消费产生的异步 `\Seen` 队列。
-
-        较小的 UID 数值区间使用有界 `UID SEARCH ... UNSEEN`；较大或稀疏的区间先用少量
-        sequence `FETCH UID` 探测定位起点，再用一次最多返回 257 条的 `FETCH (UID FLAGS)`
-        检查窗口。后续邮件头和正文始终只处理其中最早的最多 256 封未读邮件，成功提交游标后
-        再继续下一批。
-
-        请求会把主号加入去重的后台同步队列并立即返回 202；同一主号已有手动任务时重复请求会合并。
-        后台任务先等待取得该主号的账号同步锁和全局 IMAP 连接额度，随后才开始计算整轮同步预算。
-        `ICLOUD_API_SYNC_TIMEOUT` 默认 `70s`，这 70 秒全部用于实际数据库读取、IMAP 收取和事务提交；
-        排队等待不占用该预算。每条正文 FETCH 默认最多处理 2 封邮件；只读同步遇到连接关闭时会先新建连接重试，后台调度还会使用短退避继续尝试。
-        每条 IMAP 网络命令仍分别受默认 `8s` 的 `ICLOUD_API_IMAP_TIMEOUT` 限制；
-        自动轮询调度在连接断开时会用 1 秒、3 秒短退避重试（恢复窗口默认 15 秒），并在重试时进一步缩小批量。
-        管理接口和外部取信接口只负责入队，不会在 HTTP 请求内等待这些重试。积压批次会在后台连续处理，
-        客户端可通过主号详情接口轮询最终状态。
-      security:
-        - adminSession: []
-      parameters:
-        - $ref: "#/components/parameters/AdminAccountID"
-        - $ref: "#/components/parameters/AdminCSRFToken"
-      responses:
-        "200":
-          description: 本轮同步成功，主号邮件已经追平；sync_pending 字段省略
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAccountDetailResponse"
-        "202":
-          description: 手动邮件同步已进入后台队列，或同一主号已有任务正在处理
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAccountDetailResponse"
-              example:
-                data:
-                  account:
-                    id: 12
-                    name: 主账号
-                    email: owner@icloud.com
-                    imap_host: imap.mail.me.com
-                    imap_port: 993
-                    imap_username: owner@icloud.com
-                    enabled: true
-                    last_sync_status: pending
-                    last_sync_error: ""
-                    last_sync_error_log: ""
-                    last_synced_at: "2026-08-08T12:30:00Z"
-                    created_at: "2026-08-07T12:00:00Z"
-                    updated_at: "2026-08-08T12:30:00Z"
-                    alias_count: 1
-                    sync_progress:
-                      active: true
-                      source: manual
-                      stage: queued
-                      percentage: 0
-                      started_at: "2026-08-08T12:31:00Z"
-                      updated_at: "2026-08-08T12:31:00Z"
-                  aliases:
-                    - id: 44
-                      account_id: 12
-                      account_email: owner@icloud.com
-                      address: receipts@icloud.com
-                      label: 收据
-                      api_key_prefix: icm_ABCD
-                      direct_link_path: /api/v1/mail/recent?api_key=icm_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA
-                      enabled: true
-                      last_sync_status: pending
-                      last_sync_error: ""
-                      last_sync_error_log: ""
-                      last_synced_at: "2026-08-08T12:30:00Z"
-                      last_accessed_at: null
-                      latest_received_at: "2026-08-08T12:29:00Z"
-                      created_at: "2026-08-07T12:05:00Z"
-                      updated_at: "2026-08-08T12:30:00Z"
-                  apple_session: null
-                  auto_creation:
-                    enabled: false
-                    status: disabled
-                    planned_at: null
-                    planned_times: []
-                    next_run_at: null
-                    last_attempted_at: null
-                    last_created_at: null
-                    last_alias_address: ""
-                    last_error: ""
-                    pending_key_count: 0
-                    pending_auto_created_key_count: 0
-                  sync_pending: true
-        "400":
-          description: id 不是正整数
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAppleErrorResponse"
-              example:
-                error:
-                  code: VALIDATION_FAILED
-                  message: id 参数无效
-                  request_id: 6oe7j0x3x3pJv9Dv
-        "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
-        "403":
-          $ref: "#/components/responses/AdminCSRFForbidden"
-        "404":
-          $ref: "#/components/responses/AdminAccountNotFound"
-        "409":
-          $ref: "#/components/responses/AdminAccountDisabled"
-        "500":
-          $ref: "#/components/responses/AdminInternalError"
-        "502":
-          $ref: "#/components/responses/AdminSyncBadGateway"
-
-  /admin/api/v1/accounts/{id}/apple-auth:
-    parameters:
-      - $ref: "#/components/parameters/AdminAccountID"
-      - $ref: "#/components/parameters/AdminCSRFToken"
-    post:
-      tags:
-        - Admin Apple
-      operationId: startAdminAppleAuth
-      summary: 为主号建立 Apple 受信任 Web 会话
-      description: |
-        使用 Apple ID、Apple 账户密码和所选服务区域发起登录。Apple 账户密码只在本次请求中
-        用于建立 Web 会话，不写入数据库，也不用于 IMAP 收件。若 Apple 要求双重认证，返回
-        `202 verification_required` 和短期有效的 `challenge_id`；否则返回 `200 authenticated`。
-
-        `region=global` 使用全球 iCloud 服务，`region=cn` 使用中国大陆 iCloud 服务。
-        请求必须携带有效的后台会话 Cookie、当前后台会话的 `X-CSRF-Token`，并通过同源校验。
-      security:
-        - adminSession: []
+        此接口是只读 IMAPS 的配套认证接口，不构成第三种取件方式。
+        client ID 与 refresh token 都属于同一个隐私邮箱并由本服务签发。
       requestBody:
         required: true
         content:
-          application/json:
+          application/x-www-form-urlencoded:
             schema:
-              $ref: "#/components/schemas/AdminAppleAuthRequest"
-            example:
-              apple_id: owner@icloud.com
-              password: APPLE_ACCOUNT_PASSWORD
-              region: global
+              type: object
+              additionalProperties: false
+              required: [grant_type, client_id, refresh_token]
+              properties:
+                grant_type:
+                  type: string
+                  const: refresh_token
+                client_id:
+                  type: string
+                refresh_token:
+                  type: string
       responses:
         "200":
-          description: 登录完成，受信任会话已经加密保存
+          description: 一小时有效的 Bearer access token。
           headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
             Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
+              schema:
+                type: string
+              example: no-store
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AdminAppleAuthResponse"
+                $ref: "#/components/schemas/TokenResponse"
               example:
-                data:
-                  status: authenticated
-                  apple_session:
-                    status: authenticated
-                    apple_id: owner@icloud.com
-                    region: global
-                    authenticated_at: "2026-08-07T12:30:00Z"
-                    expires_at: "2026-10-06T12:30:00Z"
-        "202":
-          description: Apple 要求输入 6 位双重认证验证码
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAppleAuthResponse"
-              example:
-                data:
-                  status: verification_required
-                  challenge_id: CHALLENGE_ID
-                  apple_session:
-                    status: verification_required
-                    apple_id: owner@icloud.com
-                    region: global
-                    authenticated_at: null
-                    expires_at: "2026-08-07T12:40:00Z"
+                access_token: ACCESS_TOKEN
+                token_type: Bearer
+                expires_in: 3600
         "400":
-          $ref: "#/components/responses/AdminAppleBadRequest"
+          $ref: "#/components/responses/OAuthInvalidRequest"
         "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
-        "403":
-          $ref: "#/components/responses/AdminCSRFForbidden"
-        "404":
-          $ref: "#/components/responses/AdminAccountNotFound"
-        "409":
-          $ref: "#/components/responses/AdminAppleConflict"
-        "413":
-          $ref: "#/components/responses/AdminJSONTooLarge"
-        "415":
-          $ref: "#/components/responses/AdminUnsupportedMediaType"
-        "422":
-          $ref: "#/components/responses/AdminAppleRejected"
+          $ref: "#/components/responses/OAuthInvalidClient"
         "429":
-          $ref: "#/components/responses/AdminAppleRateLimited"
-        "500":
-          $ref: "#/components/responses/AdminInternalError"
-        "502":
-          $ref: "#/components/responses/AdminAppleBadGateway"
+          $ref: "#/components/responses/OAuthUnavailable"
         "503":
-          $ref: "#/components/responses/AdminAppleUnavailable"
-        "504":
-          $ref: "#/components/responses/AdminAppleTimeout"
-    delete:
-      tags:
-        - Admin Apple
-      operationId: clearAdminAppleAuth
-      summary: 删除主号保存的 Apple Web 会话
-      description: |
-        删除该主号加密保存的受信任 Apple Web 会话及尚未完成的验证码流程。
-        该操作不删除已导入的隐私邮箱，也不影响主号的 IMAP App 专用密码和邮件同步。
-      security:
-        - adminSession: []
-      responses:
-        "204":
-          description: 会话已删除；此前没有保存会话时也返回此状态
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-        "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
-        "403":
-          $ref: "#/components/responses/AdminCSRFForbidden"
-        "404":
-          $ref: "#/components/responses/AdminAccountNotFound"
-        "500":
-          $ref: "#/components/responses/AdminInternalError"
-        "502":
-          $ref: "#/components/responses/AdminAppleBadGateway"
-        "503":
-          $ref: "#/components/responses/AdminAppleUnavailable"
-        "504":
-          $ref: "#/components/responses/AdminAppleTimeout"
+          $ref: "#/components/responses/OAuthUnavailable"
 
-  /admin/api/v1/accounts/{id}/apple-auth/verify:
-    post:
-      tags:
-        - Admin Apple
-      operationId: verifyAdminAppleAuth
-      summary: 提交 Apple 双重认证验证码
-      description: |
-        使用登录步骤返回的 `challenge_id` 提交 6 位数字验证码。挑战只对发起登录的后台管理员、
-        对应主号和当前进程有效，并有短期有效期；成功后只加密保存受信任 Web 会话，
-        `challenge_id` 和验证码均不写入数据库。
-      security:
-        - adminSession: []
-      parameters:
-        - $ref: "#/components/parameters/AdminAccountID"
-        - $ref: "#/components/parameters/AdminCSRFToken"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AdminAppleVerifyRequest"
-            example:
-              challenge_id: CHALLENGE_ID
-              code: "246810"
-      responses:
-        "200":
-          description: 验证完成，受信任会话已经加密保存
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAppleAuthResponse"
-        "400":
-          $ref: "#/components/responses/AdminAppleBadRequest"
-        "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
-        "403":
-          $ref: "#/components/responses/AdminCSRFForbidden"
-        "404":
-          $ref: "#/components/responses/AdminAccountNotFound"
-        "409":
-          $ref: "#/components/responses/AdminAppleConflict"
-        "410":
-          $ref: "#/components/responses/AdminAppleFlowExpired"
-        "413":
-          $ref: "#/components/responses/AdminJSONTooLarge"
-        "415":
-          $ref: "#/components/responses/AdminUnsupportedMediaType"
-        "422":
-          $ref: "#/components/responses/AdminAppleRejected"
-        "429":
-          $ref: "#/components/responses/AdminAppleRateLimited"
-        "500":
-          $ref: "#/components/responses/AdminInternalError"
-        "502":
-          $ref: "#/components/responses/AdminAppleBadGateway"
-        "503":
-          $ref: "#/components/responses/AdminAppleUnavailable"
-        "504":
-          $ref: "#/components/responses/AdminAppleTimeout"
-
-  /admin/api/v1/accounts/{id}/aliases/auto-create:
-    put:
-      tags:
-        - Admin Apple
-      operationId: setAdminAliasAutoCreation
-      summary: 开关主号的隐私邮箱自动创建
-      description: |
-        该开关按主号独立保存。开启时以当前 UTC 时间为锚点生成一小时计划，包含 5 个尝试槽；
-        每个随机间隔至少 5 分钟，5 段间隔合计 60 分钟。计划会持久化，服务重启后不会重新洗牌。
-        开启前必须已有有效的 Apple Web 会话。会话失效不会自动关闭开关，后台任务会记录错误并等待
-        管理员重新登录；达到每主号 1000 个启用隐私邮箱上限后，任务会自动关闭该开关。
-      security:
-        - adminSession: []
-      parameters:
-        - $ref: "#/components/parameters/AdminAccountID"
-        - $ref: "#/components/parameters/AdminCSRFToken"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/AdminAliasAutoCreationRequest"
-            example:
-              enabled: true
-      responses:
-        "200":
-          description: 最新自动创建计划状态
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAutoCreationResponse"
-        "400":
-          $ref: "#/components/responses/AdminAppleBadRequest"
-        "413":
-          $ref: "#/components/responses/AdminJSONTooLarge"
-        "415":
-          $ref: "#/components/responses/AdminUnsupportedMediaType"
-        "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
-        "403":
-          $ref: "#/components/responses/AdminCSRFForbidden"
-        "404":
-          $ref: "#/components/responses/AdminAccountNotFound"
-        "409":
-          description: Apple 会话未登录或主号状态不允许开启
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAppleErrorResponse"
-        "410":
-          $ref: "#/components/responses/AdminAppleFlowExpired"
-        "422":
-          $ref: "#/components/responses/AdminAppleRejected"
-        "429":
-          $ref: "#/components/responses/AdminAppleRateLimited"
-        "500":
-          $ref: "#/components/responses/AdminInternalError"
-        "502":
-          $ref: "#/components/responses/AdminAppleBadGateway"
-        "504":
-          $ref: "#/components/responses/AdminAppleTimeout"
-        "503":
-          $ref: "#/components/responses/AdminAutoCreationUnavailable"
-
-  /admin/api/v1/accounts/{id}/aliases/auto-create/keys:
+  /api/v1/accounts/{id}/aliases/auto-create/keys:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
     get:
       tags:
-        - Admin Apple
-      operationId: getAdminPendingAliasAutoCreationKeys
-      summary: 领取自动创建隐私邮箱的待领取 API Key
-      description: |
-        解密并返回当前队列中的原始 API Key。响应设置为 no-store；每个 Key 只有在管理员随后
-        以 alias ID 确认保存时才会从队列删除。关闭页面或请求失败不会删除队列记录。
+        - Legacy Compatibility
+      operationId: getPendingAliasAutoCreationKeys
+      summary: 读取待领取自动创建 API Key
+      description: 读取不会删除队列；只有随后提交 alias ID 的 DELETE 确认才会删除对应 pending Key。
       security:
         - adminSession: []
       parameters:
         - $ref: "#/components/parameters/AdminAccountID"
       responses:
         "200":
-          description: 当前待领取 Key（可能为空）
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
+          description: 当前待领取 Key 列表
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminPendingAliasKeysResponse"
         "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
+          $ref: "#/components/responses/AdminUnauthorized"
         "404":
-          $ref: "#/components/responses/AdminAccountNotFound"
+          $ref: "#/components/responses/AdminNotFound"
         "500":
           $ref: "#/components/responses/AdminInternalError"
     delete:
       tags:
-        - Admin Apple
-      operationId: acknowledgeAdminPendingAliasAutoCreationKeys
-      summary: 确认已保存指定自动创建 API Key
-      description: |
-        只删除请求中列出的 alias ID，避免领取期间新产生的 Key 被误删。请求必须明确列出本次
-        已保存的 ID；重复 ID 会被服务端去重。该确认操作是幂等的，未知、已经确认或不属于
-        当前主号的 ID 会被静默忽略。
+        - Legacy Compatibility
+      operationId: acknowledgePendingAliasAutoCreationKeys
+      summary: 确认已保存待领取 API Key
+      description: 仅删除请求列出的 alias ID；重复确认幂等，未列出的 pending Key 保留。
       security:
         - adminSession: []
       parameters:
@@ -1146,378 +592,138 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/AdminPendingAliasKeysRequest"
-            example:
-              alias_ids: [44, 45]
       responses:
         "204":
-          description: 指定 Key 已幂等确认；仍在队列中的对应记录已删除
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
+          description: 指定 Key 已确认并从队列删除
         "400":
-          $ref: "#/components/responses/AdminAppleBadRequest"
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          $ref: "#/components/responses/AdminNotFound"
         "413":
-          $ref: "#/components/responses/AdminJSONTooLarge"
+          $ref: "#/components/responses/AdminRequestTooLarge"
         "415":
           $ref: "#/components/responses/AdminUnsupportedMediaType"
-        "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
-        "403":
-          $ref: "#/components/responses/AdminCSRFForbidden"
-        "404":
-          $ref: "#/components/responses/AdminAccountNotFound"
         "500":
           $ref: "#/components/responses/AdminInternalError"
 
-  /admin/api/v1/accounts/{id}/aliases/sync:
+  /api/v1/aliases/{id}/rotate-key:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
     post:
       tags:
-        - Admin Apple
-      operationId: syncAdminAppleAliases
-      summary: 从 Apple 完整目录同步主号的隐私邮箱
+        - Legacy Compatibility
+      operationId: rotateLegacyAliasKey
+      summary: 兼容轮换 alias 的 API Key
       description: |
-        校验已保存的受信任 Web 会话，然后从 Apple `premiummailsettings` 服务的
-        `/v2/hme/list` 一次读取完整 Hide My Email 目录。目录来自 Apple 账户，不扫描收件箱，
-        并同时包含启用与停用地址。服务只处理 `forwardToEmail` 与当前主号邮箱匹配的条目。
-
-        新地址以幂等方式导入并生成只显示一次的独立邮件 API Key；已有地址保留原 ID、Key、
-        本地启停状态、邮件快照、消费历史和待处理 `\Seen` 任务。Apple 已停用的地址以本地 `disabled` 状态导入；达到本地 1000 个启用地址容量后，
-        其余地址仍会导入并标记为 `disabled`。邮件内容不会经过本接口获取，后续仍由
-        当前主号保存的隐式 TLS IMAP 服务（创建时默认 `imap.mail.me.com:993`）与 App 专用密码同步。
-        会话过期时返回 `APPLE_SESSION_EXPIRED`，
-        调用方应重新完成 Apple 登录与双重认证。
-      security:
-        - adminSession: []
-      parameters:
-        - $ref: "#/components/parameters/AdminAccountID"
-        - $ref: "#/components/parameters/AdminCSRFToken"
-      responses:
-        "200":
-          description: 完整目录已同步；`created` 中包含本次新建地址仅显示一次的原始 Key
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAppleSyncResponse"
-        "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
-        "403":
-          $ref: "#/components/responses/AdminCSRFForbidden"
-        "404":
-          $ref: "#/components/responses/AdminAccountNotFound"
-        "409":
-          $ref: "#/components/responses/AdminAppleConflict"
-        "429":
-          $ref: "#/components/responses/AdminAppleRateLimited"
-        "500":
-          $ref: "#/components/responses/AdminInternalError"
-        "502":
-          $ref: "#/components/responses/AdminAppleBadGateway"
-        "503":
-          $ref: "#/components/responses/AdminAppleUnavailable"
-        "504":
-          $ref: "#/components/responses/AdminAppleTimeout"
-
-  /admin/api/v1/aliases/{id}:
-    delete:
-      tags:
-        - Admin Apple
-      operationId: deleteAdminAppleAlias
-      summary: 从 Apple 和本地永久删除隐私邮箱
-      description: |
-        使用所属主号已保存的受信任 Apple Web 会话读取完整 Hide My Email 目录，并按本地地址
-        定位远端条目。远端条目仍启用时，服务先调用 Apple `/v1/hme/deactivate` 停止转发，
-        再调用 `/v1/hme/delete` 永久删除；已经停用的条目直接永久删除。
-
-        Apple 完整目录中已经没有该地址时按幂等成功处理。远端变更返回错误或结果不明确时，
-        服务只通过 `/v2/hme/list` 重新读取权威目录进行对账；确认地址已经不存在后，才删除本地
-        隐私邮箱及其 API Key、邮件快照和关联记录。任何错误响应都会保留本地隐私邮箱记录，
-        调用方可使用同一 ID 安全重试。若远端删除已经完成，但 Apple 会话状态保存或本地清理失败，
-        本接口返回 500；重试时会通过“远端目录已缺失”的幂等分支完成本地清理。
+        只替换 API Key 及由它派生的旧直达链接，不改变 credential mode，
+        不清除消费记录、邮件快照或 IMAP Seen 状态，也不替换 v2 alias 的
+        IMAP 密码、client ID、refresh token 和 credential version。
+        本次响应直接返回新 API Key；legacy alias 不保存可恢复明文，v2 alias 的当前
+        凭证仍可由已认证管理端读取。schema 迁移不会调用此接口。
       security:
         - adminSession: []
       parameters:
         - $ref: "#/components/parameters/AdminAliasID"
         - $ref: "#/components/parameters/AdminCSRFToken"
       responses:
-        "204":
-          description: Apple 端永久删除已经确认或远端本就不存在；本地隐私邮箱及关联记录已清除
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-        "400":
-          description: id 不是正整数
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
+        "200":
+          description: 在本次受保护响应中直接返回新 API Key
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AdminAppleErrorResponse"
-              example:
-                error:
-                  code: VALIDATION_FAILED
-                  message: id 参数无效
-                  request_id: 6oe7j0x3x3pJv9Dv
+                $ref: "#/components/schemas/AdminOneTimeKeyResponse"
         "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
+          $ref: "#/components/responses/AdminUnauthorized"
         "403":
-          $ref: "#/components/responses/AdminCSRFForbidden"
+          $ref: "#/components/responses/AdminForbidden"
         "404":
-          $ref: "#/components/responses/AdminAliasNotFound"
+          $ref: "#/components/responses/AdminNotFound"
         "409":
-          $ref: "#/components/responses/AdminAliasDeleteConflict"
-        "429":
-          $ref: "#/components/responses/AdminAppleRateLimited"
+          $ref: "#/components/responses/AdminAliasConflict"
         "500":
-          $ref: "#/components/responses/AdminAliasDeleteInternalError"
-        "502":
-          $ref: "#/components/responses/AdminAppleBadGateway"
-        "503":
-          $ref: "#/components/responses/AdminAppleUnavailable"
-        "504":
-          $ref: "#/components/responses/AdminAppleTimeout"
+          $ref: "#/components/responses/AdminInternalError"
 
-  /admin/api/v1/logs:
-    get:
+  /api/v1/aliases/{id}/rotate-credentials:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
+    post:
       tags:
-        - Admin Logs
-      operationId: listAdminApplicationLogs
-      summary: 查询当前进程应用日志
+        - Administration
+      operationId: rotateAliasCredentials
+      summary: 轮换 v2 alias 的完整凭证包
       description: |
-        返回当前应用进程环形缓冲区中保留的最近最多 2000 条日志，按 `id` 从新到旧排列。
-        环形缓冲区还受总字节数限制，较大的记录可能使更早日志在达到 2000 条前被覆盖。
-        可按级别、关键词、主号、`sync_run_id` 和 `auto_create_run_id` 筛选。使用排他的
-        `before_id` 游标向更早的记录翻页，或使用 `offset` 浏览筛选结果中的固定窗口；
-        `offset` 大于 0 时不能同时提供 `before_id`。
-
-        每页默认返回 20 条，单次请求最多返回 1000 条。管理界面的“全部显示”会使用
-        `limit=1000` 和递增的 `offset` 分批读取当前筛选结果，不接受无限制的单次请求。
-
-        邮件同步流程为每次逻辑同步分配一个 `sync_run_id`；同一次追平任务的多个批次继续使用同一值。
-        每个被任务认领的自动创建计划槽分配一个 `auto_create_run_id`。两个运行标识都按结构化字段
-        完整值精确匹配，前端据此读取当前环形窗口内同一轮流程的全部分页，再按时间从早到晚组成
-        详情时间线。日志不会跨进程重启保留，较早流程事件也可能已被覆盖，因此时间线可能只包含
-        部分流程，不属于持久审计记录。隐私邮箱地址、原始 API Key、Apple 会话、Cookie、令牌和
-        凭据等敏感内容不会写入流程日志，其他敏感字段会在进入日志缓冲区前脱敏。
+        仅接受 v2 alias。显式调用后同时替换 API Key、派生取码 URL、IMAP 密码、
+        client ID 和 refresh token，并使已有 access token 失效；不清除邮件归档、
+        兼容消费记录或 IMAP Seen 状态。legacy alias 和等待目录确认的 alias 返回 409。
       security:
         - adminSession: []
       parameters:
-        - name: level
-          in: query
-          required: false
-          description: 日志级别；省略时返回全部级别。
-          schema:
-            type: string
-            enum:
-              - debug
-              - info
-              - warn
-              - error
-        - name: query
-          in: query
-          required: false
-          description: 用于匹配日志内容的关键词；前后空白会被忽略。
-          schema:
-            type: string
-            maxLength: 200
-        - name: account_id
-          in: query
-          required: false
-          description: 只返回带有指定主号 ID 的日志。
-          schema:
-            type: integer
-            format: int64
-            minimum: 1
-        - name: sync_run_id
-          in: query
-          required: false
-          description: |
-            邮件同步运行标识的精确筛选值。参数出现时会忽略前后空白，之后必须包含 1 至 128 个字符，
-            且只能使用 ASCII 字母、数字、连字符、下划线、句点和冒号。服务生成的值通常采用
-            `sync-<16位十六进制时间>-<至少8位十六进制序号>` 格式。
-          schema:
-            type: string
-            minLength: 1
-            maxLength: 128
-            pattern: "^[A-Za-z0-9_.:-]+$"
-          example: sync-1875f21a4c8b0000-00000001
-        - name: auto_create_run_id
-          in: query
-          required: false
-          description: |
-            自动创建计划槽运行标识的精确筛选值。校验规则与 `sync_run_id` 相同：参数出现时会忽略
-            前后空白，之后必须包含 1 至 128 个字符，且只能使用 ASCII 字母、数字、连字符、下划线、
-            句点和冒号。服务生成的值通常采用
-            `auto-create-<16位十六进制时间>-<至少8位十六进制序号>` 格式。
-          schema:
-            type: string
-            minLength: 1
-            maxLength: 128
-            pattern: "^[A-Za-z0-9_.:-]+$"
-          example: auto-create-1875f21a4c8b0000-00000001
-        - name: limit
-          in: query
-          required: false
-          description: 本页最多返回的日志数；管理端界面预设 20、50、100、500 和 1000 五档。
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 1000
-            default: 20
-        - name: before_id
-          in: query
-          required: false
-          description: 排他游标，只返回 ID 小于该值的日志。
-          schema:
-            type: integer
-            minimum: 1
-        - name: offset
-          in: query
-          required: false
-          description: |
-            在筛选结果中跳过的日志数，默认 0，最大 1000000。`offset` 大于 0 时不能与
-            `before_id` 同时使用。
-          schema:
-            type: integer
-            minimum: 0
-            maximum: 1000000
-            default: 0
+        - $ref: "#/components/parameters/AdminAliasID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
       responses:
         "200":
-          description: 当前筛选条件下的一页应用日志
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
+          description: 返回新的完整凭证；当前 v2 凭证随后仍可由已认证管理端读取
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/AdminApplicationLogListResponse"
-        "400":
-          description: level、query、account_id、sync_run_id、auto_create_run_id、limit、offset 或 before_id 参数无效
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/AdminNoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/AdminAppleErrorResponse"
-              example:
-                error:
-                  code: VALIDATION_FAILED
-                  message: level 参数无效
-                  request_id: 6oe7j0x3x3pJv9Dv
+                $ref: "#/components/schemas/AdminAliasResponse"
         "401":
-          $ref: "#/components/responses/AdminAuthUnauthorized"
-
-  /healthz:
-    get:
-      tags:
-        - Health
-      operationId: getHealth
-      summary: 检查服务及数据库是否可用
-      security: []
-      responses:
-        "200":
-          description: 服务与数据库连接正常
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-            Cache-Control:
-              $ref: "#/components/headers/NoStore"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HealthResponse"
-              example:
-                status: ok
-        "503":
-          description: 数据库当前不可用
-          headers:
-            X-Request-ID:
-              $ref: "#/components/headers/RequestID"
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              example:
-                error:
-                  code: DATABASE_UNAVAILABLE
-                  message: 数据库不可用
-                  request_id: 6oe7j0x3x3pJv9Dv
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          $ref: "#/components/responses/AdminNotFound"
+        "409":
+          $ref: "#/components/responses/AdminAliasConflict"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
 
 components:
   securitySchemes:
+    externalOAuthToken:
+      type: http
+      scheme: bearer
+      bearerFormat: deployment OAuth token
+    aliasAPIKey:
+      type: http
+      scheme: bearer
+      bearerFormat: service-issued API Key
+    derivedToken:
+      type: apiKey
+      in: query
+      name: token
+      description: 仅授权只读 OTP 历史；不能用于消费 recent-mail。
+    aliasAPIKeyQuery:
+      type: apiKey
+      in: query
+      name: api_key
     adminSession:
       type: apiKey
       in: cookie
       name: icloud_admin_session
-      description: |
-        后台登录后设置的 HttpOnly、SameSite=Strict 会话 Cookie。所有管理端写操作还必须发送
-        当前会话返回的 `X-CSRF-Token`，并通过服务端同源校验。此 Cookie 与 Apple Web 会话无关。
-
-    externalOAuthToken:
-      type: http
-      scheme: bearer
-      bearerFormat: opaque OAuth token
-      description: |
-        `POST /api/v1/aliases` 专用的服务级 Bearer 令牌，通过环境变量
-        `ICLOUD_API_OAUTH_TOKEN` 配置，长度为 32 至 4096 个字符且不得包含空白。调用时发送
-        `Authorization: Bearer <ICLOUD_API_OAUTH_TOKEN>`。该令牌不同于隐私邮箱自己的
-        `icm_` 邮件 API Key，不应写入 URL、日志或普通配置文件，也不得与其他凭据复用。
-
-    aliasApiKey:
-      type: http
-      scheme: bearer
-      bearerFormat: icm_ + 43 位规范 Raw Base64URL
-      x-token-pattern: "^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
-      description: |
-        后台为单个隐私邮箱生成的独立 Key。完整值固定为 47 个 ASCII 字符：
-        小写前缀 `icm_` 加 43 位无 `=` 填充的规范 Raw Base64URL，严格解码后为 32 字节。
-        精确格式正则为 `^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$`；最后一位的
-        受限字符集保证末尾填充位为零。服务端还会执行严格 Base64URL 解码和长度检查。
-        `icm_REPLACE_WITH_ALIAS_KEY` 仅为说明性占位值，其格式故意无效，直接发送会返回 401。
-
-    aliasApiKeyQuery:
-      type: apiKey
-      in: query
-      name: api_key
-      x-token-pattern: "^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
-      description: |
-        `/api/v1/mail/recent` 使用的查询参数凭据，格式和 `aliasApiKey` 完全相同。
-        可以使用隐私邮箱的原始 API Key，也可以使用管理端操作列复制的派生直达凭据。
-        派生凭据由服务端主密钥签名、不写入数据库、只对当前 API Key 状态有效，
-        不能用于 Bearer 接口；轮换隐私邮箱 API Key 会使此前复制的派生凭据失效。
-        `/api/v1/mail/recent` 是具有副作用的 `GET`，会按 `(UIDVALIDITY, UID)` 一次性消费
-        当前最新邮件并异步设置主号全局 `\Seen`。成功消费后链接本身仍然有效；当前 UID 的
-        后续请求返回 404，新 UID 到来后同一链接可再次消费。消费事务在响应写出前提交，
-        客户端断线或超时也可能已经消费邮件。浏览器预取、链接预览和安全扫描器可能提前
-        触发这些副作用；应优先使用可重复读取且不触发消费的 `/api/v1/mail/latest`。
-        查询参数会进入浏览器历史，并可能被代理或外围监控记录、通过 Referer 泄露。
-        本应用内置 HTTP 日志不记录查询字符串，但外围日志仍须删除或脱敏查询参数。
-        完整 URL 必须按密钥保护，并且只能通过 HTTPS 使用。
-        泄露链接即使当前返回 404，仍可消费未来新邮件；泄露后应立即轮换 Key。
-
   parameters:
     AdminAccountID:
       name: id
       in: path
       required: true
-      description: 本地 iCloud 主号 ID。
       schema:
         type: integer
         format: int64
@@ -1526,7 +732,6 @@ components:
       name: id
       in: path
       required: true
-      description: 本地隐私邮箱 ID。
       schema:
         type: integer
         format: int64
@@ -1535,23 +740,14 @@ components:
       name: X-CSRF-Token
       in: header
       required: true
-      description: 当前后台登录会话返回的 CSRF Token；请求还必须通过同源校验。
       schema:
         type: string
-        minLength: 1
-
   headers:
     RequestID:
       description: 服务端生成的请求追踪标识；错误响应体中的 request_id 与此值一致。
       schema:
         type: string
       example: 6oe7j0x3x3pJv9Dv
-    NoStore:
-      description: 禁止客户端及中间缓存保存响应。
-      schema:
-        type: string
-        const: no-store
-      example: no-store
     AdminNoStore:
       description: 禁止保存包含后台状态或一次性凭据的响应。
       schema:
@@ -1559,670 +755,27 @@ components:
         const: no-store, private
       example: no-store, private
 
-  responses:
-    AdminAccountBadRequest:
-      description: JSON 格式错误、含有未知字段，或主号字段校验失败
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          examples:
-            invalidJSON:
-              value:
-                error:
-                  code: INVALID_JSON
-                  message: JSON 请求体格式错误或包含未知字段
-                  request_id: 6oe7j0x3x3pJv9Dv
-            invalidIMAPHost:
-              value:
-                error:
-                  code: VALIDATION_FAILED
-                  message: "IMAP 服务地址无效: invalid imap DNS label"
-                  request_id: 6oe7j0x3x3pJv9Dv
-            invalidIMAPPort:
-              value:
-                error:
-                  code: VALIDATION_FAILED
-                  message: "IMAP 服务地址无效: imap port must be between 1 and 65535"
-                  request_id: 6oe7j0x3x3pJv9Dv
-            nullIMAPHost:
-              value:
-                error:
-                  code: VALIDATION_FAILED
-                  message: IMAP 主机不能为 null
-                  request_id: 6oe7j0x3x3pJv9Dv
-            nullIMAPPort:
-              value:
-                error:
-                  code: VALIDATION_FAILED
-                  message: IMAP 端口不能为 null
-                  request_id: 6oe7j0x3x3pJv9Dv
 
-    AdminAccountConflict:
-      description: 主号邮箱已存在，或已有隐私邮箱后尝试修改主号邮箱
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          examples:
-            accountExists:
-              value:
-                error:
-                  code: ACCOUNT_EXISTS
-                  message: 这个主号已经存在
-                  request_id: 6oe7j0x3x3pJv9Dv
-            identityLocked:
-              value:
-                error:
-                  code: ACCOUNT_IDENTITY_LOCKED
-                  message: 已有隐私邮箱时不能修改主号邮箱
-                  request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAliasNotFound:
-      description: 指定的本地隐私邮箱不存在
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: NOT_FOUND
-              message: 隐私邮箱不存在
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAliasDeleteConflict:
-      description: |
-        尚未连接 Apple 账户、Apple 会话已过期、Apple 账户需要先完成条款或其他操作、
-        Apple 登录账户或转发邮箱与主号不匹配、操作期间主号身份发生变化，或该隐私邮箱
-        仍在等待 Apple 目录确认。远端和本地删除均未确认完成，本地记录保留。
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          examples:
-            appleLoginRequired:
-              value:
-                error:
-                  code: APPLE_LOGIN_REQUIRED
-                  message: 请先连接 Apple 账户
-                  request_id: 6oe7j0x3x3pJv9Dv
-            appleSessionExpired:
-              value:
-                error:
-                  code: APPLE_SESSION_EXPIRED
-                  message: Apple 会话已过期，请重新登录
-                  request_id: 6oe7j0x3x3pJv9Dv
-            appleAccountActionRequired:
-              value:
-                error:
-                  code: APPLE_ACCOUNT_ACTION_REQUIRED
-                  message: Apple 账户需要完成条款确认或其他账户操作，请前往 Apple 官网处理后重试
-                  request_id: 6oe7j0x3x3pJv9Dv
-            appleAccountMismatch:
-              value:
-                error:
-                  code: APPLE_ACCOUNT_MISMATCH
-                  message: Apple 登录账户或转发邮箱与该主号不匹配
-                  request_id: 6oe7j0x3x3pJv9Dv
-            accountChanged:
-              value:
-                error:
-                  code: ACCOUNT_CHANGED
-                  message: 主号信息已发生变化，请重新操作
-                  request_id: 6oe7j0x3x3pJv9Dv
-            aliasConfirmationPending:
-              value:
-                error:
-                  code: ALIAS_CONFIRMATION_PENDING
-                  message: 该隐私邮箱正在等待 Apple 目录确认，暂时不能修改或删除
-                  request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAliasDeleteInternalError:
-      description: |
-        Apple 会话状态保存或本地清理失败，本地隐私邮箱记录保留。Apple 端永久删除可能已经完成；
-        使用同一隐私邮箱 ID 重试是安全的，服务会重新读取 Apple 完整目录并完成剩余的本地清理。
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: INTERNAL_ERROR
-              message: 请求处理失败，请稍后重试
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAppleBadRequest:
-      description: JSON 格式错误、含有未知字段，或 Apple 登录/验证码字段校验失败
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          examples:
-            invalidJSON:
-              value:
-                error:
-                  code: INVALID_JSON
-                  message: JSON 请求体格式错误或包含未知字段
-                  request_id: 6oe7j0x3x3pJv9Dv
-            validationFailed:
-              value:
-                error:
-                  code: VALIDATION_FAILED
-                  message: 请求字段校验失败
-                  request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAuthUnauthorized:
-      description: 后台会话 Cookie 缺失、无效或已经过期
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          examples:
-            loginRequired:
-              value:
-                error:
-                  code: AUTH_REQUIRED
-                  message: 请先登录
-                  request_id: 6oe7j0x3x3pJv9Dv
-            sessionExpired:
-              value:
-                error:
-                  code: SESSION_EXPIRED
-                  message: 登录会话已过期
-                  request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminCSRFForbidden:
-      description: X-CSRF-Token 缺失、无效，或请求未通过同源校验
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: CSRF_INVALID
-              message: 请求校验失败，请刷新页面后重试
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAccountNotFound:
-      description: 指定的本地主号不存在
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: NOT_FOUND
-              message: 主号不存在
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAccountDisabled:
-      description: 主号已停用，必须先启用后才能同步邮件
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: ACCOUNT_DISABLED
-              message: 主号已停用，请先启用主号后再同步邮件
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAppleConflict:
-      description: |
-        尚未连接 Apple 账户、Apple 会话已经过期、转发邮箱与主号不匹配、操作期间主号身份变化，
-        或目录中的地址已登记到其他主号。
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          examples:
-            appleLoginRequired:
-              value:
-                error:
-                  code: APPLE_LOGIN_REQUIRED
-                  message: 请先连接 Apple 账户
-                  request_id: 6oe7j0x3x3pJv9Dv
-            appleSessionExpired:
-              value:
-                error:
-                  code: APPLE_SESSION_EXPIRED
-                  message: Apple 会话已过期，请重新登录
-                  request_id: 6oe7j0x3x3pJv9Dv
-            appleAccountMismatch:
-              value:
-                error:
-                  code: APPLE_ACCOUNT_MISMATCH
-                  message: Apple 登录账户或转发邮箱与该主号不匹配
-                  request_id: 6oe7j0x3x3pJv9Dv
-            aliasOwnershipConflict:
-              value:
-                error:
-                  code: ALIAS_OWNERSHIP_CONFLICT
-                  message: 隐私邮箱已属于其他主号
-                  request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAppleFlowExpired:
-      description: 验证码挑战已过期、已失效或不属于当前后台会话与主号
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: APPLE_FLOW_EXPIRED
-              message: 验证流程已过期，请重新登录
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminJSONTooLarge:
-      description: JSON 请求体超过 64 KiB
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: REQUEST_TOO_LARGE
-              message: JSON 请求体不能超过 64 KiB
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminUnsupportedMediaType:
-      description: 请求正文的 Content-Type 不是 application/json
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: UNSUPPORTED_MEDIA_TYPE
-              message: 请求必须使用 application/json
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAppleRejected:
-      description: Apple ID 或账户密码错误，或双重认证验证码错误
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          examples:
-            credentialsInvalid:
-              value:
-                error:
-                  code: APPLE_CREDENTIALS_INVALID
-                  message: Apple ID 或密码不正确
-                  request_id: 6oe7j0x3x3pJv9Dv
-            verificationInvalid:
-              value:
-                error:
-                  code: APPLE_VERIFICATION_INVALID
-                  message: 验证码不正确，请重新输入
-                  request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAppleRateLimited:
-      description: Apple 服务对当前账户或会话限流
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: APPLE_RATE_LIMITED
-              message: Apple 请求过于频繁，请稍后再试
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminInternalError:
-      description: 本地数据库、加密或一次性 Key 生成操作失败
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: INTERNAL_ERROR
-              message: 请求处理失败，请稍后重试
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminSyncBadGateway:
-      description: 主号 IMAP 同步失败，当前批次未成功完成；实际同步默认预算为取得主号锁和全局连接额度后的 70s，单条 IMAP 命令默认超时为 8s；自动轮询遇到瞬时连接断开会在后台快速重试
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: SYNC_FAILED
-              message: 同步失败，请检查连接状态
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAppleBadGateway:
-      description: Apple 上游服务返回异常响应
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: APPLE_UPSTREAM_ERROR
-              message: Apple 服务暂时异常，请稍后再试
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAppleUnavailable:
-      description: Apple 隐私邮箱服务尚未初始化；本次操作未完成，本地记录保持不变
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: INTERNAL_ERROR
-              message: Apple 同步服务暂时不可用，请稍后再试
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAutoCreationUnavailable:
-      description: 隐私邮箱自动创建服务尚未初始化
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: AUTO_CREATION_UNAVAILABLE
-              message: 自动创建服务暂不可用
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    AdminAppleTimeout:
-      description: Apple 上游服务响应超时
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/AdminNoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/AdminAppleErrorResponse"
-          example:
-            error:
-              code: APPLE_UPSTREAM_ERROR
-              message: Apple 服务响应超时，请稍后再试
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasBadRequest:
-      description: |
-        请求字段缺失、为空、格式错误、重复出现在查询串或正文中、包含未知字段，
-        或隐私邮箱与已登记主号邮箱/所选主号 IMAP 用户名相同。
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: INVALID_REQUEST
-              message: 请求参数无效
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasUnauthorized:
-      description: Authorization Header 缺失、格式错误或 OAuth Bearer 令牌无效
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-        WWW-Authenticate:
-          description: 本接口要求 Bearer 鉴权。
-          schema:
-            type: string
-            const: Bearer
-          example: Bearer
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: INVALID_OAUTH_TOKEN
-              message: OAuth 令牌无效
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasAccountNotFound:
-      description: "`icloud` 指定的主号不存在"
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: ACCOUNT_NOT_FOUND
-              message: iCloud 主号不存在
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasConflict:
-      description: 隐私邮箱已经登记，或指定主号已达到启用隐私邮箱数量上限
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          examples:
-            aliasExists:
-              summary: 隐私邮箱已经登记
-              value:
-                error:
-                  code: ALIAS_EXISTS
-                  message: 隐私邮箱已存在
-                  request_id: 6oe7j0x3x3pJv9Dv
-            aliasLimitReached:
-              summary: 主号达到隐私邮箱数量上限
-              value:
-                error:
-                  code: ALIAS_LIMIT_REACHED
-                  message: 主号的隐私邮箱数量已达上限
-                  request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasRequestTooLarge:
-      description: URL 查询串与表单正文的编码参数合计超过 4 KiB
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: REQUEST_TOO_LARGE
-              message: 请求体过大
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasUnsupportedMediaType:
-      description: 请求含有正文，但 Content-Type 不是 application/x-www-form-urlencoded
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: UNSUPPORTED_MEDIA_TYPE
-              message: 仅支持 application/x-www-form-urlencoded
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasRateLimited:
-      description: 当前调用方在限流窗口内请求过多
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: RATE_LIMITED
-              message: 请求过于频繁
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasInternalError:
-      description: 生成邮件 API Key 或派生直达凭据时发生内部错误
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: INTERNAL_ERROR
-              message: 服务内部错误
-              request_id: 6oe7j0x3x3pJv9Dv
-
-    CreateAliasUnavailable:
-      description: 查询主号或登记隐私邮箱时数据库暂不可用
-      headers:
-        X-Request-ID:
-          $ref: "#/components/headers/RequestID"
-        Cache-Control:
-          $ref: "#/components/headers/NoStore"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: DATABASE_UNAVAILABLE
-              message: 数据库暂不可用
-              request_id: 6oe7j0x3x3pJv9Dv
 
   schemas:
+    AdminAccountListResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAccountPage"
+
+    AdminAppleErrorResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+      properties:
+        error:
+          $ref: "#/components/schemas/AdminAppleError"
+
     AdminCreateAccountRequest:
       type: object
       additionalProperties: false
@@ -2265,6 +818,24 @@ components:
           writeOnly: true
           description: App 专用密码；服务会去除首尾空白并加密保存，不会在响应中返回。
 
+    AdminAccountResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAccount"
+
+    AdminAccountDetailResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAccountDetail"
+
     AdminUpdateAccountRequest:
       type: object
       additionalProperties: false
@@ -2300,7 +871,8 @@ components:
           minLength: 1
           description: |
             IMAP 登录用户名；服务会去除首尾空白，已有隐私邮箱时仍可修改。规范化后的值实际变化
-            会清理旧邮箱来源的同步游标、邮件快照、消费历史和待处理 `\Seen` 任务，并重置同步状态。
+            会清理旧邮箱来源的同步游标、兼容快照、消费历史、待处理 `\Seen` 任务、v2 归档和
+            OTP 历史，轮换公开 IMAPS 的 UIDVALIDITY，并重置同步状态。
         imap_password:
           type:
             - string
@@ -2310,24 +882,6 @@ components:
         enabled:
           type: boolean
           description: 是否启用该主号的邮件同步和所属隐私邮箱 Key。
-
-    AdminAccountResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/AdminAccount"
-
-    AdminAccountListResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/AdminAccountPage"
 
     AdminAccountPage:
       type: object
@@ -2343,651 +897,56 @@ components:
         pagination:
           $ref: "#/components/schemas/AdminAccountPagination"
 
-    AdminAccountPagination:
+    AdminAppleError:
       type: object
       additionalProperties: false
       required:
-        - limit
-        - offset
-        - total
-        - has_more
-      properties:
-        limit:
-          type: integer
-          minimum: 1
-          maximum: 1000
-          description: 当前请求的每页上限。
-        offset:
-          type: integer
-          minimum: 0
-          maximum: 1000000
-          description: 当前请求跳过的主号数。
-        total:
-          type: integer
-          minimum: 0
-          description: 当前查询条件下的主号总数。
-        has_more:
-          type: boolean
-          description: 当前页之后是否仍有可返回的主号。
-
-    AdminAppleAuthRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - apple_id
-        - password
-      properties:
-        apple_id:
-          type: string
-          minLength: 1
-          maxLength: 320
-          description: 用于建立受信任 Web 会话的 Apple ID。
-        password:
-          type: string
-          minLength: 1
-          maxLength: 1024
-          writeOnly: true
-          description: |
-            Apple 账户密码，不是 App 专用密码。只在本次登录请求中使用，不写入数据库、响应或日志。
-        region:
-          type: string
-          enum:
-            - global
-            - cn
-          default: global
-          description: Apple 服务区域；global 为全球区，cn 为中国大陆区。
-
-    AdminAppleVerifyRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - challenge_id
         - code
+        - message
+        - request_id
       properties:
-        challenge_id:
-          type: string
-          minLength: 1
-          maxLength: 256
-          writeOnly: true
-          description: Apple 登录返回的短期验证码挑战标识。
         code:
           type: string
-          pattern: "^[0-9]{6}$"
-          writeOnly: true
-          description: 6 位双重认证验证码；只在本次验证请求中使用，不写入数据库。
-
-    AdminAppleAuthResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/AdminAppleAuthResult"
-
-    AdminAppleAuthResult:
-      type: object
-      additionalProperties: false
-      required:
-        - status
-        - apple_session
-      properties:
-        status:
-          type: string
           enum:
-            - verification_required
-            - authenticated
-        challenge_id:
-          type: string
-          description: 仅在 status=verification_required 时返回；提交验证码时原样带回。
-        apple_session:
-          $ref: "#/components/schemas/AdminAppleSession"
-
-    AdminAppleSession:
-      type: object
-      additionalProperties: false
-      required:
-        - status
-        - apple_id
-        - region
-        - authenticated_at
-        - expires_at
-      properties:
-        status:
-          type: string
-          enum:
-            - login_required
-            - verification_required
-            - authenticated
-            - expired
+            - AUTH_REQUIRED
+            - SESSION_EXPIRED
+            - CSRF_INVALID
+            - INVALID_CREDENTIALS
+            - CURRENT_PASSWORD_INVALID
+            - CREDENTIALS_CHANGED
+            - RATE_LIMITED
+            - NOT_FOUND
+            - INVALID_JSON
+            - VALIDATION_FAILED
+            - REQUEST_TOO_LARGE
+            - UNSUPPORTED_MEDIA_TYPE
+            - APPLE_LOGIN_REQUIRED
+            - APPLE_SESSION_EXPIRED
+            - APPLE_CREDENTIALS_INVALID
+            - APPLE_VERIFICATION_INVALID
+            - APPLE_FLOW_EXPIRED
+            - APPLE_ACCOUNT_ACTION_REQUIRED
+            - APPLE_RATE_LIMITED
+            - APPLE_UPSTREAM_ERROR
+            - AUTO_CREATION_UNAVAILABLE
+            - ACCOUNT_DISABLED
+            - ACCOUNT_EXISTS
+            - ACCOUNT_IDENTITY_LOCKED
+            - APPLE_ACCOUNT_MISMATCH
+            - ACCOUNT_CHANGED
+            - ALIAS_OWNERSHIP_CONFLICT
+            - ALIAS_CONFIRMATION_PENDING
+            - ALIAS_EXISTS
+            - ALIAS_LIMIT_REACHED
+            - SYNC_FAILED
+            - INTERNAL_ERROR
           description: |
-            login_required 表示尚无会话；verification_required 表示正在等待验证码；
-            authenticated 表示可同步目录；expired 表示需要重新登录。
-        apple_id:
-          type: string
-          description: 连接的 Apple ID；尚无会话时为空字符串。
-        region:
-          type: string
-          enum:
-            - ""
-            - global
-            - cn
-          description: Apple 服务区域；尚无会话时为空字符串。
-        authenticated_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-          description: 受信任会话认证完成的 UTC 时间；未完成登录时为 null。
-        expires_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-          description: 已知的会话或验证码挑战到期时间；上游未提供时为 null。
-
-    AdminAccountDetailResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/AdminAccountDetail"
-
-    AdminAccountDetail:
-      type: object
-      additionalProperties: false
-      required:
-        - account
-        - aliases
-        - apple_session
-        - auto_creation
-      properties:
-        account:
-          $ref: "#/components/schemas/AdminAccount"
-        aliases:
-          type: array
-          items:
-            $ref: "#/components/schemas/AdminAlias"
-        apple_session:
-          description: |
-            该主号的 Apple Web 会话状态。正常启用目录同步服务时返回对象；
-            服务未初始化的降级场景为 null。Apple 账户密码、验证码和加密会话正文不会返回。
-          oneOf:
-            - $ref: "#/components/schemas/AdminAppleSession"
-            - type: "null"
-        auto_creation:
-          $ref: "#/components/schemas/AdminAliasAutoCreation"
-        sync_pending:
-          type: boolean
-          description: |
-            仅在手动邮件同步返回 202 时出现且恒为 true，表示请求已进入后台队列，
-            或同一主号已有同步任务正在处理。
-
-    AdminAliasAutoCreationRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - enabled
-      properties:
-        enabled:
-          type: boolean
-          description: 是否开启该主号每小时 5 次的自动创建计划。
-
-    AdminAutoCreationResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/AdminAliasAutoCreation"
-
-    AdminAliasAutoCreation:
-      type: object
-      additionalProperties: false
-      required:
-        - enabled
-        - status
-        - planned_at
-        - planned_times
-        - next_run_at
-        - last_attempted_at
-        - last_created_at
-        - last_alias_address
-        - last_error
-        - pending_key_count
-        - pending_auto_created_key_count
-      properties:
-        enabled:
-          type: boolean
-        status:
-          type: string
-          enum:
-            - disabled
-            - scheduled
-            - paused
-            - login_required
-            - error
-          description: 当前计划状态；login_required 表示需重新登录 Apple，会话失效不会自动关闭开关。
-        planned_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-          description: 当前剩余计划的第一个时间点；没有剩余计划时为 null。
-        planned_times:
-          type: array
-          items:
-            type: string
-            format: date-time
-          description: 当前剩余计划的全部 UTC 时间点，最多 5 个。
-        next_run_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-        last_attempted_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-        last_created_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-        last_alias_address:
-          type: string
-        last_error:
-          type: string
-          description: 最近一次尝试的截断错误信息；不会包含原始 API Key 或 Apple 会话材料。
-        pending_key_count:
-          type: integer
-          minimum: 0
-        pending_auto_created_key_count:
-          type: integer
-          minimum: 0
-
-    AdminPendingAliasKeysRequest:
-      type: object
-      additionalProperties: false
-      required:
-        - alias_ids
-      properties:
-        alias_ids:
-          type: array
-          minItems: 1
-          maxItems: 1000
-          items:
-            type: integer
-            format: int64
-            minimum: 1
-
-    AdminPendingAliasKeysResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          type: object
-          additionalProperties: false
-          required:
-            - created
-          properties:
-            created:
-              type: array
-              items:
-                $ref: "#/components/schemas/AdminAppleCreatedAlias"
-
-    AdminApplicationLogListResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/AdminApplicationLogPage"
-
-    AdminApplicationLogPage:
-      type: object
-      additionalProperties: false
-      required:
-        - items
-        - has_more
-        - next_before_id
-        - pagination
-      properties:
-        items:
-          type: array
-          items:
-            $ref: "#/components/schemas/AdminApplicationLog"
-        has_more:
-          type: boolean
-          description: 是否还有符合当前筛选条件的更早日志。
-        next_before_id:
-          type: integer
-          minimum: 0
-          description: 下一页请求使用的 before_id；没有下一页时为 0。
-        pagination:
-          $ref: "#/components/schemas/AdminApplicationLogPagination"
-
-    AdminApplicationLogPagination:
-      type: object
-      additionalProperties: false
-      required:
-        - limit
-        - offset
-        - total
-        - has_more
-      properties:
-        limit:
-          type: integer
-          minimum: 1
-          maximum: 1000
-          description: 当前请求的每页上限。
-        offset:
-          type: integer
-          minimum: 0
-          maximum: 1000000
-          description: 当前请求跳过的筛选结果数。
-        total:
-          type: integer
-          minimum: 0
-          description: 不受 before_id 和 offset 影响的完整筛选结果数。
-        has_more:
-          type: boolean
-          description: 当前页之后是否仍有可返回的日志。
-
-    AdminApplicationLog:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - created_at
-        - level
-        - message
-        - source
-        - attributes
-      properties:
-        id:
-          type: integer
-          minimum: 1
-        created_at:
-          type: string
-          format: date-time
-        level:
-          type: string
-          enum:
-            - debug
-            - info
-            - warn
-            - error
+            Apple 会话错误使用 APPLE_ 前缀，与后台登录会话的 AUTH_REQUIRED/SESSION_EXPIRED 分离。
         message:
           type: string
-        source:
-          type: string
-        attributes:
-          $ref: "#/components/schemas/AdminApplicationLogAttributes"
-        account_id:
-          type: integer
-          format: int64
-          minimum: 1
-          description: 日志可归属到主号时返回。
         request_id:
           type: string
-          description: 日志可关联到 HTTP 请求时返回。
-        sync_run_id:
-          type: string
-          minLength: 1
-          maxLength: 128
-          pattern: "^[A-Za-z0-9_.:-]+$"
-          description: |
-            日志属于邮件同步流程时返回；非同步日志省略。该值也保留在 attributes 中，
-            同一次逻辑同步的多个追平批次共用同一值。
-        auto_create_run_id:
-          type: string
-          minLength: 1
-          maxLength: 128
-          pattern: "^[A-Za-z0-9_.:-]+$"
-          description: |
-            日志属于自动创建流程时返回；其他日志省略。该值也保留在 attributes 中，
-            每个被任务认领的计划槽使用一个独立值。
-
-    AdminApplicationLogAttributes:
-      type: object
-      description: |
-        已脱敏的结构化日志属性，所有值均编码为字符串。普通日志可以包含其他字符串属性；
-        邮件同步和自动创建流程使用下列标准字段构建详情时间线。隐私邮箱地址、原始 API Key、
-        Apple 会话、Cookie、令牌和凭据等敏感内容不会写入这些流程属性。
-      properties:
-        account_id:
-          type: string
-          pattern: "^[1-9][0-9]*$"
-        request_id:
-          type: string
-        sync_run_id:
-          type: string
-          minLength: 1
-          maxLength: 128
-          pattern: "^[A-Za-z0-9_.:-]+$"
-          description: 一次逻辑邮件同步的聚合标识。
-        auto_create_run_id:
-          type: string
-          minLength: 1
-          maxLength: 128
-          pattern: "^[A-Za-z0-9_.:-]+$"
-          description: 一个已认领自动创建计划槽的聚合标识。
-        auto_create_stage:
-          type: string
-          description: 当前自动创建阶段；终态分别使用 completed、failed 或 cancelled。
-          enum:
-            - preparing
-            - checking_account
-            - checking_capacity
-            - loading_session
-            - validating_session
-            - checking_forwarding
-            - initializing_forwarding
-            - preparing_key
-            - reserving
-            - saving_candidate
-            - confirming
-            - reconciling
-            - saving_result
-            - completed
-            - failed
-            - cancelled
-        auto_create_percent:
-          type: string
-          pattern: "^(100|[1-9]?[0-9])$"
-          description: 当前自动创建进度百分比，范围 0 至 100。
-        auto_create_event:
-          type: string
-          description: 当前自动创建流程事件，用于区分开始、阶段变化和各类终态或状态写入异常。
-          enum:
-            - run_started
-            - stage_started
-            - run_completed
-            - run_completed_with_warning
-            - run_failed
-            - run_cancelled
-            - state_persist_failed
-        trigger:
-          type: string
-          enum:
-            - manual
-            - automatic
-        sync_batch:
-          type: string
-          pattern: "^[1-9][0-9]*$"
-          description: 当前追平批次，从 1 开始。
-        sync_stage:
-          type: string
-          description: 当前邮件同步阶段；deferred 表示恢复窗口结束或资源等待超时，后续轮询会继续。
-          enum:
-            - queued
-            - waiting
-            - preparing
-            - connecting
-            - authenticating
-            - scanning
-            - reading
-            - validating
-            - saving
-            - completed
-            - deferred
-            - failed
-            - cancelled
-        sync_percent:
-          type: string
-          pattern: "^(100|[1-9]?[0-9])$"
-          description: 当前进度百分比，范围 0 至 100。
-        sync_event:
-          type: string
-          description: 当前邮件同步流程事件；run_deferred 表示本次恢复因窗口或资源等待结束而延后，后续轮询会继续。
-          enum:
-            - run_queued
-            - waiting
-            - run_started
-            - batch_started
-            - account_loaded
-            - prepared
-            - stage_started
-            - batch_saved
-            - batch_completed
-            - run_completed
-            - run_deferred
-            - run_failed
-            - run_cancelled
-        elapsed_ms:
-          type: string
-          pattern: "^[0-9]+$"
-          description: 从当前邮件同步或自动创建流程开始到本事件的累计毫秒数。
-        batch_elapsed_ms:
-          type: string
-          pattern: "^[0-9]+$"
-          description: 从当前批次开始到当前事件的毫秒数；批次尚未开始时省略。
-        failed_stage:
-          type: string
-          description: 邮件同步或自动创建失败、取消前正在执行的阶段，仅终止事件使用。
-        failed_operation:
-          type: string
-          description: 失败或取消时对应的内部操作位置；自动创建结果状态写入异常时也会返回。
-        error_code:
-          type: string
-          description: 自动创建失败、取消或结果状态写入异常的稳定诊断代码。
-        error_class:
-          type: string
-          description: 自动创建失败、取消或结果状态写入异常所属的诊断类别。
-        cause_category:
-          type: string
-          description: 受控的直接原因分类，不包含底层错误原文或敏感值。
-          enum:
-            - account_state
-            - apple_upstream
-            - capacity
-            - context
-            - crypto
-            - internal
-            - persistence
-            - plan_conflict
-            - schedule
-            - session
-        error_context:
-          type: string
-          description: |
-            不含邮箱地址、Key、Apple 会话或凭据等敏感值的错误说明；用于流程终止事件，
-            以及自动创建结果状态写入异常事件。
-        http_status:
-          type: string
-          pattern: "^[1-5][0-9]{2}$"
-          description: Apple 上游返回的 HTTP 状态；失败不涉及 HTTP 响应时省略。
-        retryable:
-          type: string
-          enum:
-            - "true"
-            - "false"
-          description: Apple 上游错误是否标记为可重试；不涉及上游错误时省略。
-        upstream_retryable:
-          type: string
-          enum:
-            - "true"
-            - "false"
-          description: 与 retryable 相同的 Apple 上游重试标记，供日志消费者显式区分。
-        schedule_action:
-          type: string
-          enum:
-            - continue
-            - disabled
-            - none
-          description: 本计划槽结束后继续运行、关闭自动创建或没有后续动作。
-        next_run_at:
-          type: string
-          format: date-time
-          description: 自动创建计划的下次运行时间；没有后续计划时省略。
-        scheduled_for:
-          type: string
-          format: date-time
-          description: 当前自动创建计划槽原定的运行时间。
-        attempted_at:
-          type: string
-          format: date-time
-          description: 当前计划槽实际被认领并开始执行的时间。
-        remote_side_effect_possible:
-          type: string
-          enum:
-            - "true"
-            - "false"
-          description: 失败或取消前是否已进入可能在 Apple 侧修改默认转发设置或创建地址的阶段。
-        pending_confirmation:
-          type: string
-          enum:
-            - "true"
-            - "false"
-          description: 本地是否已保存待确认候选，后续计划会优先对账而不会重复创建。
-        failure_state_recorded:
-          type: string
-          enum:
-            - "true"
-            - "false"
-          description: 本次失败的受控摘要是否已写入自动创建计划状态。
-        auto_creation_disabled:
-          type: string
-          enum:
-            - "true"
-            - "false"
-          description: 本次失败后是否已关闭该主号的自动创建计划。
-        result_state_recorded:
-          type: string
-          enum:
-            - "true"
-            - "false"
-          description: 创建完成后成功结果是否已写入自动创建计划状态。
-        operation:
-          type: string
-          description: 受控白名单中的 Apple 操作名称；无法识别时为 unknown。
-        service_code_present:
-          type: string
-          enum:
-            - "true"
-            - "false"
-          description: Apple 响应是否带服务码；原始服务码不会写入日志。
-        service_code_fingerprint:
-          type: string
-          pattern: "^[a-f0-9]{16}$"
-          description: 原始 Apple 服务码的不可逆短指纹，仅用于聚合同类失败。
-        confirmation_attempt:
-          type: string
-          pattern: "^[1-9][0-9]*$"
-          description: 当前只读目录确认或对账的尝试次数。
-        error:
-          type: string
-          description: 已脱敏的详细错误文本；用于流程终止或自动创建结果状态写入异常事件。
-      additionalProperties:
-        type: string
+          description: 与 X-Request-ID 响应头相同的请求追踪标识。
 
     AdminAccount:
       type: object
@@ -3056,6 +1015,63 @@ components:
         sync_progress:
           $ref: "#/components/schemas/AdminSyncProgress"
 
+    AdminAccountDetail:
+      type: object
+      additionalProperties: false
+      required:
+        - account
+        - aliases
+        - apple_session
+        - auto_creation
+      properties:
+        account:
+          $ref: "#/components/schemas/AdminAccount"
+        aliases:
+          type: array
+          items:
+            $ref: "#/components/schemas/AdminAlias"
+        apple_session:
+          description: |
+            该主号的 Apple Web 会话状态。正常启用目录同步服务时返回对象；
+            服务未初始化的降级场景为 null。Apple 账户密码、验证码和加密会话正文不会返回。
+          oneOf:
+            - $ref: "#/components/schemas/AdminAppleSession"
+            - type: "null"
+        auto_creation:
+          $ref: "#/components/schemas/AdminAliasAutoCreation"
+        sync_pending:
+          type: boolean
+          description: |
+            仅在手动邮件同步返回 202 时出现且恒为 true，表示请求已进入后台队列，
+            或同一主号已有同步任务正在处理。
+
+    AdminAccountPagination:
+      type: object
+      additionalProperties: false
+      required:
+        - limit
+        - offset
+        - total
+        - has_more
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: 当前请求的每页上限。
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: 当前请求跳过的主号数。
+        total:
+          type: integer
+          minimum: 0
+          description: 当前查询条件下的主号总数。
+        has_more:
+          type: boolean
+          description: 当前页之后是否仍有可返回的主号。
+
     AdminSyncProgress:
       type: object
       additionalProperties: false
@@ -3100,26 +1116,333 @@ components:
           type: string
           format: date-time
 
-    AdminAlias:
+    AdminAppleSession:
       type: object
       additionalProperties: false
       required:
-        - id
-        - account_id
-        - account_email
-        - address
-        - label
-        - api_key_prefix
-        - direct_link_path
+        - status
+        - apple_id
+        - region
+        - authenticated_at
+        - expires_at
+      properties:
+        status:
+          type: string
+          enum:
+            - login_required
+            - verification_required
+            - authenticated
+            - expired
+          description: |
+            login_required 表示尚无会话；verification_required 表示正在等待验证码；
+            authenticated 表示可同步目录；expired 表示需要重新登录。
+        apple_id:
+          type: string
+          description: 连接的 Apple ID；尚无会话时为空字符串。
+        region:
+          type: string
+          enum:
+            - ""
+            - global
+            - cn
+          description: Apple 服务区域；尚无会话时为空字符串。
+        authenticated_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: 受信任会话认证完成的 UTC 时间；未完成登录时为 null。
+        expires_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: 已知的会话或验证码挑战到期时间；上游未提供时为 null。
+
+    AdminAliasAutoCreation:
+      type: object
+      additionalProperties: false
+      required:
         - enabled
-        - last_sync_status
-        - last_sync_error
-        - last_sync_error_log
-        - last_synced_at
-        - last_accessed_at
-        - latest_received_at
-        - created_at
-        - updated_at
+        - status
+        - planned_at
+        - planned_times
+        - next_run_at
+        - last_attempted_at
+        - last_created_at
+        - last_alias_address
+        - last_error
+        - pending_key_count
+        - pending_auto_created_key_count
+      properties:
+        enabled:
+          type: boolean
+        status:
+          type: string
+          enum:
+            - disabled
+            - scheduled
+            - paused
+            - login_required
+            - error
+          description: 当前计划状态；login_required 表示需重新登录 Apple，会话失效不会自动关闭开关。
+        planned_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: 当前剩余计划的第一个时间点；没有剩余计划时为 null。
+        planned_times:
+          type: array
+          items:
+            type: string
+            format: date-time
+          description: 当前剩余计划的全部 UTC 时间点，最多 5 个。
+        next_run_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        last_attempted_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        last_created_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        last_alias_address:
+          type: string
+        last_error:
+          type: string
+          description: 最近一次尝试的截断错误信息；不会包含原始 API Key 或 Apple 会话材料。
+        pending_key_count:
+          type: integer
+          minimum: 0
+        pending_auto_created_key_count:
+          type: integer
+          minimum: 0
+
+    OTPRecord:
+      type: object
+      additionalProperties: false
+      required: [otp, time]
+      properties:
+        otp:
+          type: string
+          pattern: "^[0-9]{4,8}$"
+        time:
+          type: string
+          format: date-time
+    TokenResponse:
+      type: object
+      additionalProperties: false
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          const: Bearer
+        expires_in:
+          type: integer
+          const: 3600
+    LegacyAliasRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        正文中的可选部分；query 与正文合并后两个字段必须各出现一次。该跨位置约束
+        无法由标准 OpenAPI Schema 单独表达，调用方和生成代码必须遵守 operation 上的
+        x-runtime-constraint。
+      properties:
+        add_hide_my_eamil:
+          type: string
+          format: email
+        icloud:
+          type: string
+          format: email
+    LegacyAliasResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [alias, icloud, api_key, mail_api_direct_link]
+          properties:
+            alias:
+              type: string
+              format: email
+            icloud:
+              type: string
+              format: email
+            api_key:
+              type: string
+            mail_api_direct_link:
+              type: string
+              format: uri-reference
+              pattern: "^/api/v1/mail/recent\\?api_key=.*$"
+    LegacyLatestMailResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: true
+          required: [alias, message, synced_at, stale]
+          properties:
+            alias:
+              type: string
+              format: email
+            message:
+              $ref: "#/components/schemas/LegacyMailMessage"
+            synced_at:
+              type: string
+              format: date-time
+            stale:
+              type: boolean
+    LegacyRecentMailResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [address, subject, snippet, sent_at]
+          properties:
+            address:
+              type: string
+              format: email
+            subject:
+              type: string
+            snippet:
+              type: string
+            sent_at:
+              type: string
+              format: date-time
+    LegacyMailMessage:
+      type: object
+      additionalProperties: true
+      required: [id, message_id, received_at, from, to, cc, subject, text, html, attachments, has_attachments, body_truncated]
+      properties:
+        id:
+          type: string
+        message_id:
+          type: string
+        received_at:
+          type: string
+          format: date-time
+        sent_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        from:
+          type: array
+          items:
+            $ref: "#/components/schemas/MailAddress"
+        to:
+          type: array
+          items:
+            $ref: "#/components/schemas/MailAddress"
+        cc:
+          type: array
+          items:
+            $ref: "#/components/schemas/MailAddress"
+        subject:
+          type: string
+        text:
+          type: string
+        html:
+          type: string
+        attachments:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        has_attachments:
+          type: boolean
+        body_truncated:
+          type: boolean
+    MailAddress:
+      type: object
+      additionalProperties: true
+      required: [email]
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+    AdminPendingAliasKeysRequest:
+      type: object
+      additionalProperties: false
+      required: [alias_ids]
+      properties:
+        alias_ids:
+          type: array
+          minItems: 1
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+    AdminPendingAliasKeysResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [created]
+          properties:
+            created:
+              type: array
+              items:
+                $ref: "#/components/schemas/AdminPendingAliasKey"
+    AdminPendingAliasKey:
+      type: object
+      additionalProperties: false
+      required: [alias, api_key]
+      properties:
+        alias:
+          $ref: "#/components/schemas/AdminAlias"
+        api_key:
+          type: string
+        mail_api_direct_link:
+          type: string
+          format: uri-reference
+          description: Apple 目录确认完成后返回；等待确认时省略，不能作为可用链接。
+    AdminOneTimeKeyResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [alias, api_key]
+          properties:
+            alias:
+              $ref: "#/components/schemas/AdminAlias"
+            api_key:
+              type: string
+    AdminAliasResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminAlias"
+    AdminAlias:
+      type: object
+      additionalProperties: true
+      required: [id, account_id, account_email, address, label, enabled]
       properties:
         id:
           type: integer
@@ -3139,449 +1462,349 @@ components:
           type: string
         api_key_prefix:
           type: string
-          description: 用于辨认 Key 的非完整前缀。
         direct_link_path:
           type: string
           format: uri-reference
-          pattern: "^(|/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])$"
-          description: 使用派生凭据、按当前邮件一次性消费的同源收件直达路径，不含原始 API Key；成功访问会消费当前 UID 并异步标记主号邮件为已读，链接本身仍可等待后续未消费的新 UID；派生链接生成失败时为空字符串。
-        enabled:
-          type: boolean
-        last_sync_status:
-          type: string
-        last_sync_error:
-          type: string
-          description: 最近同步错误的简短摘要；最近一次同步没有错误时为空字符串。
-        last_sync_error_log:
-          type: string
-          description: 最近同步错误的完整日志；最近一次同步没有错误时为空字符串。
-        last_synced_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-        last_accessed_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-        latest_received_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-        created_at:
-          type: string
-          format: date-time
-        updated_at:
-          type: string
-          format: date-time
-
-    AdminAppleSyncResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/AdminAppleSyncResult"
-
-    AdminAppleSyncResult:
-      type: object
-      additionalProperties: false
-      required:
-        - account
-        - aliases
-        - apple_session
-        - auto_creation
-        - summary
-        - created
-      properties:
-        account:
-          $ref: "#/components/schemas/AdminAccount"
-        aliases:
-          type: array
-          items:
-            $ref: "#/components/schemas/AdminAlias"
-        apple_session:
-          $ref: "#/components/schemas/AdminAppleSession"
-        auto_creation:
-          $ref: "#/components/schemas/AdminAliasAutoCreation"
-        summary:
-          $ref: "#/components/schemas/AdminAppleSyncSummary"
-        created:
-          type: array
-          description: |
-            本次新建地址及其一次性凭据。已有地址不出现在此数组中；原始 API Key 离开响应后不可恢复。
-          items:
-            $ref: "#/components/schemas/AdminAppleCreatedAlias"
-
-    AdminAppleSyncSummary:
-      type: object
-      additionalProperties: false
-      required:
-        - total
-        - created_count
-        - existing_count
-        - inactive_count
-        - imported_disabled_count
-        - conflict_count
-        - filtered_out_count
-      properties:
-        total:
-          type: integer
-          minimum: 0
-          description: forwardToEmail 与当前主号匹配的目录条目数。
-        created_count:
-          type: integer
-          minimum: 0
-        existing_count:
-          type: integer
-          minimum: 0
-        inactive_count:
-          type: integer
-          minimum: 0
-          description: 匹配条目中 Apple 标记为 inactive 的数量。
-        imported_disabled_count:
-          type: integer
-          minimum: 0
-          description: 因超出本地 1000 个启用地址容量而以 disabled 状态新建的 active 地址数量；Apple inactive 数量单独由 inactive_count 表示。
-        conflict_count:
-          type: integer
-          minimum: 0
-        filtered_out_count:
-          type: integer
-          minimum: 0
-          description: 因 forwardToEmail 不匹配当前主号而跳过的目录条目数。
-
-    AdminAppleCreatedAlias:
-      type: object
-      additionalProperties: false
-      required:
-        - alias
-        - api_key
-        - mail_api_direct_link
-      properties:
-        alias:
-          $ref: "#/components/schemas/AdminAlias"
-        api_key:
-          type: string
-          pattern: "^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
-          description: 新导入或自动创建地址的原始邮件 API Key；仅在本次受保护响应中显示，自动创建 Key 还需按 alias ID 确认保存后才会从待领取队列删除。
-        mail_api_direct_link:
+          description: recent-mail 消费路径；legacy 保留原 v1 token，v2 使用 recent-mail 专用 token；等待 Apple 目录确认时省略。
+        legacy_direct_link_path:
           type: string
           format: uri-reference
-          pattern: "^(|/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])$"
-          description: 使用派生凭据、按当前邮件一次性消费的同源收件直达路径，不含 api_key 字段中的原始 Key；成功访问会消费当前 UID 并异步标记主号邮件为已读，链接本身仍可等待后续未消费的新 UID；派生失败时为空字符串。
-
-    AdminAppleErrorResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - error
-      properties:
-        error:
-          $ref: "#/components/schemas/AdminAppleError"
-
-    AdminAppleError:
-      type: object
-      additionalProperties: false
-      required:
-        - code
-        - message
-        - request_id
-      properties:
-        code:
-          type: string
-          enum:
-            - AUTH_REQUIRED
-            - SESSION_EXPIRED
-            - CSRF_INVALID
-            - INVALID_CREDENTIALS
-            - CURRENT_PASSWORD_INVALID
-            - CREDENTIALS_CHANGED
-            - RATE_LIMITED
-            - NOT_FOUND
-            - INVALID_JSON
-            - VALIDATION_FAILED
-            - REQUEST_TOO_LARGE
-            - UNSUPPORTED_MEDIA_TYPE
-            - APPLE_LOGIN_REQUIRED
-            - APPLE_SESSION_EXPIRED
-            - APPLE_CREDENTIALS_INVALID
-            - APPLE_VERIFICATION_INVALID
-            - APPLE_FLOW_EXPIRED
-            - APPLE_ACCOUNT_ACTION_REQUIRED
-            - APPLE_RATE_LIMITED
-            - APPLE_UPSTREAM_ERROR
-            - AUTO_CREATION_UNAVAILABLE
-            - ACCOUNT_DISABLED
-            - ACCOUNT_EXISTS
-            - ACCOUNT_IDENTITY_LOCKED
-            - APPLE_ACCOUNT_MISMATCH
-            - ACCOUNT_CHANGED
-            - ALIAS_OWNERSHIP_CONFLICT
-            - ALIAS_CONFIRMATION_PENDING
-            - ALIAS_EXISTS
-            - ALIAS_LIMIT_REACHED
-            - SYNC_FAILED
-            - INTERNAL_ERROR
-          description: |
-            Apple 会话错误使用 APPLE_ 前缀，与后台登录会话的 AUTH_REQUIRED/SESSION_EXPIRED 分离。
-        message:
-          type: string
-        request_id:
-          type: string
-          description: 与 X-Request-ID 响应头相同的请求追踪标识。
-
-    CreateAliasResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/CreateAliasData"
-
-    CreateAliasData:
-      type: object
-      additionalProperties: false
-      required:
-        - alias
-        - icloud
-        - api_key
-        - mail_api_direct_link
-      properties:
-        alias:
-          type: string
-          format: email
-          description: 已登记并规范化的隐私邮箱地址。
-        icloud:
-          type: string
-          format: email
-          description: 该隐私邮箱所属、已登记的 iCloud 主号邮箱。
-        api_key:
-          type: string
-          pattern: "^icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
-          description: |
-            新隐私邮箱的原始邮件 API Key，仅在本次成功响应中显示一次。
-            调用方应立即保存，服务端数据库只保存其哈希和辨认前缀。
-        mail_api_direct_link:
+        otp_url_path:
           type: string
           format: uri-reference
-          pattern: "^/api/v1/mail/recent\\?api_key=icm_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$"
-          description: |
-            可直接访问、按当前邮件一次性消费的同源相对路径。查询参数是服务端生成的派生直达凭据，
-            不是 `api_key` 字段中的原始邮件 API Key；轮换邮件 API Key 后该链接失效。
-            成功访问会消费当前 UID，并异步把主号收件箱中的该邮件标记为已读；链接本身仍可等待
-            后续未消费的新 UID。
-
-    RecentMailResponse:
-      type: object
-      description: |
-        返回此 200 响应前，本地消费历史和持久化 IMAP `\Seen` 任务已经在同一事务中提交。
-        `\Seen` 由后台异步写回 iCloud，收到响应时主号中的邮件仍可能暂时显示为未读。
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/RecentMailData"
-
-    RecentMailData:
-      type: object
-      additionalProperties: false
-      required:
-        - address
-        - subject
-        - snippet
-        - sent_at
-      properties:
-        address:
+          description: v2 使用只读 OTP 专用 token；legacy 保持原 recent-mail 兼容路径。
+        credential_mode:
           type: string
-          format: email
-          description: api_key 绑定的隐私邮箱地址。
-        subject:
+          enum: [legacy, v2]
+        api_key:
           type: string
-          description: 邮件主题；邮件没有主题时为空字符串。
-        snippet:
+          description: 仅在服务持有可解密的 v2 凭证时返回明文。
+        imap_password:
           type: string
-          description: 单行纯文本；优先使用邮件声明的纯文本正文，纯文本为空时从 HTML 正文中提取可读文字，并过滤结构标签、样式、脚本及常见的内联隐藏内容。换行、制表符和连续空白会压缩成一个普通空格。内容可能因服务端邮件或正文大小上限而截断。
-        sent_at:
+        client_id:
           type: string
-          format: date-time
-          description: 邮件 Date 头，缺失或无效时回退到 IMAP INTERNALDATE；按服务端 TZ 对应时区格式化为 RFC 3339，并包含该时区的 UTC 偏移。最近一小时窗口仍按 IMAP INTERNALDATE 判断。
-          examples:
-            - "2026-08-07T12:30:00+08:00"
-
-    LatestMailResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - data
-      properties:
-        data:
-          $ref: "#/components/schemas/LatestMailData"
-
-    LatestMailData:
-      type: object
-      additionalProperties: false
-      required:
-        - alias
-        - message
-        - synced_at
-        - stale
-      properties:
-        alias:
+        refresh_token:
           type: string
-          format: email
-          description: 当前 API Key 绑定的隐私邮箱地址。
-        message:
-          $ref: "#/components/schemas/MailMessage"
-        synced_at:
-          type: string
-          format: date-time
-          description: 这封邮件写入本地存储的 UTC 时间。
-        stale:
-          type: boolean
-          const: false
-          description: |
-            成功响应中恒为 false。若当前隐私邮箱状态不是 ok、last_synced_at 为空，
-            最后同步时间晚于当前时间，或最后同步距今超过上述快照新鲜度窗口，接口返回 503，
-            而不会返回带 stale=true 的旧快照。
-
-    MailMessage:
-      type: object
-      additionalProperties: false
-      required:
-        - id
-        - message_id
-        - received_at
-        - sent_at
-        - from
-        - to
-        - cc
-        - subject
-        - text
-        - html
-        - attachments
-        - has_attachments
-        - body_truncated
-      properties:
-        id:
-          type: string
-          pattern: "^[0-9]+-[0-9]+$"
-          description: 由 IMAP UIDVALIDITY 与 UID 组成的本地稳定标识。
-        message_id:
-          type: string
-          description: 邮件 Message-ID 头；邮件未提供时可能为空字符串。
-        received_at:
-          type: string
-          format: date-time
-          description: IMAP INTERNALDATE，统一以 UTC RFC 3339 格式返回。
-        sent_at:
-          type:
-            - string
-            - "null"
-          format: date-time
-          description: 邮件 Date 头的 UTC RFC 3339 时间；缺失或无效时为 null。
-        from:
-          type: array
-          items:
-            $ref: "#/components/schemas/MailAddress"
-        to:
-          type: array
-          items:
-            $ref: "#/components/schemas/MailAddress"
-        cc:
-          type: array
-          items:
-            $ref: "#/components/schemas/MailAddress"
-        subject:
-          type: string
-        text:
-          type: string
-          description: 解析后的纯文本正文；不存在时为空字符串。
-        html:
-          type: string
-          description: 解析后的 HTML 正文；不存在时为空字符串。
-        attachments:
-          type: array
-          items:
-            $ref: "#/components/schemas/Attachment"
-        has_attachments:
-          type: boolean
-          description: attachments 是否至少包含一项。
-        body_truncated:
-          type: boolean
-          description: 原始邮件或正文是否因服务端大小上限被截断。
-
-    MailAddress:
-      type: object
-      additionalProperties: false
-      required:
-        - email
-      properties:
-        name:
-          type: string
-          description: 显示名称；为空时该字段会被省略。
-        email:
-          type: string
-          format: email
-
-    Attachment:
-      type: object
-      additionalProperties: false
-      required:
-        - filename
-        - content_type
-        - size
-      properties:
-        filename:
-          type: string
-        content_type:
-          type: string
-        size:
+        credential_version:
           type: integer
           format: int64
           minimum: 0
-          description: 附件大小，单位为字节。
-
-    HealthResponse:
+        enabled:
+          type: boolean
+    APIErrorEnvelope:
       type: object
       additionalProperties: false
-      required:
-        - status
-      properties:
-        status:
-          type: string
-          const: ok
-
-    ErrorResponse:
-      type: object
-      additionalProperties: false
-      required:
-        - error
+      required: [error]
       properties:
         error:
-          $ref: "#/components/schemas/APIError"
-
-    APIError:
-      type: object
-      additionalProperties: false
-      required:
-        - code
-        - message
-        - request_id
-      properties:
-        code:
-          type: string
-          description: 稳定、可供程序判断的错误码。
+          type: object
+          additionalProperties: false
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            request_id:
+              type: string
+  responses:
+    AdminAuthUnauthorized:
+      description: 后台会话 Cookie 缺失、无效或已经过期
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
           examples:
-            - INVALID_API_KEY
-        message:
-          type: string
-          description: 面向调用方的错误说明。
-        request_id:
-          type: string
-          description: 与 X-Request-ID 响应头相同的请求追踪标识。
+            loginRequired:
+              value:
+                error:
+                  code: AUTH_REQUIRED
+                  message: 请先登录
+                  request_id: 6oe7j0x3x3pJv9Dv
+            sessionExpired:
+              value:
+                error:
+                  code: SESSION_EXPIRED
+                  message: 登录会话已过期
+                  request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminAccountBadRequest:
+      description: JSON 格式错误、含有未知字段，或主号字段校验失败
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          examples:
+            invalidJSON:
+              value:
+                error:
+                  code: INVALID_JSON
+                  message: JSON 请求体格式错误或包含未知字段
+                  request_id: 6oe7j0x3x3pJv9Dv
+            invalidIMAPHost:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: "IMAP 服务地址无效: invalid imap DNS label"
+                  request_id: 6oe7j0x3x3pJv9Dv
+            invalidIMAPPort:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: "IMAP 服务地址无效: imap port must be between 1 and 65535"
+                  request_id: 6oe7j0x3x3pJv9Dv
+            nullIMAPHost:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: IMAP 主机不能为 null
+                  request_id: 6oe7j0x3x3pJv9Dv
+            nullIMAPPort:
+              value:
+                error:
+                  code: VALIDATION_FAILED
+                  message: IMAP 端口不能为 null
+                  request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminCSRFForbidden:
+      description: X-CSRF-Token 缺失、无效，或请求未通过同源校验
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          example:
+            error:
+              code: CSRF_INVALID
+              message: 请求校验失败，请刷新页面后重试
+              request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminAccountConflict:
+      description: 主号邮箱已存在，或已有隐私邮箱后尝试修改主号邮箱
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          examples:
+            accountExists:
+              value:
+                error:
+                  code: ACCOUNT_EXISTS
+                  message: 这个主号已经存在
+                  request_id: 6oe7j0x3x3pJv9Dv
+            identityLocked:
+              value:
+                error:
+                  code: ACCOUNT_IDENTITY_LOCKED
+                  message: 已有隐私邮箱时不能修改主号邮箱
+                  request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminJSONTooLarge:
+      description: JSON 请求体超过 64 KiB
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          example:
+            error:
+              code: REQUEST_TOO_LARGE
+              message: JSON 请求体不能超过 64 KiB
+              request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminAccountNotFound:
+      description: 指定的本地主号不存在
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          example:
+            error:
+              code: NOT_FOUND
+              message: 主号不存在
+              request_id: 6oe7j0x3x3pJv9Dv
+
+    InvalidRequest:
+      description: 参数缺失、重复、格式错误，或包含不支持的字段（`INVALID_REQUEST`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    InvalidCredential:
+      description: Bearer 凭据、API Key 或派生 token 无效。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    InvalidOAuthToken:
+      description: 部署级 OAuth Bearer 凭据无效（`INVALID_OAUTH_TOKEN`）。
+      headers:
+        WWW-Authenticate:
+          description: Bearer 鉴权提示。
+          schema:
+            type: string
+            const: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    MailNotFound:
+      description: 当前没有符合条件且尚未消费的邮件（`MAIL_NOT_FOUND`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    NotFound:
+      description: 请求的主号、alias 或邮件不存在。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    Conflict:
+      description: alias 已存在或主号已达到启用数量上限。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    RequestTooLarge:
+      description: query 与正文合计超过 4 KiB（`REQUEST_TOO_LARGE`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    UnsupportedMediaType:
+      description: 非空正文没有使用 `application/x-www-form-urlencoded`（`UNSUPPORTED_MEDIA_TYPE`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    RateLimited:
+      description: 请求过于频繁。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    Unavailable:
+      description: 服务暂不可用。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    InternalError:
+      description: 服务处理凭据或直达链接时发生内部错误。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminBadRequest:
+      description: JSON 无效、包含未知字段或业务参数校验失败（`INVALID_JSON` 或 `VALIDATION_FAILED`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminUnauthorized:
+      description: 管理会话缺失或已过期（`AUTH_REQUIRED` 或 `SESSION_EXPIRED`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminForbidden:
+      description: CSRF token 或同源校验失败（`CSRF_INVALID`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminNotFound:
+      description: 管理资源不存在或路径 ID 无效（`NOT_FOUND`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminAliasConflict:
+      description: alias 等待 Apple 确认或不支持所请求的凭证轮换模式（`ALIAS_CONFIRMATION_PENDING` 或 `ALIAS_CREDENTIAL_MODE_UNSUPPORTED`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminRequestTooLarge:
+      description: JSON 请求体超过 64 KiB（`REQUEST_TOO_LARGE`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminUnsupportedMediaType:
+      description: JSON 管理操作未使用 `application/json`（`UNSUPPORTED_MEDIA_TYPE`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminInternalError:
+      description: 管理 API 处理失败（`INTERNAL_ERROR`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    OAuthInvalidRequest:
+      description: OAuth 表单格式错误。
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, error_description]
+            properties:
+              error:
+                const: invalid_request
+              error_description:
+                type: string
+    OAuthInvalidClient:
+      description: client ID 或 refresh token 无效。
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, error_description]
+            properties:
+              error:
+                const: invalid_client
+              error_description:
+                type: string
+    OAuthUnavailable:
+      description: 令牌服务暂不可用或请求受到限流。
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, error_description]
+            properties:
+              error:
+                const: temporarily_unavailable
+              error_description:
+                type: string

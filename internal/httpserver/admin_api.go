@@ -27,7 +27,6 @@ import (
 
 const (
 	adminAPILoginCSRFCookie   = "icloud_api_login_csrf"
-	adminAPILoginCSRFPath     = "/admin/api/v1/auth"
 	adminAPICSRFHeader        = "X-CSRF-Token"
 	adminAPIMaxJSONBytes      = 64 << 10
 	adminAPIDefaultPageLimit  = 20
@@ -36,22 +35,25 @@ const (
 	adminAPIMaxListQueryRunes = 200
 )
 
-// registerAdminAPIRoutes attaches the JSON admin API to a group whose base
-// path is /admin/api/v1. Authentication, request limits, and CSRF checks are
-// applied to the API endpoints below.
+const legacyAdminAPIBasePath = "/admin/api/v1"
+
+// registerAdminAPIRoutes attaches the JSON admin API to either the
+// installation-specific management path or the fixed compatibility path.
+// Authentication, request limits, and CSRF checks apply to both entry points.
 func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
+	basePath := api.BasePath()
 	auth := api.Group("/auth")
-	auth.GET("/csrf", s.adminAPILoginCSRF)
-	auth.POST("/login", s.adminAPILoginRequestGate(), s.adminAPILogin)
+	auth.GET("/csrf", s.adminAPILoginCSRF(basePath))
+	auth.POST("/login", s.adminAPILoginRequestGate(), s.adminAPILogin(basePath))
 
 	protected := api.Group("")
 	protected.Use(s.adminAPIAuth(), s.adminAPICSRF())
 	protected.GET("/auth/session", s.adminAPISession)
-	protected.POST("/auth/logout", s.adminAPILogout)
-	protected.PUT("/auth/password", s.adminAPIChangePassword)
+	protected.POST("/auth/logout", s.adminAPILogout(basePath))
+	protected.PUT("/auth/password", s.adminAPIChangePassword(basePath))
 
 	protected.GET("/accounts", s.adminAPIListAccounts)
-	protected.POST("/accounts", s.adminAPICreateAccount)
+	protected.POST("/accounts", s.adminAPICreateAccount(basePath))
 	protected.GET("/accounts/:id", s.adminAPIGetAccount)
 	protected.PUT("/accounts/:id", s.adminAPIUpdateAccount)
 	protected.DELETE("/accounts/:id", s.adminAPIDeleteAccount)
@@ -62,12 +64,13 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.PUT("/accounts/:id/aliases/auto-create", s.adminAPISetAliasAutoCreation)
 	protected.GET("/accounts/:id/aliases/auto-create/keys", s.adminAPIGetAliasAutoCreationKeys)
 	protected.DELETE("/accounts/:id/aliases/auto-create/keys", s.adminAPIAcknowledgeAliasAutoCreationKeys)
-	protected.POST("/accounts/:id/aliases", s.adminAPICreateAlias)
+	protected.POST("/accounts/:id/aliases", s.adminAPICreateAlias(basePath))
 	protected.POST("/accounts/:id/aliases/sync", s.adminAPISyncAppleAliases)
 
 	protected.GET("/aliases", s.adminAPIListAliases)
 	protected.GET("/aliases/:id", s.adminAPIGetAlias)
 	protected.POST("/aliases/:id/rotate-key", s.adminAPIRotateAliasKey)
+	protected.POST("/aliases/:id/rotate-credentials", s.adminAPIRotateAliasCredentials)
 	protected.PATCH("/aliases/:id", s.adminAPIUpdateAlias)
 	protected.DELETE("/aliases/:id", s.adminAPIDeleteAlias)
 
@@ -113,22 +116,30 @@ type adminAPISyncProgressDTO struct {
 }
 
 type adminAPIAliasDTO struct {
-	ID               int64   `json:"id"`
-	AccountID        int64   `json:"account_id"`
-	AccountEmail     string  `json:"account_email"`
-	Address          string  `json:"address"`
-	Label            string  `json:"label"`
-	APIKeyPrefix     string  `json:"api_key_prefix"`
-	DirectLinkPath   string  `json:"direct_link_path"`
-	Enabled          bool    `json:"enabled"`
-	LastSyncStatus   string  `json:"last_sync_status"`
-	LastSyncError    string  `json:"last_sync_error"`
-	LastSyncErrorLog string  `json:"last_sync_error_log"`
-	LastSyncedAt     *string `json:"last_synced_at"`
-	LastAccessedAt   *string `json:"last_accessed_at"`
-	LatestReceivedAt *string `json:"latest_received_at"`
-	CreatedAt        string  `json:"created_at"`
-	UpdatedAt        string  `json:"updated_at"`
+	ID                int64   `json:"id"`
+	AccountID         int64   `json:"account_id"`
+	AccountEmail      string  `json:"account_email"`
+	Address           string  `json:"address"`
+	Label             string  `json:"label"`
+	APIKeyPrefix      string  `json:"api_key_prefix"`
+	DirectLinkPath    string  `json:"direct_link_path"`
+	APIKey            string  `json:"api_key"`
+	IMAPPassword      string  `json:"imap_password"`
+	ClientID          string  `json:"client_id"`
+	RefreshToken      string  `json:"refresh_token"`
+	OTPURLPath        string  `json:"otp_url_path"`
+	LegacyDirectLink  string  `json:"legacy_direct_link_path,omitempty"`
+	CredentialMode    string  `json:"credential_mode,omitempty"`
+	CredentialVersion int64   `json:"credential_version"`
+	Enabled           bool    `json:"enabled"`
+	LastSyncStatus    string  `json:"last_sync_status"`
+	LastSyncError     string  `json:"last_sync_error"`
+	LastSyncErrorLog  string  `json:"last_sync_error_log"`
+	LastSyncedAt      *string `json:"last_synced_at"`
+	LastAccessedAt    *string `json:"last_accessed_at"`
+	LatestReceivedAt  *string `json:"latest_received_at"`
+	CreatedAt         string  `json:"created_at"`
+	UpdatedAt         string  `json:"updated_at"`
 }
 
 type adminAPIAuditLogDTO struct {
@@ -172,15 +183,15 @@ type adminAPIAutoCreationKeysRequest struct {
 	AliasIDs []int64 `json:"alias_ids"`
 }
 
-var (
-	errAutoCreationUnavailable     = errors.New("automatic alias creation service is unavailable")
-	errAutoCreationAccountDisabled = errors.New("primary account is disabled")
-)
-
 type adminAPIOneTimeKeyDTO struct {
 	Alias  adminAPIAliasDTO `json:"alias"`
 	APIKey string           `json:"api_key"`
 }
+
+var (
+	errAutoCreationUnavailable     = errors.New("automatic alias creation service is unavailable")
+	errAutoCreationAccountDisabled = errors.New("primary account is disabled")
+)
 
 type adminAPILoginRequest struct {
 	Username string `json:"username"`
@@ -319,36 +330,70 @@ func (s *Server) adminAPIAccountFromDomain(account domain.Account) adminAPIAccou
 }
 
 func (s *Server) adminAPIAliasFromDomain(alias domain.Alias) (adminAPIAliasDTO, error) {
-	directLinkPath := ""
-	if !adminAPIAliasConfirmationPending(alias) {
+	dto := adminAPIAliasDTO{
+		ID:                alias.ID,
+		AccountID:         alias.AccountID,
+		AccountEmail:      alias.AccountEmail,
+		Address:           alias.Address,
+		Label:             alias.Label,
+		APIKeyPrefix:      alias.APIKeyPrefix,
+		CredentialMode:    alias.CredentialMode,
+		CredentialVersion: alias.CredentialVersion,
+		Enabled:           alias.Enabled,
+		LastSyncStatus:    alias.LastSyncStatus,
+		LastSyncError:     adminAPISyncErrorSummary(alias.LastSyncError),
+		LastSyncErrorLog:  alias.LastSyncError,
+		LastSyncedAt:      adminAPIOptionalTime(alias.LastSyncedAt),
+		LastAccessedAt:    adminAPIOptionalTime(alias.LastAccessedAt),
+		LatestReceivedAt:  adminAPIOptionalTime(alias.LatestReceivedAt),
+		CreatedAt:         adminAPITime(alias.CreatedAt),
+		UpdatedAt:         adminAPITime(alias.UpdatedAt),
+	}
+	if adminAPIAliasConfirmationPending(alias) {
+		// Apple has not published this address yet. Do not expose any usable
+		// direct link, even if credential material was staged transactionally.
+		return dto, nil
+	}
+	if alias.CredentialMode == domain.AliasCredentialModeLegacy {
+		// Credential mode is the compatibility boundary. A legacy row may still
+		// contain stale ciphertext or OAuth/hash columns from an interrupted
+		// migration; those columns must never turn the row into a v2 credential
+		// bundle or expose secrets through the administrator API.
 		token, err := s.cipher.DirectLinkToken(alias.ID, alias.APIKeyHash)
 		if err != nil {
-			return adminAPIAliasDTO{}, fmt.Errorf("生成隐私邮箱直达链接: %w", err)
+			return adminAPIAliasDTO{}, fmt.Errorf("生成隐私邮箱兼容直达链接: %w", err)
 		}
 		query := url.Values{"api_key": {token}}
-		directLinkPath = (&url.URL{
-			Path:     "/api/v1/mail/recent",
-			RawQuery: query.Encode(),
-		}).String()
+		legacyDirectLink := (&url.URL{Path: "/api/v1/mail/recent", RawQuery: query.Encode()}).String()
+		dto.DirectLinkPath = legacyDirectLink
+		dto.LegacyDirectLink = legacyDirectLink
+		dto.OTPURLPath = legacyDirectLink
+		return dto, nil
 	}
-	return adminAPIAliasDTO{
-		ID:               alias.ID,
-		AccountID:        alias.AccountID,
-		AccountEmail:     alias.AccountEmail,
-		Address:          alias.Address,
-		Label:            alias.Label,
-		APIKeyPrefix:     alias.APIKeyPrefix,
-		DirectLinkPath:   directLinkPath,
-		Enabled:          alias.Enabled,
-		LastSyncStatus:   alias.LastSyncStatus,
-		LastSyncError:    adminAPISyncErrorSummary(alias.LastSyncError),
-		LastSyncErrorLog: alias.LastSyncError,
-		LastSyncedAt:     adminAPIOptionalTime(alias.LastSyncedAt),
-		LastAccessedAt:   adminAPIOptionalTime(alias.LastAccessedAt),
-		LatestReceivedAt: adminAPIOptionalTime(alias.LatestReceivedAt),
-		CreatedAt:        adminAPITime(alias.CreatedAt),
-		UpdatedAt:        adminAPITime(alias.UpdatedAt),
-	}, nil
+	recentToken, err := s.cipher.RecentMailToken(alias.ID, alias.APIKeyHash)
+	if err != nil {
+		return adminAPIAliasDTO{}, fmt.Errorf("生成隐私邮箱最近邮件链接: %w", err)
+	}
+	recentQuery := url.Values{"api_key": {recentToken}}
+	recentLink := (&url.URL{Path: "/api/v1/mail/recent", RawQuery: recentQuery.Encode()}).String()
+	dto.DirectLinkPath = recentLink
+	dto.LegacyDirectLink = recentLink
+
+	credentials, err := s.cipher.DecryptAliasCredentials(alias.ID, alias.CredentialCiphertext)
+	if err != nil {
+		return adminAPIAliasDTO{}, fmt.Errorf("解密隐私邮箱凭证: %w", err)
+	}
+	otpToken, err := s.cipher.OTPToken(alias.ID, alias.APIKeyHash)
+	if err != nil {
+		return adminAPIAliasDTO{}, fmt.Errorf("生成隐私邮箱验证码链接: %w", err)
+	}
+	otpQuery := url.Values{"token": {otpToken}}
+	dto.OTPURLPath = (&url.URL{Path: "/api/v1/otp", RawQuery: otpQuery.Encode()}).String()
+	dto.APIKey = credentials.APIKey
+	dto.IMAPPassword = credentials.IMAPPassword
+	dto.ClientID = credentials.ClientID
+	dto.RefreshToken = credentials.RefreshToken
+	return dto, nil
 }
 
 func adminAPISyncErrorSummary(message string) string {
@@ -392,7 +437,7 @@ func adminAPIOptionalTime(value *time.Time) *string {
 	return &formatted
 }
 
-func adminAPIAutoCreationFromSchedule(schedule domain.AliasCreationSchedule, pendingCount int, appleStatus string) *adminAPIAutoCreationDTO {
+func adminAPIAutoCreationFromSchedule(schedule domain.AliasCreationSchedule, appleStatus string, pendingCount ...int) *adminAPIAutoCreationDTO {
 	plannedTimes := make([]string, 0, len(schedule.PlannedAt))
 	for _, planned := range schedule.PlannedAt {
 		plannedTimes = append(plannedTimes, adminAPITime(planned))
@@ -415,6 +460,10 @@ func adminAPIAutoCreationFromSchedule(schedule domain.AliasCreationSchedule, pen
 			status = "scheduled"
 		}
 	}
+	count := 0
+	if len(pendingCount) > 0 {
+		count = pendingCount[0]
+	}
 	return &adminAPIAutoCreationDTO{
 		Enabled:          schedule.Enabled,
 		Status:           status,
@@ -425,8 +474,8 @@ func adminAPIAutoCreationFromSchedule(schedule domain.AliasCreationSchedule, pen
 		LastCreatedAt:    adminAPIOptionalTime(schedule.LastCreatedAt),
 		LastAliasAddress: schedule.LastAliasAddress,
 		LastError:        schedule.LastError,
-		PendingKeyCount:  pendingCount,
-		PendingKeyTotal:  pendingCount,
+		PendingKeyCount:  count,
+		PendingKeyTotal:  count,
 	}
 }
 
@@ -471,7 +520,7 @@ func (s *Server) adminAPIAuth() gin.HandlerFunc {
 		}
 		session, err := s.store.GetSessionByHash(c.Request.Context(), secure.HashToken(raw))
 		if errors.Is(err, store.ErrNotFound) {
-			s.clearSessionCookie(c)
+			s.clearSessionCookies(c)
 			writeAdminAPIError(c, http.StatusUnauthorized, "SESSION_EXPIRED", "登录会话已过期")
 			c.Abort()
 			return
@@ -504,99 +553,103 @@ func (s *Server) adminAPICSRF() gin.HandlerFunc {
 	}
 }
 
-func (s *Server) adminAPILoginCSRF(c *gin.Context) {
-	if token, err := c.Cookie(adminAPILoginCSRFCookie); err == nil && len(token) == 32 {
+func (s *Server) adminAPILoginCSRF(basePath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if token, err := c.Cookie(adminAPILoginCSRFCookie); err == nil && len(token) == 32 {
+			writeAdminAPIData(c, http.StatusOK, gin.H{"csrf_token": token, "expires_in": 600})
+			return
+		}
+		token, err := secure.RandomToken(24)
+		if err != nil {
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     adminAPILoginCSRFCookie,
+			Value:    token,
+			Path:     basePath + "/auth",
+			MaxAge:   600,
+			HttpOnly: true,
+			Secure:   s.cfg.CookieSecure,
+			SameSite: http.SameSiteStrictMode,
+		})
+		c.Header("Cache-Control", "no-store")
 		writeAdminAPIData(c, http.StatusOK, gin.H{"csrf_token": token, "expires_in": 600})
-		return
 	}
-	token, err := secure.RandomToken(24)
-	if err != nil {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     adminAPILoginCSRFCookie,
-		Value:    token,
-		Path:     adminAPILoginCSRFPath,
-		MaxAge:   600,
-		HttpOnly: true,
-		Secure:   s.cfg.CookieSecure,
-		SameSite: http.SameSiteStrictMode,
-	})
-	c.Header("Cache-Control", "no-store")
-	writeAdminAPIData(c, http.StatusOK, gin.H{"csrf_token": token, "expires_in": 600})
 }
 
-func (s *Server) adminAPILogin(c *gin.Context) {
-	provided := c.GetHeader(adminAPICSRFHeader)
-	if reason := adminAPILoginCSRFFailureReason(c.Request, provided); reason != "" {
-		s.logger.Warn("后台 API 登录请求校验失败",
-			"reason", reason,
-			"cookie_count", requestCookieCount(c.Request, adminAPILoginCSRFCookie),
-			"request_id", requestID(c),
-		)
-		writeAdminAPIError(c, http.StatusForbidden, "CSRF_INVALID", "请求校验失败，请重新获取登录校验信息")
-		return
-	}
-	var input adminAPILoginRequest
-	if !decodeAdminAPIJSON(c, &input) {
-		return
-	}
-	username := strings.TrimSpace(input.Username)
-	if username == "" || len(username) > 128 || len(input.Password) > 72 {
-		writeAdminAPIError(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "用户名或密码错误")
-		return
-	}
-	if !s.loginLimiter.Allow(c.ClientIP()) {
-		writeAdminAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "尝试次数过多，请稍后再试")
-		return
-	}
-
-	admin, lookupErr := s.store.GetAdminByUsername(c.Request.Context(), username)
-	hash := []byte("$2a$12$MmRQk4bYUn7nFdy4xTqIBuUqhgjYuSmkwJtQA4n.IqQvEp4zrC23e")
-	if lookupErr == nil {
-		hash = []byte(admin.PasswordHash)
-	}
-	passwordOK := bcrypt.CompareHashAndPassword(hash, []byte(input.Password)) == nil
-	if lookupErr != nil || !passwordOK {
-		s.audit(c, nil, username, "login", "admin", "", "failed", "")
-		writeAdminAPIError(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "用户名或密码错误")
-		return
-	}
-	if _, err := s.store.DeleteExpiredSessions(c.Request.Context()); err != nil {
-		s.logger.Warn("清理过期后台会话失败", "error", err, "request_id", requestID(c))
-	}
-
-	rawToken, err := secure.RandomToken(32)
-	if err != nil {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	csrf, err := secure.RandomToken(24)
-	if err != nil {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	session := domain.Session{
-		AdminID:         admin.ID,
-		Username:        admin.Username,
-		PasswordVersion: admin.PasswordVersion,
-		CSRF:            csrf,
-		ExpiresAt:       time.Now().UTC().Add(s.cfg.SessionTTL),
-	}
-	if err := s.store.CreateSession(c.Request.Context(), secure.HashToken(rawToken), session); err != nil {
-		if errors.Is(err, store.ErrCredentialsChanged) {
-			s.audit(c, &admin.ID, admin.Username, "login", "admin", "", "failed", "credentials_changed")
+func (s *Server) adminAPILogin(basePath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		provided := c.GetHeader(adminAPICSRFHeader)
+		if reason := adminAPILoginCSRFFailureReason(c.Request, provided); reason != "" {
+			s.logger.Warn("后台 API 登录请求校验失败",
+				"reason", reason,
+				"cookie_count", requestCookieCount(c.Request, adminAPILoginCSRFCookie),
+				"request_id", requestID(c),
+			)
+			writeAdminAPIError(c, http.StatusForbidden, "CSRF_INVALID", "请求校验失败，请重新获取登录校验信息")
+			return
+		}
+		var input adminAPILoginRequest
+		if !decodeAdminAPIJSON(c, &input) {
+			return
+		}
+		username := strings.TrimSpace(input.Username)
+		if username == "" || len(username) > 128 || len(input.Password) > 72 {
 			writeAdminAPIError(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "用户名或密码错误")
 			return
 		}
-		s.writeAdminAPIInternalError(c, err)
-		return
+		if !s.loginLimiter.Allow(c.ClientIP()) {
+			writeAdminAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "尝试次数过多，请稍后再试")
+			return
+		}
+
+		admin, lookupErr := s.store.GetAdminByUsername(c.Request.Context(), username)
+		hash := []byte("$2a$12$MmRQk4bYUn7nFdy4xTqIBuUqhgjYuSmkwJtQA4n.IqQvEp4zrC23e")
+		if lookupErr == nil {
+			hash = []byte(admin.PasswordHash)
+		}
+		passwordOK := bcrypt.CompareHashAndPassword(hash, []byte(input.Password)) == nil
+		if lookupErr != nil || !passwordOK {
+			s.audit(c, nil, username, "login", "admin", "", "failed", "")
+			writeAdminAPIError(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "用户名或密码错误")
+			return
+		}
+		if _, err := s.store.DeleteExpiredSessions(c.Request.Context()); err != nil {
+			s.logger.Warn("清理过期后台会话失败", "error", err, "request_id", requestID(c))
+		}
+
+		rawToken, err := secure.RandomToken(32)
+		if err != nil {
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		csrf, err := secure.RandomToken(24)
+		if err != nil {
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		session := domain.Session{
+			AdminID:         admin.ID,
+			Username:        admin.Username,
+			PasswordVersion: admin.PasswordVersion,
+			CSRF:            csrf,
+			ExpiresAt:       time.Now().UTC().Add(s.cfg.SessionTTL),
+		}
+		if err := s.store.CreateSession(c.Request.Context(), secure.HashToken(rawToken), session); err != nil {
+			if errors.Is(err, store.ErrCredentialsChanged) {
+				s.audit(c, &admin.ID, admin.Username, "login", "admin", "", "failed", "credentials_changed")
+				writeAdminAPIError(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "用户名或密码错误")
+				return
+			}
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		s.setSessionCookies(c, rawToken)
+		s.clearAdminAPILoginCSRFCookie(c, basePath)
+		s.audit(c, &admin.ID, admin.Username, "login", "admin", "", "success", "")
+		writeAdminAPIData(c, http.StatusOK, adminAPISessionFromDomain(session))
 	}
-	s.setSessionCookie(c, rawToken)
-	s.clearAdminAPILoginCSRFCookie(c)
-	s.audit(c, &admin.ID, admin.Username, "login", "admin", "", "success", "")
-	writeAdminAPIData(c, http.StatusOK, adminAPISessionFromDomain(session))
 }
 
 func adminAPILoginCSRFFailureReason(r *http.Request, provided string) string {
@@ -616,11 +669,11 @@ func adminAPILoginCSRFFailureReason(r *http.Request, provided string) string {
 	return ""
 }
 
-func (s *Server) clearAdminAPILoginCSRFCookie(c *gin.Context) {
+func (s *Server) clearAdminAPILoginCSRFCookie(c *gin.Context, basePath string) {
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     adminAPILoginCSRFCookie,
 		Value:    "",
-		Path:     adminAPILoginCSRFPath,
+		Path:     basePath + "/auth",
 		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   s.cfg.CookieSecure,
@@ -632,66 +685,70 @@ func (s *Server) adminAPISession(c *gin.Context) {
 	writeAdminAPIData(c, http.StatusOK, adminAPISessionFromDomain(mustSession(c)))
 }
 
-func (s *Server) adminAPILogout(c *gin.Context) {
-	session := mustSession(c)
-	raw, err := c.Cookie(sessionCookie)
-	if err == nil && raw != "" {
-		if err := s.store.DeleteSession(c.Request.Context(), secure.HashToken(raw)); err != nil {
-			s.audit(c, &session.AdminID, session.Username, "logout", "admin", "", "failed", "")
+func (s *Server) adminAPILogout(_ string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		session := mustSession(c)
+		raw, err := c.Cookie(sessionCookie)
+		if err == nil && raw != "" {
+			if err := s.store.DeleteSession(c.Request.Context(), secure.HashToken(raw)); err != nil {
+				s.audit(c, &session.AdminID, session.Username, "logout", "admin", "", "failed", "")
+				s.writeAdminAPIInternalError(c, err)
+				return
+			}
+		}
+		s.audit(c, &session.AdminID, session.Username, "logout", "admin", "", "success", "")
+		s.clearSessionCookies(c)
+		c.Status(http.StatusNoContent)
+	}
+}
+
+func (s *Server) adminAPIChangePassword(_ string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var input adminAPIPasswordRequest
+		if !decodeAdminAPIJSON(c, &input) {
+			return
+		}
+		session := mustSession(c)
+		admin, err := s.store.GetAdminByID(c.Request.Context(), session.AdminID)
+		if errors.Is(err, store.ErrNotFound) {
+			s.clearSessionCookies(c)
+			writeAdminAPIError(c, http.StatusUnauthorized, "SESSION_EXPIRED", "登录会话已失效")
+			return
+		}
+		if err != nil {
 			s.writeAdminAPIInternalError(c, err)
 			return
 		}
-	}
-	s.audit(c, &session.AdminID, session.Username, "logout", "admin", "", "success", "")
-	s.clearSessionCookie(c)
-	c.Status(http.StatusNoContent)
-}
-
-func (s *Server) adminAPIChangePassword(c *gin.Context) {
-	var input adminAPIPasswordRequest
-	if !decodeAdminAPIJSON(c, &input) {
-		return
-	}
-	session := mustSession(c)
-	admin, err := s.store.GetAdminByID(c.Request.Context(), session.AdminID)
-	if errors.Is(err, store.ErrNotFound) {
-		s.clearSessionCookie(c)
-		writeAdminAPIError(c, http.StatusUnauthorized, "SESSION_EXPIRED", "登录会话已失效")
-		return
-	}
-	if err != nil {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	if bcrypt.CompareHashAndPassword([]byte(admin.PasswordHash), []byte(input.CurrentPassword)) != nil {
-		writeAdminAPIError(c, http.StatusUnauthorized, "CURRENT_PASSWORD_INVALID", "当前密码不正确")
-		return
-	}
-	if len(input.NewPassword) < 12 || len(input.NewPassword) > 72 {
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "新密码长度需要在 12 到 72 字节之间")
-		return
-	}
-	if input.NewPassword != input.ConfirmPassword {
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "两次填写的新密码不一致")
-		return
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(input.NewPassword), 12)
-	if err != nil {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	if err := s.store.ChangeAdminPasswordAndRevokeSessions(c.Request.Context(), admin.ID, admin.PasswordVersion, string(hash)); err != nil {
-		if errors.Is(err, store.ErrCredentialsChanged) {
-			s.clearSessionCookie(c)
-			writeAdminAPIError(c, http.StatusConflict, "CREDENTIALS_CHANGED", "登录凭据已在其他请求中更新，请重新登录")
+		if bcrypt.CompareHashAndPassword([]byte(admin.PasswordHash), []byte(input.CurrentPassword)) != nil {
+			writeAdminAPIError(c, http.StatusUnauthorized, "CURRENT_PASSWORD_INVALID", "当前密码不正确")
 			return
 		}
-		s.writeAdminAPIInternalError(c, err)
-		return
+		if len(input.NewPassword) < 12 || len(input.NewPassword) > 72 {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "新密码长度需要在 12 到 72 字节之间")
+			return
+		}
+		if input.NewPassword != input.ConfirmPassword {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "两次填写的新密码不一致")
+			return
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(input.NewPassword), 12)
+		if err != nil {
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		if err := s.store.ChangeAdminPasswordAndRevokeSessions(c.Request.Context(), admin.ID, admin.PasswordVersion, string(hash)); err != nil {
+			if errors.Is(err, store.ErrCredentialsChanged) {
+				s.clearSessionCookies(c)
+				writeAdminAPIError(c, http.StatusConflict, "CREDENTIALS_CHANGED", "登录凭据已在其他请求中更新，请重新登录")
+				return
+			}
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		s.audit(c, &admin.ID, admin.Username, "change_password", "admin", "", "success", "")
+		s.clearSessionCookies(c)
+		writeAdminAPIData(c, http.StatusOK, gin.H{"reauthentication_required": true})
 	}
-	s.audit(c, &admin.ID, admin.Username, "change_password", "admin", "", "success", "")
-	s.clearSessionCookie(c)
-	writeAdminAPIData(c, http.StatusOK, gin.H{"reauthentication_required": true})
 }
 
 func (s *Server) adminAPIListAccounts(c *gin.Context) {
@@ -719,40 +776,45 @@ func (s *Server) adminAPIListAccounts(c *gin.Context) {
 	})
 }
 
-func (s *Server) adminAPICreateAccount(c *gin.Context) {
-	var input adminAPICreateAccountRequest
-	if !decodeAdminAPIJSON(c, &input) {
-		return
-	}
-	host, port, message := adminAPIIMAPEndpointInput(input.IMAPHost, input.IMAPPort)
-	if message != "" {
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
-		return
-	}
-	account, password, message := adminAPIAccountInput(input.Name, input.Email, input.IMAPUsername, input.IMAPPassword, host, port, domain.Account{Enabled: true})
-	if message != "" {
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
-		return
-	}
-	encrypted, err := s.cipher.Encrypt(password)
-	if err != nil {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	account.PasswordCiphertext = encrypted
-	created, err := s.store.CreateAccount(c.Request.Context(), account)
-	if err != nil {
-		if adminAPIUniqueConstraint(err) {
-			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_EXISTS", "这个主号已经存在")
+func (s *Server) adminAPICreateAccount(basePath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var input adminAPICreateAccountRequest
+		if !decodeAdminAPIJSON(c, &input) {
 			return
 		}
-		s.writeAdminAPIInternalError(c, err)
-		return
+		host, port, message := adminAPIIMAPEndpointInput(input.IMAPHost, input.IMAPPort)
+		if message != "" {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
+			return
+		}
+		account, password, message := adminAPIAccountInput(
+			input.Name, input.Email, input.IMAPUsername, input.IMAPPassword,
+			host, port, domain.Account{Enabled: true},
+		)
+		if message != "" {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
+			return
+		}
+		encrypted, err := s.cipher.Encrypt(password)
+		if err != nil {
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		account.PasswordCiphertext = encrypted
+		created, err := s.store.CreateAccount(c.Request.Context(), account)
+		if err != nil {
+			if adminAPIUniqueConstraint(err) {
+				writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_EXISTS", "这个主号已经存在")
+				return
+			}
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		session := mustSession(c)
+		s.audit(c, &session.AdminID, session.Username, "create", "account", strconv.FormatInt(created.ID, 10), "success", "")
+		c.Header("Location", fmt.Sprintf("%s/accounts/%d", basePath, created.ID))
+		writeAdminAPIData(c, http.StatusCreated, adminAPIAccountFromDomain(created))
 	}
-	session := mustSession(c)
-	s.audit(c, &session.AdminID, session.Username, "create", "account", strconv.FormatInt(created.ID, 10), "success", "")
-	c.Header("Location", fmt.Sprintf("/admin/api/v1/accounts/%d", created.ID))
-	writeAdminAPIData(c, http.StatusCreated, adminAPIAccountFromDomain(created))
 }
 
 func (s *Server) adminAPIGetAccount(c *gin.Context) {
@@ -991,71 +1053,77 @@ func (s *Server) adminAPIAutoCreation(ctx context.Context, accountID int64, appl
 	if err != nil {
 		return nil, err
 	}
-	return adminAPIAutoCreationFromSchedule(schedule, pending, appleStatus), nil
+	return adminAPIAutoCreationFromSchedule(schedule, appleStatus, pending), nil
 }
 
-func (s *Server) adminAPICreateAlias(c *gin.Context) {
-	accountID, ok := adminAPIParseID(c)
-	if !ok {
-		return
-	}
-	if _, err := s.store.GetAccount(c.Request.Context(), accountID); err != nil {
-		s.writeAdminAPIStoreReadError(c, err)
-		return
-	}
-	var input adminAPICreateAliasRequest
-	if !decodeAdminAPIJSON(c, &input) {
-		return
-	}
-	address := domain.NormalizeEmail(input.Address)
-	label := strings.TrimSpace(input.Label)
-	if validateEmail(address) != nil {
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "邮箱地址格式不正确")
-		return
-	}
-	if utf8.RuneCountInString(label) > 100 {
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "用途备注不能超过 100 个字符")
-		return
-	}
-	rawKey, keyHash, keyPrefix, err := secure.NewAPIKey()
-	if err != nil {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	var alias domain.Alias
-	err = s.withAccountLock(c.Request.Context(), accountID, func() error {
-		var createErr error
-		alias, createErr = s.store.CreateAlias(c.Request.Context(), domain.Alias{
-			AccountID:    accountID,
-			Address:      address,
-			Label:        label,
-			APIKeyHash:   keyHash,
-			APIKeyPrefix: keyPrefix,
-			Enabled:      true,
-		})
-		return createErr
-	})
-	if err != nil {
-		switch {
-		case errors.Is(err, store.ErrAliasLimit):
-			writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
-		case adminAPIUniqueConstraint(err):
-			writeAdminAPIError(c, http.StatusConflict, "ALIAS_EXISTS", "这个隐私邮箱已经登记")
-		default:
-			s.writeAdminAPIInternalError(c, err)
+func (s *Server) adminAPICreateAlias(basePath string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		accountID, ok := adminAPIParseID(c)
+		if !ok {
+			return
 		}
-		return
+		if _, err := s.store.GetAccount(c.Request.Context(), accountID); err != nil {
+			s.writeAdminAPIStoreReadError(c, err)
+			return
+		}
+		var input adminAPICreateAliasRequest
+		if !decodeAdminAPIJSON(c, &input) {
+			return
+		}
+		address := domain.NormalizeEmail(input.Address)
+		label := strings.TrimSpace(input.Label)
+		if validateEmail(address) != nil {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "邮箱地址格式不正确")
+			return
+		}
+		if utf8.RuneCountInString(label) > 100 {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "用途备注不能超过 100 个字符")
+			return
+		}
+		var alias domain.Alias
+		err := s.withAccountLock(c.Request.Context(), accountID, func() error {
+			var createErr error
+			alias, createErr = s.store.CreateAlias(c.Request.Context(), domain.Alias{
+				AccountID: accountID,
+				Address:   address,
+				Label:     label,
+				Enabled:   true,
+			})
+			return createErr
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrAliasLimit):
+				writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
+			case adminAPIUniqueConstraint(err):
+				writeAdminAPIError(c, http.StatusConflict, "ALIAS_EXISTS", "这个隐私邮箱已经登记")
+			default:
+				s.writeAdminAPIInternalError(c, err)
+			}
+			return
+		}
+		aliasDTO, err := s.adminAPIAliasFromDomain(alias)
+		if err != nil {
+			s.writeAdminAPIInternalError(c, err)
+			return
+		}
+		if strings.TrimSpace(aliasDTO.APIKey) == "" {
+			s.writeAdminAPIInternalError(c, errors.New("新建 v2 隐私邮箱未生成 API Key"))
+			return
+		}
+		session := mustSession(c)
+		s.audit(c, &session.AdminID, session.Username, "create", "alias", strconv.FormatInt(alias.ID, 10), "success", "")
+		c.Header("Cache-Control", "no-store")
+		c.Header("Location", fmt.Sprintf("%s/aliases/%d", basePath, alias.ID))
+		// The original administrator contract returned the newly generated API key
+		// in a one-time envelope. Keep that shape for manually created aliases so
+		// existing clients can continue to persist the key they need to use the
+		// mailbox, while the alias DTO still carries the v2 direct-link metadata.
+		writeAdminAPIData(c, http.StatusCreated, adminAPIOneTimeKeyDTO{
+			Alias:  aliasDTO,
+			APIKey: aliasDTO.APIKey,
+		})
 	}
-	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
-	if err != nil {
-		s.writeAdminAPIInternalError(c, err)
-		return
-	}
-	session := mustSession(c)
-	s.audit(c, &session.AdminID, session.Username, "create", "alias", strconv.FormatInt(alias.ID, 10), "success", "")
-	c.Header("Cache-Control", "no-store")
-	c.Header("Location", fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID))
-	writeAdminAPIData(c, http.StatusCreated, adminAPIOneTimeKeyDTO{Alias: aliasDTO, APIKey: rawKey})
 }
 
 func (s *Server) adminAPISetAliasAutoCreation(c *gin.Context) {
@@ -1129,12 +1197,15 @@ func (s *Server) adminAPISetAliasAutoCreation(c *gin.Context) {
 		}
 		return
 	}
-	dto := adminAPIAutoCreationFromSchedule(schedule, pending, appleStatus)
+	dto := adminAPIAutoCreationFromSchedule(schedule, appleStatus, pending)
 	session := mustSession(c)
 	s.audit(c, &session.AdminID, session.Username, "alias_auto_create_set", "account", strconv.FormatInt(accountID, 10), "success", strconv.FormatBool(*input.Enabled))
 	writeAdminAPIData(c, http.StatusOK, dto)
 }
 
+// adminAPIGetAliasAutoCreationKeys preserves the v1 administrator workflow:
+// reading the queue is non-destructive, and the raw key remains available
+// until the caller explicitly acknowledges it with the DELETE endpoint.
 func (s *Server) adminAPIGetAliasAutoCreationKeys(c *gin.Context) {
 	accountID, ok := adminAPIParseID(c)
 	if !ok || !s.adminAPIAppleAccountExists(c, accountID) {
@@ -1157,16 +1228,11 @@ func (s *Server) adminAPIGetAliasAutoCreationKeys(c *gin.Context) {
 			s.writeAdminAPIInternalError(c, aliasErr)
 			return
 		}
-		directLink := ""
-		if aliasDTO.DirectLinkPath != "" {
-			directLink = aliasDTO.DirectLinkPath
-		}
 		created = append(created, adminAPIAppleCreatedAliasDTO{
 			Alias:             aliasDTO,
 			APIKey:            rawKey,
-			MailAPIDirectLink: directLink,
+			MailAPIDirectLink: aliasDTO.DirectLinkPath,
 		})
-		rawKey = ""
 	}
 	c.Header("Cache-Control", "no-store")
 	c.Header("Pragma", "no-cache")
@@ -1268,6 +1334,39 @@ func (s *Server) adminAPIGetAlias(c *gin.Context) {
 	writeAdminAPIData(c, http.StatusOK, aliasDTO)
 }
 
+func (s *Server) adminAPIRotateAliasCredentials(c *gin.Context) {
+	id, ok := adminAPIParseID(c)
+	if !ok {
+		return
+	}
+	if _, err := s.store.GetAlias(c.Request.Context(), id); err != nil {
+		s.writeAdminAPIStoreReadError(c, err)
+		return
+	}
+	alias, err := s.store.RotateAliasCredentials(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrAliasConfirmationPending) {
+			writeAdminAPIAliasConfirmationPending(c)
+		} else if errors.Is(err, store.ErrAliasCredentialMode) {
+			writeAdminAPIError(c, http.StatusConflict, "ALIAS_CREDENTIAL_MODE_UNSUPPORTED", "旧版隐私邮箱只支持轮换 API Key")
+		} else {
+			s.writeAdminAPIStoreReadError(c, err)
+		}
+		return
+	}
+	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "rotate_credentials", "alias", strconv.FormatInt(id, 10), "success", "")
+	c.Header("Cache-Control", "no-store")
+	writeAdminAPIData(c, http.StatusOK, aliasDTO)
+}
+
+// adminAPIRotateAliasKey preserves the original route and one-time response.
+// It replaces only the API key; v2 IMAP/OAuth credentials remain valid.
 func (s *Server) adminAPIRotateAliasKey(c *gin.Context) {
 	id, ok := adminAPIParseID(c)
 	if !ok {
@@ -1282,7 +1381,7 @@ func (s *Server) adminAPIRotateAliasKey(c *gin.Context) {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
-	alias, err := s.store.RotateAliasAPIKey(c.Request.Context(), id, hash, prefix)
+	alias, err := s.store.RotateAliasAPIKeyWithRawKey(c.Request.Context(), id, hash, prefix, rawKey)
 	if err != nil {
 		if errors.Is(err, store.ErrAliasConfirmationPending) {
 			writeAdminAPIAliasConfirmationPending(c)

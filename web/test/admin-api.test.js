@@ -2,10 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  clearAliasAutoCreationKeys,
   deleteAlias,
   deleteAppleSession,
-  getAliasAutoCreationKeys,
   getAutoCreateLogRun,
   getAccount,
   getAccountPage,
@@ -21,6 +19,7 @@ import {
   getRuntimeLogs,
   loginAppleSession,
   normalizeAutoCreation,
+  rotateAlias,
   setAliasAutoCreation,
   syncAccount,
   syncAccountAliases,
@@ -279,7 +278,6 @@ test("account detail normalizes automatic alias creation state", async () => {
         last_created_at: "2026-08-08T07:00:00Z",
         last_alias_address: "new@icloud.com",
         last_error: "",
-        pending_key_count: 5,
       },
     });
 
@@ -299,7 +297,6 @@ test("account detail normalizes automatic alias creation state", async () => {
     lastCreatedAt: "2026-08-08T07:00:00Z",
     lastAliasAddress: "new@icloud.com",
     lastError: "",
-    pendingKeyCount: 5,
   });
 
   assert.deepEqual(
@@ -331,7 +328,6 @@ test("account detail normalizes automatic alias creation state", async () => {
       lastCreatedAt: "2026-08-08T08:00:00Z",
       lastAliasAddress: "pascal@icloud.com",
       lastError: "temporary failure",
-      pendingKeyCount: 0,
     },
   );
 });
@@ -344,7 +340,6 @@ test("automatic alias creation toggle uses an encoded account URL and CSRF", asy
       auto_creation: {
         enabled: true,
         status: "scheduled",
-        pending_key_count: 0,
       },
     });
   };
@@ -368,84 +363,7 @@ test("automatic alias creation toggle uses an encoded account URL and CSRF", asy
     lastCreatedAt: null,
     lastAliasAddress: "",
     lastError: "",
-    pendingKeyCount: 0,
   });
-});
-
-test("automatic alias creation key retrieval normalizes created entries", async () => {
-  let request;
-  globalThis.fetch = async (url, options) => {
-    request = { url, options };
-    return jsonResponse({
-      created: [
-        {
-          alias: {
-            id: 91,
-            account_id: 12,
-            account_email: "owner@icloud.com",
-            address: "queued@icloud.com",
-            api_key_prefix: "icm_queued",
-            direct_link_path: "/api/v1/mail/recent?api_key=derived",
-            enabled: true,
-          },
-          api_key: "icm_one-time-secret",
-          mail_api_direct_link: "/api/v1/mail/recent?api_key=derived",
-        },
-      ],
-    });
-  };
-
-  const result = await getAliasAutoCreationKeys("account/12");
-
-  assert.equal(
-    request.url,
-    "/admin/api/v1/accounts/account%2F12/aliases/auto-create/keys",
-  );
-  assert.equal(request.options.method, "GET");
-  assert.equal(request.options.headers.get("X-CSRF-Token"), null);
-  assert.deepEqual(result.created[0], {
-    alias: {
-      id: 91,
-      accountId: 12,
-      accountEmail: "owner@icloud.com",
-      address: "queued@icloud.com",
-      label: "",
-      apiKeyPrefix: "icm_queued",
-      directLinkPath: "/api/v1/mail/recent?api_key=derived",
-      enabled: true,
-      lastSyncStatus: "pending",
-      lastSyncError: "",
-      lastSyncErrorLog: "",
-      lastSyncedAt: null,
-      lastAccessedAt: null,
-      latestReceivedAt: null,
-    },
-    apiKey: "icm_one-time-secret",
-    mailApiDirectLink: "/api/v1/mail/recent?api_key=derived",
-  });
-});
-
-test("automatic alias creation key acknowledgement sends DELETE with IDs and CSRF", async () => {
-  let request;
-  globalThis.fetch = async (url, options) => {
-    request = { url, options };
-    return new Response(null, { status: 204 });
-  };
-
-  const result = await clearAliasAutoCreationKeys(
-    "account/12",
-    [91, 92],
-    "csrf-token",
-  );
-
-  assert.equal(result, null);
-  assert.equal(
-    request.url,
-    "/admin/api/v1/accounts/account%2F12/aliases/auto-create/keys",
-  );
-  assert.equal(request.options.method, "DELETE");
-  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
-  assert.deepEqual(JSON.parse(request.options.body), { alias_ids: [91, 92] });
 });
 
 test("alias deletion sends an authenticated DELETE without a request body", async () => {
@@ -462,6 +380,80 @@ test("alias deletion sends an authenticated DELETE without a request body", asyn
   assert.equal(request.options.method, "DELETE");
   assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
   assert.equal(request.options.body, undefined);
+});
+
+test("v2 alias rotation uses the complete bundle endpoint", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      id: 91,
+      address: "alias@example.com",
+      api_key: "api-key",
+      imap_password: "imap-password",
+      client_id: "client-id",
+      refresh_token: "refresh-token",
+      otp_url_path: "/api/v1/otp?token=derived-token",
+      credential_version: 2,
+      enabled: true,
+    });
+  };
+
+  const result = await rotateAlias("alias/91", "csrf-token", "v2");
+
+  assert.equal(
+    request.url,
+    "/admin/api/v1/aliases/alias%2F91/rotate-credentials",
+  );
+  assert.equal(request.options.method, "POST");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.equal(request.options.body, undefined);
+  assert.deepEqual(
+    {
+      apiKey: result.alias.apiKey,
+      imapPassword: result.alias.imapPassword,
+      clientId: result.alias.clientId,
+      refreshToken: result.alias.refreshToken,
+      otpUrlPath: result.alias.otpUrlPath,
+      credentialVersion: result.alias.credentialVersion,
+    },
+    {
+      apiKey: "api-key",
+      imapPassword: "imap-password",
+      clientId: "client-id",
+      refreshToken: "refresh-token",
+      otpUrlPath: "/api/v1/otp?token=derived-token",
+      credentialVersion: 2,
+    },
+  );
+});
+
+test("legacy alias rotation uses the API-key-only compatibility endpoint", async () => {
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url, options };
+    return jsonResponse({
+      alias: {
+        id: 91,
+        address: "legacy@example.com",
+        api_key_prefix: "new-key-",
+        credential_mode: "legacy",
+        direct_link_path: "/api/v1/mail/recent?api_key=new-token",
+        enabled: true,
+      },
+      api_key: "new-key-secret",
+    });
+  };
+
+  const result = await rotateAlias("alias/91", "csrf-token", "legacy");
+
+  assert.equal(request.url, "/admin/api/v1/aliases/alias%2F91/rotate-key");
+  assert.equal(request.options.method, "POST");
+  assert.equal(request.options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.equal(request.options.body, undefined);
+  assert.equal(result.alias.credentialMode, "legacy");
+  assert.equal(result.alias.directLinkPath, "/api/v1/mail/recent?api_key=new-token");
+  assert.equal(result.apiKey, "new-key-secret");
 });
 
 test("alias directory forwards the optional primary-account filter", async () => {
@@ -746,7 +738,7 @@ test("Apple session endpoints send credentials and verification only in request 
   );
 });
 
-test("alias directory sync normalizes its summary and one-time keys", async () => {
+test("alias directory sync normalizes its summary and persistent credential bundles", async () => {
   let request;
   globalThis.fetch = async (url, options) => {
     request = { url, options };
@@ -779,12 +771,14 @@ test("alias directory sync normalizes its summary and one-time keys", async () =
           alias: {
             id: 9,
             address: "new@icloud.com",
-            api_key_prefix: "icm_new",
-            direct_link_path: "/api/v1/mail/recent/?api_key=derived",
+            api_key: "api-key",
+            imap_password: "imap-password",
+            client_id: "client-id",
+            refresh_token: "refresh-token",
+            otp_url_path: "/api/v1/otp?token=derived",
+            credential_version: 1,
             enabled: true,
           },
-          api_key: "icm_one-time-secret",
-          mail_api_direct_link: "/api/v1/mail/recent/?api_key=derived",
         },
       ],
     });
@@ -803,26 +797,28 @@ test("alias directory sync normalizes its summary and one-time keys", async () =
     importedDisabledCount: 1,
     conflictCount: 1,
   });
-  assert.deepEqual(result.created[0], {
-    alias: {
-      id: 9,
-      accountId: undefined,
-      accountEmail: "",
-      address: "new@icloud.com",
-      label: "",
-      apiKeyPrefix: "icm_new",
-      directLinkPath: "/api/v1/mail/recent/?api_key=derived",
-      enabled: true,
-      lastSyncStatus: "pending",
-      lastSyncError: "",
-      lastSyncErrorLog: "",
-      lastSyncedAt: null,
-      lastAccessedAt: null,
-      latestReceivedAt: null,
+  assert.equal(result.created[0].apiKey, "api-key");
+  assert.equal(result.created[0].otpUrlPath, "/api/v1/otp?token=derived");
+  assert.deepEqual(
+    {
+      address: result.created[0].alias.address,
+      apiKey: result.created[0].alias.apiKey,
+      imapPassword: result.created[0].alias.imapPassword,
+      clientId: result.created[0].alias.clientId,
+      refreshToken: result.created[0].alias.refreshToken,
+      otpUrlPath: result.created[0].alias.otpUrlPath,
+      credentialVersion: result.created[0].alias.credentialVersion,
     },
-    apiKey: "icm_one-time-secret",
-    mailApiDirectLink: "/api/v1/mail/recent/?api_key=derived",
-  });
+    {
+      address: "new@icloud.com",
+      apiKey: "api-key",
+      imapPassword: "imap-password",
+      clientId: "client-id",
+      refreshToken: "refresh-token",
+      otpUrlPath: "/api/v1/otp?token=derived",
+      credentialVersion: 1,
+    },
+  );
 });
 
 test("runtime log pages use offset filters and normalize pagination metadata", async () => {

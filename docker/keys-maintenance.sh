@@ -27,7 +27,7 @@ random_hex() {
 
 is_known_key_name() {
 	case "$1" in
-		master.key|admin-password|admin-password.pending|admin-password.source|oauth-token|oauth-token.source)
+		master.key|admin-password|admin-password.pending|admin-password.source|oauth-token|oauth-token.source|admin-path|public-imap-cert.pem|public-imap-key.pem)
 			return 0
 			;;
 		*)
@@ -61,6 +61,47 @@ validate_hex_file() {
 	case "$value" in
 		*[!0-9a-f]*) die "$name 包含非法字符" ;;
 	esac
+}
+
+validate_admin_path_file() {
+	file="$1"
+	name="${file##*/}"
+	[ "$(wc -l < "$file" | tr -d ' ')" = "1" ] || die "$name 格式错误"
+	path_value="$(sed -n '1p' "$file")"
+	[ "${#path_value}" -eq 40 ] || die "$name 格式错误"
+	case "$path_value" in
+		/????????????????????????????????/admin/) ;;
+		*) die "$name 格式错误" ;;
+	esac
+	path_hex="${path_value#/}"
+	path_hex="${path_hex%/admin/}"
+	case "$path_hex" in
+		*[!0-9a-f]*) die "$name 包含非法字符" ;;
+	esac
+}
+
+validate_certificate_file() {
+	file="$1"
+	name="${file##*/}"
+	[ -s "$file" ] || die "$name 为空"
+	[ "$(wc -c < "$file" | tr -d ' ')" -le 1048576 ] || die "$name 超过 1 MiB"
+	[ "$(sed -n '1p' "$file")" = "-----BEGIN CERTIFICATE-----" ] || die "$name 格式错误"
+	[ "$(tail -n 1 "$file")" = "-----END CERTIFICATE-----" ] || die "$name 格式错误"
+}
+
+validate_private_key_file() {
+	file="$1"
+	name="${file##*/}"
+	[ -s "$file" ] || die "$name 为空"
+	[ "$(wc -c < "$file" | tr -d ' ')" -le 1048576 ] || die "$name 超过 1 MiB"
+	first_line="$(sed -n '1p' "$file")"
+	case "$first_line" in
+		"-----BEGIN PRIVATE KEY-----") last_line="-----END PRIVATE KEY-----" ;;
+		"-----BEGIN EC PRIVATE KEY-----") last_line="-----END EC PRIVATE KEY-----" ;;
+		"-----BEGIN RSA PRIVATE KEY-----") last_line="-----END RSA PRIVATE KEY-----" ;;
+		*) die "$name 格式错误" ;;
+	esac
+	[ "$(tail -n 1 "$file")" = "$last_line" ] || die "$name 格式错误"
 }
 
 validate_source_file() {
@@ -191,6 +232,16 @@ validate_key_set() {
 		fi
 	fi
 
+	if [ -f "$directory/admin-path" ]; then
+		validate_admin_path_file "$directory/admin-path"
+	fi
+	if [ -f "$directory/public-imap-cert.pem" ] && [ -f "$directory/public-imap-key.pem" ]; then
+		validate_certificate_file "$directory/public-imap-cert.pem"
+		validate_private_key_file "$directory/public-imap-key.pem"
+	elif [ -f "$directory/public-imap-cert.pem" ] || [ -f "$directory/public-imap-key.pem" ]; then
+		die "本地 IMAPS 证书与私钥必须成对存在"
+	fi
+
 	if [ -f "$directory/oauth-token" ] && [ -f "$directory/oauth-token.source" ]; then
 		die "OAuth Token 与来源标记不能同时存在"
 	elif [ -f "$directory/oauth-token" ]; then
@@ -244,7 +295,7 @@ restore_keys() {
 		cleanup_failed=false
 		if [ "$publish_started" = true ] && [ "$publish_committed" = false ]; then
 			rollback_failed=false
-			for name in master.key admin-password admin-password.source oauth-token oauth-token.source; do
+			for name in master.key admin-password admin-password.source oauth-token oauth-token.source admin-path public-imap-cert.pem public-imap-key.pem; do
 				if [ -f "$old/$name" ]; then
 					cp -p "$old/$name" "$keys_directory/$name" || rollback_failed=true
 				else
@@ -402,6 +453,13 @@ restore_keys() {
 	else
 		rm -f "$keys_directory/admin-password" "$keys_directory/admin-password.source"
 	fi
+	for name in admin-path public-imap-cert.pem public-imap-key.pem; do
+		if [ -f "$stage/$name" ]; then
+			mv -f "$stage/$name" "$keys_directory/$name"
+		else
+			rm -f "$keys_directory/$name"
+		fi
+	done
 	if [ -f "$stage/oauth-token" ]; then
 		mv -f "$stage/oauth-token" "$keys_directory/oauth-token"
 		rm -f "$keys_directory/oauth-token.source"
@@ -434,7 +492,7 @@ restore_keys() {
 }
 
 keys_directory="${ICLOUD_API_KEYS_DIR:-/app/keys}"
-known_names="master.key admin-password admin-password.pending admin-password.source oauth-token oauth-token.source"
+known_names="master.key admin-password admin-password.pending admin-password.source oauth-token oauth-token.source admin-path public-imap-cert.pem public-imap-key.pem"
 [ -d "$keys_directory" ] && [ ! -L "$keys_directory" ] || die "密钥目录不存在或不是普通目录"
 exec 9<"$keys_directory" || die "打开密钥卷互斥锁失败"
 flock -n 9 || die "另一个密钥备份、校验或恢复任务正在运行"

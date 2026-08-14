@@ -11,6 +11,8 @@ compose*.yml
 .vscode
 .agents
 .codex
+.cache
+.tmp
 
 data
 *.db

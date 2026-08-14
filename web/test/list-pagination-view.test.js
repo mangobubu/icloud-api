@@ -143,7 +143,7 @@ test("every desktop data table uses the shared virtual table", async () => {
 
   assert.equal(
     (accountDetail.match(/<VirtualDataTable/g) || []).length,
-    2,
+    1,
   );
   assert.equal(
     [accounts, aliases, audit, logs]
@@ -154,9 +154,9 @@ test("every desktop data table uses the shared virtual table", async () => {
   assert.equal(
     [accounts, aliases, audit, logs, accountDetail]
       .reduce((count, source) => count + (source.match(/fill-height/g) || []).length, 0),
-    6,
+    5,
   );
-  assert.match(accountDetail, /row-key="address"/);
+  assert.match(accountDetail, /row-key="id"/);
   assert.match(aliases, /someExportableAliasesSelected/);
   assert.match(aliases, /function setAllAliasesSelected/);
 });

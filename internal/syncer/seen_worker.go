@@ -14,6 +14,7 @@ import (
 
 const (
 	defaultSeenTaskBatchSize    = 256
+	defaultSeenAccountWorkers   = 16
 	defaultSeenPollInterval     = time.Minute
 	defaultSeenAcquireTimeout   = 30 * time.Second
 	defaultSeenOperationTimeout = 2 * time.Minute
@@ -44,6 +45,7 @@ type SeenWorker struct {
 	logger           *slog.Logger
 	interval         time.Duration
 	batchSize        int
+	accountWorkers   int
 	acquireTimeout   time.Duration
 	operationTimeout time.Duration
 	notifications    chan struct{}
@@ -72,6 +74,7 @@ func NewSeenWorker(
 		logger:           logger,
 		interval:         interval,
 		batchSize:        defaultSeenTaskBatchSize,
+		accountWorkers:   defaultSeenAccountWorkers,
 		acquireTimeout:   defaultSeenAcquireTimeout,
 		operationTimeout: defaultSeenOperationTimeout,
 		notifications:    make(chan struct{}, 1),
@@ -220,23 +223,34 @@ func (w *SeenWorker) processPending(ctx context.Context) (bool, error) {
 		})
 	}
 
-	// Each account gets an independent waiter so a busy account lock or slow
-	// IMAP session cannot delay later accounts. The locker remains responsible
-	// for the per-account lock and global connection limit.
+	// Use a bounded worker pool so a large pending-account set cannot create one
+	// goroutine per account. The locker remains responsible for the per-account
+	// lock and global IMAP connection limit.
 	results := make([]accountResult, len(pendingAccounts))
+	workerCount := min(w.accountWorkers, len(pendingAccounts))
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	jobs := make(chan int, workerCount)
 	var wg sync.WaitGroup
-	for index, pending := range pendingAccounts {
-		index, pending := index, pending
+	for range workerCount {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			results[index] = accountResult{
-				accountID: pending.work.id,
-				taskCount: pending.taskCount,
-				err:       w.processAccount(ctx, pending.work),
+			for index := range jobs {
+				pending := pendingAccounts[index]
+				results[index] = accountResult{
+					accountID: pending.work.id,
+					taskCount: pending.taskCount,
+					err:       w.processAccount(ctx, pending.work),
+				}
 			}
 		}()
 	}
+	for index := range pendingAccounts {
+		jobs <- index
+	}
+	close(jobs)
 	wg.Wait()
 	if err := ctx.Err(); err != nil {
 		return false, err

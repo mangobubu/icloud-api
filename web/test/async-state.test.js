@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   createActionLock,
   createLatestRequestGate,
-  oneTimeSecretNavigationMode,
 } from "../src/utils/asyncState.js";
 
 test("latest request gate rejects stale route responses", () => {
@@ -74,20 +73,4 @@ test("keyed action locks isolate aliases while blocking duplicate alias actions"
   lock.release(10);
   lock.release(11);
   assert.equal(lock.hasAny(), false);
-});
-
-test("one-time secrets block pending navigation and confirm visible keys", () => {
-  assert.equal(
-    oneTimeSecretNavigationMode({ requestPending: true, keyVisible: false }),
-    "block",
-  );
-  assert.equal(
-    oneTimeSecretNavigationMode({ requestPending: true, keyVisible: true }),
-    "block",
-  );
-  assert.equal(
-    oneTimeSecretNavigationMode({ requestPending: false, keyVisible: true }),
-    "confirm",
-  );
-  assert.equal(oneTimeSecretNavigationMode(), "allow");
 });

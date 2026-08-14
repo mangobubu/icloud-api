@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildRecentMailDirectLink,
+  buildOTPDirectLink,
   copyText,
 } from "../src/utils/clipboard.js";
 
@@ -37,28 +37,28 @@ function fallbackDocument(copyResult = true) {
   return { document, state };
 }
 
-test("recent-mail direct links stay on the current origin", () => {
+test("OTP direct links stay on the current origin", () => {
   assert.equal(
-    buildRecentMailDirectLink(
-      "/api/v1/mail/recent?api_key=icm_a%2Bb%2Fc",
+    buildOTPDirectLink(
+      "/api/v1/otp?token=derived_a%2Bb%2Fc",
       "https://mail.example.test:8443",
     ),
-    "https://mail.example.test:8443/api/v1/mail/recent?api_key=icm_a%2Bb%2Fc",
+    "https://mail.example.test:8443/api/v1/otp?token=derived_a%2Bb%2Fc",
   );
 });
 
-test("recent-mail direct links reject unsafe or unexpected paths", () => {
+test("OTP direct links reject unsafe or unexpected paths", () => {
   for (const path of [
-    "//attacker.example/api/v1/mail/recent?api_key=secret",
-    "https://attacker.example/api/v1/mail/recent?api_key=secret",
-    "/api/v1/mail/latest?api_key=secret",
-    "/api/v1/mail/recent?api_key=",
-    "/api/v1/mail/recent?api_key=one&api_key=two",
-    "/api/v1/mail/recent?api_key=secret&next=elsewhere",
-    "/api/v1/mail/recent?api_key=secret#fragment",
+    "//attacker.example/api/v1/otp?token=secret",
+    "https://attacker.example/api/v1/otp?token=secret",
+    "/api/v1/mail/latest?token=secret",
+    "/api/v1/otp?token=",
+    "/api/v1/otp?token=one&token=two",
+    "/api/v1/otp?token=secret&next=elsewhere",
+    "/api/v1/otp?token=secret#fragment",
   ]) {
     assert.throws(
-      () => buildRecentMailDirectLink(path, "https://mail.example.test"),
+      () => buildOTPDirectLink(path, "https://mail.example.test"),
       /链接格式无效/,
     );
   }

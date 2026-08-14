@@ -16,10 +16,12 @@ import (
 )
 
 var _ LegacySQLiteCipherValidator = (*secure.Cipher)(nil)
+var _ legacyPendingAliasKeyCipherValidator = (*secure.Cipher)(nil)
 
 type legacyCipherValidatorStub struct {
 	credentialValues []string
 	appleValues      []string
+	pendingKeyValues []string
 	err              error
 }
 
@@ -34,6 +36,7 @@ func (validator *legacyCipherValidatorStub) DecryptAppleSession(value string) (s
 }
 
 func (validator *legacyCipherValidatorStub) DecryptPendingAliasAPIKey(value string) (string, error) {
+	validator.pendingKeyValues = append(validator.pendingKeyValues, value)
 	return "", validator.err
 }
 
@@ -365,6 +368,19 @@ func TestLegacySQLiteCopySpecsHandleOlderSchemas(t *testing.T) {
 	if !strings.Contains(v1[1].selectSQL, "admin_id, 1, csrf") {
 		t.Fatalf("v1 session query does not default password_version: %q", v1[1].selectSQL)
 	}
+	aliasSpec := v1[3]
+	if aliasSpec.table != "aliases" || !strings.Contains(aliasSpec.selectSQL, "api_key_prefix") {
+		t.Fatalf("alias copy spec does not preserve API key prefix: %#v", aliasSpec)
+	}
+	if !strings.Contains(aliasSpec.insertSQL, "credential_mode") ||
+		!strings.Contains(aliasSpec.insertSQL, "'legacy'") {
+		t.Fatalf("alias copy spec does not preserve legacy credential mode: %q", aliasSpec.insertSQL)
+	}
+	messageSpec := v1[4]
+	if messageSpec.table != "latest_messages" ||
+		!strings.Contains(messageSpec.selectSQL, "WHERE uid_validity > 0 AND uid > 0") {
+		t.Fatalf("latest message copy spec does not preserve complete valid snapshots: %#v", messageSpec)
+	}
 
 	v3 := legacySQLiteCopySpecs(true, true, true)
 	if len(v3) != 7 || v3[len(v3)-1].table != "apple_web_sessions" {
@@ -374,6 +390,243 @@ func TestLegacySQLiteCopySpecsHandleOlderSchemas(t *testing.T) {
 		if spec.table == "imap_sync_states" {
 			t.Fatal("legacy importer must not synthesize or copy an IMAP cursor")
 		}
+	}
+}
+
+func TestLegacySQLiteAliasCopySpecPreservesLegacyCredentialIdentity(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	source, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatalf("open source fixture: %v", err)
+	}
+	defer source.Close()
+	target, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "target.db"))
+	if err != nil {
+		t.Fatalf("open target fixture: %v", err)
+	}
+	defer target.Close()
+
+	if _, err := source.ExecContext(ctx, `
+		CREATE TABLE aliases (
+			id INTEGER PRIMARY KEY,
+			account_id INTEGER NOT NULL,
+			address TEXT NOT NULL,
+			label TEXT NOT NULL,
+			api_key_hash BLOB NOT NULL,
+			api_key_prefix TEXT NOT NULL,
+			enabled INTEGER NOT NULL,
+			last_sync_status TEXT NOT NULL,
+			last_sync_error TEXT NOT NULL,
+			last_synced_at INTEGER,
+			last_accessed_at INTEGER,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		CREATE TABLE latest_messages(alias_id INTEGER, uid_validity INTEGER, uid INTEGER);
+	`); err != nil {
+		t.Fatalf("create source alias schema: %v", err)
+	}
+	if _, err := target.ExecContext(ctx, `
+		CREATE TABLE aliases (
+			id INTEGER PRIMARY KEY,
+			account_id INTEGER NOT NULL,
+			address TEXT NOT NULL,
+			label TEXT NOT NULL,
+			api_key_hash BLOB NOT NULL,
+			api_key_prefix TEXT NOT NULL,
+			enabled INTEGER NOT NULL,
+			last_sync_status TEXT NOT NULL,
+			last_sync_error TEXT NOT NULL,
+			last_synced_at INTEGER,
+			last_accessed_at INTEGER,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			credential_mode TEXT NOT NULL
+		);
+	`); err != nil {
+		t.Fatalf("create target alias schema: %v", err)
+	}
+	apiKeyHash := []byte{0x10, 0x20, 0x30}
+	if _, err := source.ExecContext(ctx, `
+		INSERT INTO aliases(
+			id, account_id, address, label, api_key_hash, api_key_prefix, enabled,
+			last_sync_status, last_sync_error, last_synced_at, last_accessed_at,
+			created_at, updated_at
+		) VALUES(17, 3, 'legacy@example.test', 'legacy', ?, 'legacy-prefix', 1,
+			'success', '', 101, 102, 103, 104)`, apiKeyHash); err != nil {
+		t.Fatalf("insert source alias: %v", err)
+	}
+
+	sourceTx, err := source.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin source alias snapshot: %v", err)
+	}
+	defer sourceTx.Rollback()
+	targetTx, err := target.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin target alias transaction: %v", err)
+	}
+	defer targetTx.Rollback()
+	aliasSpec := legacySQLiteCopySpecs(false, false, false)[3]
+	if err := copyLegacySQLiteTable(ctx, sourceTx, targetTx, aliasSpec, nil); err != nil {
+		t.Fatalf("copy legacy alias: %v", err)
+	}
+	if err := targetTx.Commit(); err != nil {
+		t.Fatalf("commit target alias: %v", err)
+	}
+	if err := sourceTx.Commit(); err != nil {
+		t.Fatalf("finish source alias snapshot: %v", err)
+	}
+
+	var copiedHash []byte
+	var prefix, mode string
+	if err := target.QueryRowContext(ctx, `
+		SELECT api_key_hash, api_key_prefix, credential_mode FROM aliases WHERE id = 17`,
+	).Scan(&copiedHash, &prefix, &mode); err != nil {
+		t.Fatalf("read copied alias identity: %v", err)
+	}
+	if !bytes.Equal(copiedHash, apiKeyHash) || prefix != "legacy-prefix" || mode != "legacy" {
+		t.Fatalf("copied alias identity = (%x, %q, %q)", copiedHash, prefix, mode)
+	}
+}
+
+func TestLegacySQLiteLatestMessageAndPendingKeyCopySpecsPreserveRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	source, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatalf("open source fixture: %v", err)
+	}
+	defer source.Close()
+	target, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "target.db"))
+	if err != nil {
+		t.Fatalf("open target fixture: %v", err)
+	}
+	defer target.Close()
+
+	fixtureSchema := `
+		CREATE TABLE latest_messages (
+			alias_id INTEGER PRIMARY KEY,
+			uid_validity INTEGER NOT NULL,
+			uid INTEGER NOT NULL,
+			message_id TEXT NOT NULL,
+			internal_date INTEGER NOT NULL,
+			header_date INTEGER,
+			from_json TEXT NOT NULL,
+			to_json TEXT NOT NULL,
+			cc_json TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			text_body TEXT NOT NULL,
+			html_body TEXT NOT NULL,
+			attachments_json TEXT NOT NULL,
+			body_truncated INTEGER NOT NULL,
+			synced_at INTEGER NOT NULL
+		);
+		CREATE TABLE pending_alias_api_keys (
+			alias_id INTEGER PRIMARY KEY,
+			api_key_ciphertext TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		);
+	`
+	for _, db := range []*sql.DB{source, target} {
+		if _, err := db.ExecContext(ctx, fixtureSchema); err != nil {
+			t.Fatalf("create message fixture schema: %v", err)
+		}
+	}
+	if _, err := source.ExecContext(ctx, `
+		INSERT INTO latest_messages(
+			alias_id, uid_validity, uid, message_id, internal_date, header_date,
+			from_json, to_json, cc_json, subject, text_body, html_body,
+			attachments_json, body_truncated, synced_at
+		) VALUES(9, 4294967295, 4000000000, 'message-id', 101, 99,
+			'["from"]', '["to"]', '["cc"]', 'subject', 'text body', '<p>html body</p>',
+			'["attachment"]', 1, 102);
+		INSERT INTO latest_messages(
+			alias_id, uid_validity, uid, message_id, internal_date, header_date,
+			from_json, to_json, cc_json, subject, text_body, html_body,
+			attachments_json, body_truncated, synced_at
+		) VALUES(10, 0, 0, 'invalid-placeholder', 201, NULL,
+			'[]', '[]', '[]', '', '', '', '[]', 0, 202);
+		INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
+		VALUES(9, 'ak1.pending-ciphertext', 103);
+	`); err != nil {
+		t.Fatalf("insert source message state: %v", err)
+	}
+
+	sourceTx, err := source.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin source message snapshot: %v", err)
+	}
+	defer sourceTx.Rollback()
+	targetTx, err := target.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin target message transaction: %v", err)
+	}
+	defer targetTx.Rollback()
+	messageSpec := legacySQLiteCopySpecs(false, false, false)[4]
+	if err := copyLegacySQLiteTable(ctx, sourceTx, targetTx, messageSpec, nil); err != nil {
+		t.Fatalf("copy latest message: %v", err)
+	}
+	validator := &legacyCipherValidatorStub{}
+	if err := copyLegacySQLiteTable(
+		ctx, sourceTx, targetTx, legacySQLitePendingAliasKeyCopySpec(), validator,
+	); err != nil {
+		t.Fatalf("copy pending alias API key: %v", err)
+	}
+	if err := targetTx.Commit(); err != nil {
+		t.Fatalf("commit target message state: %v", err)
+	}
+	if err := sourceTx.Commit(); err != nil {
+		t.Fatalf("finish source message snapshot: %v", err)
+	}
+
+	var messageCount int
+	if err := target.QueryRowContext(ctx, `SELECT COUNT(*) FROM latest_messages`).Scan(&messageCount); err != nil {
+		t.Fatalf("count copied latest messages: %v", err)
+	}
+	if messageCount != 1 {
+		t.Fatalf("copied latest message count = %d, want 1 valid row", messageCount)
+	}
+	var (
+		aliasID, uidValidity, uid, internalDate, headerDate, syncedAt int64
+		messageID, fromJSON, toJSON, ccJSON                           string
+		subject, textBody, htmlBody, attachmentsJSON                  string
+		bodyTruncated                                                 bool
+	)
+	if err := target.QueryRowContext(ctx, `
+		SELECT alias_id, uid_validity, uid, message_id, internal_date, header_date,
+			from_json, to_json, cc_json, subject, text_body, html_body,
+			attachments_json, body_truncated, synced_at
+		FROM latest_messages`,
+	).Scan(
+		&aliasID, &uidValidity, &uid, &messageID, &internalDate, &headerDate,
+		&fromJSON, &toJSON, &ccJSON, &subject, &textBody, &htmlBody,
+		&attachmentsJSON, &bodyTruncated, &syncedAt,
+	); err != nil {
+		t.Fatalf("read copied latest message: %v", err)
+	}
+	if aliasID != 9 || uidValidity != 4294967295 || uid != 4000000000 ||
+		messageID != "message-id" || internalDate != 101 || headerDate != 99 ||
+		fromJSON != `["from"]` || toJSON != `["to"]` || ccJSON != `["cc"]` ||
+		subject != "subject" || textBody != "text body" || htmlBody != "<p>html body</p>" ||
+		attachmentsJSON != `["attachment"]` || !bodyTruncated || syncedAt != 102 {
+		t.Fatalf("copied latest message did not preserve every field")
+	}
+
+	var pendingCiphertext string
+	var pendingCreatedAt int64
+	if err := target.QueryRowContext(ctx, `
+		SELECT api_key_ciphertext, created_at FROM pending_alias_api_keys WHERE alias_id = 9`,
+	).Scan(&pendingCiphertext, &pendingCreatedAt); err != nil {
+		t.Fatalf("read copied pending alias API key: %v", err)
+	}
+	if pendingCiphertext != "ak1.pending-ciphertext" || pendingCreatedAt != 103 ||
+		len(validator.pendingKeyValues) != 1 || validator.pendingKeyValues[0] != pendingCiphertext {
+		t.Fatalf("copied pending alias key = (%q, %d), validated %#v",
+			pendingCiphertext, pendingCreatedAt, validator.pendingKeyValues)
 	}
 }
 
@@ -851,11 +1104,18 @@ func TestValidateLegacySQLiteCiphertext(t *testing.T) {
 	if err := validateLegacySQLiteCiphertext("apple_web_sessions", appleSession, validator); err != nil {
 		t.Fatalf("validate Apple session ciphertext: %v", err)
 	}
+	pendingKey := []any{int64(42), "ak1.pending-key-ciphertext", int64(123)}
+	if err := validateLegacySQLiteCiphertext("pending_alias_api_keys", pendingKey, validator); err != nil {
+		t.Fatalf("validate pending alias API key ciphertext: %v", err)
+	}
 	if len(validator.credentialValues) != 1 || validator.credentialValues[0] != account[6] {
 		t.Fatalf("validated account ciphertexts = %#v", validator.credentialValues)
 	}
 	if len(validator.appleValues) != 1 || validator.appleValues[0] != appleSession[1] {
 		t.Fatalf("validated Apple ciphertexts = %#v", validator.appleValues)
+	}
+	if len(validator.pendingKeyValues) != 1 || validator.pendingKeyValues[0] != pendingKey[1] {
+		t.Fatalf("validated pending API key ciphertexts = %#v", validator.pendingKeyValues)
 	}
 
 	validator.err = sql.ErrNoRows
@@ -925,5 +1185,16 @@ func TestValidateLegacySQLiteCiphertextRejectsWrongMasterKey(t *testing.T) {
 	}
 	if err := validateLegacySQLiteCiphertext("accounts", account, wrong); err == nil {
 		t.Fatal("wrong master key accepted legacy ciphertext")
+	}
+	pendingKey, err := correct.EncryptPendingAliasAPIKey("legacy-api-key")
+	if err != nil {
+		t.Fatalf("encrypt pending alias API key: %v", err)
+	}
+	pending := []any{int64(1), pendingKey, int64(123)}
+	if err := validateLegacySQLiteCiphertext("pending_alias_api_keys", pending, correct); err != nil {
+		t.Fatalf("correct master key rejected pending alias API key: %v", err)
+	}
+	if err := validateLegacySQLiteCiphertext("pending_alias_api_keys", pending, wrong); err == nil {
+		t.Fatal("wrong master key accepted pending alias API key")
 	}
 }

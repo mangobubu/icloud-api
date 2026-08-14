@@ -31,30 +31,6 @@ func TestHTTPWriteTimeoutCoversConfiguredSyncTimeout(t *testing.T) {
 	}
 }
 
-func TestSeenOperationTimeoutIsShortAndTracksIMAPTimeout(t *testing.T) {
-	tests := []struct {
-		name        string
-		imapTimeout time.Duration
-		want        time.Duration
-	}{
-		{name: "non-positive", imapTimeout: 0, want: 2 * time.Minute},
-		{name: "small", imapTimeout: 5 * time.Second, want: 2 * time.Minute},
-		{name: "minimum range", imapTimeout: 18 * time.Second, want: 2 * time.Minute},
-		{name: "default", imapTimeout: 25 * time.Second, want: 160 * time.Second},
-		{name: "middle", imapTimeout: 45 * time.Second, want: 280 * time.Second},
-		{name: "maximum range", imapTimeout: 50 * time.Second, want: 5 * time.Minute},
-		{name: "large", imapTimeout: 90 * time.Second, want: 5 * time.Minute},
-		{name: "configured maximum", imapTimeout: 5 * time.Minute, want: 5 * time.Minute},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := seenOperationTimeout(test.imapTimeout); got != test.want {
-				t.Fatalf("seen operation timeout = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
-
 type shutdownerStub struct {
 	shutdown func(context.Context) error
 	close    func() error

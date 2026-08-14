@@ -38,15 +38,13 @@ type externalAliasResponse struct {
 func (s *Server) oauthTokenAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
-		if !s.externalAPILimiter.Allow(c.ClientIP()) {
+		if s.externalAPILimiter != nil && !s.externalAPILimiter.Allow(c.ClientIP()) {
 			s.writeAPIError(c, http.StatusTooManyRequests, "RATE_LIMITED", "请求过于频繁")
 			c.Abort()
 			return
 		}
-
-		token, validHeader := strictBearerToken(c.Request)
-		tokenMatches := secure.HashEqual(s.oauthTokenHash, secure.HashToken(token))
-		if !s.oauthTokenConfigured || !validHeader || !tokenMatches {
+		token, valid := strictBearerToken(c.Request)
+		if !s.oauthTokenConfigured || !valid || !secure.HashEqual(s.oauthTokenHash, secure.HashToken(token)) {
 			c.Header("WWW-Authenticate", "Bearer")
 			s.writeAPIError(c, http.StatusUnauthorized, "INVALID_OAUTH_TOKEN", "OAuth 令牌无效")
 			c.Abort()
@@ -62,8 +60,7 @@ func strictBearerToken(r *http.Request) (string, bool) {
 		return "", false
 	}
 	scheme, token, ok := strings.Cut(values[0], " ")
-	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" ||
-		strings.ContainsAny(token, " \t\r\n") {
+	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" || strings.ContainsAny(token, " \t\r\n") {
 		return "", false
 	}
 	return token, true
@@ -79,30 +76,21 @@ func (s *Server) createExternalAlias(c *gin.Context) {
 		s.writeAPIError(c, http.StatusBadRequest, "INVALID_REQUEST", "请求参数必须且只能包含一次 add_hide_my_eamil 和 icloud")
 		return
 	}
-	address = domain.NormalizeEmail(address)
-	accountEmail = domain.NormalizeEmail(accountEmail)
+	address, accountEmail = domain.NormalizeEmail(address), domain.NormalizeEmail(accountEmail)
 	if validateEmail(address) != nil || validateEmail(accountEmail) != nil {
 		s.writeAPIError(c, http.StatusBadRequest, "INVALID_REQUEST", "邮箱地址格式不正确")
 		return
 	}
-
 	account, err := s.store.GetAccountByEmail(c.Request.Context(), accountEmail)
 	if err != nil {
 		s.writeExternalAccountLookupError(c, err)
 		return
 	}
-	identityConflict, err := s.externalAliasIdentityConflict(c.Request.Context(), address, account)
-	if err != nil {
+	if conflict, err := s.externalAliasIdentityConflict(c.Request.Context(), address, account); err != nil {
 		s.writeExternalStoreError(c, err)
 		return
-	}
-	if identityConflict {
+	} else if conflict {
 		s.writeAPIError(c, http.StatusBadRequest, "INVALID_REQUEST", "隐私邮箱不能与已登记主号邮箱或所选主号的 IMAP 用户名相同")
-		return
-	}
-	rawKey, keyHash, keyPrefix, err := secure.NewAPIKey()
-	if err != nil {
-		s.writeExternalInternalError(c, err)
 		return
 	}
 
@@ -115,11 +103,9 @@ func (s *Server) createExternalAlias(c *gin.Context) {
 		if current.ID != account.ID {
 			return store.ErrNotFound
 		}
-		identityConflict, conflictErr := s.externalAliasIdentityConflict(c.Request.Context(), address, current)
-		if conflictErr != nil {
+		if conflict, conflictErr := s.externalAliasIdentityConflict(c.Request.Context(), address, current); conflictErr != nil {
 			return conflictErr
-		}
-		if identityConflict {
+		} else if conflict {
 			return errExternalAliasIdentityConflict
 		}
 		if _, duplicateErr := s.store.GetAliasByAddress(c.Request.Context(), address); duplicateErr == nil {
@@ -127,13 +113,13 @@ func (s *Server) createExternalAlias(c *gin.Context) {
 		} else if !errors.Is(duplicateErr, store.ErrNotFound) {
 			return duplicateErr
 		}
+		// The store's configured issuer owns new v2 credentials. Passing no
+		// provisional hash avoids returning a key that was discarded by CreateAlias.
 		var createErr error
 		alias, createErr = s.store.CreateAlias(c.Request.Context(), domain.Alias{
-			AccountID:    account.ID,
-			Address:      address,
-			APIKeyHash:   keyHash,
-			APIKeyPrefix: keyPrefix,
-			Enabled:      true,
+			AccountID: account.ID,
+			Address:   address,
+			Enabled:   true,
 		})
 		return createErr
 	})
@@ -141,18 +127,20 @@ func (s *Server) createExternalAlias(c *gin.Context) {
 		s.writeExternalAliasCreateError(c, err)
 		return
 	}
-
-	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
+	credentials, err := s.cipher.DecryptAliasCredentials(alias.ID, alias.CredentialCiphertext)
+	if err != nil {
+		s.writeExternalInternalError(c, err)
+		return
+	}
+	directLink, err := s.cipher.RecentMailToken(alias.ID, alias.APIKeyHash)
 	if err != nil {
 		s.writeExternalInternalError(c, err)
 		return
 	}
 	s.audit(c, nil, "oauth_api", "create", "alias", strconv.FormatInt(alias.ID, 10), "success", "")
 	c.JSON(http.StatusCreated, gin.H{"data": externalAliasResponse{
-		Alias:             alias.Address,
-		ICloud:            alias.AccountEmail,
-		APIKey:            rawKey,
-		MailAPIDirectLink: aliasDTO.DirectLinkPath,
+		Alias: alias.Address, ICloud: alias.AccountEmail, APIKey: credentials.APIKey,
+		MailAPIDirectLink: "/api/v1/mail/recent?api_key=" + url.QueryEscape(directLink),
 	}})
 }
 
@@ -173,27 +161,26 @@ func (s *Server) externalAliasIdentityConflict(ctx context.Context, address stri
 
 func (s *Server) externalAliasForm(c *gin.Context) (url.Values, bool) {
 	r := c.Request
-	remainingBodyBytes := int64(externalAliasMaxFormBytes - len(r.URL.RawQuery))
-	if remainingBodyBytes < 0 || r.ContentLength > remainingBodyBytes {
+	remaining := int64(externalAliasMaxFormBytes - len(r.URL.RawQuery))
+	if remaining < 0 || r.ContentLength > remaining {
 		s.writeAPIError(c, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "请求参数不能超过 4 KiB")
 		return nil, false
 	}
-	hasBody := r.Body != nil && r.Body != http.NoBody && (r.ContentLength != 0 || len(r.TransferEncoding) > 0)
-	if hasBody {
+	if r.Body != nil && r.Body != http.NoBody && (r.ContentLength != 0 || len(r.TransferEncoding) > 0) {
 		mediaType, _, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
 		if err != nil || !strings.EqualFold(mediaType, "application/x-www-form-urlencoded") {
 			s.writeAPIError(c, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "请求正文必须使用 application/x-www-form-urlencoded")
 			return nil, false
 		}
-		r.Body = http.MaxBytesReader(c.Writer, r.Body, remainingBodyBytes)
+		r.Body = http.MaxBytesReader(c.Writer, r.Body, remaining)
 	}
 	if err := r.ParseForm(); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			s.writeAPIError(c, http.StatusRequestEntityTooLarge, "REQUEST_TOO_LARGE", "请求参数不能超过 4 KiB")
-		} else {
-			s.writeAPIError(c, http.StatusBadRequest, "INVALID_REQUEST", "URL 编码参数格式错误")
+			return nil, false
 		}
+		s.writeAPIError(c, http.StatusBadRequest, "INVALID_REQUEST", "URL 编码参数格式错误")
 		return nil, false
 	}
 	return r.Form, true
@@ -205,10 +192,8 @@ func externalAliasFields(values url.Values) (string, string, bool) {
 			return "", "", false
 		}
 	}
-	addresses := values[externalAliasAddressField]
-	accounts := values[externalAliasAccountField]
-	if len(addresses) != 1 || len(accounts) != 1 ||
-		strings.TrimSpace(addresses[0]) == "" || strings.TrimSpace(accounts[0]) == "" {
+	addresses, accounts := values[externalAliasAddressField], values[externalAliasAccountField]
+	if len(addresses) != 1 || len(accounts) != 1 || strings.TrimSpace(addresses[0]) == "" || strings.TrimSpace(accounts[0]) == "" {
 		return "", "", false
 	}
 	return addresses[0], accounts[0], true
@@ -226,14 +211,12 @@ func (s *Server) writeExternalAliasCreateError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, errExternalAliasIdentityConflict):
 		s.writeAPIError(c, http.StatusBadRequest, "INVALID_REQUEST", "隐私邮箱不能与已登记主号邮箱或所选主号的 IMAP 用户名相同")
-	case errors.Is(err, errExternalAliasExists):
+	case errors.Is(err, errExternalAliasExists), adminAPIUniqueConstraint(err):
 		s.writeAPIError(c, http.StatusConflict, "ALIAS_EXISTS", "这个隐私邮箱已经登记")
 	case errors.Is(err, store.ErrNotFound):
 		s.writeAPIError(c, http.StatusNotFound, "ACCOUNT_NOT_FOUND", "主号邮箱不存在")
 	case errors.Is(err, store.ErrAliasLimit):
 		s.writeAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
-	case adminAPIUniqueConstraint(err):
-		s.writeAPIError(c, http.StatusConflict, "ALIAS_EXISTS", "这个隐私邮箱已经登记")
 	default:
 		s.writeExternalStoreError(c, err)
 	}

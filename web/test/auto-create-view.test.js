@@ -2,10 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-const viewPath = new URL(
-  "../src/views/AccountDetailView.vue",
-  import.meta.url,
-);
+const viewPath = new URL("../src/views/AccountDetailView.vue", import.meta.url);
 
 function functionBody(source, signature) {
   const start = source.indexOf(signature);
@@ -36,64 +33,52 @@ function autoCreationErrorFormatter(source) {
   )(messages);
 }
 
-test("account detail exposes automatic alias creation and safe key handling", async () => {
+test("account detail exposes automatic alias creation with persistent credential handling", async () => {
   const source = await readFile(viewPath, "utf8");
 
   assert.match(source, /<el-switch[\s\S]*自动创建隐私邮箱/);
   assert.match(source, /resumeAutoCreationAfterAuth/);
-  assert.match(source, /getAliasAutoCreationKeys/);
-  assert.match(source, /clearAliasAutoCreationKeys/);
-  assert.match(source, /batchSecretsSource/);
-  assert.match(source, /aliasId: item\.alias\?\.id/);
-  assert.match(source, /@click="acknowledgeAndCloseBatchSecrets"/);
-  assert.match(source, /@click="dismissBatchSecrets"/);
-  assert.match(
-    source,
-    /autoCreationErrorMessage\(autoCreation\.lastError\)/,
-  );
   assert.match(source, /autoCreation\.plannedTimes\?\.length/);
-  assert.match(source, /autoCreation\.plannedTimes/);
   assert.match(source, /autoCreation\.plannedAt/);
+  assert.doesNotMatch(source, /getAliasAutoCreationKeys/);
+  assert.doesNotMatch(source, /clearAliasAutoCreationKeys/);
+  assert.doesNotMatch(source, /pendingAutoKeys|batchSecrets|OneTimeSecret/);
+
+  for (const field of ["apiKey", "imapPassword", "clientId", "refreshToken"]) {
+    assert.match(source, new RegExp(`\\{\\{ (?:row|alias)\\.${field} \\}\\}`));
+  }
+  assert.match(source, /copyAliasCredentials\(row, ALIAS_EXPORT_OTP\)/);
+  assert.match(source, /copyAliasCredentials\(row, ALIAS_EXPORT_IMAP\)/);
+  assert.match(
+    functionBody(source, "async function rotateKey"),
+    /旧 API Key、取码链接、IMAP 密码、refresh token 和访问令牌会同时失效/,
+  );
+  assert.match(
+    functionBody(source, "async function rotateKey"),
+    /邮件消费状态和 IMAP 已读状态保持不变/,
+  );
+  assert.match(
+    functionBody(source, "async function rotateKey"),
+    /alias\.credentialMode/,
+  );
 
   const formatAutoCreationError = autoCreationErrorFormatter(source);
   assert.equal(
-    formatAutoCreationError("APPLE_ACCOUNT_MISMATCH"),
-    "Apple 登录账户或隐藏邮件地址的默认转发目标与当前主号不匹配，请确认登录了正确的 Apple 账户，并在 iCloud 设置中把‘转发到’改为当前主号后重新开启",
-  );
-  assert.equal(
-    formatAutoCreationError("APPLE_FORWARDING_TARGET_MISSING"),
-    "Apple 未能确认隐私邮箱的默认转发目标，本次没有发起创建；请确认当前主号可作为转发邮箱，或先在 iCloud 手动创建一个隐私邮箱后重新同步",
-  );
-  assert.equal(
     formatAutoCreationError("APPLE_SESSION_EXPIRED"),
     "Apple 登录已过期，请点击“同步隐私邮箱”并重新登录后重试",
-  );
-  assert.equal(
-    formatAutoCreationError("APPLE_ACCOUNT_ACTION_REQUIRED"),
-    "Apple 账户需要完成条款确认或其他账户操作，请前往 Apple 官网处理后重试",
   );
   assert.equal(
     formatAutoCreationError("APPLE_RATE_LIMITED"),
     "Apple 请求过于频繁，自动创建已进入冷却，冷却后会继续执行",
   );
   assert.equal(
-    formatAutoCreationError("APPLE_UPSTREAM_ERROR"),
-    "Apple 服务暂时异常，请稍后再试；自动创建会按计划继续执行",
-  );
-  assert.equal(
-    formatAutoCreationError("APPLE_ALIAS_CONFIRMATION_PENDING"),
-    "Apple 已创建隐私邮箱，正在等待目录确认；后续自动创建计划只会继续确认，不会重复创建",
-  );
-  assert.equal(
-    formatAutoCreationError("ALIAS_LIMIT_REACHED"),
-    "当前主号已达到隐私邮箱容量上限，请确认自动创建计划状态",
-  );
-  assert.equal(
     formatAutoCreationError(" unknown upstream detail "),
     " unknown upstream detail ",
   );
-  assert.equal(formatAutoCreationError("constructor"), "constructor");
+});
 
+test("directory-confirmation aliases remain visibly gated without a key-claim queue", async () => {
+  const source = await readFile(viewPath, "utf8");
   const confirmationBody = functionBody(
     source,
     "function isAliasConfirmationPending",
@@ -101,6 +86,7 @@ test("account detail exposes automatic alias creation and safe key handling", as
   const isAliasConfirmationPending = Function(
     `"use strict"; return function (item) ${confirmationBody}`,
   )();
+
   assert.equal(
     isAliasConfirmationPending({
       enabled: false,
@@ -115,106 +101,18 @@ test("account detail exposes automatic alias creation and safe key handling", as
     }),
     false,
   );
-  assert.equal(
-    isAliasConfirmationPending({
-      enabled: false,
-      lastSyncError: "APPLE_UPSTREAM_ERROR",
-    }),
-    false,
-  );
-
-  const desktopStart = source.indexOf(
-    'class="data-panel desktop-data-table account-alias-table"',
-  );
-  const mobileStart = source.indexOf(
-    '<div v-if="aliases.length" class="mobile-record-list">',
-  );
-  const aliasFormStart = source.indexOf("<el-form", mobileStart);
-  assert.ok(desktopStart >= 0 && mobileStart > desktopStart);
-  assert.ok(aliasFormStart > mobileStart);
-  const desktopAliases = source.slice(desktopStart, mobileStart);
-  const mobileAliases = source.slice(mobileStart, aliasFormStart);
-
-  assert.match(
-    desktopAliases,
-    /v-if="isAliasConfirmationPending\(row\)"[\s\S]{0,180}等待目录确认/,
-  );
-  assert.match(
-    desktopAliases,
-    /<el-switch\s+v-if="!isAliasConfirmationPending\(row\)"/,
-  );
-  assert.match(
-    desktopAliases,
-    /<div\s+v-if="!isAliasConfirmationPending\(row\)"\s+class="icon-action-row"/,
-  );
-  assert.match(
-    mobileAliases,
-    /v-if="isAliasConfirmationPending\(alias\)"[\s\S]{0,180}等待目录确认/,
-  );
-  assert.match(
-    mobileAliases,
-    /<div v-if="!isAliasConfirmationPending\(alias\)">\s*<dt>启用<\/dt>/,
-  );
-  assert.match(
-    mobileAliases,
-    /<footer\s+v-if="!isAliasConfirmationPending\(alias\)"\s+class="mobile-record__actions mobile-record__actions--three"/,
-  );
-
   for (const signature of [
     "async function rotateKey",
-    "async function copyAliasDirectLink",
+    "async function copyAliasCredentials",
     "async function toggleAlias",
     "async function removeAlias",
   ]) {
     assert.match(
       functionBody(source, signature),
       /isAliasConfirmationPending\(alias\)/,
-      `${signature} must reject a pending alias`,
+      `${signature} must reject a directory-confirmation alias`,
     );
   }
-
-  const acknowledge = functionBody(
-    source,
-    "async function acknowledgeAndCloseBatchSecrets",
-  );
-  assert.match(acknowledge, /clearAliasAutoCreationKeys\(/);
-  assert.match(acknowledge, /aliasIDAcknowledgementBatches\(aliasIds\)/);
-  assert.match(acknowledge, /for \(const aliasIDBatch of aliasIDBatches\)/);
-  assert.match(acknowledge, /clearBatchSecrets\(\)/);
-
-  const batchBody = functionBody(
-    source,
-    "function aliasIDAcknowledgementBatches",
-  );
-  const aliasIDAcknowledgementBatches = Function(
-    "AUTO_CREATION_KEY_ACK_BATCH_SIZE",
-    `"use strict"; return function (aliasIds) ${batchBody}`,
-  )(1000);
-  const moreThanOneBatch = Array.from({ length: 1001 }, (_, index) => index + 1);
-  const batches = aliasIDAcknowledgementBatches(moreThanOneBatch);
-  assert.deepEqual(
-    batches.map((batch) => batch.length),
-    [1000, 1],
-  );
-  assert.deepEqual(batches.flat(), moreThanOneBatch);
-
-  const dismiss = functionBody(source, "function dismissBatchSecrets");
-  assert.doesNotMatch(dismiss, /clearAliasAutoCreationKeys\(/);
-
-  const close = functionBody(source, "function closeBatchSecrets");
-  assert.doesNotMatch(close, /clearAliasAutoCreationKeys\(/);
-
-  const mutationGuard = functionBody(source, "function detailMutationPending");
-  assert.match(mutationGuard, /autoCreationLoading\.value/);
-  assert.match(mutationGuard, /pendingAutoKeysLoading\.value/);
-  assert.match(mutationGuard, /pendingAutoKeysClearing\.value/);
-
-  const navigationGuard = functionBody(
-    source,
-    "function hasPendingSecretRequest",
-  );
-  assert.match(navigationGuard, /pendingAutoKeysLoading\.value/);
-  assert.match(navigationGuard, /pendingAutoKeysClearing\.value/);
 });
 
 test("alias deletion is presented as an irreversible iCloud operation", async () => {

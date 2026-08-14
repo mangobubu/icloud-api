@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +27,7 @@ import (
 	"icloud-api/internal/hmesync"
 	"icloud-api/internal/httpserver"
 	mailfetch "icloud-api/internal/mail"
+	"icloud-api/internal/publicimap"
 	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
 	"icloud-api/internal/syncer"
@@ -61,6 +63,14 @@ func run() error {
 		slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}),
 		applicationLogs,
 	))
+	adminPath, adminPathCreated, err := secure.LoadOrCreateAdminPath(cfg.AdminPathFile, cfg.AdminPath)
+	if err != nil {
+		return fmt.Errorf("初始化管理路径: %w", err)
+	}
+	cfg.AdminPath = adminPath
+	if adminPathCreated {
+		logger.Warn("已生成随机管理路径，请通过 keys 卷中的 admin-path 文件读取")
+	}
 
 	db, cipher, keyCreated, err := openInitializedStore(context.Background(), cfg)
 	if err != nil {
@@ -100,6 +110,7 @@ func run() error {
 	fetcher.MaxMessageBytes = int(cfg.MaxMessageBytes)
 	fetcher.MaxBodyBytes = int(cfg.MaxBodyBytes)
 	fetcher.AllowWeakRecipientHeaders = cfg.AllowWeakRecipientHeaders
+	fetcher.ArchiveTempDir = db.MailArchiveTempDir()
 
 	signalContext, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
@@ -133,11 +144,34 @@ func run() error {
 	}
 	seenWorker := syncer.NewSeenWorker(db, cipher, fetcher, manager, logger, cfg.PollInterval)
 	seenWorker.SetOperationTimeout(seenOperationTimeout(cfg.IMAPTimeout))
-
+	publicIMAPCertFile := cfg.PublicIMAPTLSCertFile
+	publicIMAPKeyFile := cfg.PublicIMAPTLSKeyFile
+	generatePublicIMAPCertificate := publicIMAPCertFile == "" && publicIMAPKeyFile == ""
+	if generatePublicIMAPCertificate {
+		keysDirectory := filepath.Dir(cfg.AdminPathFile)
+		publicIMAPCertFile = filepath.Join(keysDirectory, "public-imap-cert.pem")
+		publicIMAPKeyFile = filepath.Join(keysDirectory, "public-imap-key.pem")
+	}
+	publicIMAPTLS, publicIMAPCertificateCreated, err := publicimap.LoadOrCreateTLSConfig(
+		publicIMAPCertFile,
+		publicIMAPKeyFile,
+		cfg.PublicIMAPServerName,
+		generatePublicIMAPCertificate,
+	)
+	if err != nil {
+		return fmt.Errorf("初始化 IMAPS TLS: %w", err)
+	}
+	if publicIMAPCertificateCreated {
+		logger.Warn("已生成持久化本地 IMAPS 证书，请在客户端信任 keys 卷中的 public-imap-cert.pem")
+	}
+	publicIMAPService, err := publicimap.NewService(db, cipher, publicIMAPTLS, imapLogAdapter{logger: logger})
+	if err != nil {
+		return fmt.Errorf("初始化 IMAPS 服务: %w", err)
+	}
+	defer publicIMAPService.Close()
 	web, err := httpserver.New(db, cipher, cfg, logger, func(accountID int64) error {
 		return manager.QueueAccountSync(workerContext, accountID)
 	})
-	cfg.OAuthToken = ""
 	if err != nil {
 		return fmt.Errorf("初始化 HTTP 服务: %w", err)
 	}
@@ -147,6 +181,7 @@ func run() error {
 	web.SetHMESyncService(hmeService)
 	web.SetAliasAutoCreationService(autoManager)
 	web.SetSeenNotifier(seenWorker.Notify)
+	web.SetReadinessChecker(publicIMAPService.Ready)
 	router, err := web.Router()
 	if err != nil {
 		return err
@@ -161,6 +196,9 @@ func run() error {
 		WriteTimeout:      httpWriteTimeout(cfg.SyncTimeout),
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    32 << 10,
+	}
+	if err := publicIMAPService.Listen(cfg.PublicIMAPAddr); err != nil {
+		return fmt.Errorf("启动 IMAPS 监听器: %w", err)
 	}
 
 	var background sync.WaitGroup
@@ -183,23 +221,38 @@ func run() error {
 		close(backgroundDone)
 	}()
 
-	serverErrors := make(chan error, 1)
+	type serverResult struct {
+		name string
+		err  error
+	}
+	serverErrors := make(chan serverResult, 2)
 	go func() {
-		logger.Info("服务已启动", "address", cfg.Addr, "admin", "http://"+cfg.Addr+"/admin")
-		serverErrors <- httpService.ListenAndServe()
+		serverErrors <- serverResult{name: "HTTP", err: httpService.ListenAndServe()}
 	}()
+	go func() {
+		serverErrors <- serverResult{name: "IMAPS", err: publicIMAPService.Serve()}
+	}()
+	logger.Info(
+		"服务已启动",
+		"http_address", cfg.Addr,
+		"imaps_address", publicIMAPService.Address(),
+		"admin", "http://"+cfg.Addr+"/<admin-prefix>/admin/",
+	)
 
 	var serveErr error
 	select {
-	case err := <-serverErrors:
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serveErr = fmt.Errorf("HTTP 服务异常退出: %w", err)
+	case result := <-serverErrors:
+		if result.err != nil && !errors.Is(result.err, http.ErrServerClosed) && !errors.Is(result.err, net.ErrClosed) {
+			serveErr = fmt.Errorf("%s 服务异常退出: %w", result.name, result.err)
+		} else {
+			serveErr = fmt.Errorf("%s 服务意外停止", result.name)
 		}
 	case <-signalContext.Done():
 	}
 	shutdownContext, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 	requestDone := drainingRouter.Stop()
+	publicIMAPCloseErr := publicIMAPService.Close()
 	// Stop background loops only after new HTTP work is rejected. Existing
 	// requests retain requestContext until HTTP draining finishes or times out.
 	manager.BeginShutdown()
@@ -223,11 +276,21 @@ func run() error {
 			_ = db.Close()
 		}()
 	}
-	if err := errors.Join(serveErr, shutdownErr); err != nil {
+	if err := errors.Join(serveErr, publicIMAPCloseErr, shutdownErr); err != nil {
 		return err
 	}
 	logger.Info("服务已关闭")
 	return nil
+}
+
+type imapLogAdapter struct {
+	logger *slog.Logger
+}
+
+func (adapter imapLogAdapter) Printf(format string, arguments ...any) {
+	if adapter.logger != nil {
+		adapter.logger.Warn("IMAPS 协议错误", "error", fmt.Sprintf(format, arguments...))
+	}
 }
 
 func httpWriteTimeout(syncTimeout time.Duration) time.Duration {
@@ -448,6 +511,62 @@ func openInitializedStore(
 	if err != nil {
 		_ = db.Close()
 		return nil, nil, false, err
+	}
+	db.ConfigureAliasCredentialFactory(func(aliasID, version int64) (domain.AliasCredentialMaterial, error) {
+		_, material, issueErr := secure.NewAliasCredentialMaterial(cipher, aliasID, version)
+		return material, issueErr
+	})
+	db.ConfigureAliasCredentialReuseFactory(func(aliasID, version int64, pendingCiphertext string) (domain.AliasCredentialMaterial, error) {
+		apiKey, decryptErr := cipher.DecryptPendingAliasAPIKey(pendingCiphertext)
+		if decryptErr != nil {
+			return domain.AliasCredentialMaterial{}, fmt.Errorf("解密待领取 API Key: %w", decryptErr)
+		}
+		_, material, issueErr := secure.NewAliasCredentialMaterialWithAPIKey(cipher, aliasID, version, apiKey)
+		apiKey = ""
+		return material, issueErr
+	})
+	db.ConfigureAliasCredentialRevealFactory(func(aliasID int64, credentialCiphertext string) (string, error) {
+		credentials, decryptErr := cipher.DecryptAliasCredentials(aliasID, credentialCiphertext)
+		if decryptErr != nil {
+			return "", decryptErr
+		}
+		return credentials.APIKey, nil
+	})
+	db.ConfigureAliasAPIKeyRotationFactory(func(aliasID, version int64, credentialCiphertext, apiKey string) (domain.AliasCredentialMaterial, error) {
+		credentials, decryptErr := cipher.DecryptAliasCredentials(aliasID, credentialCiphertext)
+		if decryptErr != nil {
+			return domain.AliasCredentialMaterial{}, decryptErr
+		}
+		credentials.APIKey = apiKey
+		rotatedCiphertext, encryptErr := cipher.EncryptAliasCredentials(aliasID, credentials)
+		if encryptErr != nil {
+			return domain.AliasCredentialMaterial{}, encryptErr
+		}
+		return domain.AliasCredentialMaterial{
+			Ciphertext:       rotatedCiphertext,
+			APIKeyHash:       secure.HashToken(credentials.APIKey),
+			APIKeyPrefix:     credentials.APIKey[:12],
+			IMAPPasswordHash: secure.HashToken(credentials.IMAPPassword),
+			OAuthClientID:    credentials.ClientID,
+			RefreshTokenHash: secure.HashToken(credentials.RefreshToken),
+			Version:          version,
+		}, nil
+	})
+	if err := db.EnsureAliasCredentials(ctx); err != nil {
+		_ = db.Close()
+		return nil, nil, false, fmt.Errorf("初始化隐私邮箱凭证: %w", err)
+	}
+	if err := db.ConfigureMailArchive(cfg.MailContentDir, cfg.MailContentLimitBytes); err != nil {
+		_ = db.Close()
+		return nil, nil, false, fmt.Errorf("初始化邮件归档: %w", err)
+	}
+	if err := db.ReconcileMailArchive(ctx); err != nil {
+		_ = db.Close()
+		return nil, nil, false, fmt.Errorf("校验邮件归档文件: %w", err)
+	}
+	if err := db.EnforceMailArchiveLimit(ctx); err != nil {
+		_ = db.Close()
+		return nil, nil, false, fmt.Errorf("执行邮件归档留存: %w", err)
 	}
 	return db, cipher, keyCreated, nil
 }

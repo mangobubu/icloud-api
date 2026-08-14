@@ -8,9 +8,9 @@ import (
 	"icloud-api/internal/domain"
 )
 
-// GetMailboxBindingByAPIKeyHash resolves exactly one alias, its owning account,
-// and that alias's sole latest-message row in one consistent read transaction.
-// Disabled records are returned so the HTTP layer can apply one uniform policy.
+// GetMailboxBindingByAPIKeyHash resolves exactly one alias and its owning
+// account in one consistent read transaction. Disabled records are returned so
+// the HTTP layer can apply one uniform policy.
 func (s *Store) GetMailboxBindingByAPIKeyHash(
 	ctx context.Context,
 	apiKeyHash []byte,
@@ -29,63 +29,32 @@ func (s *Store) GetMailboxBindingByAPIKeyHash(
 	defer func() { _ = tx.Rollback() }()
 
 	var binding domain.MailboxBinding
-	var aliasEnabled, accountEnabled bool
-	var aliasLastSynced, aliasLastAccessed sql.NullInt64
-	var aliasCreatedAt, aliasUpdatedAt int64
-	var accountLastSynced sql.NullInt64
-	var accountCreatedAt, accountUpdatedAt int64
-	err = s.txQueryRowContext(ctx, tx, `
-		SELECT
-			al.id, al.account_id, a.email, al.address, al.label, al.api_key_hash,
-			al.api_key_prefix, al.enabled, al.last_sync_status, al.last_sync_error,
-			al.last_synced_at, al.last_accessed_at, al.created_at, al.updated_at,
-			a.id, a.name, a.email, a.imap_host, a.imap_port, a.imap_username,
-			a.password_ciphertext, a.enabled, a.last_sync_status, a.last_sync_error,
-			a.last_synced_at, a.created_at, a.updated_at,
-			(SELECT COUNT(*) FROM aliases own WHERE own.account_id = a.id)
-		FROM aliases al
-		JOIN accounts a ON a.id = al.account_id
-		WHERE al.api_key_hash = ?`, apiKeyHash,
-	).Scan(
-		&binding.Alias.ID, &binding.Alias.AccountID, &binding.Alias.AccountEmail,
-		&binding.Alias.Address, &binding.Alias.Label, &binding.Alias.APIKeyHash,
-		&binding.Alias.APIKeyPrefix, &aliasEnabled, &binding.Alias.LastSyncStatus,
-		&binding.Alias.LastSyncError, &aliasLastSynced, &aliasLastAccessed,
-		&aliasCreatedAt, &aliasUpdatedAt,
-		&binding.Account.ID, &binding.Account.Name, &binding.Account.Email,
-		&binding.Account.IMAPHost, &binding.Account.IMAPPort, &binding.Account.IMAPUsername,
-		&binding.Account.PasswordCiphertext, &accountEnabled,
-		&binding.Account.LastSyncStatus, &binding.Account.LastSyncError,
-		&accountLastSynced, &accountCreatedAt, &accountUpdatedAt, &binding.Account.AliasCount,
-	)
+	binding.Alias, err = scanAlias(s.txQueryRowContext(ctx, tx,
+		`SELECT `+aliasColumns+aliasJoins+` WHERE al.api_key_hash = ?`, apiKeyHash,
+	))
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if err == ErrNotFound {
 			return domain.MailboxBinding{}, ErrNotFound
 		}
 		return domain.MailboxBinding{}, fmt.Errorf("get mailbox binding: %w", err)
 	}
-
-	binding.Alias.Enabled = aliasEnabled
-	binding.Alias.LastSyncedAt = timePtr(aliasLastSynced)
-	binding.Alias.LastAccessedAt = timePtr(aliasLastAccessed)
-	binding.Alias.CreatedAt = timeFromTimestamp(aliasCreatedAt)
-	binding.Alias.UpdatedAt = timeFromTimestamp(aliasUpdatedAt)
-	binding.Account.Enabled = accountEnabled
-	binding.Account.LastSyncedAt = timePtr(accountLastSynced)
-	binding.Account.CreatedAt = timeFromTimestamp(accountCreatedAt)
-	binding.Account.UpdatedAt = timeFromTimestamp(accountUpdatedAt)
-
-	message, err := scanLatestMessage(s.txQueryRowContext(ctx, tx,
-		`SELECT `+latestMessageColumns+` FROM latest_messages WHERE alias_id = ?`,
-		binding.Alias.ID,
+	binding.Account, err = scanAccount(s.txQueryRowContext(ctx, tx,
+		`SELECT `+accountColumns+` FROM accounts a WHERE a.id = ?`, binding.Alias.AccountID,
 	))
-	if err != nil && err != ErrNotFound {
-		return domain.MailboxBinding{}, fmt.Errorf("get mailbox binding message: %w", err)
+	if err != nil {
+		return domain.MailboxBinding{}, fmt.Errorf("get mailbox binding account: %w", err)
 	}
-	if err == nil {
+	// Legacy aliases keep a compact latest snapshot in the compatibility table.
+	// Loading it here lets both restored v1 handlers and embedders use one
+	// consistent credential/ownership lookup path. V2 callers simply receive a
+	// nil message when no legacy row exists.
+	message, messageErr := scanLatestMessage(s.txQueryRowContext(ctx, tx,
+		`SELECT `+latestMessageColumns+` FROM latest_messages WHERE alias_id = ?`, binding.Alias.ID,
+	))
+	if messageErr == nil {
 		binding.Message = &message
-		receivedAt := message.InternalDate
-		binding.Alias.LatestReceivedAt = &receivedAt
+	} else if messageErr != ErrNotFound {
+		return domain.MailboxBinding{}, fmt.Errorf("get mailbox binding latest message: %w", messageErr)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -99,4 +68,40 @@ func (s *Store) MailboxBindingByAPIKeyHash(
 	apiKeyHash []byte,
 ) (domain.MailboxBinding, error) {
 	return s.GetMailboxBindingByAPIKeyHash(ctx, apiKeyHash)
+}
+
+func (s *Store) GetMailboxBindingByOAuthClientID(ctx context.Context, clientID string) (domain.MailboxBinding, error) {
+	alias, err := s.GetAliasByOAuthClientID(ctx, clientID)
+	if err != nil {
+		return domain.MailboxBinding{}, err
+	}
+	account, err := s.GetAccount(ctx, alias.AccountID)
+	if err != nil {
+		return domain.MailboxBinding{}, err
+	}
+	return domain.MailboxBinding{Alias: alias, Account: account}, nil
+}
+
+func (s *Store) GetMailboxBindingByIMAPPasswordHash(ctx context.Context, hash []byte) (domain.MailboxBinding, error) {
+	alias, err := s.GetAliasByIMAPPasswordHash(ctx, hash)
+	if err != nil {
+		return domain.MailboxBinding{}, err
+	}
+	account, err := s.GetAccount(ctx, alias.AccountID)
+	if err != nil {
+		return domain.MailboxBinding{}, err
+	}
+	return domain.MailboxBinding{Alias: alias, Account: account}, nil
+}
+
+func (s *Store) GetMailboxBindingByAddress(ctx context.Context, address string) (domain.MailboxBinding, error) {
+	alias, err := s.GetAliasByAddress(ctx, address)
+	if err != nil {
+		return domain.MailboxBinding{}, err
+	}
+	account, err := s.GetAccount(ctx, alias.AccountID)
+	if err != nil {
+		return domain.MailboxBinding{}, err
+	}
+	return domain.MailboxBinding{Alias: alias, Account: account}, nil
 }

@@ -161,6 +161,7 @@ const actionLabels = {
   delete: "删除",
   sync: "同步主号",
   rotate_key: "轮换 API Key",
+  rotate_credentials: "轮换整套凭证",
   toggle: "切换启用状态",
 };
 

@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-import { buildAliasExportText } from "../src/utils/aliasExport.js";
+import {
+  ALIAS_EXPORT_IMAP,
+  ALIAS_EXPORT_OTP,
+  buildAliasExportText,
+} from "../src/utils/aliasExport.js";
 
 const aliasesViewPath = new URL("../src/views/AliasesView.vue", import.meta.url);
 
@@ -22,134 +26,128 @@ function functionBody(source, signature) {
   assert.fail(`unterminated body for ${signature}`);
 }
 
-test("alias export uses one email and absolute direct link per line", () => {
+test("OTP export uses five hyphens, absolute links, one line per alias, and no header", () => {
   const exported = buildAliasExportText(
     [
       {
         address: "first@icloud.com",
-        directLinkPath: "/api/v1/mail/recent?api_key=first-token",
+        otpUrlPath: "/api/v1/otp?token=first-token",
       },
       {
         address: "second@icloud.com",
-        directLinkPath: "/api/v1/mail/recent/?api_key=second%2Btoken",
+        otpUrlPath: "/api/v1/otp?token=second%2Btoken",
       },
     ],
+    ALIAS_EXPORT_OTP,
     "https://mail.example.test:8443",
   );
 
   assert.equal(
     exported,
     [
-      "first@icloud.com----https://mail.example.test:8443/api/v1/mail/recent?api_key=first-token",
-      "second@icloud.com----https://mail.example.test:8443/api/v1/mail/recent/?api_key=second%2Btoken",
+      "first@icloud.com-----https://mail.example.test:8443/api/v1/otp?token=first-token",
+      "second@icloud.com-----https://mail.example.test:8443/api/v1/otp?token=second%2Btoken",
     ].join("\r\n"),
   );
 });
 
-test("alias export preserves the requested order and has no header", () => {
+test("IMAP export uses four hyphens and preserves requested alias order", () => {
   const exported = buildAliasExportText(
     [
       {
         address: "z-last@icloud.com",
-        directLinkPath: "/api/v1/mail/recent?api_key=z-token",
+        imapPassword: "imap-z",
+        clientId: "client-z",
+        refreshToken: "refresh-z",
       },
       {
         address: "a-first@icloud.com",
-        directLinkPath: "/api/v1/mail/recent?api_key=a-token",
+        imapPassword: "imap-a",
+        clientId: "client-a",
+        refreshToken: "refresh-a",
       },
     ],
-    "https://mail.example.test",
+    ALIAS_EXPORT_IMAP,
   );
 
-  assert.deepEqual(
-    exported.split("\r\n").map((line) => line.split("----")[0]),
-    ["z-last@icloud.com", "a-first@icloud.com"],
+  assert.equal(
+    exported,
+    [
+      "z-last@icloud.com----imap-z----client-z----refresh-z",
+      "a-first@icloud.com----imap-a----client-a----refresh-a",
+    ].join("\r\n"),
   );
 });
 
-test("alias export rejects missing addresses and invalid direct links", () => {
+test("credential export rejects missing fields, injected lines, and foreign OTP links", () => {
   assert.throws(
     () =>
       buildAliasExportText(
-        [
-          {
-            address: "",
-            directLinkPath: "/api/v1/mail/recent?api_key=token",
-          },
-        ],
+        [{ address: "", otpUrlPath: "/api/v1/otp?token=token" }],
+        ALIAS_EXPORT_OTP,
         "https://mail.example.test",
       ),
     /邮箱地址格式无效/,
   );
-
   assert.throws(
     () =>
       buildAliasExportText(
         [
           {
             address: "private@icloud.com",
-            directLinkPath:
-              "https://attacker.example/api/v1/mail/recent?api_key=token",
+            otpUrlPath: "https://attacker.example/api/v1/otp?token=token",
           },
         ],
+        ALIAS_EXPORT_OTP,
         "https://mail.example.test",
       ),
     /链接格式无效/,
   );
+  assert.throws(
+    () =>
+      buildAliasExportText(
+        [
+          {
+            address: "private@icloud.com",
+            imapPassword: "imap\npassword",
+            clientId: "client",
+            refreshToken: "refresh",
+          },
+        ],
+        ALIAS_EXPORT_IMAP,
+      ),
+    /IMAP 密码格式无效/,
+  );
 });
 
-test("all aliases view withholds pending confirmation links and exports", async () => {
+test("all aliases view keeps full credentials visible and supports single, checked, and all copy", async () => {
   const source = await readFile(aliasesViewPath, "utf8");
-  const pendingBody = functionBody(source, "function isAliasConfirmationPending");
-  const isAliasConfirmationPending = Function(
-    `"use strict"; return function (alias) ${pendingBody}`,
-  )();
   const exportableBody = functionBody(source, "function isAliasExportable");
   const isAliasExportable = Function(
-    "isAliasConfirmationPending",
     `"use strict"; return function (alias) ${exportableBody}`,
-  )(isAliasConfirmationPending);
-
-  const pending = {
-    enabled: false,
-    lastSyncError: "APPLE_ALIAS_CONFIRMATION_PENDING",
-    directLinkPath: "/api/v1/mail/recent?api_key=pending-token",
+  )();
+  const complete = {
+    address: "private@icloud.com",
+    apiKey: "api-key",
+    imapPassword: "imap-password",
+    clientId: "client-id",
+    refreshToken: "refresh-token",
+    otpUrlPath: "/api/v1/otp?token=derived",
   };
-  assert.equal(isAliasConfirmationPending(pending), true);
-  assert.equal(isAliasExportable(pending), false);
-  assert.equal(
-    isAliasExportable({ enabled: true, lastSyncError: "", directLinkPath: "/recent" }),
-    true,
-  );
-  assert.equal(isAliasExportable({ enabled: true, directLinkPath: "" }), false);
 
-  assert.match(source, /:disabled="!isAliasExportable\(row\)"/);
-  assert.match(source, /:model-value="allExportableAliasesSelected"/);
-  assert.match(source, /:indeterminate="someExportableAliasesSelected"/);
-  assert.match(source, /function setAllAliasesSelected/);
-  assert.match(source, /:disabled="!isAliasExportable\(alias\)"/);
+  assert.equal(isAliasExportable(complete), true);
+  assert.equal(isAliasExportable({ ...complete, refreshToken: "" }), false);
+  for (const field of ["apiKey", "imapPassword", "clientId", "refreshToken"]) {
+    assert.match(source, new RegExp(`\\{\\{ (?:row|alias)\\.${field} \\}\\}`));
+  }
+  assert.match(source, /copyAliasLine\(row, ALIAS_EXPORT_OTP\)/);
+  assert.match(source, /copyAliasLine\(row, ALIAS_EXPORT_IMAP\)/);
+  assert.match(source, /copySelectedAliases\(ALIAS_EXPORT_OTP\)/);
+  assert.match(source, /copySelectedAliases\(ALIAS_EXPORT_IMAP\)/);
+  assert.match(source, /copyAllAliases\(ALIAS_EXPORT_OTP\)/);
+  assert.match(source, /copyAllAliases\(ALIAS_EXPORT_IMAP\)/);
   assert.match(
-    source,
-    /v-if="isAliasConfirmationPending\(row\)"[\s\S]{0,180}等待目录确认/,
-  );
-  assert.match(
-    source,
-    /v-if="isAliasConfirmationPending\(alias\)"[\s\S]{0,180}等待目录确认/,
-  );
-  assert.match(source, /v-if="isAliasExportable\(row\)"/);
-  assert.match(source, /v-if="isAliasExportable\(alias\)"/);
-  assert.match(
-    functionBody(source, "function exportAliases"),
-    /items\.filter\(isAliasExportable\)/,
-  );
-  assert.match(
-    functionBody(source, "function exportAllAliases"),
+    functionBody(source, "function copyAllAliases"),
     /getAllAliases\(selectedAccountId\.value,\s*\{[\s\S]*query:\s*appliedAliasQuery\.value/,
-  );
-  assert.match(source, /:loading="exportingAll"/);
-  assert.match(source, /exportingAll\.value = true/);
-  assert.match(
-    functionBody(source, "async function copyAliasDirectLink"),
-    /!isAliasExportable\(alias\)/,
   );
 });

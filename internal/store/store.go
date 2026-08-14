@@ -8,8 +8,11 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"icloud-api/internal/domain"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
@@ -21,6 +24,7 @@ var (
 	ErrInvalidPostgresURL       = errors.New("PostgreSQL URL must use postgres:// or postgresql://")
 	ErrAliasLimit               = errors.New("enabled alias limit reached")
 	ErrAliasConfirmationPending = errors.New("alias is awaiting Apple confirmation")
+	ErrAliasCredentialMode      = errors.New("alias credential mode does not support this operation")
 	ErrAliasOwnershipConflict   = errors.New("alias address belongs to another account")
 	ErrAccountIdentityLocked    = errors.New("account identity is locked by aliases")
 	ErrAccountDisabled          = errors.New("primary account is disabled")
@@ -37,9 +41,19 @@ const (
 
 // Store owns the application's persistence layer.
 type Store struct {
-	db      *sql.DB
-	dialect dialect
-	now     func() time.Time
+	db                              *sql.DB
+	dialect                         dialect
+	now                             func() time.Time
+	credentialFactory               func(aliasID, version int64) (domain.AliasCredentialMaterial, error)
+	credentialReuseFactory          func(aliasID, version int64, pendingCiphertext string) (domain.AliasCredentialMaterial, error)
+	credentialRevealFactory         func(aliasID int64, credentialCiphertext string) (string, error)
+	credentialAPIKeyRotationFactory func(
+		aliasID, version int64,
+		credentialCiphertext, apiKey string,
+	) (domain.AliasCredentialMaterial, error)
+	mailArchiveDir          string
+	mailArchiveLimit        int64
+	mailArchiveAccountLocks sync.Map
 }
 
 // Open opens a PostgreSQL connection URL or a legacy SQLite database and

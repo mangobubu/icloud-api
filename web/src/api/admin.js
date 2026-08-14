@@ -187,15 +187,54 @@ export function normalizeAlias(raw = {}) {
       firstDefined(raw, "account_email", "accountEmail", "AccountEmail") || "",
     address: firstDefined(raw, "address", "Address") || "",
     label: firstDefined(raw, "label", "Label") || "",
+    apiKey: firstDefined(raw, "api_key", "apiKey", "APIKey") || "",
     apiKeyPrefix:
-      firstDefined(raw, "api_key_prefix", "apiKeyPrefix", "APIKeyPrefix") || "",
+      firstDefined(raw, "api_key_prefix", "apiKeyPrefix", "APIKeyPrefix") ||
+      "",
+    imapPassword:
+      firstDefined(raw, "imap_password", "imapPassword", "IMAPPassword") || "",
+    clientId: firstDefined(raw, "client_id", "clientId", "ClientID") || "",
+    refreshToken:
+      firstDefined(raw, "refresh_token", "refreshToken", "RefreshToken") || "",
+    otpUrlPath:
+      firstDefined(
+        raw,
+        "otp_url_path",
+        "otpUrlPath",
+        "OTPURLPath",
+      ) || "",
     directLinkPath:
       firstDefined(
         raw,
         "direct_link_path",
         "directLinkPath",
         "DirectLinkPath",
+        "legacy_direct_link_path",
+        "legacyDirectLinkPath",
+        "LegacyDirectLink",
       ) || "",
+    legacyDirectLinkPath:
+      firstDefined(
+        raw,
+        "legacy_direct_link_path",
+        "legacyDirectLinkPath",
+        "LegacyDirectLink",
+        "direct_link_path",
+        "directLinkPath",
+        "DirectLinkPath",
+      ) || "",
+    credentialMode:
+      firstDefined(raw, "credential_mode", "credentialMode", "CredentialMode") ||
+      "",
+    credentialVersion:
+      Number(
+        firstDefined(
+          raw,
+          "credential_version",
+          "credentialVersion",
+          "CredentialVersion",
+        ),
+      ) || 0,
     enabled: Boolean(firstDefined(raw, "enabled", "Enabled")),
     lastSyncStatus:
       firstDefined(raw, "last_sync_status", "lastSyncStatus", "LastSyncStatus") ||
@@ -262,19 +301,6 @@ export function normalizeAutoCreation(raw = {}) {
     firstDefined(value, "planned_at", "plannedAt", "PlannedAt") ||
     plannedTimes[0] ||
     null;
-  const pendingRaw = firstDefined(
-    value,
-    "pending_key_count",
-    "pending_auto_created_key_count",
-    "pendingKeyCount",
-    "PendingKeyCount",
-  );
-  const pendingNumber = Number(pendingRaw);
-  const pendingKeyCount =
-    Number.isFinite(pendingNumber) && pendingNumber >= 0
-      ? Math.floor(pendingNumber)
-      : 0;
-
   return {
     enabled: Boolean(firstDefined(value, "enabled", "Enabled")),
     status: firstDefined(value, "status", "Status") || "",
@@ -305,7 +331,6 @@ export function normalizeAutoCreation(raw = {}) {
       ) || "",
     lastError:
       firstDefined(value, "last_error", "lastError", "LastError") || "",
-    pendingKeyCount,
   };
 }
 
@@ -593,18 +618,23 @@ function normalizeSyncSummary(raw = {}) {
 
 function normalizeCreatedAlias(raw = {}) {
   const aliasRaw = firstDefined(raw, "alias", "Alias") || {};
+  const alias = normalizeAlias(
+    typeof aliasRaw === "string" ? { address: aliasRaw } : aliasRaw,
+  );
   return {
-    alias: normalizeAlias(
-      typeof aliasRaw === "string" ? { address: aliasRaw } : aliasRaw,
-    ),
-    apiKey: firstDefined(raw, "api_key", "apiKey", "APIKey") || "",
-    mailApiDirectLink:
+    alias,
+    apiKey:
+      firstDefined(raw, "api_key", "apiKey", "APIKey") || alias.apiKey,
+    otpUrlPath:
       firstDefined(
         raw,
+        "otp_url_path",
+        "otpUrlPath",
+        "OTPURLPath",
         "mail_api_direct_link",
         "mailApiDirectLink",
         "MailAPIDirectLink",
-      ) || "",
+      ) || alias.otpUrlPath || alias.directLinkPath,
   };
 }
 
@@ -630,33 +660,6 @@ export async function setAliasAutoCreation(accountId, enabled, csrfToken) {
   return normalizeAutoCreationResult(data);
 }
 
-export async function getAliasAutoCreationKeys(accountId) {
-  const data = await apiRequest(
-    `/accounts/${encodeURIComponent(accountId)}/aliases/auto-create/keys`,
-  );
-  return {
-    created: listFrom(data, "created", "Created").map(normalizeCreatedAlias),
-  };
-}
-
-export function clearAliasAutoCreationKeys(accountId, aliasIds, csrfToken) {
-  const hasAliasIDs = Array.isArray(aliasIds);
-  const requestCSRF = hasAliasIDs ? csrfToken : csrfToken ?? aliasIds;
-  const options = {
-    method: "DELETE",
-    csrfToken: requestCSRF,
-  };
-  if (hasAliasIDs) {
-    options.body = {
-      alias_ids: aliasIds,
-    };
-  }
-  return apiRequest(
-    `/accounts/${encodeURIComponent(accountId)}/aliases/auto-create/keys`,
-    options,
-  );
-}
-
 export async function syncAccountAliases(accountId, csrfToken) {
   const data =
     (await apiRequest(
@@ -674,9 +677,21 @@ export async function syncAccountAliases(accountId, csrfToken) {
 }
 
 function aliasMutationResult(data = {}) {
+  const alias = normalizeAlias(data.alias || data);
   return {
-    alias: normalizeAlias(data.alias || data),
-    apiKey: data.api_key || data.apiKey || "",
+    alias,
+    apiKey:
+      firstDefined(data, "api_key", "apiKey", "APIKey") || alias.apiKey,
+    otpUrlPath:
+      firstDefined(
+        data,
+        "otp_url_path",
+        "otpUrlPath",
+        "OTPURLPath",
+        "mail_api_direct_link",
+        "mailApiDirectLink",
+        "MailAPIDirectLink",
+      ) || alias.otpUrlPath || alias.directLinkPath,
   };
 }
 
@@ -712,9 +727,11 @@ export function getAllAliases(accountId = "", options = {}) {
   );
 }
 
-export async function rotateAlias(id, csrfToken) {
+export async function rotateAlias(id, csrfToken, credentialMode = "") {
+  const operation =
+    credentialMode === "v2" ? "rotate-credentials" : "rotate-key";
   return aliasMutationResult(
-    await apiRequest(`/aliases/${encodeURIComponent(id)}/rotate-key`, {
+    await apiRequest(`/aliases/${encodeURIComponent(id)}/${operation}`, {
       method: "POST",
       csrfToken,
     }),

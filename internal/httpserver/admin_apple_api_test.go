@@ -14,7 +14,6 @@ import (
 	"icloud-api/internal/apple"
 	"icloud-api/internal/domain"
 	"icloud-api/internal/hmesync"
-	"icloud-api/internal/secure"
 	"icloud-api/internal/store"
 )
 
@@ -90,7 +89,6 @@ func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
 		appleSecret = "ordinary-apple-password-secret"
 		challengeID = "challenge-secret-0123456789"
 		code        = "246810"
-		apiKey      = "icm_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	)
 	authenticatedAt := time.Date(2026, time.August, 7, 12, 30, 0, 0, time.UTC)
 	currentSession := hmesync.SessionInfo{Status: hmesync.StatusLoginRequired}
@@ -129,19 +127,17 @@ func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
 			t.Fatalf("SyncAliases account = %d, want %d", accountID, account.ID)
 		}
 		alias, err := env.store.CreateAlias(ctx, domain.Alias{
-			AccountID:    accountID,
-			Address:      "generated@privaterelay.appleid.com",
-			Label:        "Apple 导入",
-			APIKeyHash:   secure.HashToken(apiKey),
-			APIKeyPrefix: apiKey[:12],
-			Enabled:      true,
+			AccountID: accountID,
+			Address:   "generated@privaterelay.appleid.com",
+			Label:     "Apple 导入",
+			Enabled:   true,
 		})
 		if err != nil {
 			return hmesync.SyncResult{}, err
 		}
 		return hmesync.SyncResult{
 			Summary: hmesync.SyncSummary{Total: 3, CreatedCount: 1, ExistingCount: 2, InactiveCount: 1, ImportedDisabledCount: 1},
-			Created: []hmesync.CreatedAlias{{Alias: alias, APIKey: apiKey}},
+			Created: []hmesync.CreatedAlias{{Alias: alias}},
 			Session: currentSession,
 		}, nil
 	}
@@ -218,11 +214,7 @@ func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
 				InactiveCount         int `json:"inactive_count"`
 				ImportedDisabledCount int `json:"imported_disabled_count"`
 			} `json:"summary"`
-			Created []struct {
-				Alias             adminAPIAliasDTO `json:"alias"`
-				APIKey            string           `json:"api_key"`
-				MailAPIDirectLink string           `json:"mail_api_direct_link"`
-			} `json:"created"`
+			Created []adminAPIAppleCreatedAliasDTO `json:"created"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(syncResponse.Body.Bytes(), &syncPayload); err != nil {
@@ -232,7 +224,12 @@ func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
 		t.Fatalf("Apple sync payload = %#v", syncPayload.Data)
 	}
 	created := syncPayload.Data.Created[0]
-	if created.Alias.Address != "generated@privaterelay.appleid.com" || created.APIKey != apiKey || !strings.Contains(created.MailAPIDirectLink, "api_key=") || strings.Contains(created.MailAPIDirectLink, apiKey) {
+	if created.Alias.Address != "generated@privaterelay.appleid.com" || created.Alias.APIKey == "" ||
+		created.APIKey != created.Alias.APIKey || created.MailAPIDirectLink != created.Alias.DirectLinkPath ||
+		!strings.HasPrefix(created.MailAPIDirectLink, "/api/v1/mail/recent?api_key=") ||
+		created.Alias.IMAPPassword == "" || created.Alias.ClientID == "" || created.Alias.RefreshToken == "" ||
+		!strings.Contains(created.Alias.OTPURLPath, "/api/v1/otp?token=") ||
+		strings.Contains(created.Alias.OTPURLPath, created.Alias.APIKey) {
 		t.Fatalf("created credential = %#v", created)
 	}
 
@@ -249,7 +246,7 @@ func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
 		t.Fatalf("list Apple audit logs: %v", err)
 	}
 	auditText := fmt.Sprintf("%+v", audits)
-	for _, secret := range []string{appleSecret, challengeID, code, apiKey, sessionCookie.Value} {
+	for _, secret := range []string{appleSecret, challengeID, code, created.Alias.APIKey, sessionCookie.Value} {
 		if strings.Contains(auditText, secret) {
 			t.Fatalf("audit log exposed secret %q: %s", secret, auditText)
 		}
@@ -500,45 +497,38 @@ func TestAdminAPIAppleErrorsUseDedicatedCodesAndRedactedLogs(t *testing.T) {
 	}
 }
 
-func TestAdminAPIAppleSyncReturnsOneTimeKeyWhenDirectLinkRenderingFails(t *testing.T) {
+func TestAdminAPIAppleSyncReportsCredentialRenderingFailure(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	var logs strings.Builder
 	env.server.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	sessionCookie, csrf, _ := env.createSession(t, "apple-key-fallback-admin", "unused-password")
 	account := adminAPITestCreateAccount(t, env, "fallback@icloud.com")
-	const apiKey = "icm_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 	env.server.SetHMESyncService(&fakeHMESyncService{
 		syncAliases: func(ctx context.Context, accountID int64) (hmesync.SyncResult, error) {
 			alias, err := env.store.CreateAlias(ctx, domain.Alias{
-				AccountID:    accountID,
-				Address:      "fallback@privaterelay.appleid.com",
-				APIKeyHash:   secure.HashToken(apiKey),
-				APIKeyPrefix: apiKey[:12],
-				Enabled:      true,
+				AccountID: accountID,
+				Address:   "fallback@privaterelay.appleid.com",
+				Enabled:   true,
 			})
 			if err != nil {
 				return hmesync.SyncResult{}, err
 			}
-			// Simulate a malformed optional DTO field after the database commit.
-			// The raw key still has to reach the caller.
+			// Simulate corrupted authentication metadata after the database commit.
 			alias.APIKeyHash = []byte("invalid")
 			return hmesync.SyncResult{
 				Summary: hmesync.SyncSummary{Total: 1, CreatedCount: 1},
-				Created: []hmesync.CreatedAlias{{Alias: alias, APIKey: apiKey}},
+				Created: []hmesync.CreatedAlias{{Alias: alias}},
 				Session: hmesync.SessionInfo{Status: hmesync.StatusAuthenticated, AppleID: account.Email, Region: hmesync.RegionGlobal},
 			}, nil
 		},
 	})
 	path := fmt.Sprintf("/admin/api/v1/accounts/%d/aliases/sync", account.ID)
 	response := env.request(t, http.MethodPost, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), apiKey) || !strings.Contains(response.Body.String(), `"mail_api_direct_link":""`) {
-		t.Fatalf("fallback sync response = %d; body=%s", response.Code, response.Body.String())
+	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "api_key") {
+		t.Fatalf("credential rendering failure = %d; body=%s", response.Code, response.Body.String())
 	}
 	if _, err := env.store.GetAliasByAddress(context.Background(), "fallback@privaterelay.appleid.com"); err != nil {
 		t.Fatalf("committed alias missing after fallback response: %v", err)
-	}
-	if strings.Contains(logs.String(), apiKey) {
-		t.Fatalf("fallback warning exposed API key: %s", logs.String())
 	}
 }
 
@@ -546,31 +536,26 @@ func TestAdminAPIAppleSyncRefreshesCommittedAccountDetail(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	sessionCookie, csrf, _ := env.createSession(t, "apple-refresh-admin", "unused-password")
 	account := adminAPITestCreateAccount(t, env, "refresh@icloud.com")
-	const apiKey = "icm_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 	env.server.SetHMESyncService(&fakeHMESyncService{
 		syncAliases: func(ctx context.Context, accountID int64) (hmesync.SyncResult, error) {
 			created, err := env.store.CreateAlias(ctx, domain.Alias{
-				AccountID:    accountID,
-				Address:      "created@privaterelay.appleid.com",
-				APIKeyHash:   secure.HashToken(apiKey),
-				APIKeyPrefix: apiKey[:12],
-				Enabled:      true,
+				AccountID: accountID,
+				Address:   "created@privaterelay.appleid.com",
+				Enabled:   true,
 			})
 			if err != nil {
 				return hmesync.SyncResult{}, err
 			}
 			if _, err := env.store.CreateAlias(ctx, domain.Alias{
-				AccountID:    accountID,
-				Address:      "concurrent@privaterelay.appleid.com",
-				APIKeyHash:   secure.HashToken("concurrent-key"),
-				APIKeyPrefix: "concurrent",
-				Enabled:      true,
+				AccountID: accountID,
+				Address:   "concurrent@privaterelay.appleid.com",
+				Enabled:   true,
 			}); err != nil {
 				return hmesync.SyncResult{}, err
 			}
 			return hmesync.SyncResult{
 				Summary: hmesync.SyncSummary{Total: 1, CreatedCount: 1},
-				Created: []hmesync.CreatedAlias{{Alias: created, APIKey: apiKey}},
+				Created: []hmesync.CreatedAlias{{Alias: created}},
 				Session: hmesync.SessionInfo{Status: hmesync.StatusAuthenticated},
 			}, nil
 		},
@@ -586,33 +571,29 @@ func TestAdminAPIAppleSyncRefreshesCommittedAccountDetail(t *testing.T) {
 			Account struct {
 				AliasCount int `json:"alias_count"`
 			} `json:"account"`
-			Aliases []adminAPIAliasDTO `json:"aliases"`
-			Created []struct {
-				APIKey string `json:"api_key"`
-			} `json:"created"`
+			Aliases []adminAPIAliasDTO             `json:"aliases"`
+			Created []adminAPIAppleCreatedAliasDTO `json:"created"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode refresh sync response: %v; body=%s", err, response.Body.String())
 	}
-	if payload.Data.Account.AliasCount != 2 || len(payload.Data.Aliases) != 2 || len(payload.Data.Created) != 1 || payload.Data.Created[0].APIKey != apiKey {
+	if payload.Data.Account.AliasCount != 2 || len(payload.Data.Aliases) != 2 || len(payload.Data.Created) != 1 ||
+		payload.Data.Created[0].Alias.APIKey == "" {
 		t.Fatalf("refreshed sync payload = %#v", payload.Data)
 	}
 }
 
-func TestAdminAPIAppleSyncKeepsOneTimeKeyWhenDetailRefreshFails(t *testing.T) {
+func TestAdminAPIAppleSyncKeepsCredentialBundleWhenDetailRefreshFails(t *testing.T) {
 	env := newAdminAPITestEnv(t)
 	sessionCookie, csrf, _ := env.createSession(t, "apple-refresh-fallback-admin", "unused-password")
 	account := adminAPITestCreateAccount(t, env, "refresh-fallback@icloud.com")
-	const apiKey = "icm_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
 	env.server.SetHMESyncService(&fakeHMESyncService{
 		syncAliases: func(ctx context.Context, accountID int64) (hmesync.SyncResult, error) {
 			alias, err := env.store.CreateAlias(ctx, domain.Alias{
-				AccountID:    accountID,
-				Address:      "refresh-fallback@privaterelay.appleid.com",
-				APIKeyHash:   secure.HashToken(apiKey),
-				APIKeyPrefix: apiKey[:12],
-				Enabled:      true,
+				AccountID: accountID,
+				Address:   "refresh-fallback@privaterelay.appleid.com",
+				Enabled:   true,
 			})
 			if err != nil {
 				return hmesync.SyncResult{}, err
@@ -622,7 +603,7 @@ func TestAdminAPIAppleSyncKeepsOneTimeKeyWhenDetailRefreshFails(t *testing.T) {
 			}
 			return hmesync.SyncResult{
 				Summary: hmesync.SyncSummary{Total: 1, CreatedCount: 1},
-				Created: []hmesync.CreatedAlias{{Alias: alias, APIKey: apiKey}},
+				Created: []hmesync.CreatedAlias{{Alias: alias}},
 				Session: hmesync.SessionInfo{Status: hmesync.StatusAuthenticated},
 			}, nil
 		},
@@ -630,7 +611,8 @@ func TestAdminAPIAppleSyncKeepsOneTimeKeyWhenDetailRefreshFails(t *testing.T) {
 
 	path := fmt.Sprintf("/admin/api/v1/accounts/%d/aliases/sync", account.ID)
 	response := env.request(t, http.MethodPost, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
-	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), apiKey) || !strings.Contains(response.Body.String(), `"alias_count":1`) {
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"api_key":"icm_`) ||
+		!strings.Contains(response.Body.String(), `"alias_count":1`) {
 		t.Fatalf("refresh fallback sync response = %d; body=%s", response.Code, response.Body.String())
 	}
 }
@@ -685,12 +667,10 @@ func adminAPITestCreateAccount(t *testing.T, env *adminAPITestEnv, email string)
 func adminAPITestCreateDeleteAlias(t *testing.T, env *adminAPITestEnv, accountID int64, address string) domain.Alias {
 	t.Helper()
 	alias, err := env.store.CreateAlias(context.Background(), domain.Alias{
-		AccountID:    accountID,
-		Address:      address,
-		Label:        "Delete test alias",
-		APIKeyHash:   secure.HashToken("delete-test-key-" + address),
-		APIKeyPrefix: "delete-test",
-		Enabled:      true,
+		AccountID: accountID,
+		Address:   address,
+		Label:     "Delete test alias",
+		Enabled:   true,
 	})
 	if err != nil {
 		t.Fatalf("create delete test alias: %v", err)

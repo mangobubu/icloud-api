@@ -410,15 +410,6 @@ case "${1:-}" in
 				auto_alias_table_count=$((auto_alias_table_count + 1))
 			fi
 		done
-		case "$auto_alias_table_count" in
-			0)
-				;;
-			2)
-				;;
-			*)
-				die "恢复归档中的自动别名 schema 表不完整"
-				;;
-		esac
 		seen_table_count=0
 		for seen_table in consumed_messages imap_seen_tasks; do
 			if awk -v required_table="$seen_table" '
@@ -429,34 +420,85 @@ case "${1:-}" in
 				seen_table_count=$((seen_table_count + 1))
 			fi
 		done
-		case "$seen_table_count" in
-			0)
-				;;
-			2)
-				;;
-			*)
-				die "恢复归档中的消费与 IMAP Seen schema 表不完整"
-				;;
-		esac
+		archive_table_count=0
+		for archive_table in archived_messages alias_messages; do
+			if awk -v required_table="$archive_table" '
+				$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
+					$6 == required_table { found = 1 }
+				END { exit(found ? 0 : 1) }
+			' "$restore_toc"; then
+				archive_table_count=$((archive_table_count + 1))
+			fi
+		done
+		latest_message_table_count=0
+		if awk '
+			$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
+				$6 == "latest_messages" { found = 1 }
+			END { exit(found ? 0 : 1) }
+		' "$restore_toc"; then
+			latest_message_table_count=1
+		fi
 		optional_required_tables=""
 		optional_required_constraints=""
 		optional_required_foreign_keys=""
 		optional_required_indexes=""
-		if [ "$auto_alias_table_count" -eq 2 ]; then
-			optional_required_tables="alias_creation_schedules pending_alias_api_keys"
-			optional_required_constraints="alias_creation_schedules:alias_creation_schedules_pkey pending_alias_api_keys:pending_alias_api_keys_pkey"
-			optional_required_foreign_keys="alias_creation_schedules:alias_creation_schedules_account_id_fkey pending_alias_api_keys:pending_alias_api_keys_alias_id_fkey"
-			optional_required_indexes="alias_creation_schedules_due_idx"
-		fi
-		if [ "$seen_table_count" -eq 2 ]; then
-			optional_required_tables="$optional_required_tables consumed_messages imap_seen_tasks"
-			optional_required_constraints="$optional_required_constraints consumed_messages:consumed_messages_pkey imap_seen_tasks:imap_seen_tasks_pkey"
-			optional_required_foreign_keys="$optional_required_foreign_keys consumed_messages:consumed_messages_alias_id_fkey imap_seen_tasks:imap_seen_tasks_account_id_fkey"
-			optional_required_indexes="$optional_required_indexes imap_seen_tasks_account_created_idx"
-		fi
+		optional_required_sequences=""
+		message_required_tables="latest_messages"
+		message_required_constraints="latest_messages:latest_messages_pkey"
+		message_required_foreign_keys="latest_messages:latest_messages_alias_id_fkey"
+		case "$archive_table_count" in
+			0)
+				case "$auto_alias_table_count" in
+					0|2) ;;
+					*) die "恢复归档中的自动别名 schema 表不完整" ;;
+				esac
+				case "$seen_table_count" in
+					0|2) ;;
+					*) die "恢复归档中的消费与 IMAP Seen schema 表不完整" ;;
+				esac
+				if [ "$auto_alias_table_count" -eq 2 ]; then
+					optional_required_tables="alias_creation_schedules pending_alias_api_keys"
+					optional_required_constraints="alias_creation_schedules:alias_creation_schedules_pkey pending_alias_api_keys:pending_alias_api_keys_pkey"
+					optional_required_foreign_keys="alias_creation_schedules:alias_creation_schedules_account_id_fkey pending_alias_api_keys:pending_alias_api_keys_alias_id_fkey"
+					optional_required_indexes="alias_creation_schedules_due_idx"
+				fi
+				if [ "$seen_table_count" -eq 2 ]; then
+					optional_required_tables="$optional_required_tables consumed_messages imap_seen_tasks"
+					optional_required_constraints="$optional_required_constraints consumed_messages:consumed_messages_pkey imap_seen_tasks:imap_seen_tasks_pkey"
+					optional_required_foreign_keys="$optional_required_foreign_keys consumed_messages:consumed_messages_alias_id_fkey imap_seen_tasks:imap_seen_tasks_account_id_fkey"
+					optional_required_indexes="$optional_required_indexes imap_seen_tasks_account_created_idx"
+				fi
+				;;
+			2)
+				# The first published v7 removed the legacy compatibility tables; application
+				# convergence recreates them after restore. Current v7 keeps the complete groups.
+				case "$auto_alias_table_count:$seen_table_count:$latest_message_table_count" in
+					1:0:0)
+						message_required_tables=""
+						message_required_constraints=""
+						message_required_foreign_keys=""
+						optional_required_tables="alias_creation_schedules archived_messages alias_messages"
+						optional_required_constraints="alias_creation_schedules:alias_creation_schedules_pkey archived_messages:archived_messages_pkey archived_messages:archived_messages_account_id_uid_validity_upstream_uid_key alias_messages:alias_messages_pkey alias_messages:alias_messages_alias_id_mailbox_uid_key"
+						optional_required_foreign_keys="alias_creation_schedules:alias_creation_schedules_account_id_fkey archived_messages:archived_messages_account_id_fkey alias_messages:alias_messages_alias_id_fkey alias_messages:alias_messages_message_id_fkey"
+						optional_required_indexes="alias_creation_schedules_due_idx aliases_oauth_client_id_idx aliases_imap_password_hash_idx archived_messages_retention_idx alias_messages_alias_uid_idx alias_messages_alias_otp_idx"
+						;;
+					2:2:1)
+						optional_required_tables="alias_creation_schedules pending_alias_api_keys consumed_messages imap_seen_tasks archived_messages alias_messages"
+						optional_required_constraints="alias_creation_schedules:alias_creation_schedules_pkey pending_alias_api_keys:pending_alias_api_keys_pkey consumed_messages:consumed_messages_pkey imap_seen_tasks:imap_seen_tasks_pkey archived_messages:archived_messages_pkey archived_messages:archived_messages_account_id_uid_validity_upstream_uid_key alias_messages:alias_messages_pkey alias_messages:alias_messages_alias_id_mailbox_uid_key"
+						optional_required_foreign_keys="alias_creation_schedules:alias_creation_schedules_account_id_fkey pending_alias_api_keys:pending_alias_api_keys_alias_id_fkey consumed_messages:consumed_messages_alias_id_fkey imap_seen_tasks:imap_seen_tasks_account_id_fkey archived_messages:archived_messages_account_id_fkey alias_messages:alias_messages_alias_id_fkey alias_messages:alias_messages_message_id_fkey"
+						optional_required_indexes="alias_creation_schedules_due_idx imap_seen_tasks_account_created_idx aliases_oauth_client_id_idx aliases_imap_password_hash_idx archived_messages_retention_idx alias_messages_alias_uid_idx alias_messages_alias_otp_idx"
+						;;
+					*) die "恢复归档中的 v7 兼容 schema 组合不完整" ;;
+				esac
+				optional_required_sequences="archived_messages_id_seq"
+				;;
+			*)
+				die "恢复归档中的邮件归档 schema 表不完整"
+				;;
+		esac
 		for required_table in \
 			schema_migrations app_metadata admins admin_sessions accounts aliases \
-			latest_messages audit_logs apple_web_sessions imap_sync_states data_migrations \
+			$message_required_tables audit_logs apple_web_sessions imap_sync_states data_migrations \
 			$optional_required_tables; do
 			if ! awk -v required_table="$required_table" '
 				$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
@@ -468,7 +510,8 @@ case "${1:-}" in
 				die "恢复归档缺少项目必需表或数据段：public.$required_table"
 			fi
 		done
-		for required_sequence in admins_id_seq accounts_id_seq aliases_id_seq audit_logs_id_seq; do
+		for required_sequence in admins_id_seq accounts_id_seq aliases_id_seq audit_logs_id_seq \
+			$optional_required_sequences; do
 			if ! awk -v required_sequence="$required_sequence" '
 				$1 ~ /^[0-9]+;$/ && $4 == "SEQUENCE" && $5 == "public" && \
 					$6 == required_sequence { found_sequence = 1 }
@@ -486,7 +529,7 @@ case "${1:-}" in
 			admin_sessions:admin_sessions_pkey \
 			accounts:accounts_pkey accounts:accounts_email_key \
 			aliases:aliases_pkey aliases:aliases_address_key aliases:aliases_api_key_hash_key \
-			latest_messages:latest_messages_pkey audit_logs:audit_logs_pkey \
+			$message_required_constraints audit_logs:audit_logs_pkey \
 			apple_web_sessions:apple_web_sessions_pkey \
 			imap_sync_states:imap_sync_states_pkey data_migrations:data_migrations_pkey \
 			$optional_required_constraints; do
@@ -505,7 +548,7 @@ case "${1:-}" in
 		for required_foreign_key in \
 			admin_sessions:admin_sessions_admin_id_fkey \
 			aliases:aliases_account_id_fkey \
-			latest_messages:latest_messages_alias_id_fkey \
+			$message_required_foreign_keys \
 			audit_logs:audit_logs_admin_id_fkey \
 			apple_web_sessions:apple_web_sessions_account_id_fkey \
 			imap_sync_states:imap_sync_states_account_id_fkey \
@@ -556,12 +599,13 @@ DECLARE
 	restored_schema_version INTEGER;
 	auto_alias_table_count INTEGER;
 	seen_table_count INTEGER;
+	archive_table_count INTEGER;
 BEGIN
 	SELECT version
 	INTO restored_schema_version
 	FROM public.schema_migrations
 	WHERE id = 1;
-	IF restored_schema_version IS NULL OR restored_schema_version NOT IN (4, 5, 6) THEN
+	IF restored_schema_version IS NULL OR restored_schema_version NOT IN (4, 5, 6, 7) THEN
 		RAISE EXCEPTION 'restored schema version % is not supported', restored_schema_version;
 	END IF;
 
@@ -573,51 +617,89 @@ BEGIN
 	INTO seen_table_count
 	FROM (VALUES ('consumed_messages'), ('imap_seen_tasks')) AS extension(table_name)
 	WHERE pg_catalog.to_regclass('public.' || extension.table_name) IS NOT NULL;
-	IF auto_alias_table_count NOT IN (0, 2) THEN
-		RAISE EXCEPTION 'restored schema contains a partial automatic-alias table group';
-	END IF;
-	IF seen_table_count NOT IN (0, 2) THEN
-		RAISE EXCEPTION 'restored schema contains a partial seen-queue table group';
-	END IF;
+	SELECT count(*)
+	INTO archive_table_count
+	FROM (VALUES ('archived_messages'), ('alias_messages')) AS extension(table_name)
+	WHERE pg_catalog.to_regclass('public.' || extension.table_name) IS NOT NULL;
 	IF restored_schema_version = 4 AND
-		(auto_alias_table_count <> 0 OR seen_table_count <> 0) THEN
+		(auto_alias_table_count <> 0 OR seen_table_count <> 0 OR archive_table_count <> 0) THEN
 		RAISE EXCEPTION 'restored schema v4 contains later-version objects';
 	END IF;
 	IF restored_schema_version = 5 AND
-		auto_alias_table_count = 0 AND seen_table_count = 0 THEN
+		(auto_alias_table_count NOT IN (0, 2) OR seen_table_count NOT IN (0, 2) OR
+		 archive_table_count <> 0 OR
+		 (auto_alias_table_count = 0 AND seen_table_count = 0)) THEN
 		RAISE EXCEPTION 'restored schema v5 contains neither recognized v5 table group';
 	END IF;
 	IF restored_schema_version = 6 AND
-		(auto_alias_table_count <> 2 OR seen_table_count <> 2) THEN
+		(auto_alias_table_count <> 2 OR seen_table_count <> 2 OR archive_table_count <> 0) THEN
 		RAISE EXCEPTION 'restored schema v6 is missing required table groups';
+	END IF;
+	IF restored_schema_version BETWEEN 4 AND 6 AND
+		pg_catalog.to_regclass('public.latest_messages') IS NULL THEN
+		RAISE EXCEPTION 'restored legacy schema is missing latest_messages';
+	END IF;
+	-- Accept only the original destructive v7 or the current compatibility-preserving v7.
+	IF restored_schema_version = 7 AND NOT (
+		(
+			auto_alias_table_count = 1 AND seen_table_count = 0 AND archive_table_count = 2 AND
+			pg_catalog.to_regclass('public.alias_creation_schedules') IS NOT NULL AND
+			pg_catalog.to_regclass('public.pending_alias_api_keys') IS NULL AND
+			pg_catalog.to_regclass('public.latest_messages') IS NULL AND
+			pg_catalog.to_regclass('public.consumed_messages') IS NULL AND
+			pg_catalog.to_regclass('public.imap_seen_tasks') IS NULL
+		) OR (
+			auto_alias_table_count = 2 AND seen_table_count = 2 AND archive_table_count = 2 AND
+			pg_catalog.to_regclass('public.alias_creation_schedules') IS NOT NULL AND
+			pg_catalog.to_regclass('public.pending_alias_api_keys') IS NOT NULL AND
+			pg_catalog.to_regclass('public.latest_messages') IS NOT NULL AND
+			pg_catalog.to_regclass('public.consumed_messages') IS NOT NULL AND
+			pg_catalog.to_regclass('public.imap_seen_tasks') IS NOT NULL
+		)
+	) THEN
+		RAISE EXCEPTION 'restored schema v7 has an unrecognized compatibility-table set';
 	END IF;
 
 	SELECT required.table_name || '.' || required.constraint_name
 	INTO missing_object
 	FROM (VALUES
-		('schema_migrations', 'schema_migrations_pkey', 'p'),
-		('app_metadata', 'app_metadata_pkey', 'p'),
-		('admins', 'admins_pkey', 'p'),
-		('admins', 'admins_username_key', 'u'),
-		('admin_sessions', 'admin_sessions_pkey', 'p'),
-		('accounts', 'accounts_pkey', 'p'),
-		('accounts', 'accounts_email_key', 'u'),
-		('aliases', 'aliases_pkey', 'p'),
-		('aliases', 'aliases_address_key', 'u'),
-		('aliases', 'aliases_api_key_hash_key', 'u'),
-		('latest_messages', 'latest_messages_pkey', 'p'),
-		('audit_logs', 'audit_logs_pkey', 'p'),
-		('apple_web_sessions', 'apple_web_sessions_pkey', 'p'),
-		('imap_sync_states', 'imap_sync_states_pkey', 'p'),
-		('data_migrations', 'data_migrations_pkey', 'p'),
-		('admin_sessions', 'admin_sessions_admin_id_fkey', 'f'),
-		('aliases', 'aliases_account_id_fkey', 'f'),
-		('latest_messages', 'latest_messages_alias_id_fkey', 'f'),
-		('audit_logs', 'audit_logs_admin_id_fkey', 'f'),
-		('apple_web_sessions', 'apple_web_sessions_account_id_fkey', 'f'),
-		('imap_sync_states', 'imap_sync_states_account_id_fkey', 'f')
-	) AS required(table_name, constraint_name, constraint_type)
-	WHERE NOT EXISTS (
+		('all', 'schema_migrations', 'schema_migrations_pkey', 'p'),
+		('all', 'app_metadata', 'app_metadata_pkey', 'p'),
+		('all', 'admins', 'admins_pkey', 'p'),
+		('all', 'admins', 'admins_username_key', 'u'),
+		('all', 'admin_sessions', 'admin_sessions_pkey', 'p'),
+		('all', 'accounts', 'accounts_pkey', 'p'),
+		('all', 'accounts', 'accounts_email_key', 'u'),
+		('all', 'aliases', 'aliases_pkey', 'p'),
+		('all', 'aliases', 'aliases_address_key', 'u'),
+		('all', 'aliases', 'aliases_api_key_hash_key', 'u'),
+		('legacy', 'latest_messages', 'latest_messages_pkey', 'p'),
+		('v7', 'archived_messages', 'archived_messages_pkey', 'p'),
+		('v7', 'archived_messages', 'archived_messages_account_id_uid_validity_upstream_uid_key', 'u'),
+		('v7', 'alias_messages', 'alias_messages_pkey', 'p'),
+		('v7', 'alias_messages', 'alias_messages_alias_id_mailbox_uid_key', 'u'),
+		('all', 'audit_logs', 'audit_logs_pkey', 'p'),
+		('all', 'apple_web_sessions', 'apple_web_sessions_pkey', 'p'),
+		('all', 'imap_sync_states', 'imap_sync_states_pkey', 'p'),
+		('all', 'data_migrations', 'data_migrations_pkey', 'p'),
+		('all', 'admin_sessions', 'admin_sessions_admin_id_fkey', 'f'),
+		('all', 'aliases', 'aliases_account_id_fkey', 'f'),
+		('legacy', 'latest_messages', 'latest_messages_alias_id_fkey', 'f'),
+		('v7', 'archived_messages', 'archived_messages_account_id_fkey', 'f'),
+		('v7', 'alias_messages', 'alias_messages_alias_id_fkey', 'f'),
+		('v7', 'alias_messages', 'alias_messages_message_id_fkey', 'f'),
+		('all', 'audit_logs', 'audit_logs_admin_id_fkey', 'f'),
+		('all', 'apple_web_sessions', 'apple_web_sessions_account_id_fkey', 'f'),
+		('all', 'imap_sync_states', 'imap_sync_states_account_id_fkey', 'f')
+	) AS required(schema_scope, table_name, constraint_name, constraint_type)
+	WHERE (required.schema_scope = 'all' OR
+		(required.schema_scope = 'legacy' AND (
+			restored_schema_version BETWEEN 4 AND 6 OR
+			(restored_schema_version = 7 AND
+			 pg_catalog.to_regclass('public.latest_messages') IS NOT NULL)
+		)) OR
+		(required.schema_scope = 'v7' AND restored_schema_version = 7))
+	AND NOT EXISTS (
 		SELECT 1
 		FROM pg_catalog.pg_constraint AS constraint_state
 		JOIN pg_catalog.pg_class AS table_state
@@ -638,16 +720,23 @@ BEGIN
 	SELECT required.table_name || '.' || required.index_name
 	INTO missing_object
 	FROM (VALUES
-		('admin_sessions', 'admin_sessions_expires_at_idx'),
-		('admin_sessions', 'admin_sessions_admin_id_idx'),
-		('accounts', 'accounts_enabled_email_idx'),
-		('aliases', 'aliases_account_id_idx'),
-		('aliases', 'aliases_account_address_idx'),
-		('aliases', 'aliases_enabled_account_address_idx'),
-		('audit_logs', 'audit_logs_created_at_idx'),
-		('audit_logs', 'audit_logs_admin_id_idx')
-	) AS required(table_name, index_name)
-	WHERE NOT EXISTS (
+		('all', 'admin_sessions', 'admin_sessions_expires_at_idx'),
+		('all', 'admin_sessions', 'admin_sessions_admin_id_idx'),
+		('all', 'accounts', 'accounts_enabled_email_idx'),
+		('all', 'aliases', 'aliases_account_id_idx'),
+		('all', 'aliases', 'aliases_account_address_idx'),
+		('all', 'aliases', 'aliases_enabled_account_address_idx'),
+		('v7', 'aliases', 'aliases_oauth_client_id_idx'),
+		('v7', 'aliases', 'aliases_imap_password_hash_idx'),
+		('v7', 'archived_messages', 'archived_messages_retention_idx'),
+		('v7', 'alias_messages', 'alias_messages_alias_uid_idx'),
+		('v7', 'alias_messages', 'alias_messages_alias_otp_idx'),
+		('all', 'audit_logs', 'audit_logs_created_at_idx'),
+		('all', 'audit_logs', 'audit_logs_admin_id_idx')
+	) AS required(schema_scope, table_name, index_name)
+	WHERE (required.schema_scope = 'all' OR
+		(required.schema_scope = 'v7' AND restored_schema_version = 7))
+	AND NOT EXISTS (
 		SELECT 1
 		FROM pg_catalog.pg_class AS index_state
 		JOIN pg_catalog.pg_namespace AS schema_state
@@ -671,13 +760,16 @@ BEGIN
 	SELECT required.table_name || '.' || required.constraint_name
 	INTO missing_object
 	FROM (VALUES
+		('message', 'latest_messages', 'latest_messages_pkey', ARRAY['alias_id']::TEXT[]),
 		('auto', 'alias_creation_schedules', 'alias_creation_schedules_pkey', ARRAY['account_id']::TEXT[]),
 		('auto', 'pending_alias_api_keys', 'pending_alias_api_keys_pkey', ARRAY['alias_id']::TEXT[]),
 		('seen', 'consumed_messages', 'consumed_messages_pkey', ARRAY['alias_id', 'uid_validity', 'uid']::TEXT[]),
-		('seen', 'imap_seen_tasks', 'imap_seen_tasks_pkey', ARRAY['account_id', 'uid_validity', 'uid']::TEXT[])
+		('seen', 'imap_seen_tasks', 'imap_seen_tasks_pkey', ARRAY['account_id', 'uid_validity', 'uid']::TEXT[]),
+		('archive', 'archived_messages', 'archived_messages_pkey', ARRAY['id']::TEXT[]),
+		('archive', 'alias_messages', 'alias_messages_pkey', ARRAY['alias_id', 'message_id']::TEXT[])
 	) AS required(extension_group, table_name, constraint_name, key_columns)
-	WHERE ((required.extension_group = 'auto' AND auto_alias_table_count = 2) OR
-		(required.extension_group = 'seen' AND seen_table_count = 2))
+	WHERE pg_catalog.to_regclass('public.' || required.table_name) IS NOT NULL
+		AND (required.extension_group <> 'archive' OR restored_schema_version = 7)
 		AND NOT EXISTS (
 			SELECT 1
 			FROM pg_catalog.pg_constraint AS constraint_state
@@ -707,13 +799,17 @@ BEGIN
 	SELECT required.table_name || '.' || required.constraint_name
 	INTO missing_object
 	FROM (VALUES
+		('message', 'latest_messages', 'latest_messages_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[]),
 		('auto', 'alias_creation_schedules', 'alias_creation_schedules_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[]),
 		('auto', 'pending_alias_api_keys', 'pending_alias_api_keys_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[]),
 		('seen', 'consumed_messages', 'consumed_messages_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[]),
-		('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[])
+		('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[]),
+		('archive', 'archived_messages', 'archived_messages_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[]),
+		('archive', 'alias_messages', 'alias_messages_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[]),
+		('archive', 'alias_messages', 'alias_messages_message_id_fkey', 'archived_messages', ARRAY['message_id']::TEXT[], ARRAY['id']::TEXT[])
 	) AS required(extension_group, table_name, constraint_name, referenced_table, local_columns, referenced_columns)
-	WHERE ((required.extension_group = 'auto' AND auto_alias_table_count = 2) OR
-		(required.extension_group = 'seen' AND seen_table_count = 2))
+	WHERE pg_catalog.to_regclass('public.' || required.table_name) IS NOT NULL
+		AND (required.extension_group <> 'archive' OR restored_schema_version = 7)
 		AND NOT EXISTS (
 			SELECT 1
 			FROM pg_catalog.pg_constraint AS constraint_state
@@ -754,10 +850,13 @@ BEGIN
 	INTO missing_object
 	FROM (VALUES
 		('auto', 'alias_creation_schedules', 'alias_creation_schedules_due_idx', ARRAY['enabled', 'next_run_at', 'account_id']::TEXT[]),
-		('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_created_idx', ARRAY['account_id', 'created_at', 'uid_validity', 'uid']::TEXT[])
+		('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_created_idx', ARRAY['account_id', 'created_at', 'uid_validity', 'uid']::TEXT[]),
+		('archive', 'aliases', 'aliases_imap_password_hash_idx', ARRAY['imap_password_hash']::TEXT[]),
+		('archive', 'archived_messages', 'archived_messages_retention_idx', ARRAY['content_state', 'internal_date', 'id']::TEXT[]),
+		('archive', 'alias_messages', 'alias_messages_alias_uid_idx', ARRAY['alias_id', 'mailbox_uid']::TEXT[])
 	) AS required(extension_group, table_name, index_name, key_columns)
-	WHERE ((required.extension_group = 'auto' AND auto_alias_table_count = 2) OR
-		(required.extension_group = 'seen' AND seen_table_count = 2))
+	WHERE pg_catalog.to_regclass('public.' || required.table_name) IS NOT NULL
+		AND (required.extension_group <> 'archive' OR restored_schema_version = 7)
 		AND NOT EXISTS (
 			SELECT 1
 			FROM pg_catalog.pg_class AS index_state

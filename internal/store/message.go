@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"icloud-api/internal/domain"
 )
@@ -177,11 +176,6 @@ func sanitizeLatestMessageText(message *domain.LatestMessage) {
 	message.HTMLBody = sanitizePostgresText(message.HTMLBody)
 }
 
-func sanitizePostgresText(value string) string {
-	value = strings.ToValidUTF8(value, "\uFFFD")
-	return strings.ReplaceAll(value, "\x00", "\uFFFD")
-}
-
 func (s *Store) GetLatestMessage(ctx context.Context, aliasID int64) (domain.LatestMessage, error) {
 	return scanLatestMessage(s.queryRowContext(ctx,
 		`SELECT `+latestMessageColumns+` FROM latest_messages WHERE alias_id = ?`, aliasID,
@@ -236,14 +230,6 @@ func scanLatestMessage(scanner rowScanner) (domain.LatestMessage, error) {
 		return domain.LatestMessage{}, err
 	}
 	return message, nil
-}
-
-func marshalJSONList[T any](value []T) (string, error) {
-	if value == nil {
-		value = []T{}
-	}
-	encoded, err := json.Marshal(value)
-	return string(encoded), err
 }
 
 func unmarshalMessageJSON(
