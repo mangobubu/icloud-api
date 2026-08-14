@@ -20,6 +20,7 @@ type Repository interface {
 	ListEnabledAccounts(context.Context) ([]domain.Account, error)
 	GetAccount(context.Context, int64) (domain.Account, error)
 	ListEnabledAliasesByAccount(context.Context, int64) ([]domain.Alias, error)
+	ListMailboxSnapshotPositions(context.Context, int64) (map[int64]domain.MailboxSnapshotPosition, error)
 	GetIMAPSyncState(context.Context, int64) (domain.IMAPSyncState, error)
 	ApplyMailboxSync(context.Context, int64, time.Time, []domain.Alias, domain.MailboxSyncResult, time.Time) error
 	RecordMailboxSyncFailure(context.Context, int64, time.Time, string, time.Time) error
@@ -1140,6 +1141,11 @@ func (m *Manager) syncAccountLocked(
 	for _, alias := range enabled {
 		sensitiveValues = append(sensitiveValues, alias.Address)
 	}
+	failedOperation = "load_legacy_snapshot_positions"
+	snapshotPositions, err := m.repo.ListMailboxSnapshotPositions(ctx, accountID)
+	if err != nil {
+		return fmt.Errorf("读取旧版邮件快照位置: %w", err)
+	}
 	failedOperation = "load_incremental_cursor"
 	state, err := m.repo.GetIMAPSyncState(ctx, accountID)
 	var previousState *domain.IMAPSyncState
@@ -1183,7 +1189,9 @@ func (m *Manager) syncAccountLocked(
 		m.reportProgress(accountID, trigger, update)
 	})
 	failedOperation = "fetch_incremental"
-	result, err := m.fetcher.FetchIncremental(fetchCtx, account, password, enabled, previousState, nil)
+	result, err := m.fetcher.FetchIncremental(
+		fetchCtx, account, password, enabled, previousState, snapshotPositions,
+	)
 	password = ""
 	if err != nil {
 		wrapped := fmt.Errorf("fetch IMAP mailbox increment: %w", err)
@@ -1205,7 +1213,7 @@ func (m *Manager) syncAccountLocked(
 		trigger,
 		"stage_started",
 		saving,
-		slog.Int("result_count", len(result.Messages)),
+		slog.Int("result_count", len(result.ArchivedMessages)),
 		slog.Uint64("cursor_uid", uint64(result.State.LastUID)),
 		slog.Uint64("target_uid", uint64(result.TargetUID)),
 		slog.Bool("has_more", result.HasMore),
@@ -1224,7 +1232,7 @@ func (m *Manager) syncAccountLocked(
 		trigger,
 		"batch_saved",
 		saving,
-		slog.Int("result_count", len(result.Messages)),
+		slog.Int("result_count", len(result.ArchivedMessages)),
 		slog.Uint64("cursor_uid", uint64(result.State.LastUID)),
 		slog.Uint64("target_uid", uint64(result.TargetUID)),
 		slog.Bool("has_more", result.HasMore),
@@ -1263,7 +1271,7 @@ func (m *Manager) syncAccountLocked(
 		trigger,
 		"run_completed",
 		completed,
-		slog.Int("result_count", len(result.Messages)),
+		slog.Int("result_count", len(result.ArchivedMessages)),
 		slog.Uint64("cursor_uid", uint64(result.State.LastUID)),
 		slog.Uint64("target_uid", uint64(result.TargetUID)),
 	)
@@ -1322,7 +1330,7 @@ func isTransientIMAPTransportError(err error) bool {
 
 // WithAccountLock serializes account configuration changes with IMAP syncs.
 // The service intentionally runs as a single process, so this lock also forms
-// the publication boundary for credentials and alias snapshots.
+// the publication boundary for credentials, cursor progress, and archived mail.
 func (m *Manager) WithAccountLock(ctx context.Context, accountID int64, operation func() error) error {
 	if operation == nil {
 		return errors.New("主号操作不能为空")

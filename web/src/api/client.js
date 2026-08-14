@@ -1,4 +1,4 @@
-const API_PREFIX = "/admin/api/v1";
+import { ADMIN_API_PREFIX } from "../utils/runtimePath.js";
 
 let unauthorizedHandler = null;
 
@@ -72,7 +72,7 @@ export async function apiRequest(path, options = {}) {
 
   let response;
   try {
-    response = await fetch(`${API_PREFIX}${path}`, {
+    response = await fetch(`${ADMIN_API_PREFIX}${path}`, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),

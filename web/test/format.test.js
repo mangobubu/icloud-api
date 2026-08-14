@@ -36,18 +36,25 @@ test("admin DTO normalizers expose only the frontend contract", () => {
   const alias = normalizeAlias({
     id: 9,
     address: "relay@icloud.com",
-    api_key_prefix: "icm_prefix",
-    direct_link_path: "/api/v1/mail/recent?api_key=icm_full_key",
+    api_key: "api-key",
+    imap_password: "imap-password",
+    client_id: "client-id",
+    refresh_token: "refresh-token",
+    otp_url_path: "/api/v1/otp?token=derived-token",
+    credential_version: 4,
     api_key_hash: "must-not-propagate",
+    credential_ciphertext: "must-not-propagate",
     enabled: true,
   });
 
   assert.equal(account.email, "primary@icloud.com");
-  assert.equal(alias.apiKeyPrefix, "icm_prefix");
-  assert.equal(
-    alias.directLinkPath,
-    "/api/v1/mail/recent?api_key=icm_full_key",
-  );
+  assert.equal(alias.apiKey, "api-key");
+  assert.equal(alias.imapPassword, "imap-password");
+  assert.equal(alias.clientId, "client-id");
+  assert.equal(alias.refreshToken, "refresh-token");
+  assert.equal(alias.otpUrlPath, "/api/v1/otp?token=derived-token");
+  assert.equal(alias.credentialVersion, 4);
   assert.equal("passwordCiphertext" in account, false);
   assert.equal("apiKeyHash" in alias, false);
+  assert.equal("credentialCiphertext" in alias, false);
 });

@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"icloud-api/internal/domain"
 )
 
 const (
@@ -27,7 +29,11 @@ type MasterKeyCipherValidator interface {
 	DecryptAppleSession(string) (string, error)
 }
 
-type pendingAliasKeyCipherValidator interface {
+type aliasCredentialCipherValidator interface {
+	DecryptAliasCredentials(int64, string) (domain.AliasCredentials, error)
+}
+
+type pendingAliasAPIKeyCipherValidator interface {
 	DecryptPendingAliasAPIKey(string) (string, error)
 }
 
@@ -225,7 +231,10 @@ func validateStoredCiphertexts(ctx context.Context, tx *sql.Tx, validator Master
 		UNION ALL
 		SELECT 'apple', account_id, session_ciphertext FROM apple_web_sessions
 		UNION ALL
-		SELECT 'pending_alias', alias_id, api_key_ciphertext FROM pending_alias_api_keys
+		SELECT 'alias_credentials', id, credential_ciphertext FROM aliases
+		WHERE credential_ciphertext <> ''
+		UNION ALL
+		SELECT 'pending_alias_api_key', alias_id, api_key_ciphertext FROM pending_alias_api_keys
 		ORDER BY 1, 2
 	`)
 	if err != nil {
@@ -250,10 +259,16 @@ func validateStoredCiphertexts(ctx context.Context, tx *sql.Tx, validator Master
 			_, decryptErr = validator.Decrypt(ciphertext)
 		case "apple":
 			_, decryptErr = validator.DecryptAppleSession(ciphertext)
-		case "pending_alias":
-			pendingValidator, ok := validator.(pendingAliasKeyCipherValidator)
+		case "alias_credentials":
+			credentialValidator, ok := validator.(aliasCredentialCipherValidator)
 			if !ok {
-				return fmt.Errorf("validate stored pending alias ciphertext for alias %d before binding master key: validator does not support pending alias keys", accountID)
+				return fmt.Errorf("validate stored alias credentials for alias %d: validator does not support credential bundles", accountID)
+			}
+			_, decryptErr = credentialValidator.DecryptAliasCredentials(accountID, ciphertext)
+		case "pending_alias_api_key":
+			pendingValidator, ok := validator.(pendingAliasAPIKeyCipherValidator)
+			if !ok {
+				return fmt.Errorf("validate stored pending API key for alias %d: validator does not support pending alias API keys", accountID)
 			}
 			_, decryptErr = pendingValidator.DecryptPendingAliasAPIKey(ciphertext)
 		default:

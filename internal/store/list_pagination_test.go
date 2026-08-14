@@ -182,12 +182,11 @@ func TestListAliasesPageSearchesAddressAndLabelBeforePagination(t *testing.T) {
 	}
 	for index, fixture := range fixtures {
 		if _, err := db.CreateAlias(ctx, domain.Alias{
-			AccountID:    fixture.accountID,
-			Address:      fixture.address,
-			Label:        fixture.label,
-			APIKeyHash:   []byte(fmt.Sprintf("alias-search-hash-%d", index)),
-			APIKeyPrefix: "search",
-			Enabled:      true,
+			AccountID:  fixture.accountID,
+			Address:    fixture.address,
+			Label:      fixture.label,
+			APIKeyHash: []byte(fmt.Sprintf("alias-search-hash-%d", index)),
+			Enabled:    true,
 		}); err != nil {
 			t.Fatalf("create searchable alias %q: %v", fixture.address, err)
 		}

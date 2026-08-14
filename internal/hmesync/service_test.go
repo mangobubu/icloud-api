@@ -171,7 +171,7 @@ func TestVerificationRejectsIMAPUsernameChangeDuringAppleRequest(t *testing.T) {
 	}
 }
 
-func TestSyncFiltersByForwardingMailboxAndReturnsOnlyNewKeys(t *testing.T) {
+func TestSyncFiltersByForwardingMailboxAndReturnsOnlyNewAliases(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 8, 7, 10, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "Primary@icloud.com"}, now)
@@ -202,11 +202,8 @@ func TestSyncFiltersByForwardingMailboxAndReturnsOnlyNewKeys(t *testing.T) {
 			candidates[0].Label != "New" || !candidates[0].Active || candidates[1].Address != "old@icloud.com" || candidates[1].Active {
 			t.Fatalf("import candidates = %#v", candidates)
 		}
-		if len(candidates[0].APIKeyHash) != 32 || candidates[0].APIKeyPrefix == "" {
-			t.Fatalf("new candidate is missing API key material: %#v", candidates[0])
-		}
 		return domain.AliasImportResult{
-			Created:               []domain.Alias{{ID: 10, AccountID: accountID, Address: candidates[0].Address, APIKeyHash: candidates[0].APIKeyHash}},
+			Created:               []domain.Alias{{ID: 10, AccountID: accountID, Address: candidates[0].Address, CredentialVersion: 1}},
 			Existing:              []domain.Alias{{ID: 11, AccountID: accountID, Address: candidates[1].Address}},
 			ImportedDisabledCount: 1,
 		}, nil
@@ -226,14 +223,9 @@ func TestSyncFiltersByForwardingMailboxAndReturnsOnlyNewKeys(t *testing.T) {
 	if result.Summary != (SyncSummary{Total: 2, CreatedCount: 1, ExistingCount: 1, InactiveCount: 1, ImportedDisabledCount: 1, FilteredOutCount: 1}) {
 		t.Fatalf("summary = %#v", result.Summary)
 	}
-	if len(result.Created) != 1 || result.Created[0].Alias.Address != "new@icloud.com" || result.Created[0].APIKey == "" {
-		t.Fatalf("created credentials = %#v", result.Created)
-	}
-	if !secure.HashEqual(secure.HashToken(result.Created[0].APIKey), result.Created[0].Alias.APIKeyHash) {
-		t.Fatal("returned raw API key does not match the imported hash")
-	}
-	if strings.Contains(repo.mustSession(t, 3).Ciphertext, result.Created[0].APIKey) {
-		t.Fatal("raw API key leaked into the Apple session record")
+	if len(result.Created) != 1 || result.Created[0].Alias.Address != "new@icloud.com" ||
+		result.Created[0].Alias.CredentialVersion != 1 {
+		t.Fatalf("created aliases = %#v", result.Created)
 	}
 }
 
@@ -690,9 +682,9 @@ func TestCreateAutoAliasPersistsAndReconcilesPendingConfirmationWithoutAnotherRe
 			first, client.createCalls.Load(), repo.creates.Load(), repo.confirms.Load())
 	}
 	pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3)
-	if pendingErr != nil || pending.Alias.ID == 0 || pending.Alias.Enabled ||
-		pending.Alias.LastSyncError != domain.AppleAliasConfirmationPending ||
-		pending.APIKeyCiphertext == "" {
+	if pendingErr != nil || pending.ID == 0 || pending.Enabled ||
+		pending.LastSyncError != domain.AppleAliasConfirmationPending ||
+		pending.CredentialVersion != 1 {
 		t.Fatalf("persisted pending confirmation = %#v, err=%v", pending, pendingErr)
 	}
 
@@ -709,7 +701,7 @@ func TestCreateAutoAliasPersistsAndReconcilesPendingConfirmationWithoutAnotherRe
 	if err != nil {
 		t.Fatalf("reconcile pending confirmation: %v", err)
 	}
-	if confirmed.ID != pending.Alias.ID || confirmed.Address != pending.Alias.Address || !confirmed.Enabled ||
+	if confirmed.ID != pending.ID || confirmed.Address != pending.Address || !confirmed.Enabled ||
 		confirmed.LastSyncError != "" || client.createCalls.Load() != 1 || repo.creates.Load() != 1 ||
 		repo.confirms.Load() != 1 || listCalls.Load() != 4 {
 		t.Fatalf("confirmed=%#v lists=%d reserves=%d creates=%d confirms=%d",
@@ -758,7 +750,7 @@ func TestCreateAutoAliasConfirmsMissingReserveForwardFromAuthoritativeList(t *te
 	if listCalls.Load() != 2 || client.createCalls.Load() != 1 || repo.creates.Load() != 1 || repo.confirms.Load() != 0 {
 		t.Fatalf("post-reserve mismatch calls: lists=%d reserves=%d writes=%d", listCalls.Load(), client.createCalls.Load(), repo.creates.Load())
 	}
-	if pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil || pending.Alias.Address != "new-alias@icloud.com" {
+	if pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil || pending.Address != "new-alias@icloud.com" {
 		t.Fatalf("post-reserve mismatch lost pending alias: pending=%#v err=%v", pending, pendingErr)
 	}
 }
@@ -803,7 +795,7 @@ func TestCreateAutoAliasPreservesRotatedSessionWhenReserveFails(t *testing.T) {
 		t.Fatalf("reserve failure calls: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
 	}
 	pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3)
-	if pendingErr != nil || pending.Alias.Address != "new-alias@icloud.com" || pending.Alias.Label != autoCreateLabel {
+	if pendingErr != nil || pending.Address != "new-alias@icloud.com" || pending.Label != autoCreateLabel {
 		t.Fatalf("ambiguous reserve pending alias = %#v, err=%v", pending, pendingErr)
 	}
 }
@@ -842,7 +834,7 @@ func TestCreateAutoAliasPersistsCandidateAfterCallerCancellation(t *testing.T) {
 			client.createCalls.Load(), repo.creates.Load(), repo.confirms.Load())
 	}
 	pending, pendingErr := repo.GetPendingAutoAliasConfirmation(context.Background(), 3)
-	if pendingErr != nil || pending.Alias.Address != "new-alias@icloud.com" || pending.Alias.Label != autoCreateLabel {
+	if pendingErr != nil || pending.Address != "new-alias@icloud.com" || pending.Label != autoCreateLabel {
 		t.Fatalf("canceled reserve pending alias = %#v, err=%v", pending, pendingErr)
 	}
 	stored, decryptErr := service.decryptSession(repo.mustSession(t, 3))
@@ -1284,7 +1276,7 @@ func TestCreateAutoAliasRejectsExplicitReserveForwardMismatch(t *testing.T) {
 		t.Fatalf("reserve mismatch side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
 	}
 	if pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil ||
-		pending.Alias.Address != "new-alias@icloud.com" {
+		pending.Address != "new-alias@icloud.com" {
 		t.Fatalf("reserve mismatch lost pending alias: pending=%#v err=%v", pending, pendingErr)
 	}
 }
@@ -1319,7 +1311,7 @@ func TestCreateAutoAliasRejectsExplicitInactiveReserveResult(t *testing.T) {
 		t.Fatalf("inactive reserve side effects: reserves=%d writes=%d", client.createCalls.Load(), repo.creates.Load())
 	}
 	if pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil ||
-		pending.Alias.Address != "new-alias@icloud.com" {
+		pending.Address != "new-alias@icloud.com" {
 		t.Fatalf("inactive reserve lost pending alias: pending=%#v err=%v", pending, pendingErr)
 	}
 }
@@ -1364,16 +1356,14 @@ func TestCreateAutoAliasClassifiesPendingSessionCheckpointAsPersistence(t *testi
 	ctx := context.Background()
 	now := time.Date(2026, 8, 8, 9, 0, 0, 0, time.UTC)
 	repo := newFakeRepository(domain.Account{ID: 3, Email: "primary@icloud.com", Enabled: true}, now)
-	repo.pending = &domain.PendingAliasAPIKey{
-		Alias: domain.Alias{
-			ID:             77,
-			AccountID:      3,
-			Address:        "pending@icloud.com",
-			Enabled:        false,
-			LastSyncStatus: domain.SyncStatusPending,
-			LastSyncError:  domain.AppleAliasConfirmationPending,
-		},
-		APIKeyCiphertext: "sealed-key",
+	repo.pending = &domain.Alias{
+		ID:                77,
+		AccountID:         3,
+		Address:           "pending@icloud.com",
+		Enabled:           false,
+		LastSyncStatus:    domain.SyncStatusPending,
+		LastSyncError:     domain.AppleAliasConfirmationPending,
+		CredentialVersion: 1,
 	}
 	client := &fakeAppleClient{
 		validate: func(_ context.Context, session apple.Session) (apple.Session, error) {
@@ -1477,7 +1467,7 @@ func TestCreateAutoAliasPublishesCandidateBeforeReturningCodedSessionError(t *te
 	if client.createCalls.Load() != 1 || repo.creates.Load() != 1 {
 		t.Fatalf("coded session error candidate writes: reserves=%d creates=%d", client.createCalls.Load(), repo.creates.Load())
 	}
-	if pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil || pending.Alias.Address != "new-alias@icloud.com" {
+	if pending, pendingErr := repo.GetPendingAutoAliasConfirmation(ctx, 3); pendingErr != nil || pending.Address != "new-alias@icloud.com" {
 		t.Fatalf("coded session error lost pending alias: pending=%#v err=%v", pending, pendingErr)
 	}
 }
@@ -1694,7 +1684,7 @@ func TestSyncOwnershipConflictIsTypedAndDoesNotReturnKeys(t *testing.T) {
 		t.Fatalf("ownership conflict = %v code=%q", err, Code(err))
 	}
 	if len(result.Created) != 0 {
-		t.Fatalf("conflict returned one-time keys: %#v", result.Created)
+		t.Fatalf("conflict returned created credential bundles: %#v", result.Created)
 	}
 }
 
@@ -2336,7 +2326,7 @@ type fakeRepository struct {
 	account          domain.Account
 	sessions         map[int64]domain.AppleWebSession
 	aliases          map[int64]domain.Alias
-	pending          *domain.PendingAliasAPIKey
+	pending          *domain.Alias
 	now              time.Time
 	deleteSessionErr error
 	deleteAliasErr   error
@@ -2463,6 +2453,17 @@ func (r *fakeRepository) CreateAliasWithPendingAPIKey(
 	alias domain.Alias,
 	apiKeyCiphertext string,
 ) (domain.Alias, domain.AppleWebSession, error) {
+	if strings.TrimSpace(apiKeyCiphertext) == "" || len(alias.APIKeyHash) != 32 || alias.APIKeyPrefix == "" {
+		return domain.Alias{}, domain.AppleWebSession{}, errors.New("invalid automatic alias key publication")
+	}
+	return r.createAutoAliasCandidate(ctx, session, alias)
+}
+
+func (r *fakeRepository) createAutoAliasCandidate(
+	ctx context.Context,
+	session domain.AppleWebSession,
+	alias domain.Alias,
+) (domain.Alias, domain.AppleWebSession, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, err
 	}
@@ -2472,28 +2473,24 @@ func (r *fakeRepository) CreateAliasWithPendingAPIKey(
 	if r.createErr != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, r.createErr
 	}
-	if alias.AccountID != r.account.ID || len(alias.APIKeyHash) != 32 ||
-		alias.APIKeyPrefix == "" || strings.TrimSpace(apiKeyCiphertext) == "" {
+	if alias.AccountID != r.account.ID || strings.TrimSpace(alias.Address) == "" {
 		return domain.Alias{}, domain.AppleWebSession{}, errors.New("invalid automatic alias publication")
 	}
 	alias.ID = 100 + int64(r.creates.Load())
+	alias.CredentialVersion = 1
 	r.sessions[session.AccountID] = session
-	r.pending = &domain.PendingAliasAPIKey{
-		Alias:            alias,
-		APIKeyCiphertext: apiKeyCiphertext,
-		CreatedAt:        r.now,
-	}
+	r.pending = &alias
 	return alias, session, nil
 }
 
 func (r *fakeRepository) GetPendingAutoAliasConfirmation(_ context.Context, accountID int64) (domain.PendingAliasAPIKey, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.pending == nil || r.pending.Alias.AccountID != accountID ||
-		r.pending.Alias.Enabled || r.pending.Alias.LastSyncError != domain.AppleAliasConfirmationPending {
+	if r.pending == nil || r.pending.AccountID != accountID ||
+		r.pending.Enabled || r.pending.LastSyncError != domain.AppleAliasConfirmationPending {
 		return domain.PendingAliasAPIKey{}, store.ErrNotFound
 	}
-	return *r.pending, nil
+	return domain.PendingAliasAPIKey{Alias: *r.pending}, nil
 }
 
 func (r *fakeRepository) ConfirmPendingAutoAlias(
@@ -2509,16 +2506,16 @@ func (r *fakeRepository) ConfirmPendingAutoAlias(
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.pending == nil || r.pending.Alias.ID != aliasID || r.pending.Alias.Enabled ||
-		r.pending.Alias.LastSyncError != domain.AppleAliasConfirmationPending {
+	if r.pending == nil || r.pending.ID != aliasID || r.pending.Enabled ||
+		r.pending.LastSyncError != domain.AppleAliasConfirmationPending {
 		return domain.Alias{}, domain.AppleWebSession{}, store.ErrNotFound
 	}
 	r.confirms.Add(1)
-	r.pending.Alias.Enabled = true
-	r.pending.Alias.LastSyncStatus = domain.SyncStatusPending
-	r.pending.Alias.LastSyncError = ""
+	r.pending.Enabled = true
+	r.pending.LastSyncStatus = domain.SyncStatusPending
+	r.pending.LastSyncError = ""
 	r.sessions[session.AccountID] = session
-	return r.pending.Alias, session, nil
+	return *r.pending, session, nil
 }
 
 func (r *fakeRepository) setAccountEmail(email string) {

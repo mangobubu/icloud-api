@@ -365,6 +365,7 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 	}
 
 	var imported domain.AliasImportResult
+	var issued []domain.AliasImportCredential
 	var saved domain.AppleWebSession
 	err = s.locker.WithAccountLock(ctx, accountID, func() error {
 		current, err := s.repo.GetAccount(ctx, accountID)
@@ -378,7 +379,11 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		if err != nil {
 			return err
 		}
-		imported, err = s.repo.ImportAliases(ctx, accountID, candidates)
+		if credentialRepo, ok := s.repo.(CredentialImportRepository); ok {
+			imported, issued, err = credentialRepo.ImportAliasesWithCredentials(ctx, accountID, candidates)
+		} else {
+			imported, err = s.repo.ImportAliases(ctx, accountID, candidates)
+		}
 		if errors.Is(err, store.ErrAliasOwnershipConflict) {
 			return wrapError(CodeAliasOwnershipConflict, ErrAliasOwnershipConflict, err)
 		}
@@ -389,8 +394,21 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 	}
 
 	created := make([]CreatedAlias, 0, len(imported.Created))
+	issuedByAddress := make(map[string]string, len(issued))
+	for _, credential := range issued {
+		issuedByAddress[domain.NormalizeEmail(credential.Alias.Address)] = credential.APIKey
+	}
 	for _, alias := range imported.Created {
-		created = append(created, CreatedAlias{Alias: alias, APIKey: rawKeys[domain.NormalizeEmail(alias.Address)]})
+		apiKey := issuedByAddress[domain.NormalizeEmail(alias.Address)]
+		if apiKey == "" {
+			// Repositories that implement only the original ImportAliases
+			// contract persisted this caller-issued key unchanged.
+			apiKey = rawKeys[domain.NormalizeEmail(alias.Address)]
+		}
+		created = append(created, CreatedAlias{
+			Alias:  alias,
+			APIKey: apiKey,
+		})
 	}
 	return SyncResult{
 		Summary: SyncSummary{
@@ -706,9 +724,9 @@ func findAppleAliasForDeletion(all, owned []apple.Alias, address string) (apple.
 }
 
 // CreateAutoAlias reserves exactly one Hide My Email address and publishes it
-// locally with a one-time API key sealed for administrator retrieval. The
-// method never retries reserve because repeating that remote side effect could
-// create duplicates; only the read-only directory confirmation is retried.
+// locally with a complete persistent credential bundle. The method never
+// retries reserve because repeating that remote side effect could create
+// duplicates; only the read-only directory confirmation is retried.
 func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (createdAlias domain.Alias, resultErr error) {
 	currentPercent := autoCreatePreparingPercent
 	pendingConfirmationTracked := false
@@ -739,8 +757,33 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 	if accountID < 1 {
 		return domain.Alias{}, errors.New("account ID must be positive")
 	}
-	autoRepo, ok := s.repo.(AutoCreateRepository)
-	if !ok {
+	// Accept both the original repository contract and the short-lived richer
+	// adapter shape used by early v2 integrations. The former preserves pending
+	// key delivery; the latter remains usable for embedders that have not yet
+	// added that optional field to their persistence layer.
+	var countEnabled func(context.Context, int64) (int, error)
+	var getPending func(context.Context, int64) (domain.PendingAliasAPIKey, error)
+	var createAlias func(context.Context, domain.AppleWebSession, domain.Alias, string) (domain.Alias, domain.AppleWebSession, error)
+	var confirmPending func(context.Context, domain.AppleWebSession, int64) (domain.Alias, domain.AppleWebSession, error)
+	if autoRepo, ok := s.repo.(AutoCreateRepository); ok {
+		countEnabled = autoRepo.CountEnabledAliasesByAccount
+		getPending = autoRepo.GetPendingAutoAliasConfirmation
+		createAlias = autoRepo.CreateAliasWithPendingAPIKey
+		confirmPending = autoRepo.ConfirmPendingAutoAlias
+	} else if modernRepo, ok := s.repo.(ModernAutoCreateRepository); ok {
+		countEnabled = modernRepo.CountEnabledAliasesByAccount
+		getPending = func(ctx context.Context, accountID int64) (domain.PendingAliasAPIKey, error) {
+			alias, err := modernRepo.GetPendingAutoAliasConfirmation(ctx, accountID)
+			if err != nil {
+				return domain.PendingAliasAPIKey{}, err
+			}
+			return domain.PendingAliasAPIKey{Alias: alias}, nil
+		}
+		createAlias = func(ctx context.Context, session domain.AppleWebSession, alias domain.Alias, _ string) (domain.Alias, domain.AppleWebSession, error) {
+			return modernRepo.CreateAutoAliasCandidate(ctx, session, alias)
+		}
+		confirmPending = modernRepo.ConfirmPendingAutoAlias
+	} else {
 		return domain.Alias{}, errors.New("automatic alias creation persistence is unavailable")
 	}
 	autoClient, ok := s.client.(AutoAliasClient)
@@ -807,14 +850,14 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		return domain.Alias{}, wrapError(CodeAccountDisabled, ErrAccountDisabled, nil)
 	}
 	reportProgress(domain.AliasCreationPhaseCheckingCapacity, autoCreateCheckingCapacityPercent, 0)
-	pendingConfirmation, pendingErr := autoRepo.GetPendingAutoAliasConfirmation(ctx, accountID)
+	pendingConfirmation, pendingErr := getPending(ctx, accountID)
 	hasPendingConfirmation := pendingErr == nil
 	pendingConfirmationTracked = hasPendingConfirmation
 	if pendingErr != nil && !errors.Is(pendingErr, store.ErrNotFound) {
 		return domain.Alias{}, pendingErr
 	}
 	if !hasPendingConfirmation {
-		count, err := autoRepo.CountEnabledAliasesByAccount(ctx, accountID)
+		count, err := countEnabled(ctx, accountID)
 		if err != nil {
 			return domain.Alias{}, err
 		}
@@ -926,7 +969,12 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		returned.Region = region
 		return checkpointSession(operationContext, *returned)
 	}
-	publishAlias := func(operationContext context.Context, sessionRecord domain.AppleWebSession, alias domain.Alias, apiKeyCiphertext string) (domain.Alias, error) {
+	publishAlias := func(
+		operationContext context.Context,
+		sessionRecord domain.AppleWebSession,
+		alias domain.Alias,
+		apiKeyCiphertext string,
+	) (domain.Alias, error) {
 		var saved domain.Alias
 		publish := func() error {
 			current, err := s.repo.GetAccount(operationContext, accountID)
@@ -940,7 +988,9 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 				return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 			}
 			var saveErr error
-			saved, _, saveErr = autoRepo.CreateAliasWithPendingAPIKey(operationContext, sessionRecord, alias, apiKeyCiphertext)
+			saved, _, saveErr = createAlias(
+				operationContext, sessionRecord, alias, apiKeyCiphertext,
+			)
 			return saveErr
 		}
 		var publishErr error
@@ -998,7 +1048,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 				return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 			}
 			var confirmErr error
-			saved, _, confirmErr = autoRepo.ConfirmPendingAutoAlias(operationContext, sessionRecord, pending.ID)
+			saved, _, confirmErr = confirmPending(operationContext, sessionRecord, pending.ID)
 			return confirmErr
 		}
 		var confirmErr error
@@ -1121,14 +1171,15 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		return domain.Alias{}, forwardingErr
 	}
 
-	// Prepare every locally fallible key operation before reserve so a local key
-	// failure cannot strand an address after Apple's irreversible side effect.
+	// Prepare the one-time API key before reserve. The store later reuses this
+	// exact key for the v2 bundle, so the legacy delivery queue and every v2
+	// authenticator agree on one credential.
 	reportProgress(domain.AliasCreationPhasePreparingKey, autoCreatePreparingKeyPercent, 0)
 	rawKey, hash, prefix, err := secure.NewAPIKey()
 	if err != nil {
 		return domain.Alias{}, wrapCryptoError(fmt.Errorf("generate automatic alias API key: %w", err))
 	}
-	ciphertext, err := keyCipher.EncryptPendingAliasAPIKey(rawKey)
+	apiKeyCiphertext, err := keyCipher.EncryptPendingAliasAPIKey(rawKey)
 	rawKey = ""
 	if err != nil {
 		return domain.Alias{}, wrapCryptoError(fmt.Errorf("encrypt automatic alias API key: %w", err))
@@ -1205,7 +1256,7 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		Enabled:        false,
 		LastSyncStatus: domain.SyncStatusPending,
 		LastSyncError:  domain.AppleAliasConfirmationPending,
-	}, ciphertext)
+	}, apiKeyCiphertext)
 	cancelPersist()
 	if persistErr != nil {
 		persistErr = markRemoteSideEffectPossible(wrapPersistenceError(persistErr))

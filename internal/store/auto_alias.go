@@ -23,11 +23,40 @@ func (s *Store) CountEnabledAliasesByAccount(ctx context.Context, accountID int6
 	return count, nil
 }
 
-// CreateAliasWithPendingAPIKey atomically persists a newly reserved Apple
-// alias, its one-time API key ciphertext, and the rotated Apple web session.
-// Enabled aliases are published immediately; disabled aliases remain staged
-// for authoritative directory confirmation.
+// CreateAliasWithPendingAPIKey atomically stores a newly reserved Apple alias,
+// a v2 bundle that reuses its already-issued API key, the legacy encrypted
+// pending key, and the rotated Apple session.
 func (s *Store) CreateAliasWithPendingAPIKey(
+	ctx context.Context,
+	session domain.AppleWebSession,
+	alias domain.Alias,
+	apiKeyCiphertext string,
+) (domain.Alias, domain.AppleWebSession, error) {
+	if len(alias.APIKeyHash) == 0 || strings.TrimSpace(alias.APIKeyPrefix) == "" {
+		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: API key metadata is incomplete")
+	}
+	if strings.TrimSpace(apiKeyCiphertext) == "" {
+		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: API key ciphertext is empty")
+	}
+	return s.createAutoAliasCandidate(ctx, session, alias, apiKeyCiphertext)
+}
+
+// SupportsV2AutoAliasCredentials identifies the richer implementation without
+// changing the original AutoCreateRepository method set.
+func (s *Store) SupportsV2AutoAliasCredentials() bool { return true }
+
+// CreateAutoAlias preserves the concise compatibility spelling exposed by the
+// original store implementation.
+func (s *Store) CreateAutoAlias(
+	ctx context.Context,
+	session domain.AppleWebSession,
+	alias domain.Alias,
+	apiKeyCiphertext string,
+) (domain.Alias, domain.AppleWebSession, error) {
+	return s.CreateAliasWithPendingAPIKey(ctx, session, alias, apiKeyCiphertext)
+}
+
+func (s *Store) createAutoAliasCandidate(
 	ctx context.Context,
 	session domain.AppleWebSession,
 	alias domain.Alias,
@@ -36,14 +65,8 @@ func (s *Store) CreateAliasWithPendingAPIKey(
 	if alias.AccountID < 1 || session.AccountID != alias.AccountID {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: account identity is invalid")
 	}
-	if len(alias.APIKeyHash) == 0 {
-		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: api key hash is empty")
-	}
 	if strings.TrimSpace(alias.Address) == "" {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: address is empty")
-	}
-	if strings.TrimSpace(apiKeyCiphertext) == "" {
-		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: api key ciphertext is empty")
 	}
 	if strings.TrimSpace(session.Ciphertext) == "" || strings.TrimSpace(session.AppleID) == "" {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: Apple session is incomplete")
@@ -64,6 +87,13 @@ func (s *Store) CreateAliasWithPendingAPIKey(
 			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: %w", err)
 		}
 	}
+	initialHash := alias.APIKeyHash
+	if len(initialHash) == 0 {
+		initialHash, err = provisionalAliasHash(nil)
+		if err != nil {
+			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias provisional credential: %w", err)
+		}
+	}
 
 	if err := s.saveAppleWebSessionTx(ctx, tx, session, now); err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("save rotated Apple session: %w", err)
@@ -81,25 +111,51 @@ func (s *Store) CreateAliasWithPendingAPIKey(
 	var aliasID int64
 	err = s.txQueryRowContext(ctx, tx, `
 		INSERT INTO aliases(
-			account_id, address, label, api_key_hash, api_key_prefix, enabled,
+			account_id, address, label, api_key_hash, api_key_prefix, credential_mode, enabled,
 			last_sync_status, last_sync_error, last_synced_at,
 			last_accessed_at, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id`,
 		alias.AccountID,
 		domain.NormalizeEmail(sanitizePostgresText(alias.Address)),
-		strings.TrimSpace(sanitizePostgresText(alias.Label)), alias.APIKeyHash,
-		strings.TrimSpace(sanitizePostgresText(alias.APIKeyPrefix)), alias.Enabled, status,
+		strings.TrimSpace(sanitizePostgresText(alias.Label)), initialHash,
+		strings.TrimSpace(sanitizePostgresText(alias.APIKeyPrefix)),
+		func() string {
+			if apiKeyCiphertext != "" && s.credentialReuseFactory != nil {
+				return domain.AliasCredentialModeV2
+			}
+			return domain.AliasCredentialModeLegacy
+		}(), alias.Enabled, status,
 		syncError, nullableTimestamp(alias.LastSyncedAt),
 		nullableTimestamp(alias.LastAccessedAt), timestamp(now), timestamp(now),
 	).Scan(&aliasID)
 	if err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("insert automatic alias: %w", err)
 	}
-	if _, err := s.txExecContext(ctx, tx, `
-		INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
-		VALUES(?, ?, ?)`, aliasID, apiKeyCiphertext, timestamp(now)); err != nil {
-		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("save pending automatic alias key: %w", err)
+	if apiKeyCiphertext != "" && s.credentialReuseFactory != nil {
+		if err := s.installAliasCredentialMaterialTx(
+			ctx, tx, aliasID, 1, true, s.credentialReuseFactory,
+			apiKeyCiphertext, alias.APIKeyHash,
+		); err != nil {
+			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias credentials: %w", err)
+		}
+		if _, err := s.txExecContext(ctx, tx, `
+			INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
+			VALUES(?, ?, ?)`, aliasID, apiKeyCiphertext, timestamp(now)); err != nil {
+			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("save pending automatic alias key: %w", err)
+		}
+	} else if apiKeyCiphertext != "" {
+		// Legacy deployments have no v2 issuer. Preserve their original
+		// pending-key record and API-key hash exactly.
+		if _, err := s.txExecContext(ctx, tx, `
+			INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
+			VALUES(?, ?, ?)`, aliasID, apiKeyCiphertext, timestamp(now)); err != nil {
+			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("save pending automatic alias key: %w", err)
+		}
+	} else if s.credentialFactory != nil {
+		if _, err := s.installGeneratedAliasCredentialsTx(ctx, tx, aliasID, 1, true); err != nil {
+			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias credentials: %w", err)
+		}
 	}
 	if alias.Enabled {
 		if _, err := s.txExecContext(ctx, tx,
@@ -113,7 +169,7 @@ func (s *Store) CreateAliasWithPendingAPIKey(
 	// Read the committed-shaped values while the transaction is still open.
 	// Once Commit succeeds the caller's context may be canceled, so a second
 	// query on the original context could report a false failure even though
-	// the alias, key, and rotated session were already published atomically.
+	// the alias, credential bundle, and rotated session were already published.
 	createdAlias, err := scanAlias(s.txQueryRowContext(ctx, tx,
 		`SELECT `+aliasColumns+aliasJoins+` WHERE al.id = ?`, aliasID,
 	))
@@ -130,12 +186,6 @@ func (s *Store) CreateAliasWithPendingAPIKey(
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("commit automatic alias creation: %w", err)
 	}
 	return createdAlias, savedSession, nil
-}
-
-// CreateAutoAlias is kept as a concise compatibility name for service
-// adapters; it has exactly the same atomic behavior as the explicit method.
-func (s *Store) CreateAutoAlias(ctx context.Context, session domain.AppleWebSession, alias domain.Alias, apiKeyCiphertext string) (domain.Alias, domain.AppleWebSession, error) {
-	return s.CreateAliasWithPendingAPIKey(ctx, session, alias, apiKeyCiphertext)
 }
 
 func (s *Store) GetPendingAutoAliasConfirmation(ctx context.Context, accountID int64) (domain.PendingAliasAPIKey, error) {
@@ -157,8 +207,8 @@ func (s *Store) GetPendingAutoAliasConfirmation(ctx context.Context, accountID i
 }
 
 // ConfirmPendingAutoAlias atomically publishes an alias whose Apple directory
-// visibility was delayed after reserve. Its pending API key remains available
-// for the normal one-time administrator retrieval flow.
+// visibility was delayed after reserve. Its credential bundle was already
+// persisted with the provisional alias and becomes usable when enabled.
 func (s *Store) ConfirmPendingAutoAlias(
 	ctx context.Context,
 	session domain.AppleWebSession,
@@ -244,110 +294,6 @@ func (s *Store) ConfirmPendingAutoAlias(
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("commit pending automatic alias confirmation: %w", err)
 	}
 	return confirmedAlias, savedSession, nil
-}
-
-func (s *Store) ListPendingAliasAPIKeysByAccount(ctx context.Context, accountID int64) ([]domain.PendingAliasAPIKey, error) {
-	rows, err := s.queryContext(ctx, `
-		SELECT `+aliasColumns+`, p.api_key_ciphertext, p.created_at`+aliasJoins+`
-		JOIN pending_alias_api_keys p ON p.alias_id = al.id
-		WHERE al.account_id = ?
-		  AND NOT (al.enabled = FALSE AND al.last_sync_error = ?)
-		ORDER BY p.created_at, al.id`, accountID, domain.AppleAliasConfirmationPending)
-	if err != nil {
-		return nil, fmt.Errorf("list pending automatic alias keys: %w", err)
-	}
-	defer rows.Close()
-	result := make([]domain.PendingAliasAPIKey, 0)
-	for rows.Next() {
-		pending, err := scanPendingAliasAPIKey(rows)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, pending)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate pending automatic alias keys: %w", err)
-	}
-	return result, nil
-}
-
-func (s *Store) ListPendingAliasAPIKeys(ctx context.Context, accountID int64) ([]domain.PendingAliasAPIKey, error) {
-	return s.ListPendingAliasAPIKeysByAccount(ctx, accountID)
-}
-
-func (s *Store) CountPendingAliasAPIKeysByAccount(ctx context.Context, accountID int64) (int, error) {
-	var count int
-	if err := s.queryRowContext(ctx, `
-		SELECT COUNT(*) FROM pending_alias_api_keys p
-		JOIN aliases al ON al.id = p.alias_id
-		WHERE al.account_id = ?
-		  AND NOT (al.enabled = FALSE AND al.last_sync_error = ?)`,
-		accountID, domain.AppleAliasConfirmationPending).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count pending automatic alias keys: %w", err)
-	}
-	return count, nil
-}
-
-// DeletePendingAliasAPIKeys acknowledges only the supplied alias IDs for this
-// account. It never bulk-deletes a newer key created after a prior retrieval.
-func (s *Store) DeletePendingAliasAPIKeys(ctx context.Context, accountID int64, aliasIDs []int64) error {
-	if len(aliasIDs) == 0 {
-		return nil
-	}
-	placeholders := make([]string, len(aliasIDs))
-	args := make([]any, 0, len(aliasIDs)+1)
-	args = append(args, accountID)
-	for i, id := range aliasIDs {
-		if id < 1 {
-			return fmt.Errorf("delete pending automatic alias keys: alias id must be positive")
-		}
-		placeholders[i] = "?"
-		args = append(args, id)
-	}
-	_, err := s.execContext(ctx, `
-		DELETE FROM pending_alias_api_keys
-		WHERE alias_id IN (`+strings.Join(placeholders, ",")+`)
-		  AND alias_id IN (
-			SELECT id FROM aliases
-			WHERE account_id = ?
-			  AND NOT (enabled = FALSE AND last_sync_error = ?)
-		  )`, append(args[1:], accountID, domain.AppleAliasConfirmationPending)...)
-	if err != nil {
-		return fmt.Errorf("delete pending automatic alias keys: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) DeletePendingAliasAPIKey(ctx context.Context, accountID, aliasID int64) error {
-	return s.DeletePendingAliasAPIKeys(ctx, accountID, []int64{aliasID})
-}
-
-func scanPendingAliasAPIKey(scanner rowScanner) (domain.PendingAliasAPIKey, error) {
-	var pending domain.PendingAliasAPIKey
-	var alias domain.Alias
-	var enabled bool
-	var lastSyncedAt, lastAccessedAt, latestReceivedAt sql.NullInt64
-	var createdAt, updatedAt, pendingCreatedAt int64
-	if err := scanner.Scan(
-		&alias.ID, &alias.AccountID, &alias.AccountEmail, &alias.Address, &alias.Label,
-		&alias.APIKeyHash, &alias.APIKeyPrefix, &enabled, &alias.LastSyncStatus,
-		&alias.LastSyncError, &lastSyncedAt, &lastAccessedAt, &createdAt, &updatedAt,
-		&latestReceivedAt, &pending.APIKeyCiphertext, &pendingCreatedAt,
-	); err != nil {
-		if err == sql.ErrNoRows {
-			return domain.PendingAliasAPIKey{}, ErrNotFound
-		}
-		return domain.PendingAliasAPIKey{}, fmt.Errorf("scan pending automatic alias key: %w", err)
-	}
-	alias.Enabled = enabled
-	alias.LastSyncedAt = timePtr(lastSyncedAt)
-	alias.LastAccessedAt = timePtr(lastAccessedAt)
-	alias.LatestReceivedAt = timePtr(latestReceivedAt)
-	alias.CreatedAt = timeFromTimestamp(createdAt)
-	alias.UpdatedAt = timeFromTimestamp(updatedAt)
-	pending.Alias = alias
-	pending.CreatedAt = timeFromTimestamp(pendingCreatedAt)
-	return pending, nil
 }
 
 func (s *Store) requirePendingAutoAliasConfirmationCapacity(

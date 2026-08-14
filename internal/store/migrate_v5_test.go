@@ -3,9 +3,9 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -13,373 +13,471 @@ import (
 	"icloud-api/internal/store"
 )
 
-func TestSQLiteFreshSchemaV6Tables(t *testing.T) {
+func TestSQLiteFreshSchemaV7IncludesLegacyCompatibilityTables(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "fresh-v6.db"))
+	db, err := store.Open(filepath.Join(t.TempDir(), "fresh-v7.db"))
 	if err != nil {
-		t.Fatalf("create fresh v6 database: %v", err)
+		t.Fatalf("create fresh v7 database: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close fresh v6 database: %v", err)
-		}
-	})
+	t.Cleanup(func() { _ = db.Close() })
 
 	var version int
 	if err := db.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read fresh schema version: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("fresh schema version = %d, want 6", version)
+	if version != 7 {
+		t.Fatalf("fresh schema version = %d, want 7", version)
 	}
 
-	wantedDefinitions := map[string][]string{
-		"consumed_messages": {
-			"alias_id integer not null references aliases(id) on delete cascade",
-			"uid_validity integer not null check(uid_validity between 1 and 4294967295)",
-			"uid integer not null check(uid between 1 and 4294967295)",
-			"consumed_at integer not null",
-			"primary key(alias_id, uid_validity, uid)",
-		},
-		"imap_seen_tasks": {
-			"account_id integer not null references accounts(id) on delete cascade",
-			"uid_validity integer not null check(uid_validity between 1 and 4294967295)",
-			"uid integer not null check(uid between 1 and 4294967295)",
-			"created_at integer not null",
-			"primary key(account_id, uid_validity, uid)",
-		},
-	}
-	for table, fragments := range wantedDefinitions {
-		var definition string
-		if err := db.DB().QueryRowContext(ctx,
-			`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
-		).Scan(&definition); err != nil {
-			t.Fatalf("read %s definition: %v", table, err)
-		}
-		normalized := normalizeV5SQL(definition)
-		for _, fragment := range fragments {
-			if !strings.Contains(normalized, fragment) {
-				t.Errorf("%s definition %q is missing %q", table, normalized, fragment)
-			}
+	for _, table := range []string{
+		"archived_messages", "alias_messages", "alias_creation_schedules",
+		"latest_messages", "pending_alias_api_keys", "consumed_messages", "imap_seen_tasks",
+	} {
+		if !sqliteObjectExists(t, ctx, db.DB(), "table", table) {
+			t.Errorf("fresh v7 schema is missing table %s", table)
 		}
 	}
 
-	const indexName = "imap_seen_tasks_account_created_idx"
-	var indexDefinition string
-	if err := db.DB().QueryRowContext(ctx,
-		`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`, indexName,
-	).Scan(&indexDefinition); err != nil {
-		t.Fatalf("read %s definition: %v", indexName, err)
-	}
-	const wantedIndex = "create index imap_seen_tasks_account_created_idx on imap_seen_tasks(account_id, created_at, uid_validity, uid)"
-	if normalized := normalizeV5SQL(indexDefinition); normalized != wantedIndex {
-		t.Fatalf("%s definition = %q, want %q", indexName, normalized, wantedIndex)
-	}
-
-	rows, err := db.DB().QueryContext(ctx, `PRAGMA index_info('imap_seen_tasks_account_created_idx')`)
-	if err != nil {
-		t.Fatalf("inspect %s columns: %v", indexName, err)
-	}
-	defer rows.Close()
-	var columns []string
-	for rows.Next() {
-		var sequence, columnID int
-		var column string
-		if err := rows.Scan(&sequence, &columnID, &column); err != nil {
-			t.Fatalf("scan %s column: %v", indexName, err)
+	columns := sqliteTableColumns(t, ctx, db.DB(), "aliases")
+	for _, column := range []string{
+		"api_key_prefix", "credential_ciphertext", "credential_mode", "imap_password_hash", "oauth_client_id",
+		"refresh_token_hash", "credential_version", "mailbox_uid_validity", "mailbox_uid_next",
+	} {
+		if !columns[column] {
+			t.Errorf("fresh v7 aliases table is missing column %s", column)
 		}
-		columns = append(columns, column)
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate %s columns: %v", indexName, err)
-	}
-	wantedColumns := []string{"account_id", "created_at", "uid_validity", "uid"}
-	if !reflect.DeepEqual(columns, wantedColumns) {
-		t.Fatalf("%s columns = %v, want %v", indexName, columns, wantedColumns)
 	}
 }
 
-func TestMigrateV4ToV6AddsAliasAndSeenTablesAndRetainsData(t *testing.T) {
+func TestSQLiteV7ConvergenceRepairsLegacyTablesAndCredentialMode(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	databasePath := filepath.Join(t.TempDir(), "legacy-v4.db")
-	fixture, err := store.Open(databasePath)
+	databasePath := filepath.Join(t.TempDir(), "partially-migrated-v7.db")
+	current, err := store.Open(databasePath)
 	if err != nil {
-		t.Fatalf("create v4 migration fixture: %v", err)
+		t.Fatalf("create v7 database: %v", err)
 	}
-	account := createAccount(t, ctx, fixture, "Legacy v4", "legacy-v4@icloud.com")
-	alias := createAlias(t, ctx, fixture, account.ID, "legacy-v4-alias@icloud.com", []byte("legacy-v4-hash"))
-	if _, err := fixture.DB().ExecContext(ctx, `
-		INSERT INTO imap_sync_states(account_id, uid_validity, last_uid, updated_at)
-		VALUES(?, 31, 32, 33)`, account.ID); err != nil {
-		_ = fixture.Close()
-		t.Fatalf("seed v4 IMAP sync state: %v", err)
+	if err := current.Close(); err != nil {
+		t.Fatalf("close v7 database before damage: %v", err)
 	}
 
+	damaged, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open v7 database for compatibility damage: %v", err)
+	}
 	for _, statement := range []string{
-		`DROP TABLE imap_seen_tasks`,
-		`DROP TABLE consumed_messages`,
+		`DROP INDEX imap_seen_tasks_account_created_idx`,
+		`DROP TABLE latest_messages`,
 		`DROP TABLE pending_alias_api_keys`,
-		`DROP TABLE alias_creation_schedules`,
-		`PRAGMA user_version = 4`,
+		`DROP TABLE consumed_messages`,
+		`DROP TABLE imap_seen_tasks`,
+		`ALTER TABLE aliases DROP COLUMN credential_mode`,
 	} {
-		if _, err := fixture.DB().ExecContext(ctx, statement); err != nil {
-			_ = fixture.Close()
-			t.Fatalf("prepare v4 migration fixture with %q: %v", statement, err)
+		if _, err := damaged.ExecContext(ctx, statement); err != nil {
+			_ = damaged.Close()
+			t.Fatalf("damage v7 schema with %q: %v", statement, err)
 		}
 	}
-	if err := fixture.Close(); err != nil {
-		t.Fatalf("close v4 migration fixture: %v", err)
+	if err := damaged.Close(); err != nil {
+		t.Fatalf("close damaged v7 database: %v", err)
+	}
+
+	repaired, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatalf("repair partially migrated v7 database: %v", err)
+	}
+	t.Cleanup(func() { _ = repaired.Close() })
+
+	for _, table := range []string{
+		"latest_messages", "pending_alias_api_keys", "consumed_messages", "imap_seen_tasks",
+	} {
+		if !sqliteObjectExists(t, ctx, repaired.DB(), "table", table) {
+			t.Errorf("repaired v7 database is missing compatibility table %s", table)
+		}
+	}
+	if !sqliteObjectExists(t, ctx, repaired.DB(), "index", "imap_seen_tasks_account_created_idx") {
+		t.Fatal("repaired v7 database is missing the IMAP Seen task index")
+	}
+	columns := sqliteTableColumns(t, ctx, repaired.DB(), "aliases")
+	if !columns["credential_mode"] {
+		t.Fatal("repaired v7 aliases table is missing credential_mode")
+	}
+}
+
+func TestSQLiteV7ConvergenceClassifiesOnlyCompletePreModeCredentials(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "pre-mode-v7.db")
+	db, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatalf("create v7 database: %v", err)
+	}
+	account := createAccount(t, ctx, db, "Pre-mode credentials", "pre-mode@icloud.com")
+	complete := createAlias(t, ctx, db, account.ID, "complete@icloud.com", []byte(strings.Repeat("a", 32)))
+	incomplete := createAlias(t, ctx, db, account.ID, "incomplete@icloud.com", []byte(strings.Repeat("b", 32)))
+	alreadyLegacy := createAlias(t, ctx, db, account.ID, "existing-mode@icloud.com", []byte(strings.Repeat("c", 32)))
+	for index, id := range []int64{complete.ID, alreadyLegacy.ID} {
+		if _, err := db.DB().ExecContext(ctx, `
+			UPDATE aliases SET credential_ciphertext = 'mc1.complete', credential_version = 1,
+				imap_password_hash = ?, oauth_client_id = ?, refresh_token_hash = ?
+			WHERE id = ?`, []byte(strings.Repeat("i", 32)), fmt.Sprintf("icl_complete_credential_%d", index), []byte(strings.Repeat("r", 32)), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		UPDATE aliases SET credential_ciphertext = 'mc1.incomplete', credential_version = 1,
+			imap_password_hash = ?, oauth_client_id = '', refresh_token_hash = ?
+		WHERE id = ?`, []byte(strings.Repeat("i", 32)), []byte(strings.Repeat("r", 32)), incomplete.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.ExecContext(ctx, `ALTER TABLE aliases DROP COLUMN credential_mode`); err != nil {
+		_ = raw.Close()
+		t.Fatalf("remove pre-mode column: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatalf("converge pre-mode v7 database: %v", err)
+	}
+	defer reopened.Close()
+	for _, test := range []struct {
+		id   int64
+		want string
+	}{
+		{complete.ID, domain.AliasCredentialModeV2},
+		{incomplete.ID, domain.AliasCredentialModeLegacy},
+		{alreadyLegacy.ID, domain.AliasCredentialModeV2},
+	} {
+		got, err := reopened.GetAlias(ctx, test.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.CredentialMode != test.want {
+			t.Errorf("alias %d mode = %q, want %q", test.id, got.CredentialMode, test.want)
+		}
+	}
+
+	if _, err := reopened.DB().ExecContext(ctx, `UPDATE aliases SET credential_mode = 'legacy' WHERE id = ?`, alreadyLegacy.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err = store.Open(databasePath)
+	if err != nil {
+		t.Fatalf("repeat convergence: %v", err)
+	}
+	defer reopened.Close()
+	got, err := reopened.GetAlias(ctx, alreadyLegacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CredentialMode != domain.AliasCredentialModeLegacy {
+		t.Fatalf("existing credential mode was reinterpreted as %q", got.CredentialMode)
+	}
+}
+
+func TestSQLiteV7ConvergenceDoesNotInferV2FromStaleCredentialFields(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "stale-credential-fields-v7.db")
+	db, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatalf("create v7 database: %v", err)
+	}
+	account := createAccount(t, ctx, db, "Stale credential fields", "stale-fields@icloud.com")
+	legacyHash := []byte(strings.Repeat("l", 32))
+	alias, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID:      account.ID,
+		Address:        "stale-fields-alias@icloud.com",
+		APIKeyHash:     legacyHash,
+		APIKeyPrefix:   "legacy-prefix",
+		CredentialMode: domain.AliasCredentialModeLegacy,
+		Enabled:        true,
+	})
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("create legacy alias: %v", err)
+	}
+	if _, err := db.DB().ExecContext(ctx, `
+		UPDATE aliases
+		SET credential_ciphertext = 'stale-ciphertext', credential_version = 7,
+			oauth_client_id = 'stale-client-id', imap_password_hash = ?, refresh_token_hash = ?
+		WHERE id = ?`, []byte(strings.Repeat("i", 32)), []byte(strings.Repeat("r", 32)), alias.ID); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed stale credential fields: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close v7 database before restart: %v", err)
+	}
+
+	reopened, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatalf("reopen v7 database: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	got, err := reopened.GetAlias(ctx, alias.ID)
+	if err != nil {
+		t.Fatalf("read alias after convergence: %v", err)
+	}
+	if got.CredentialMode != domain.AliasCredentialModeLegacy {
+		t.Fatalf("stale credential fields changed mode to %q, want legacy", got.CredentialMode)
+	}
+	var issuerCalls int
+	reopened.ConfigureAliasCredentialFactory(func(aliasID, version int64) (domain.AliasCredentialMaterial, error) {
+		issuerCalls++
+		return domain.AliasCredentialMaterial{}, errors.New("legacy alias must not be issued v2 credentials")
+	})
+	if err := reopened.EnsureAliasCredentials(ctx); err != nil {
+		t.Fatalf("initialize credentials after convergence: %v", err)
+	}
+	if issuerCalls != 0 {
+		t.Fatalf("legacy alias triggered credential issuance %d times", issuerCalls)
+	}
+}
+
+func TestMigrateV6ToV7PreservesSharedSnapshotAndLegacyState(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "legacy-v6.db")
+	legacy := createSQLiteV6Fixture(t, databasePath)
+	fixtures := []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO accounts(
+			id, name, email, imap_host, imap_port, imap_username, password_ciphertext,
+			enabled, last_sync_status, last_sync_error, created_at, updated_at
+		) VALUES(1, 'Legacy v6', 'legacy-v6@icloud.com', 'imap.mail.me.com', 993,
+			'legacy-v6@icloud.com', 'ciphertext', 1, 'ok', '', 1, 1)`, nil},
+		{`INSERT INTO aliases(
+			id, account_id, address, label, api_key_hash, api_key_prefix, enabled,
+			last_sync_status, last_sync_error, created_at, updated_at
+		) VALUES(1, 1, 'first@icloud.com', '', ?, 'old-first', 1, 'ok', '', 1, 1)`, []any{[]byte("old-first-hash")}},
+		{`INSERT INTO aliases(
+			id, account_id, address, label, api_key_hash, api_key_prefix, enabled,
+			last_sync_status, last_sync_error, created_at, updated_at
+		) VALUES(2, 1, 'second@icloud.com', '', ?, 'old-second', 1, 'ok', '', 1, 1)`, []any{[]byte("old-second-hash")}},
+		{`INSERT INTO latest_messages(
+			alias_id, uid_validity, uid, message_id, internal_date, header_date,
+			from_json, to_json, cc_json, subject, text_body, html_body,
+			attachments_json, body_truncated, synced_at
+		) VALUES(1, 44, 55, '<shared@example.test>', 100, 90,
+			'[{"email":"sender@example.test"}]', '[{"email":"first@icloud.com"}]', '[]',
+			'Shared legacy snapshot', 'discarded body', '', '[]', 1, 110)`, nil},
+		{`INSERT INTO latest_messages(
+			alias_id, uid_validity, uid, message_id, internal_date, header_date,
+			from_json, to_json, cc_json, subject, text_body, html_body,
+			attachments_json, body_truncated, synced_at
+		) VALUES(2, 44, 55, '<shared@example.test>', 100, 90,
+			'[{"email":"sender@example.test"}]', '[{"email":"second@icloud.com"}]', '[]',
+			'Shared legacy snapshot', 'discarded body', '', '[]', 0, 111)`, nil},
+		{`INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
+			VALUES(1, 'legacy-key', 1)`, nil},
+		{`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
+			VALUES(1, 44, 55, 1)`, nil},
+		{`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
+			VALUES(1, 44, 55, 1)`, nil},
+	}
+	for _, fixture := range fixtures {
+		if _, err := legacy.ExecContext(ctx, fixture.query, fixture.args...); err != nil {
+			_ = legacy.Close()
+			t.Fatalf("seed v6 fixture: %v", err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close v6 fixture: %v", err)
 	}
 
 	migrated, err := store.Open(databasePath)
 	if err != nil {
-		t.Fatalf("open and migrate v4 database: %v", err)
+		t.Fatalf("migrate v6 database: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := migrated.Close(); err != nil {
-			t.Errorf("close migrated v6 database: %v", err)
-		}
-	})
+	t.Cleanup(func() { _ = migrated.Close() })
 
-	var version int
+	var version, archivedCount, routedCount int
 	if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read migrated schema version: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("migrated schema version = %d, want 6", version)
+	if version != 7 {
+		t.Fatalf("migrated schema version = %d, want 7", version)
 	}
-	retained, err := migrated.GetAlias(ctx, alias.ID)
-	if err != nil {
-		t.Fatalf("read retained v4 alias: %v", err)
+	if err := migrated.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM archived_messages`).Scan(&archivedCount); err != nil {
+		t.Fatalf("count migrated archive messages: %v", err)
 	}
-	if retained.AccountID != account.ID || retained.Address != alias.Address {
-		t.Fatalf("retained v4 alias = %#v, want account %d address %q", retained, account.ID, alias.Address)
+	if err := migrated.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM alias_messages`).Scan(&routedCount); err != nil {
+		t.Fatalf("count migrated alias mappings: %v", err)
 	}
-	var retainedUIDValidity, retainedUID int64
-	if err := migrated.DB().QueryRowContext(ctx, `
-		SELECT uid_validity, last_uid FROM imap_sync_states WHERE account_id = ?`, account.ID,
-	).Scan(&retainedUIDValidity, &retainedUID); err != nil {
-		t.Fatalf("read retained v4 IMAP sync state: %v", err)
-	}
-	if retainedUIDValidity != 31 || retainedUID != 32 {
-		t.Fatalf("retained v4 IMAP sync state = (%d, %d), want (31, 32)", retainedUIDValidity, retainedUID)
+	if archivedCount != 1 || routedCount != 2 {
+		t.Fatalf("migrated shared snapshot counts = archive:%d mappings:%d, want 1 and 2", archivedCount, routedCount)
 	}
 
-	if _, err := migrated.DB().ExecContext(ctx, `
-		INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
-		VALUES(?, 41, 42, 43)`, alias.ID); err != nil {
-		t.Fatalf("use migrated consumed_messages table: %v", err)
+	first := oneArchivedMailboxMessage(t, ctx, migrated, 1)
+	second := oneArchivedMailboxMessage(t, ctx, migrated, 2)
+	if first.ID != second.ID || first.MailboxUID != 1 || second.MailboxUID != 1 {
+		t.Fatalf("migrated local identities = first:%#v second:%#v", first, second)
 	}
-	if _, err := migrated.DB().ExecContext(ctx, `
-		INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
-		VALUES(?, 41, 42, 43)`, account.ID); err != nil {
-		t.Fatalf("use migrated imap_seen_tasks table: %v", err)
+	if first.Subject != "Shared legacy snapshot" || first.MessageID != "<shared@example.test>" ||
+		first.ContentState != domain.ArchiveContentMetadata || first.ContentPath != "" ||
+		len(first.From) != 1 || first.From[0].Email != "sender@example.test" {
+		t.Fatalf("migrated metadata message = %#v", first)
 	}
-
-	var queued int
-	if err := migrated.DB().QueryRowContext(ctx, `
-		SELECT COUNT(*)
-		FROM consumed_messages c
-		JOIN imap_seen_tasks q
-		  ON q.account_id = ? AND q.uid_validity = c.uid_validity AND q.uid = c.uid
-		WHERE c.alias_id = ?`, account.ID, alias.ID,
-	).Scan(&queued); err != nil {
-		t.Fatalf("read migrated v6 rows: %v", err)
+	var firstNext, secondNext int64
+	if err := migrated.DB().QueryRowContext(ctx,
+		`SELECT mailbox_uid_next FROM aliases WHERE id = 1`).Scan(&firstNext); err != nil {
+		t.Fatal(err)
 	}
-	if queued != 1 {
-		t.Fatalf("joined migrated v6 row count = %d, want 1", queued)
+	if err := migrated.DB().QueryRowContext(ctx,
+		`SELECT mailbox_uid_next FROM aliases WHERE id = 2`).Scan(&secondNext); err != nil {
+		t.Fatal(err)
 	}
-}
-
-func TestMigrateV3ToV6AddsSyncAliasAndSeenTables(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	databasePath := filepath.Join(t.TempDir(), "legacy-v3.db")
-	fixture, err := store.Open(databasePath)
-	if err != nil {
-		t.Fatalf("create v3 migration fixture: %v", err)
-	}
-	account := createAccount(t, ctx, fixture, "Legacy v3", "legacy-v3@icloud.com")
-	alias := createAlias(t, ctx, fixture, account.ID, "legacy-v3-alias@icloud.com", []byte("legacy-v3-hash"))
-	if _, err := fixture.UpsertAppleWebSession(ctx, domain.AppleWebSession{
-		AccountID: account.ID, Ciphertext: "as1.legacy-v3", AppleID: account.Email,
-		Region: "US", Authenticated: true,
-	}); err != nil {
-		_ = fixture.Close()
-		t.Fatalf("seed v3 Apple web session: %v", err)
+	if firstNext != 2 || secondNext != 2 {
+		t.Fatalf("migrated next local UIDs = (%d, %d), want (2, 2)", firstNext, secondNext)
 	}
 
-	for _, statement := range []string{
-		`DROP TABLE imap_seen_tasks`,
-		`DROP TABLE consumed_messages`,
-		`DROP TABLE pending_alias_api_keys`,
-		`DROP TABLE alias_creation_schedules`,
-		`DROP TABLE imap_sync_states`,
-		`PRAGMA user_version = 3`,
-	} {
-		if _, err := fixture.DB().ExecContext(ctx, statement); err != nil {
-			_ = fixture.Close()
-			t.Fatalf("prepare v3 migration fixture with %q: %v", statement, err)
+	for _, table := range []string{"latest_messages", "pending_alias_api_keys", "consumed_messages", "imap_seen_tasks"} {
+		if !sqliteObjectExists(t, ctx, migrated.DB(), "table", table) {
+			t.Errorf("v6 migration removed compatibility table %s", table)
 		}
 	}
-	if err := fixture.Close(); err != nil {
-		t.Fatalf("close v3 migration fixture: %v", err)
+
+	var firstPrefix, firstMode, secondPrefix, secondMode string
+	if err := migrated.DB().QueryRowContext(ctx,
+		`SELECT api_key_prefix, credential_mode FROM aliases WHERE id = 1`,
+	).Scan(&firstPrefix, &firstMode); err != nil {
+		t.Fatalf("read first migrated alias credentials: %v", err)
+	}
+	if err := migrated.DB().QueryRowContext(ctx,
+		`SELECT api_key_prefix, credential_mode FROM aliases WHERE id = 2`,
+	).Scan(&secondPrefix, &secondMode); err != nil {
+		t.Fatalf("read second migrated alias credentials: %v", err)
+	}
+	if firstPrefix != "old-first" || secondPrefix != "old-second" ||
+		firstMode != domain.AliasCredentialModeLegacy || secondMode != domain.AliasCredentialModeLegacy {
+		t.Fatalf("migrated alias credentials = (%q, %q), (%q, %q), want preserved prefixes in legacy mode",
+			firstPrefix, firstMode, secondPrefix, secondMode)
 	}
 
-	migrated, err := store.Open(databasePath)
-	if err != nil {
-		t.Fatalf("open and migrate v3 database: %v", err)
+	var latestText string
+	var latestTruncated, latestSyncedAt int64
+	if err := migrated.DB().QueryRowContext(ctx, `
+		SELECT text_body, body_truncated, synced_at
+		FROM latest_messages
+		WHERE alias_id = 1 AND uid_validity = 44 AND uid = 55`,
+	).Scan(&latestText, &latestTruncated, &latestSyncedAt); err != nil {
+		t.Fatalf("read preserved latest message: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := migrated.Close(); err != nil {
-			t.Errorf("close migrated v3 database: %v", err)
-		}
-	})
+	if latestText != "discarded body" || latestTruncated != 1 || latestSyncedAt != 110 {
+		t.Fatalf("preserved latest message state = (%q, %d, %d), want (%q, 1, 110)",
+			latestText, latestTruncated, latestSyncedAt, "discarded body")
+	}
 
-	var version int
-	if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-		t.Fatalf("read v3 migration schema version: %v", err)
+	var pendingKey string
+	var pendingCreatedAt int64
+	if err := migrated.DB().QueryRowContext(ctx, `
+		SELECT api_key_ciphertext, created_at FROM pending_alias_api_keys WHERE alias_id = 1`,
+	).Scan(&pendingKey, &pendingCreatedAt); err != nil {
+		t.Fatalf("read preserved pending API key: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("v3 migration schema version = %d, want 6", version)
+	if pendingKey != "legacy-key" || pendingCreatedAt != 1 {
+		t.Fatalf("preserved pending API key = (%q, %d), want (%q, 1)", pendingKey, pendingCreatedAt, "legacy-key")
 	}
-	retainedSession, err := migrated.GetAppleWebSession(ctx, account.ID)
-	if err != nil {
-		t.Fatalf("read retained v3 Apple web session: %v", err)
-	}
-	if retainedSession.Ciphertext != "as1.legacy-v3" || !retainedSession.Authenticated {
-		t.Fatalf("retained v3 Apple web session = %#v", retainedSession)
-	}
-	if _, err := migrated.DB().ExecContext(ctx, `
-		INSERT INTO imap_sync_states(account_id, uid_validity, last_uid, updated_at)
-		VALUES(?, 51, 52, 53)`, account.ID); err != nil {
-		t.Fatalf("use v3-to-v6 migrated IMAP sync state: %v", err)
-	}
-	if _, err := migrated.DB().ExecContext(ctx, `
-		INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
-		VALUES(?, 51, 52, 53)`, alias.ID); err != nil {
-		t.Fatalf("use v3-to-v6 migrated consumption table: %v", err)
-	}
-	if _, err := migrated.DB().ExecContext(ctx, `
-		INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
-		VALUES(?, 51, 52, 53)`, account.ID); err != nil {
-		t.Fatalf("use v3-to-v6 migrated seen queue: %v", err)
-	}
-}
 
-func TestMigrateHistoricalV5LayoutsToV6(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name           string
-		drop           []string
-		retainedRows   []string
-		newEmptyTables []string
+	for _, state := range []struct {
+		name  string
+		query string
 	}{
 		{
-			name: "automatic alias tables only",
-			drop: []string{
-				`DROP TABLE imap_seen_tasks`,
-				`DROP TABLE consumed_messages`,
-			},
-			retainedRows:   []string{"alias_creation_schedules", "pending_alias_api_keys"},
-			newEmptyTables: []string{"consumed_messages", "imap_seen_tasks"},
+			name: "consumed message",
+			query: `SELECT COUNT(*) FROM consumed_messages
+				WHERE alias_id = 1 AND uid_validity = 44 AND uid = 55 AND consumed_at = 1`,
 		},
 		{
-			name: "seen tables only",
-			drop: []string{
-				`DROP TABLE pending_alias_api_keys`,
-				`DROP TABLE alias_creation_schedules`,
-			},
-			retainedRows:   []string{"consumed_messages", "imap_seen_tasks"},
-			newEmptyTables: []string{"alias_creation_schedules", "pending_alias_api_keys"},
+			name: "IMAP Seen task",
+			query: `SELECT COUNT(*) FROM imap_seen_tasks
+				WHERE account_id = 1 AND uid_validity = 44 AND uid = 55 AND created_at = 1`,
 		},
-		{
-			name: "both table groups",
-			retainedRows: []string{
-				"alias_creation_schedules", "pending_alias_api_keys",
-				"consumed_messages", "imap_seen_tasks",
-			},
-		},
+	} {
+		var count int
+		if err := migrated.DB().QueryRowContext(ctx, state.query).Scan(&count); err != nil {
+			t.Fatalf("read preserved %s: %v", state.name, err)
+		}
+		if count != 1 {
+			t.Errorf("preserved %s count = %d, want 1", state.name, count)
+		}
 	}
+}
 
-	for _, test := range tests {
+func TestMigrateHistoricalV5LayoutsToV7(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		drop []string
+	}{
+		{name: "automatic alias tables only", drop: []string{"imap_seen_tasks", "consumed_messages"}},
+		{name: "seen tables only", drop: []string{"pending_alias_api_keys", "alias_creation_schedules"}},
+		{name: "both table groups"},
+	} {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
 			databasePath := filepath.Join(t.TempDir(), "historical-v5.db")
-			fixture, err := store.Open(databasePath)
-			if err != nil {
-				t.Fatalf("create historical v5 fixture: %v", err)
+			legacy := createSQLiteV6Fixture(t, databasePath)
+			if _, err := legacy.ExecContext(ctx, `INSERT INTO accounts(
+				id, name, email, imap_host, imap_port, imap_username, password_ciphertext,
+				enabled, last_sync_status, last_sync_error, created_at, updated_at
+			) VALUES(1, 'Historical v5', 'historical-v5@icloud.com', 'imap.mail.me.com', 993,
+				'historical-v5@icloud.com', 'ciphertext', 1, 'pending', '', 1, 1)`); err != nil {
+				_ = legacy.Close()
+				t.Fatal(err)
 			}
-			account := createAccount(t, ctx, fixture, "Historical v5", "historical-v5@icloud.com")
-			alias := createAlias(
-				t, ctx, fixture, account.ID, "historical-v5-alias@icloud.com", []byte("historical-v5-hash"),
-			)
-			for _, statement := range []struct {
-				query string
-				args  []any
-			}{
-				{
-					query: `INSERT INTO alias_creation_schedules(
-						account_id, enabled, planned_at_json, last_alias_address,
-						last_error, created_at, updated_at
-					) VALUES(?, 1, '[]', 'retained-auto@icloud.com', '', 11, 12)`,
-					args: []any{account.ID},
-				},
-				{
-					query: `INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
-						VALUES(?, 'retained-ciphertext', 13)`,
-					args: []any{alias.ID},
-				},
-				{
-					query: `INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
-						VALUES(?, 71, 72, 73)`,
-					args: []any{alias.ID},
-				},
-				{
-					query: `INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
-						VALUES(?, 71, 72, 74)`,
-					args: []any{account.ID},
-				},
-			} {
-				if _, err := fixture.DB().ExecContext(ctx, statement.query, statement.args...); err != nil {
-					_ = fixture.Close()
-					t.Fatalf("seed historical v5 fixture: %v", err)
+			for _, table := range test.drop {
+				if _, err := legacy.ExecContext(ctx, `DROP TABLE `+table); err != nil {
+					_ = legacy.Close()
+					t.Fatalf("drop %s from v5 fixture: %v", table, err)
 				}
 			}
-			for _, statement := range append(test.drop, `PRAGMA user_version = 5`) {
-				if _, err := fixture.DB().ExecContext(ctx, statement); err != nil {
-					_ = fixture.Close()
-					t.Fatalf("prepare historical v5 fixture with %q: %v", statement, err)
-				}
+			if _, err := legacy.ExecContext(ctx, `PRAGMA user_version = 5`); err != nil {
+				_ = legacy.Close()
+				t.Fatal(err)
 			}
-			if err := fixture.Close(); err != nil {
-				t.Fatalf("close historical v5 fixture: %v", err)
+			if err := legacy.Close(); err != nil {
+				t.Fatal(err)
 			}
 
 			migrated, err := store.Open(databasePath)
 			if err != nil {
-				t.Fatalf("migrate historical v5 fixture: %v", err)
+				t.Fatalf("migrate historical v5 layout: %v", err)
 			}
-			t.Cleanup(func() { _ = migrated.Close() })
+			defer migrated.Close()
 			var version int
 			if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
-				t.Fatalf("read migrated schema version: %v", err)
+				t.Fatal(err)
 			}
-			if version != 6 {
-				t.Fatalf("migrated schema version = %d, want 6", version)
+			if version != 7 || !sqliteObjectExists(t, ctx, migrated.DB(), "table", "archived_messages") {
+				t.Fatalf("historical v5 layout did not converge to v7; version=%d", version)
 			}
-			for _, table := range test.retainedRows {
-				assertSQLiteRowCount(t, ctx, migrated.DB(), table, 1)
-			}
-			for _, table := range test.newEmptyTables {
-				assertSQLiteRowCount(t, ctx, migrated.DB(), table, 0)
+			if _, err := migrated.GetAccount(ctx, 1); err != nil {
+				t.Fatalf("historical account was not retained: %v", err)
 			}
 		})
 	}
@@ -388,446 +486,150 @@ func TestMigrateHistoricalV5LayoutsToV6(t *testing.T) {
 func TestMigrateHistoricalV5RejectsPartialTableGroup(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
+	for _, test := range []struct {
 		name      string
 		dropTable string
-		wantError string
+		want      string
 	}{
-		{
-			name:      "automatic alias group",
-			dropTable: "pending_alias_api_keys",
-			wantError: "automatic alias",
-		},
-		{
-			name:      "seen group",
-			dropTable: "imap_seen_tasks",
-			wantError: "seen",
-		},
-	}
-
-	for _, test := range tests {
+		{name: "automatic alias group", dropTable: "pending_alias_api_keys", want: "automatic alias"},
+		{name: "seen group", dropTable: "imap_seen_tasks", want: "seen"},
+	} {
+		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
 			databasePath := filepath.Join(t.TempDir(), "partial-v5.db")
-			fixture, err := store.Open(databasePath)
-			if err != nil {
-				t.Fatalf("create partial v5 fixture: %v", err)
+			legacy := createSQLiteV6Fixture(t, databasePath)
+			if _, err := legacy.ExecContext(ctx, `DROP TABLE `+test.dropTable); err != nil {
+				_ = legacy.Close()
+				t.Fatal(err)
 			}
-			if _, err := fixture.DB().ExecContext(ctx, `DROP TABLE `+test.dropTable); err != nil {
-				_ = fixture.Close()
-				t.Fatalf("drop %s from partial v5 fixture: %v", test.dropTable, err)
+			if _, err := legacy.ExecContext(ctx, `PRAGMA user_version = 5`); err != nil {
+				_ = legacy.Close()
+				t.Fatal(err)
 			}
-			if _, err := fixture.DB().ExecContext(ctx, `PRAGMA user_version = 5`); err != nil {
-				_ = fixture.Close()
-				t.Fatalf("mark partial fixture as v5: %v", err)
-			}
-			if err := fixture.Close(); err != nil {
-				t.Fatalf("close partial v5 fixture: %v", err)
+			if err := legacy.Close(); err != nil {
+				t.Fatal(err)
 			}
 
 			reopened, err := store.Open(databasePath)
 			if err == nil {
 				_ = reopened.Close()
-				t.Fatal("opening v5 schema with a partial table group succeeded")
+				t.Fatal("partial v5 schema unexpectedly migrated")
 			}
-			if !strings.Contains(strings.ToLower(err.Error()), test.wantError) {
-				t.Fatalf("partial v5 schema error = %q, want fragment %q", err, test.wantError)
-			}
-		})
-	}
-}
-
-func TestSQLiteV6SeenTableConstraintsAndCascades(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	db := openTestStore(t)
-	account := createAccount(t, ctx, db, "Seen constraints", "seen-constraints@icloud.com")
-	alias := createAlias(t, ctx, db, account.ID, "seen-constraints-alias@icloud.com", []byte("seen-constraints-hash"))
-	unusedAlias := createAlias(t, ctx, db, account.ID, "seen-constraints-unused@icloud.com", []byte("seen-constraints-unused-hash"))
-
-	if _, err := db.DB().ExecContext(ctx, `
-		INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
-		VALUES(?, 4294967295, 4294967295, 1)`, alias.ID); err != nil {
-		t.Fatalf("insert valid consumed message at uint32 maximum: %v", err)
-	}
-	if _, err := db.DB().ExecContext(ctx, `
-		INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
-		VALUES(?, 2, 2, 2)`, alias.ID); err != nil {
-		t.Fatalf("insert a newer consumed message for the same alias: %v", err)
-	}
-	if _, err := db.DB().ExecContext(ctx, `
-		INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
-		VALUES(?, 4294967295, 4294967295, 1)`, account.ID); err != nil {
-		t.Fatalf("insert valid seen task at uint32 maximum: %v", err)
-	}
-
-	rejected := []struct {
-		name  string
-		query string
-		args  []any
-	}{
-		{
-			"consumed message null alias",
-			`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at) VALUES(NULL, 1, 1, 1)`,
-			nil,
-		},
-		{
-			"consumed message missing alias",
-			`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at) VALUES(?, 1, 1, 1)`,
-			[]any{alias.ID + 100000},
-		},
-		{
-			"consumed message zero UIDVALIDITY",
-			`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at) VALUES(?, 0, 1, 1)`,
-			[]any{unusedAlias.ID},
-		},
-		{
-			"consumed message UIDVALIDITY overflow",
-			`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at) VALUES(?, 4294967296, 1, 1)`,
-			[]any{unusedAlias.ID},
-		},
-		{
-			"consumed message zero UID",
-			`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at) VALUES(?, 1, 0, 1)`,
-			[]any{unusedAlias.ID},
-		},
-		{
-			"consumed message UID overflow",
-			`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at) VALUES(?, 1, 4294967296, 1)`,
-			[]any{unusedAlias.ID},
-		},
-		{
-			"consumed message null timestamp",
-			`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at) VALUES(?, 1, 1, NULL)`,
-			[]any{unusedAlias.ID},
-		},
-		{
-			"consumed message duplicate identity",
-			`INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at) VALUES(?, 4294967295, 4294967295, 2)`,
-			[]any{alias.ID},
-		},
-		{
-			"seen task null account",
-			`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at) VALUES(NULL, 1, 1, 1)`,
-			nil,
-		},
-		{
-			"seen task missing account",
-			`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at) VALUES(?, 1, 1, 1)`,
-			[]any{account.ID + 100000},
-		},
-		{
-			"seen task zero UIDVALIDITY",
-			`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at) VALUES(?, 0, 1, 1)`,
-			[]any{account.ID},
-		},
-		{
-			"seen task UIDVALIDITY overflow",
-			`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at) VALUES(?, 4294967296, 1, 1)`,
-			[]any{account.ID},
-		},
-		{
-			"seen task zero UID",
-			`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at) VALUES(?, 1, 0, 1)`,
-			[]any{account.ID},
-		},
-		{
-			"seen task UID overflow",
-			`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at) VALUES(?, 1, 4294967296, 1)`,
-			[]any{account.ID},
-		},
-		{
-			"seen task null timestamp",
-			`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at) VALUES(?, 1, 1, NULL)`,
-			[]any{account.ID},
-		},
-		{
-			"seen task duplicate identity",
-			`INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at) VALUES(?, 4294967295, 4294967295, 2)`,
-			[]any{account.ID},
-		},
-	}
-	for _, test := range rejected {
-		t.Run(test.name, func(t *testing.T) {
-			if _, err := db.DB().ExecContext(ctx, test.query, test.args...); err == nil {
-				t.Fatal("invalid row was accepted")
-			}
-		})
-	}
-
-	if _, err := db.DB().ExecContext(ctx, `DELETE FROM aliases WHERE id = ?`, alias.ID); err != nil {
-		t.Fatalf("delete consumed alias: %v", err)
-	}
-	assertSQLiteRowCount(t, ctx, db.DB(), "consumed_messages", 0)
-	assertSQLiteRowCount(t, ctx, db.DB(), "imap_seen_tasks", 1)
-
-	if _, err := db.DB().ExecContext(ctx, `DELETE FROM accounts WHERE id = ?`, account.ID); err != nil {
-		t.Fatalf("delete queued account: %v", err)
-	}
-	assertSQLiteRowCount(t, ctx, db.DB(), "consumed_messages", 0)
-	assertSQLiteRowCount(t, ctx, db.DB(), "imap_seen_tasks", 0)
-	assertSQLiteRowCount(t, ctx, db.DB(), "aliases", 0)
-}
-
-func TestSQLiteV6ConvergenceRestoresSeenTaskIndex(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	databasePath := filepath.Join(t.TempDir(), "v6-seen-index-convergence.db")
-	fixture, err := store.Open(databasePath)
-	if err != nil {
-		t.Fatalf("create v6 convergence fixture: %v", err)
-	}
-	if _, err := fixture.DB().ExecContext(ctx, `DROP INDEX imap_seen_tasks_account_created_idx`); err != nil {
-		_ = fixture.Close()
-		t.Fatalf("drop seen task index from fixture: %v", err)
-	}
-	if err := fixture.Close(); err != nil {
-		t.Fatalf("close v6 convergence fixture: %v", err)
-	}
-
-	converged, err := store.Open(databasePath)
-	if err != nil {
-		t.Fatalf("reopen and converge v6 database: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := converged.Close(); err != nil {
-			t.Errorf("close converged v6 database: %v", err)
-		}
-	})
-
-	var definition string
-	if err := converged.DB().QueryRowContext(ctx, `
-		SELECT sql FROM sqlite_master
-		WHERE type = 'index' AND name = 'imap_seen_tasks_account_created_idx'`,
-	).Scan(&definition); err != nil {
-		t.Fatalf("read restored seen task index: %v", err)
-	}
-	const wanted = "create index imap_seen_tasks_account_created_idx on imap_seen_tasks(account_id, created_at, uid_validity, uid)"
-	if normalized := normalizeV5SQL(definition); normalized != wanted {
-		t.Fatalf("restored seen task index = %q, want %q", normalized, wanted)
-	}
-}
-
-func TestSQLiteV6ValidationRejectsMissingSeenTables(t *testing.T) {
-	t.Parallel()
-
-	for _, table := range []string{"consumed_messages", "imap_seen_tasks"} {
-		t.Run(table, func(t *testing.T) {
-			databasePath := filepath.Join(t.TempDir(), "v6-missing-table.db")
-			fixture, err := store.Open(databasePath)
-			if err != nil {
-				t.Fatalf("create v6 missing-table fixture: %v", err)
-			}
-			if _, err := fixture.DB().ExecContext(context.Background(), `DROP TABLE `+table); err != nil {
-				_ = fixture.Close()
-				t.Fatalf("drop %s from v6 fixture: %v", table, err)
-			}
-			if err := fixture.Close(); err != nil {
-				t.Fatalf("close v6 missing-table fixture: %v", err)
-			}
-
-			reopened, err := store.Open(databasePath)
-			if err == nil {
-				_ = reopened.Close()
-				t.Fatal("opening v6 schema with a missing required table succeeded")
-			}
-			wantError := "missing required table " + table
-			if !strings.Contains(err.Error(), wantError) {
-				t.Fatalf("open v6 schema error = %q, want fragment %q", err, wantError)
+			if !strings.Contains(strings.ToLower(err.Error()), test.want) {
+				t.Fatalf("partial v5 error = %q, want fragment %q", err, test.want)
 			}
 		})
 	}
 }
 
-func TestSQLiteV6ValidationRejectsMalformedSeenSchema(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name       string
-		statements []string
-		wantError  string
-	}{
-		{
-			name: "missing required column",
-			statements: []string{
-				`DROP TABLE consumed_messages`,
-				`CREATE TABLE consumed_messages (
-					alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
-					uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
-					uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
-					PRIMARY KEY(alias_id, uid_validity, uid)
-				)`,
-			},
-			wantError: "consumed_messages is missing required column consumed_at",
-		},
-		{
-			name: "wrong composite primary key",
-			statements: []string{
-				`DROP TABLE consumed_messages`,
-				`CREATE TABLE consumed_messages (
-					alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
-					uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
-					uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
-					consumed_at INTEGER NOT NULL,
-					PRIMARY KEY(alias_id, uid)
-				)`,
-			},
-			wantError: "consumed_messages primary key",
-		},
-		{
-			name: "wrong foreign key target",
-			statements: []string{
-				`DROP TABLE imap_seen_tasks`,
-				`CREATE TABLE imap_seen_tasks (
-					account_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
-					uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
-					uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
-					created_at INTEGER NOT NULL,
-					PRIMARY KEY(account_id, uid_validity, uid)
-				)`,
-			},
-			wantError: "imap_seen_tasks foreign key",
-		},
-		{
-			name: "wrong foreign key cascade",
-			statements: []string{
-				`DROP TABLE imap_seen_tasks`,
-				`CREATE TABLE imap_seen_tasks (
-					account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
-					uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
-					uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
-					created_at INTEGER NOT NULL,
-					PRIMARY KEY(account_id, uid_validity, uid)
-				)`,
-			},
-			wantError: "ON DELETE RESTRICT",
-		},
-		{
-			name: "missing one UID range check",
-			statements: []string{
-				`DROP TABLE consumed_messages`,
-				`CREATE TABLE consumed_messages (
-					alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
-					uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
-					uid INTEGER NOT NULL,
-					consumed_at INTEGER NOT NULL,
-					PRIMARY KEY(alias_id, uid_validity, uid)
-				)`,
-			},
-			wantError: "consumed_messages column uid is missing required CHECK(uid BETWEEN 1 AND 4294967295)",
-		},
-		{
-			name: "missing both UID range checks",
-			statements: []string{
-				`DROP TABLE imap_seen_tasks`,
-				`CREATE TABLE imap_seen_tasks (
-					account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-					uid_validity INTEGER NOT NULL,
-					uid INTEGER NOT NULL,
-					created_at INTEGER NOT NULL,
-					PRIMARY KEY(account_id, uid_validity, uid)
-				)`,
-				`CREATE INDEX imap_seen_tasks_account_created_idx
-					ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
-			},
-			wantError: "imap_seen_tasks column uid_validity is missing required CHECK(uid_validity BETWEEN 1 AND 4294967295)",
-		},
-		{
-			name: "extra marker column cannot forge range checks",
-			statements: []string{
-				`DROP TABLE consumed_messages`,
-				`CREATE TABLE consumed_messages (
-					alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
-					uid_validity INTEGER NOT NULL,
-					uid INTEGER NOT NULL,
-					consumed_at INTEGER NOT NULL,
-					marker TEXT NOT NULL DEFAULT 'CHECK(uid_validity BETWEEN 1 AND 4294967295) CHECK(uid BETWEEN 1 AND 4294967295)',
-					PRIMARY KEY(alias_id, uid_validity, uid)
-				)`,
-			},
-			wantError: "consumed_messages has 5 columns, want exactly 4",
-		},
-		{
-			name: "defaults strings and comments cannot forge range checks",
-			statements: []string{
-				`DROP TABLE consumed_messages`,
-				`CREATE TABLE consumed_messages (
-					alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
-					uid_validity INTEGER NOT NULL DEFAULT 'CHECK(uid_validity BETWEEN 1 AND 4294967295)',
-					uid INTEGER NOT NULL,
-					consumed_at INTEGER NOT NULL,
-					PRIMARY KEY(alias_id, uid_validity, uid),
-					CHECK('CHECK(uid BETWEEN 1 AND 4294967295)' <> '')
-					/* CHECK(uid_validity BETWEEN 1 AND 4294967295) */
-					-- CHECK(uid BETWEEN 1 AND 4294967295)
-				)`,
-			},
-			wantError: "consumed_messages column uid_validity is missing required CHECK(uid_validity BETWEEN 1 AND 4294967295)",
-		},
-		{
-			name: "wrong index column order",
-			statements: []string{
-				`DROP INDEX imap_seen_tasks_account_created_idx`,
-				`CREATE INDEX imap_seen_tasks_account_created_idx
-					ON imap_seen_tasks(account_id, uid_validity, created_at, uid)`,
-			},
-			wantError: "index imap_seen_tasks_account_created_idx column position 2",
-		},
-		{
-			name: "partial index",
-			statements: []string{
-				`DROP INDEX imap_seen_tasks_account_created_idx`,
-				`CREATE INDEX imap_seen_tasks_account_created_idx
-					ON imap_seen_tasks(account_id, created_at, uid_validity, uid)
-					WHERE created_at > 0`,
-			},
-			wantError: "index imap_seen_tasks_account_created_idx must not be partial",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			databasePath := filepath.Join(t.TempDir(), "malformed-v6.db")
-			fixture, err := store.Open(databasePath)
-			if err != nil {
-				t.Fatalf("create malformed v6 fixture: %v", err)
-			}
-			for _, statement := range test.statements {
-				if _, err := fixture.DB().ExecContext(context.Background(), statement); err != nil {
-					_ = fixture.Close()
-					t.Fatalf("prepare malformed v6 fixture with %q: %v", statement, err)
-				}
-			}
-			if err := fixture.Close(); err != nil {
-				t.Fatalf("close malformed v6 fixture: %v", err)
-			}
-
-			reopened, err := store.Open(databasePath)
-			if err == nil {
-				_ = reopened.Close()
-				t.Fatal("opening malformed v6 schema succeeded")
-			}
-			if !strings.Contains(err.Error(), test.wantError) {
-				t.Fatalf("open malformed v6 schema error = %q, want fragment %q", err, test.wantError)
-			}
-		})
-	}
-}
-
-func assertSQLiteRowCount(t *testing.T, ctx context.Context, db *sql.DB, table string, want int) {
+func createSQLiteV6Fixture(t *testing.T, databasePath string) *sql.DB {
 	t.Helper()
-	var got int
-	if err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM %s`, table)).Scan(&got); err != nil {
-		t.Fatalf("count %s rows: %v", table, err)
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open v6 fixture: %v", err)
 	}
-	if got != want {
-		t.Fatalf("%s row count = %d, want %d", table, got, want)
+	for _, statement := range legacyV1Schema {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			_ = db.Close()
+			t.Fatalf("create v6 core fixture: %v", err)
+		}
 	}
+	statements := []string{
+		`ALTER TABLE admins ADD COLUMN password_version INTEGER NOT NULL DEFAULT 1 CHECK(password_version >= 1)`,
+		`ALTER TABLE admin_sessions ADD COLUMN password_version INTEGER NOT NULL DEFAULT 1 CHECK(password_version >= 1)`,
+		`CREATE TABLE apple_web_sessions (
+			account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+			session_ciphertext TEXT NOT NULL, apple_id TEXT NOT NULL, region TEXT NOT NULL DEFAULT '',
+			authenticated INTEGER NOT NULL DEFAULT 0, last_validated_at INTEGER,
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE imap_sync_states (
+			account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+			uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+			last_uid INTEGER NOT NULL DEFAULT 0 CHECK(last_uid BETWEEN 0 AND 4294967295),
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE alias_creation_schedules (
+			account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+			enabled INTEGER NOT NULL DEFAULT 0, planned_at_json TEXT NOT NULL DEFAULT '[]',
+			next_run_at INTEGER, last_attempted_at INTEGER, last_created_at INTEGER,
+			last_alias_address TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE pending_alias_api_keys (
+			alias_id INTEGER PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+			api_key_ciphertext TEXT NOT NULL, created_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE consumed_messages (
+			alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+			uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+			uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295), consumed_at INTEGER NOT NULL,
+			PRIMARY KEY(alias_id, uid_validity, uid)
+		)`,
+		`CREATE TABLE imap_seen_tasks (
+			account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+			uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+			uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295), created_at INTEGER NOT NULL,
+			PRIMARY KEY(account_id, uid_validity, uid)
+		)`,
+		`CREATE INDEX imap_seen_tasks_account_created_idx
+			ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
+		`PRAGMA user_version = 6`,
+	}
+	for _, statement := range statements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			_ = db.Close()
+			t.Fatalf("create v6 extension fixture with %q: %v", statement, err)
+		}
+	}
+	return db
 }
 
-func normalizeV5SQL(statement string) string {
-	return strings.Join(strings.Fields(strings.ToLower(statement)), " ")
+func sqliteObjectExists(t *testing.T, ctx context.Context, db *sql.DB, objectType, name string) bool {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = ? AND name = ?`, objectType, name,
+	).Scan(&count); err != nil {
+		t.Fatalf("inspect SQLite %s %s: %v", objectType, name, err)
+	}
+	return count == 1
+}
+
+func sqliteTableColumns(t *testing.T, ctx context.Context, db *sql.DB, table string) map[string]bool {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		t.Fatalf("inspect SQLite table %s: %v", table, err)
+	}
+	defer rows.Close()
+	columns := make(map[string]bool)
+	for rows.Next() {
+		var position, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&position, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return columns
+}
+
+func oneArchivedMailboxMessage(t *testing.T, ctx context.Context, db *store.Store, aliasID int64) domain.ArchivedMailboxMessage {
+	t.Helper()
+	messages, err := db.ListArchivedMailboxMessages(ctx, aliasID)
+	if err != nil {
+		t.Fatalf("list migrated alias %d messages: %v", aliasID, err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("migrated alias %d message count = %d, want 1", aliasID, len(messages))
+	}
+	return messages[0]
 }

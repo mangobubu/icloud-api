@@ -1,7 +1,6 @@
 function normalizeKey(key) {
   return String(key ?? "");
 }
-
 export function createLatestRequestGate() {
   let generation = 0;
   let active = true;
@@ -28,7 +27,6 @@ export function createLatestRequestGate() {
     },
   };
 }
-
 export function createActionLock() {
   const activeKeys = new Set();
 
@@ -51,13 +49,4 @@ export function createActionLock() {
       return activeKeys.size > 0;
     },
   };
-}
-
-export function oneTimeSecretNavigationMode({
-  requestPending = false,
-  keyVisible = false,
-} = {}) {
-  if (requestPending) return "block";
-  if (keyVisible) return "confirm";
-  return "allow";
 }

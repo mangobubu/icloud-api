@@ -5,16 +5,17 @@ import AdminLayout from "../layouts/AdminLayout.vue";
 import { useAuth } from "../stores/auth.js";
 import { setPageHeader } from "../stores/page.js";
 import { buildLoginRedirect } from "../utils/authFlow.js";
+import { ADMIN_BASE_PATH } from "../utils/runtimePath.js";
 
 const routes = [
   {
-    path: "/admin/login",
+    path: "/login",
     name: "login",
     component: () => import("../views/LoginView.vue"),
     meta: { title: "登录", public: true },
   },
   {
-    path: "/admin/",
+    path: "/",
     component: AdminLayout,
     meta: { requiresAuth: true },
     children: [
@@ -55,7 +56,7 @@ const routes = [
         component: () => import("../views/AliasesView.vue"),
         meta: {
           title: "隐私邮箱",
-          subtitle: "查看每个地址的主号归属、Key 状态和最新收件时间",
+          subtitle: "查看每个地址的主号归属、完整凭证和最新收件时间",
         },
       },
       {
@@ -82,16 +83,15 @@ const routes = [
     ],
   },
   {
-    path: "/admin/:pathMatch(.*)*",
+    path: "/:pathMatch(.*)*",
     name: "admin-not-found",
     component: () => import("../views/NotFoundView.vue"),
     meta: { title: "页面不存在", public: true },
   },
-  { path: "/", redirect: "/admin/" },
 ];
 
 const router = createRouter({
-  history: createWebHistory(),
+  history: createWebHistory(`${ADMIN_BASE_PATH}/`),
   routes,
   scrollBehavior() {
     return { top: 0 };

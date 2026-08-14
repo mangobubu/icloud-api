@@ -63,7 +63,8 @@ func (s *Store) ImportLegacySQLite(ctx context.Context, legacyPath string) error
 }
 
 // ImportLegacySQLiteWithValidator is ImportLegacySQLite with authentication of
-// every encrypted IMAP credential and Apple session before it is persisted.
+// every encrypted IMAP credential, Apple session, and pending alias key before
+// it is persisted.
 func (s *Store) ImportLegacySQLiteWithValidator(
 	ctx context.Context,
 	legacyPath string,
@@ -157,6 +158,8 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 			UNION ALL SELECT 1 FROM accounts
 			UNION ALL SELECT 1 FROM aliases
 			UNION ALL SELECT 1 FROM latest_messages
+			UNION ALL SELECT 1 FROM archived_messages
+			UNION ALL SELECT 1 FROM alias_messages
 			UNION ALL SELECT 1 FROM audit_logs
 			UNION ALL SELECT 1 FROM apple_web_sessions
 			UNION ALL SELECT 1 FROM alias_creation_schedules
@@ -223,7 +226,6 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 	if err != nil {
 		return false, err
 	}
-
 	specs := legacySQLiteCopySpecs(adminHasPasswordVersion, sessionHasPasswordVersion, hasAppleSessions)
 	if hasAliasSchedules {
 		specs = append(specs, legacySQLiteAliasScheduleCopySpec())
@@ -243,6 +245,9 @@ func (s *Store) importLegacySQLiteWithValidatorTx(
 		if err := copyLegacySQLiteTable(ctx, legacyTx, tx, spec, validator); err != nil {
 			return false, err
 		}
+	}
+	if err := importLegacySQLiteSnapshots(ctx, legacyTx, tx); err != nil {
+		return false, err
 	}
 	for _, spec := range specs {
 		if spec.resetSequence {
@@ -322,8 +327,8 @@ func legacySQLiteCopySpecs(adminHasVersion, sessionHasVersion, hasAppleSessions 
 			insertSQL: `INSERT INTO aliases(
 				id, account_id, address, label, api_key_hash, api_key_prefix, enabled,
 				last_sync_status, last_sync_error, last_synced_at, last_accessed_at,
-				created_at, updated_at
-			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+				created_at, updated_at, credential_mode
+			) VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'legacy')`,
 			booleanColumns: map[int]string{6: "enabled"},
 		},
 		{
@@ -369,6 +374,81 @@ func legacySQLiteCopySpecs(adminHasVersion, sessionHasVersion, hasAppleSessions 
 		})
 	}
 	return specs
+}
+
+// importLegacySQLiteSnapshots keeps only the title and timestamps from the
+// pre-v2 one-message snapshot. The archived MIME and OTP history deliberately
+// begin at the upgrade boundary.
+func importLegacySQLiteSnapshots(ctx context.Context, source, target *sql.Tx) error {
+	rows, err := source.QueryContext(ctx, `
+		SELECT alias_id, uid_validity, uid, internal_date, header_date, subject, synced_at
+		FROM latest_messages
+		WHERE uid_validity > 0 AND uid > 0
+		ORDER BY alias_id`)
+	if err != nil {
+		return fmt.Errorf("read legacy SQLite latest_messages: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var aliasID, uidValidity, upstreamUID, internalDate, syncedAt int64
+		var headerDate sql.NullInt64
+		var subject string
+		if err := rows.Scan(
+			&aliasID, &uidValidity, &upstreamUID, &internalDate, &headerDate, &subject, &syncedAt,
+		); err != nil {
+			return fmt.Errorf("scan legacy SQLite latest_messages: %w", err)
+		}
+		var accountID int64
+		if err := target.QueryRowContext(ctx,
+			`SELECT account_id FROM aliases WHERE id = $1`, aliasID,
+		).Scan(&accountID); err != nil {
+			return fmt.Errorf("resolve imported legacy alias %d: %w", aliasID, err)
+		}
+		if _, err := target.ExecContext(ctx, `
+			INSERT INTO archived_messages(
+				account_id, uid_validity, upstream_uid, message_id, internal_date, header_date,
+				from_json, to_json, cc_json, subject, content_path, content_bytes,
+				content_sha256, content_state, body_truncated, synced_at, created_at
+			) VALUES($1, $2, $3, '', $4, $5, '[]', '[]', '[]', $6, '', 0, '',
+				'metadata_only', FALSE, $7, $7)
+			ON CONFLICT(account_id, uid_validity, upstream_uid) DO NOTHING`,
+			accountID, uidValidity, upstreamUID, internalDate, nullableLegacyInt64(headerDate),
+			sanitizePostgresText(subject), syncedAt,
+		); err != nil {
+			return fmt.Errorf("import legacy SQLite message metadata: %w", err)
+		}
+		var archivedID int64
+		if err := target.QueryRowContext(ctx, `
+			SELECT id FROM archived_messages
+			WHERE account_id = $1 AND uid_validity = $2 AND upstream_uid = $3`,
+			accountID, uidValidity, upstreamUID,
+		).Scan(&archivedID); err != nil {
+			return fmt.Errorf("resolve imported legacy message metadata: %w", err)
+		}
+		if _, err := target.ExecContext(ctx, `
+			INSERT INTO alias_messages(alias_id, message_id, mailbox_uid, otp, created_at)
+			VALUES($1, $2, 1, '', $3)
+			ON CONFLICT(alias_id, message_id) DO NOTHING`, aliasID, archivedID, syncedAt,
+		); err != nil {
+			return fmt.Errorf("link imported legacy message metadata: %w", err)
+		}
+		if _, err := target.ExecContext(ctx, `
+			UPDATE aliases SET mailbox_uid_next = GREATEST(mailbox_uid_next, 2) WHERE id = $1`, aliasID,
+		); err != nil {
+			return fmt.Errorf("advance imported legacy alias UID: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate legacy SQLite latest_messages: %w", err)
+	}
+	return nil
+}
+
+func nullableLegacyInt64(value sql.NullInt64) any {
+	if !value.Valid {
+		return nil
+	}
+	return value.Int64
 }
 
 func legacySQLiteAliasScheduleCopySpec() legacyCopySpec {

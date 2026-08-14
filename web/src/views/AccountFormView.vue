@@ -101,7 +101,7 @@
           <div class="switch-field">
             <div>
               <strong>启用主号同步</strong>
-              <p>停用后，此主号下所有隐私邮箱的 Key 会立即失效。</p>
+              <p>停用后，此主号下所有隐私邮箱的全部取件凭证会立即失效。</p>
             </div>
             <el-switch
               v-model="form.enabled"

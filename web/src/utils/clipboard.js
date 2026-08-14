@@ -1,4 +1,5 @@
-const RECENT_MAIL_PATHS = new Set([
+const OTP_PATH = "/api/v1/otp";
+const LEGACY_RECENT_MAIL_PATHS = new Set([
   "/api/v1/mail/recent",
   "/api/v1/mail/recent/",
 ]);
@@ -27,7 +28,7 @@ export function buildRecentMailDirectLink(relativePath, origin = globalThis.loca
     base.username ||
     base.password ||
     target.origin !== base.origin ||
-    !RECENT_MAIL_PATHS.has(target.pathname) ||
+    !LEGACY_RECENT_MAIL_PATHS.has(target.pathname) ||
     target.hash
   ) {
     throw new TypeError("邮件 API 直达链接格式无效。");
@@ -40,6 +41,49 @@ export function buildRecentMailDirectLink(relativePath, origin = globalThis.loca
     queryKeys[0] !== "api_key" ||
     apiKeys.length !== 1 ||
     !apiKeys[0]
+  ) {
+    throw new TypeError("邮件 API 直达链接格式无效。");
+  }
+  return target.href;
+}
+
+export function buildOTPDirectLink(relativePath, origin = globalThis.location?.origin) {
+  if (
+    typeof relativePath !== "string" ||
+    relativePath !== relativePath.trim() ||
+    !relativePath.startsWith("/") ||
+    relativePath.startsWith("//")
+  ) {
+    throw new TypeError("邮件 API 直达链接格式无效。");
+  }
+
+  let base;
+  let target;
+  try {
+    base = new URL(origin);
+    target = new URL(relativePath, `${base.origin}/`);
+  } catch {
+    throw new TypeError("邮件 API 直达链接格式无效。");
+  }
+
+  if (
+    !["http:", "https:"].includes(base.protocol) ||
+    base.username ||
+    base.password ||
+    target.origin !== base.origin ||
+    target.pathname !== OTP_PATH ||
+    target.hash
+  ) {
+    throw new TypeError("邮件 API 直达链接格式无效。");
+  }
+
+  const queryKeys = [...target.searchParams.keys()];
+  const tokens = target.searchParams.getAll("token");
+  if (
+    queryKeys.length !== 1 ||
+    queryKeys[0] !== "token" ||
+    tokens.length !== 1 ||
+    !tokens[0]
   ) {
     throw new TypeError("邮件 API 直达链接格式无效。");
   }

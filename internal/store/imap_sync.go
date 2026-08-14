@@ -44,10 +44,13 @@ func (s *Store) GetIMAPSyncState(ctx context.Context, accountID int64) (domain.I
 	return state, nil
 }
 
-// ListMailboxSnapshotPositions returns current snapshots for enabled aliases in
-// one account-level query. The sync fetcher validates all returned UIDs with a
-// single shared IMAP command, never one command per alias.
-func (s *Store) ListMailboxSnapshotPositions(ctx context.Context, accountID int64) (map[int64]domain.MailboxSnapshotPosition, error) {
+// ListMailboxSnapshotPositions returns the persisted v1 compatibility
+// snapshots for every enabled alias. V2 aliases use the archive for IMAPS and
+// OTP history, but their API keys and direct links still work with v1 routes.
+func (s *Store) ListMailboxSnapshotPositions(
+	ctx context.Context,
+	accountID int64,
+) (map[int64]domain.MailboxSnapshotPosition, error) {
 	if accountID < 1 {
 		return nil, fmt.Errorf("list mailbox snapshot positions: account ID must be positive")
 	}
@@ -86,7 +89,7 @@ func (s *Store) ListMailboxSnapshotPositions(ctx context.Context, accountID int6
 	return positions, nil
 }
 
-// ApplyMailboxSync publishes mailbox snapshots, advances the account cursor,
+// ApplyMailboxSync publishes archived messages, advances the account cursor,
 // and updates enabled aliases to pending or healthy in one transaction.
 func (s *Store) ApplyMailboxSync(
 	ctx context.Context,
@@ -96,13 +99,25 @@ func (s *Store) ApplyMailboxSync(
 	result domain.MailboxSyncResult,
 	syncedAt time.Time,
 ) error {
+	defer s.cleanupArchiveInputs(result.ArchivedMessages)
 	if expectedAccountVersion.IsZero() {
 		return fmt.Errorf("apply mailbox sync: expected account version is required")
 	}
-	messageIDs, err := validateMailboxSync(accountID, enabledAliases, result)
-	if err != nil {
+	if err := validateMailboxSync(accountID, enabledAliases, result); err != nil {
 		return err
 	}
+	unlockArchive := s.lockMailArchiveAccount(accountID)
+	defer unlockArchive()
+	stagedArchive, err := s.stageArchiveMessages(result.ArchivedMessages)
+	if err != nil {
+		return fmt.Errorf("stage mailbox archive: %w", err)
+	}
+	archiveCommitted := false
+	defer func() {
+		if !archiveCommitted {
+			s.cleanupPublishedArchive(stagedArchive)
+		}
+	}()
 	if syncedAt.IsZero() {
 		syncedAt = s.now()
 	}
@@ -164,7 +179,7 @@ func (s *Store) ApplyMailboxSync(
 			observedAt = syncedAt
 		}
 	case err == sql.ErrNoRows:
-		// Only an authoritative bounded snapshot may establish a missing cursor.
+		// Only an authoritative no-backfill baseline may establish a missing cursor.
 		// This also prevents an in-flight incremental result from recreating a
 		// cursor that an account or alias mutation deliberately invalidated.
 		if !result.Reset {
@@ -177,37 +192,19 @@ func (s *Store) ApplyMailboxSync(
 		return fmt.Errorf("read IMAP sync state before publish: %w", err)
 	}
 
-	if result.Reset {
-		query := `
-			DELETE FROM latest_messages
-			WHERE alias_id IN (SELECT id FROM aliases WHERE account_id = ?)`
-		args := []any{accountID}
-		if !currentStateExists || currentUIDValidity == int64(result.State.UIDValidity) {
-			// Cursor invalidation caused by a configuration or alias change must
-			// preserve same-generation snapshots outside the bounded reset window.
-			query += ` AND uid_validity <> ?`
-			args = append(args, int64(result.State.UIDValidity))
-		}
-		if _, err := s.txExecContext(ctx, tx, query, args...); err != nil {
-			return fmt.Errorf("reset mailbox snapshots: %w", err)
-		}
+	if err := s.persistArchivedMessagesTx(ctx, tx, result.ArchivedMessages, stagedArchive, syncedAt); err != nil {
+		return fmt.Errorf("persist mailbox archive: %w", err)
 	}
-
-	for _, aliasID := range messageIDs {
-		message := result.Messages[aliasID]
-		switch message.SnapshotState {
-		case domain.SnapshotFound:
-			message.SyncedAt = syncedAt
-			if err := s.upsertMailboxSnapshot(ctx, tx, message); err != nil {
-				return err
-			}
-		case domain.SnapshotEmpty:
-			if _, err := s.txExecContext(ctx, tx,
-				`DELETE FROM latest_messages WHERE alias_id = ?`, aliasID,
-			); err != nil {
-				return fmt.Errorf("delete empty mailbox snapshot for alias %d: %w", aliasID, err)
-			}
-		}
+	// Keep the v1 one-row snapshot in sync while the archive API uses the new
+	// normalized tables. This is intentionally a dual write: legacy aliases
+	// retain their old routes and consumption state, while v2 aliases can read
+	// the archive without depending on this compatibility table.
+	resetAllLegacySnapshots := result.Reset && currentStateExists &&
+		currentUIDValidity != int64(result.State.UIDValidity)
+	if err := s.persistLegacyLatestMessagesTx(
+		ctx, tx, accountID, result, syncedAt, resetAllLegacySnapshots,
+	); err != nil {
+		return fmt.Errorf("persist legacy mailbox snapshot: %w", err)
 	}
 
 	if _, err := s.txExecContext(ctx, tx, `
@@ -253,6 +250,109 @@ func (s *Store) ApplyMailboxSync(
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit mailbox sync: %w", err)
+	}
+	archiveCommitted = true
+	if err := s.EnforceMailArchiveLimit(ctx); err != nil {
+		return fmt.Errorf("enforce mailbox archive limit: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) persistLegacyLatestMessagesTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	accountID int64,
+	result domain.MailboxSyncResult,
+	syncedAt time.Time,
+	resetAllSnapshots bool,
+) error {
+	if result.Reset {
+		query := `DELETE FROM latest_messages WHERE alias_id IN (SELECT id FROM aliases WHERE account_id = ?)`
+		args := []any{accountID}
+		if !resetAllSnapshots && result.State.UIDValidity != 0 {
+			query += ` AND uid_validity <> ?`
+			args = append(args, int64(result.State.UIDValidity))
+		}
+		if _, err := s.txExecContext(ctx, tx, query, args...); err != nil {
+			return err
+		}
+	}
+	for aliasID, update := range result.LegacySnapshotUpdates {
+		if update.SnapshotState != domain.SnapshotEmpty {
+			continue
+		}
+		if _, err := s.txExecContext(ctx, tx, `
+			DELETE FROM latest_messages
+			WHERE alias_id = ?
+			  AND EXISTS (
+				SELECT 1 FROM aliases
+				WHERE id = ? AND account_id = ? AND enabled = TRUE
+			  )`,
+			aliasID, aliasID, accountID,
+		); err != nil {
+			return err
+		}
+	}
+	for _, archived := range result.ArchivedMessages {
+		// The v1 contract only exposed messages discovered as unread. Keep an
+		// already-read message in the normalized v2 archive, but do not let the
+		// compatibility projection resurrect or replace the legacy latest row.
+		if archived.UpstreamSeen {
+			continue
+		}
+		if len(archived.AliasIDs) == 0 {
+			continue
+		}
+		messageSyncedAt := archived.SyncedAt
+		if messageSyncedAt.IsZero() {
+			messageSyncedAt = syncedAt
+		}
+		for _, aliasID := range archived.AliasIDs {
+			if aliasID < 1 {
+				return fmt.Errorf("invalid legacy snapshot alias ID %d", aliasID)
+			}
+			fromJSON, err := marshalJSONList(archived.From)
+			if err != nil {
+				return err
+			}
+			toJSON, err := marshalJSONList(archived.To)
+			if err != nil {
+				return err
+			}
+			ccJSON, err := marshalJSONList(archived.CC)
+			if err != nil {
+				return err
+			}
+			attachmentsJSON, err := marshalJSONList(archived.Attachments)
+			if err != nil {
+				return err
+			}
+			if _, err := s.txExecContext(ctx, tx, `
+				INSERT INTO latest_messages(
+					alias_id, uid_validity, uid, message_id, internal_date, header_date,
+					from_json, to_json, cc_json, subject, text_body, html_body,
+					attachments_json, body_truncated, synced_at
+				) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+				WHERE EXISTS (SELECT 1 FROM aliases WHERE id = ? AND account_id = ?)
+				ON CONFLICT(alias_id) DO UPDATE SET
+					uid_validity = excluded.uid_validity, uid = excluded.uid,
+					message_id = excluded.message_id, internal_date = excluded.internal_date,
+					header_date = excluded.header_date, from_json = excluded.from_json,
+					to_json = excluded.to_json, cc_json = excluded.cc_json,
+					subject = excluded.subject, text_body = excluded.text_body,
+					html_body = excluded.html_body, attachments_json = excluded.attachments_json,
+					body_truncated = excluded.body_truncated, synced_at = excluded.synced_at
+				WHERE excluded.uid_validity != latest_messages.uid_validity
+				   OR (excluded.uid_validity = latest_messages.uid_validity AND excluded.uid >= latest_messages.uid)`,
+				aliasID, int64(archived.UIDValidity), int64(archived.UID),
+				sanitizePostgresText(archived.MessageID), timestamp(archived.InternalDate),
+				nullableTimestamp(archived.HeaderDate), fromJSON, toJSON, ccJSON,
+				sanitizePostgresText(archived.Subject), sanitizePostgresText(archived.TextBody),
+				sanitizePostgresText(archived.HTMLBody), attachmentsJSON, archived.BodyTruncated,
+				timestamp(messageSyncedAt), aliasID, accountID); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -369,128 +469,77 @@ func validateMailboxSync(
 	accountID int64,
 	enabledAliases []domain.Alias,
 	result domain.MailboxSyncResult,
-) ([]int64, error) {
+) error {
 	if accountID < 1 {
-		return nil, fmt.Errorf("apply mailbox sync: account ID must be positive")
+		return fmt.Errorf("apply mailbox sync: account ID must be positive")
 	}
 	if result.State.AccountID != accountID {
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"apply mailbox sync: state account ID %d does not match account %d",
 			result.State.AccountID, accountID,
 		)
 	}
 	if result.State.UIDValidity == 0 {
-		return nil, fmt.Errorf("apply mailbox sync: state UIDVALIDITY must be positive")
+		return fmt.Errorf("apply mailbox sync: state UIDVALIDITY must be positive")
 	}
-	enabled := make(map[int64]struct{}, len(enabledAliases))
+	enabled := make(map[int64]domain.Alias, len(enabledAliases))
 	for _, alias := range enabledAliases {
 		if alias.ID < 1 {
-			return nil, fmt.Errorf("apply mailbox sync: enabled alias ID must be positive")
+			return fmt.Errorf("apply mailbox sync: enabled alias ID must be positive")
 		}
 		if alias.AccountID != accountID {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"apply mailbox sync: alias %d belongs to account %d, not account %d",
 				alias.ID, alias.AccountID, accountID,
 			)
 		}
 		if !alias.Enabled {
-			return nil, fmt.Errorf("apply mailbox sync: alias %d is not enabled", alias.ID)
+			return fmt.Errorf("apply mailbox sync: alias %d is not enabled", alias.ID)
 		}
 		if _, duplicate := enabled[alias.ID]; duplicate {
-			return nil, fmt.Errorf("apply mailbox sync: duplicate enabled alias %d", alias.ID)
+			return fmt.Errorf("apply mailbox sync: duplicate enabled alias %d", alias.ID)
 		}
-		enabled[alias.ID] = struct{}{}
+		enabled[alias.ID] = alias
 	}
-	messageIDs := make([]int64, 0, len(result.Messages))
-	for aliasID, message := range result.Messages {
-		if _, ok := enabled[aliasID]; !ok {
-			return nil, fmt.Errorf("apply mailbox sync: message alias %d is not in the enabled alias set", aliasID)
+	for aliasID, update := range result.LegacySnapshotUpdates {
+		_, ok := enabled[aliasID]
+		if !ok {
+			return fmt.Errorf("apply mailbox sync: legacy snapshot alias %d is not enabled", aliasID)
 		}
-		if message.AliasID != aliasID {
-			return nil, fmt.Errorf(
-				"apply mailbox sync: message alias ID %d does not match map key %d",
-				message.AliasID, aliasID,
+		if update.AliasID != aliasID {
+			return fmt.Errorf(
+				"apply mailbox sync: legacy snapshot alias ID %d does not match map key %d",
+				update.AliasID, aliasID,
 			)
 		}
-		switch message.SnapshotState {
-		case domain.SnapshotFound:
-			if err := validateLatestMessagePosition(message); err != nil {
-				return nil, fmt.Errorf("apply mailbox sync: alias %d: %w", aliasID, err)
-			}
-			if message.UIDValidity != result.State.UIDValidity {
-				return nil, fmt.Errorf(
-					"apply mailbox sync: alias %d UIDVALIDITY %d does not match state %d",
-					aliasID, message.UIDValidity, result.State.UIDValidity,
-				)
-			}
-			if message.UID > result.State.LastUID {
-				return nil, fmt.Errorf(
-					"apply mailbox sync: alias %d UID %d is beyond state UID %d",
-					aliasID, message.UID, result.State.LastUID,
-				)
-			}
-		case domain.SnapshotEmpty:
-		default:
-			return nil, fmt.Errorf(
-				"apply mailbox sync: alias %d has unsupported snapshot state %q",
-				aliasID, message.SnapshotState,
-			)
+		if update.SnapshotState != domain.SnapshotEmpty ||
+			update.UIDValidity != result.State.UIDValidity || update.UID != 0 {
+			return fmt.Errorf("apply mailbox sync: legacy snapshot alias %d has invalid empty state", aliasID)
 		}
-		messageIDs = append(messageIDs, aliasID)
 	}
-	sort.Slice(messageIDs, func(left, right int) bool { return messageIDs[left] < messageIDs[right] })
-	return messageIDs, nil
-}
-
-func (s *Store) upsertMailboxSnapshot(ctx context.Context, tx *sql.Tx, message domain.LatestMessage) error {
-	sanitizeLatestMessageText(&message)
-	fromJSON, err := marshalJSONList(message.From)
-	if err != nil {
-		return fmt.Errorf("encode mailbox snapshot from addresses for alias %d: %w", message.AliasID, err)
-	}
-	toJSON, err := marshalJSONList(message.To)
-	if err != nil {
-		return fmt.Errorf("encode mailbox snapshot to addresses for alias %d: %w", message.AliasID, err)
-	}
-	ccJSON, err := marshalJSONList(message.CC)
-	if err != nil {
-		return fmt.Errorf("encode mailbox snapshot cc addresses for alias %d: %w", message.AliasID, err)
-	}
-	attachmentsJSON, err := marshalJSONList(message.Attachments)
-	if err != nil {
-		return fmt.Errorf("encode mailbox snapshot attachments for alias %d: %w", message.AliasID, err)
-	}
-
-	if _, err := s.txExecContext(ctx, tx, `
-		INSERT INTO latest_messages(
-			alias_id, uid_validity, uid, message_id, internal_date, header_date,
-			from_json, to_json, cc_json, subject, text_body, html_body,
-			attachments_json, body_truncated, synced_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(alias_id) DO UPDATE SET
-			uid_validity = excluded.uid_validity,
-			uid = excluded.uid,
-			message_id = excluded.message_id,
-			internal_date = excluded.internal_date,
-			header_date = excluded.header_date,
-			from_json = excluded.from_json,
-			to_json = excluded.to_json,
-			cc_json = excluded.cc_json,
-			subject = excluded.subject,
-			text_body = excluded.text_body,
-			html_body = excluded.html_body,
-			attachments_json = excluded.attachments_json,
-			body_truncated = excluded.body_truncated,
-			synced_at = excluded.synced_at
-		WHERE excluded.uid_validity != latest_messages.uid_validity
-		   OR (excluded.uid_validity = latest_messages.uid_validity
-		       AND excluded.uid >= latest_messages.uid)`,
-		message.AliasID, int64(message.UIDValidity), int64(message.UID), message.MessageID,
-		timestamp(message.InternalDate), nullableTimestamp(message.HeaderDate),
-		fromJSON, toJSON, ccJSON, message.Subject, message.TextBody, message.HTMLBody,
-		attachmentsJSON, message.BodyTruncated, timestamp(message.SyncedAt),
-	); err != nil {
-		return fmt.Errorf("upsert mailbox snapshot for alias %d: %w", message.AliasID, err)
+	upstreamUIDs := make(map[uint32]struct{}, len(result.ArchivedMessages))
+	for index, message := range result.ArchivedMessages {
+		if message.AccountID != accountID || message.UIDValidity != result.State.UIDValidity ||
+			message.UID == 0 || message.UID > result.State.LastUID || message.InternalDate.IsZero() {
+			return fmt.Errorf("apply mailbox sync: archived message %d has invalid identity", index)
+		}
+		if _, duplicate := upstreamUIDs[message.UID]; duplicate {
+			return fmt.Errorf("apply mailbox sync: archived message UID %d is duplicated", message.UID)
+		}
+		upstreamUIDs[message.UID] = struct{}{}
+		if len(message.AliasIDs) == 0 {
+			return fmt.Errorf("apply mailbox sync: archived message %d has no alias recipients", index)
+		}
+		messageAliases := make(map[int64]struct{}, len(message.AliasIDs))
+		for _, aliasID := range message.AliasIDs {
+			if _, ok := enabled[aliasID]; !ok {
+				return fmt.Errorf("apply mailbox sync: archived message alias %d is not enabled", aliasID)
+			}
+			if _, duplicate := messageAliases[aliasID]; duplicate {
+				return fmt.Errorf("apply mailbox sync: archived message alias %d is duplicated", aliasID)
+			}
+			messageAliases[aliasID] = struct{}{}
+		}
 	}
 	return nil
 }

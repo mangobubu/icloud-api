@@ -130,8 +130,8 @@ const noticeType = computed(() =>
 function redirectTarget() {
   const target = String(route.query.redirect || "");
   if (
-    target.startsWith("/admin") &&
-    !target.startsWith("/admin/login") &&
+    target.startsWith("/") &&
+    !target.startsWith("/login") &&
     !target.startsWith("//")
   ) {
     return target;

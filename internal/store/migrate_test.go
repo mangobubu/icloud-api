@@ -3,7 +3,6 @@ package store_test
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,7 +12,7 @@ import (
 	"icloud-api/internal/store"
 )
 
-func TestMigrateV1ToV6(t *testing.T) {
+func TestMigrateV1ToV7PreservesSnapshotMetadataOnly(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -105,8 +104,8 @@ func TestMigrateV1ToV6(t *testing.T) {
 	if err := db.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatalf("read migrated schema version: %v", err)
 	}
-	if schemaVersion != 6 {
-		t.Fatalf("schema version = %d, want 6", schemaVersion)
+	if schemaVersion != 7 {
+		t.Fatalf("schema version = %d, want 7", schemaVersion)
 	}
 
 	var adminPasswordVersion, sessionPasswordVersion int64
@@ -128,12 +127,14 @@ func TestMigrateV1ToV6(t *testing.T) {
 		t.Fatalf("migrated session = %#v", session)
 	}
 
-	message, err := db.GetLatestMessage(ctx, 2)
+	messages, err := db.ListArchivedMailboxMessages(ctx, 2)
 	if err != nil {
-		t.Fatalf("read retained latest message: %v", err)
+		t.Fatalf("read migrated metadata message: %v", err)
 	}
-	if message.Subject != "retained snapshot" || message.UIDValidity != 100 || message.UID != 7 {
-		t.Fatalf("retained latest message = %#v", message)
+	if len(messages) != 1 || messages[0].Subject != "retained snapshot" ||
+		messages[0].MessageID != "valid-message" || messages[0].MailboxUID != 1 ||
+		messages[0].ContentState != domain.ArchiveContentMetadata {
+		t.Fatalf("migrated metadata message = %#v", messages)
 	}
 	validAlias, err := db.GetAlias(ctx, 2)
 	if err != nil {
@@ -143,8 +144,9 @@ func TestMigrateV1ToV6(t *testing.T) {
 		t.Fatalf("valid alias sync state changed: %#v", validAlias)
 	}
 
-	if _, err := db.GetLatestMessage(ctx, 1); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("removed UID 0 snapshot error = %v, want ErrNotFound", err)
+	invalidMessages, err := db.ListArchivedMailboxMessages(ctx, 1)
+	if err != nil || len(invalidMessages) != 0 {
+		t.Fatalf("invalid UID 0 snapshot migrated: messages=%#v err=%v", invalidMessages, err)
 	}
 	invalidAlias, err := db.GetAlias(ctx, 1)
 	if err != nil {
@@ -155,18 +157,21 @@ func TestMigrateV1ToV6(t *testing.T) {
 		t.Fatalf("reset alias sync state = %#v", invalidAlias)
 	}
 
+	if !sqliteObjectExists(t, ctx, db.DB(), "table", "latest_messages") {
+		t.Fatal("v7 migration removed the legacy latest_messages compatibility table")
+	}
 	if _, err := db.DB().ExecContext(ctx, `
 		INSERT INTO latest_messages(alias_id, uid_validity, uid, internal_date, synced_at)
 		VALUES(1, 100, 0, ?, ?)`, now.UnixNano(), now.UnixNano()); err == nil {
-		t.Fatal("migrated latest_messages constraint accepted UID 0")
+		t.Fatal("latest_messages accepted an invalid zero UID")
 	}
 }
 
-func TestSQLiteV6ConvergenceRestoresQueryIndexes(t *testing.T) {
+func TestSQLiteV7ConvergenceRestoresQueryIndexes(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	databasePath := filepath.Join(t.TempDir(), "v6-index-convergence.db")
+	databasePath := filepath.Join(t.TempDir(), "v7-index-convergence.db")
 	current, err := store.Open(databasePath)
 	if err != nil {
 		t.Fatalf("create current database: %v", err)
@@ -174,27 +179,29 @@ func TestSQLiteV6ConvergenceRestoresQueryIndexes(t *testing.T) {
 	for _, index := range []string{
 		"aliases_account_address_idx",
 		"aliases_enabled_account_address_idx",
-		"imap_seen_tasks_account_created_idx",
+		"archived_messages_retention_idx",
+		"alias_messages_alias_uid_idx",
 	} {
 		if _, err := current.DB().ExecContext(ctx, `DROP INDEX `+index); err != nil {
 			_ = current.Close()
-			t.Fatalf("drop %s from v6 fixture: %v", index, err)
+			t.Fatalf("drop %s from v7 fixture: %v", index, err)
 		}
 	}
 	if err := current.Close(); err != nil {
-		t.Fatalf("close v6 fixture: %v", err)
+		t.Fatalf("close v7 fixture: %v", err)
 	}
 
 	converged, err := store.Open(databasePath)
 	if err != nil {
-		t.Fatalf("reopen and converge v6 database: %v", err)
+		t.Fatalf("reopen and converge v7 database: %v", err)
 	}
 	t.Cleanup(func() { _ = converged.Close() })
 
 	wanted := map[string]string{
 		"aliases_account_address_idx":         "create index aliases_account_address_idx on aliases(account_id, address, id)",
 		"aliases_enabled_account_address_idx": "create index aliases_enabled_account_address_idx on aliases(account_id, enabled, address, id)",
-		"imap_seen_tasks_account_created_idx": "create index imap_seen_tasks_account_created_idx on imap_seen_tasks(account_id, created_at, uid_validity, uid)",
+		"archived_messages_retention_idx":     "create index archived_messages_retention_idx on archived_messages(content_state, internal_date, id)",
+		"alias_messages_alias_uid_idx":        "create index alias_messages_alias_uid_idx on alias_messages(alias_id, mailbox_uid desc)",
 	}
 	for name, definition := range wanted {
 		var got string

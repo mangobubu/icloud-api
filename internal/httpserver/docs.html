@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>隐私邮箱外部取件 API v2</title>
+  <style>
+    :root{color-scheme:light dark;font:16px/1.6 system-ui,sans-serif}body{max-width:900px;margin:0 auto;padding:40px 24px 80px}h1,h2{line-height:1.25}code,pre{font-family:ui-monospace,monospace}pre{padding:16px;border:1px solid #8886;border-radius:10px;overflow:auto;background:#8881}.note{padding:12px 16px;border-left:4px solid #4b8cff;background:#4b8cff16}
+  </style>
+</head>
+<body>
+  <h1>隐私邮箱外部取件 API v2</h1>
+  <p>本服务提供两种取件方式：只读 IMAPS，以及返回验证码历史的 HTTP API。所有响应均可重复读取，不消费验证码，也不改变邮件已读状态。</p>
+
+  <h2>验证码 API</h2>
+  <p>使用完整 API Key：</p>
+  <pre>curl -H "Authorization: Bearer API_KEY" https://HOST/api/v1/otp</pre>
+  <p>或直接访问签发的取码 URL：</p>
+  <pre>https://HOST/api/v1/otp?token=DERIVED_TOKEN</pre>
+  <p>响应是最新优先的裸 JSON 数组，每个邮箱最多保留 100 条验证码：</p>
+  <pre>[{"otp":"123456","time":"2026-08-11T12:00:00+08:00"}]</pre>
+  <p>没有验证码时返回 <code>200 []</code>。</p>
+
+  <h2>访问令牌</h2>
+  <p>用服务签发的 client ID 与 refresh token 换取一小时有效的 IMAPS XOAUTH2 访问令牌：</p>
+  <pre>curl -X POST https://HOST/oauth2/v2.0/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=refresh_token" \
+  --data-urlencode "client_id=CLIENT_ID" \
+  --data-urlencode "refresh_token=REFRESH_TOKEN"</pre>
+  <pre>{"access_token":"ACCESS_TOKEN","token_type":"Bearer","expires_in":3600}</pre>
+
+  <h2>只读 IMAPS</h2>
+  <p>连接部署方提供的 IMAPS 主机与端口，用户名为隐私邮箱地址。可直接使用服务签发的 IMAP 密码登录，也可使用上一步访问令牌进行 XOAUTH2 登录。</p>
+  <p>邮箱仅包含一个只读 <code>INBOX</code>，支持 LIST、STATUS、SELECT/EXAMINE、SEARCH、FETCH、UID FETCH 与 IDLE。写入、改旗标、移动和删除命令会返回只读错误。</p>
+  <p class="note">API Key、IMAP 密码、client ID、refresh token 与 access token 都由本服务签发；轮换邮箱凭证后，旧凭证会同时失效。</p>
+</body>
+</html>

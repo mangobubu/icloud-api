@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -16,12 +17,22 @@ const (
 )
 
 type Config struct {
-	Addr                      string
-	DatabaseURL               string
-	LegacySQLitePath          string
-	WebRoot                   string
-	MasterKeyFile             string
+	Addr             string
+	DatabaseURL      string
+	LegacySQLitePath string
+	WebRoot          string
+	MasterKeyFile    string
+	// OAuthToken authenticates the legacy external alias-registration API.
+	// It is hashed into the HTTP server at startup and never retained in cfg.
 	OAuthToken                string
+	AdminPath                 string
+	AdminPathFile             string
+	MailContentDir            string
+	MailContentLimitBytes     int64
+	PublicIMAPAddr            string
+	PublicIMAPServerName      string
+	PublicIMAPTLSCertFile     string
+	PublicIMAPTLSKeyFile      string
 	AdminUsername             string
 	AdminPassword             string
 	CookieSecure              bool
@@ -41,15 +52,22 @@ type Config struct {
 
 func Load() (Config, error) {
 	cfg := Config{
-		Addr:             env("ICLOUD_API_ADDR", "127.0.0.1:8080"),
-		DatabaseURL:      env("ICLOUD_API_DATABASE_URL", "postgres://icloud_api@/icloud_api?host=/var/run/postgresql&sslmode=disable"),
-		LegacySQLitePath: strings.TrimSpace(os.Getenv("ICLOUD_API_LEGACY_SQLITE")),
-		WebRoot:          strings.TrimSpace(os.Getenv("ICLOUD_API_WEB_ROOT")),
-		OAuthToken:       strings.TrimSpace(os.Getenv("ICLOUD_API_OAUTH_TOKEN")),
-		AdminUsername:    env("ICLOUD_API_ADMIN_USER", "admin"),
-		AdminPassword:    os.Getenv("ICLOUD_API_ADMIN_PASSWORD"),
-		GinMode:          env("GIN_MODE", "release"),
-		Timezone:         time.Local,
+		Addr:                  env("ICLOUD_API_ADDR", "127.0.0.1:8080"),
+		DatabaseURL:           env("ICLOUD_API_DATABASE_URL", "postgres://icloud_api@/icloud_api?host=/var/run/postgresql&sslmode=disable"),
+		LegacySQLitePath:      strings.TrimSpace(os.Getenv("ICLOUD_API_LEGACY_SQLITE")),
+		WebRoot:               strings.TrimSpace(os.Getenv("ICLOUD_API_WEB_ROOT")),
+		OAuthToken:            strings.TrimSpace(os.Getenv("ICLOUD_API_OAUTH_TOKEN")),
+		AdminPath:             strings.TrimSpace(os.Getenv("ICLOUD_API_ADMIN_PATH")),
+		AdminPathFile:         env("ICLOUD_API_ADMIN_PATH_FILE", "/app/keys/admin-path"),
+		MailContentDir:        env("ICLOUD_API_MAIL_CONTENT_DIR", "/app/mail-archive"),
+		PublicIMAPAddr:        env("ICLOUD_API_PUBLIC_IMAP_ADDR", "127.0.0.1:1993"),
+		PublicIMAPServerName:  env("ICLOUD_API_PUBLIC_IMAP_SERVER_NAME", "localhost"),
+		PublicIMAPTLSCertFile: strings.TrimSpace(os.Getenv("ICLOUD_API_PUBLIC_IMAP_TLS_CERT_FILE")),
+		PublicIMAPTLSKeyFile:  strings.TrimSpace(os.Getenv("ICLOUD_API_PUBLIC_IMAP_TLS_KEY_FILE")),
+		AdminUsername:         env("ICLOUD_API_ADMIN_USER", "admin"),
+		AdminPassword:         os.Getenv("ICLOUD_API_ADMIN_PASSWORD"),
+		GinMode:               env("GIN_MODE", "release"),
+		Timezone:              time.Local,
 	}
 	if value := strings.TrimSpace(os.Getenv("TZ")); value != "" {
 		location, err := time.LoadLocation(value)
@@ -92,10 +110,13 @@ func Load() (Config, error) {
 	if cfg.SyncConcurrency, err = envInt("ICLOUD_API_SYNC_CONCURRENCY", 3); err != nil {
 		return Config{}, err
 	}
-	if cfg.MaxMessageBytes, err = envInt64("ICLOUD_API_MAX_MESSAGE_BYTES", 1<<20); err != nil {
+	if cfg.MaxMessageBytes, err = envInt64("ICLOUD_API_MAX_MESSAGE_BYTES", 100<<20); err != nil {
 		return Config{}, err
 	}
 	if cfg.MaxBodyBytes, err = envInt64("ICLOUD_API_MAX_BODY_BYTES", 512<<10); err != nil {
+		return Config{}, err
+	}
+	if cfg.MailContentLimitBytes, err = envInt64("ICLOUD_API_MAIL_CONTENT_LIMIT_BYTES", 10<<30); err != nil {
 		return Config{}, err
 	}
 
@@ -138,6 +159,24 @@ func Load() (Config, error) {
 	}
 	if cfg.MaxBodyBytes < 1<<10 || cfg.MaxBodyBytes > cfg.MaxMessageBytes {
 		return Config{}, fmt.Errorf("ICLOUD_API_MAX_BODY_BYTES 必须在 1 KiB 到邮件上限之间")
+	}
+	if cfg.MailContentLimitBytes < 1<<20 || cfg.MailContentLimitBytes > 1<<50 {
+		return Config{}, fmt.Errorf("ICLOUD_API_MAIL_CONTENT_LIMIT_BYTES 必须在 1 MiB 到 1 PiB 之间")
+	}
+	if strings.TrimSpace(cfg.MailContentDir) == "" {
+		return Config{}, fmt.Errorf("ICLOUD_API_MAIL_CONTENT_DIR 不能为空")
+	}
+	if strings.TrimSpace(cfg.AdminPathFile) == "" {
+		return Config{}, fmt.Errorf("ICLOUD_API_ADMIN_PATH_FILE 不能为空")
+	}
+	if _, _, err := net.SplitHostPort(cfg.PublicIMAPAddr); err != nil {
+		return Config{}, fmt.Errorf("ICLOUD_API_PUBLIC_IMAP_ADDR 必须是 host:port")
+	}
+	if cfg.PublicIMAPServerName == "" || strings.ContainsAny(cfg.PublicIMAPServerName, " \t\r\n") {
+		return Config{}, fmt.Errorf("ICLOUD_API_PUBLIC_IMAP_SERVER_NAME 必须是非空且不含空白的名称")
+	}
+	if (cfg.PublicIMAPTLSCertFile == "") != (cfg.PublicIMAPTLSKeyFile == "") {
+		return Config{}, fmt.Errorf("公开 IMAPS 证书与私钥必须同时配置")
 	}
 	return cfg, nil
 }

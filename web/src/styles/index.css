@@ -1042,90 +1042,6 @@ code {
   font-size: 13px;
 }
 
-.secret-region {
-  position: relative;
-  scroll-margin-top: calc(var(--topbar-height) + 14px);
-}
-
-.one-time-secret {
-  display: grid;
-  grid-template-columns: minmax(180px, 0.65fr) minmax(0, 1.35fr);
-  align-items: center;
-  gap: 24px;
-  padding: 18px 54px 18px 18px;
-  background: #f0f8f4;
-  border: 1px solid #b9d9c9;
-  border-left: 4px solid var(--success);
-  border-radius: 6px;
-}
-
-.one-time-secret h2 {
-  color: #124e34;
-  font-size: 15px;
-}
-
-.one-time-secret p {
-  margin-top: 5px;
-  color: #446557;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.one-time-secret__values,
-.one-time-secret__item {
-  display: grid;
-  min-width: 0;
-}
-
-.one-time-secret__values {
-  gap: 12px;
-}
-
-.one-time-secret__item {
-  gap: 5px;
-}
-
-.one-time-secret__label {
-  color: #315f4b;
-  font-size: 12px;
-  font-weight: 650;
-}
-
-.one-time-secret__value {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-}
-
-.one-time-secret__value code {
-  min-width: 0;
-  padding: 10px 11px;
-  overflow: auto hidden;
-  color: #173a2b;
-  white-space: nowrap;
-  background: #ffffff;
-  border: 1px solid #bfd5ca;
-  border-radius: 4px;
-}
-
-.one-time-secret__value--link code {
-  line-height: 1.45;
-  overflow-wrap: anywhere;
-  white-space: normal;
-  word-break: break-all;
-}
-
-.one-time-secret__value .el-button {
-  min-width: 104px;
-}
-
-.secret-region__close {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-}
-
 .empty-state {
   display: flex;
   align-items: center;
@@ -1599,11 +1515,6 @@ code {
     gap: 12px;
   }
 
-  .one-time-secret {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 13px;
-  }
-
   .login-panel {
     padding: 24px 20px;
   }
@@ -1624,14 +1535,6 @@ code {
 
   .auto-creation-metrics {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  .one-time-secret__value {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .one-time-secret__value .el-button {
-    width: 100%;
   }
 
   .switch-field {
@@ -1695,7 +1598,6 @@ code {
   .mobile-record__actions,
   .danger-zone,
   .request-alert,
-  .secret-region__close,
   .el-button {
     display: none !important;
   }

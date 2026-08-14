@@ -2,11 +2,14 @@ package mail
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"sort"
 
-	"github.com/emersion/go-imap"
+	imapv2 "github.com/emersion/go-imap/v2"
+	imapclientv2 "github.com/emersion/go-imap/v2/imapclient"
 
 	"icloud-api/internal/domain"
 )
@@ -53,7 +56,7 @@ func (f *Fetcher) MarkSeen(
 	if err != nil {
 		return err
 	}
-	session, err := settings.dial(ctx, address, host, settings.timeout)
+	client, err := dialSeenIMAP(ctx, address, host, settings)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -67,23 +70,23 @@ func (f *Fetcher) MarkSeen(
 		defer close(cancellationStopped)
 		select {
 		case <-ctx.Done():
-			_ = session.Terminate()
+			_ = client.Close()
 		case <-stopCancellation:
 		}
 	}()
 	defer func() {
 		close(stopCancellation)
 		<-cancellationStopped
-		_ = session.Terminate()
+		_ = client.Close()
 	}()
 
-	if err := session.Login(username, password); err != nil {
+	if err := client.Login(username, password).Wait(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		return fmt.Errorf("login IMAP account to mark messages seen: %w", err)
 	}
-	mailbox, err := session.Select("INBOX", false)
+	mailbox, err := client.Select("INBOX", &imapv2.SelectOptions{ReadOnly: false}).Wait()
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
@@ -93,29 +96,54 @@ func (f *Fetcher) MarkSeen(
 	if mailbox == nil {
 		return errors.New("select INBOX read-write to mark messages seen: empty mailbox status")
 	}
-	if mailbox.UidValidity == 0 {
+	if mailbox.UIDValidity == 0 {
 		return errors.New("select INBOX read-write to mark messages seen: UIDVALIDITY is zero")
 	}
-	if mailbox.UidValidity != expectedUIDValidity {
+	if mailbox.UIDValidity != expectedUIDValidity {
 		return &UIDValidityMismatchError{
 			Expected: expectedUIDValidity,
-			Actual:   mailbox.UidValidity,
+			Actual:   mailbox.UIDValidity,
 		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	set := new(imap.SeqSet)
-	set.AddNum(uniqueUIDs...)
-	item := imap.FormatFlagsOp(imap.AddFlags, true)
-	if err := session.UidStore(set, item, []interface{}{imap.SeenFlag}, nil); err != nil {
+	set := imapv2.UIDSet{}
+	for _, uid := range uniqueUIDs {
+		set.AddNum(imapv2.UID(uid))
+	}
+	flags := &imapv2.StoreFlags{
+		Op:     imapv2.StoreFlagsAdd,
+		Silent: true,
+		Flags:  []imapv2.Flag{imapv2.FlagSeen},
+	}
+	if err := client.Store(set, flags, nil).Close(); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 		return fmt.Errorf("mark IMAP messages seen with UID STORE: %w", err)
 	}
 	return nil
+}
+
+// dialSeenIMAP keeps the write-side compatibility path independent from the
+// archive fetcher's connection implementation.
+func dialSeenIMAP(ctx context.Context, address, serverName string, settings fetchSettings) (*imapclientv2.Client, error) {
+	dialer := &net.Dialer{Timeout: settings.timeout}
+	connection, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
+	tlsConnection := tls.Client(connection, tlsConfig)
+	handshakeContext, cancel := context.WithTimeout(ctx, settings.timeout)
+	defer cancel()
+	if err := tlsConnection.HandshakeContext(handshakeContext); err != nil {
+		_ = connection.Close()
+		return nil, err
+	}
+	return imapclientv2.New(tlsConnection, &imapclientv2.Options{WordDecoder: headerWordDecoder}), nil
 }
 
 func normalizeUIDs(uids []uint32) ([]uint32, error) {

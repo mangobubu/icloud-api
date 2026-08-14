@@ -20,20 +20,56 @@ func (s *Store) ImportAliases(
 	accountID int64,
 	candidates []domain.AliasImportCandidate,
 ) (domain.AliasImportResult, error) {
+	result, _, err := s.importAliases(ctx, accountID, candidates, false)
+	return result, err
+}
+
+// ImportAliasesWithCredentials preserves the original one-time sync response
+// while keeping v2 credential generation inside the store transaction.
+func (s *Store) ImportAliasesWithCredentials(
+	ctx context.Context,
+	accountID int64,
+	candidates []domain.AliasImportCandidate,
+) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
+	return s.importAliases(ctx, accountID, candidates, true)
+}
+
+func (s *Store) importAliases(
+	ctx context.Context,
+	accountID int64,
+	candidates []domain.AliasImportCandidate,
+	includeCredentials bool,
+) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
+	if includeCredentials && s.credentialFactory == nil {
+		return domain.AliasImportResult{}, nil, fmt.Errorf("import aliases: v2 credential factory is not configured")
+	}
+	if includeCredentials && s.credentialRevealFactory == nil {
+		return domain.AliasImportResult{}, nil, fmt.Errorf("import aliases: credential reveal factory is not configured")
+	}
 	normalized, err := normalizeAliasImportCandidates(candidates)
 	if err != nil {
-		return domain.AliasImportResult{}, err
+		return domain.AliasImportResult{}, nil, err
+	}
+	if !includeCredentials {
+		for _, candidate := range normalized {
+			if len(candidate.APIKeyHash) == 0 {
+				return domain.AliasImportResult{}, nil, fmt.Errorf("import aliases: candidate %q has empty api key hash", candidate.Address)
+			}
+			if candidate.APIKeyPrefix == "" {
+				return domain.AliasImportResult{}, nil, fmt.Errorf("import aliases: candidate %q has empty api key prefix", candidate.Address)
+			}
+		}
 	}
 
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
-		return domain.AliasImportResult{}, fmt.Errorf("begin alias import: %w", err)
+		return domain.AliasImportResult{}, nil, fmt.Errorf("begin alias import: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
 	if err != nil {
-		return domain.AliasImportResult{}, fmt.Errorf("lock account for alias import: %w", err)
+		return domain.AliasImportResult{}, nil, fmt.Errorf("lock account for alias import: %w", err)
 	}
 
 	result := domain.AliasImportResult{
@@ -57,12 +93,12 @@ func (s *Store) ImportAliases(
 			})
 			continue
 		case findErr != ErrNotFound:
-			return domain.AliasImportResult{}, fmt.Errorf("find alias %q during import: %w", candidate.Address, findErr)
+			return domain.AliasImportResult{}, nil, fmt.Errorf("find alias %q during import: %w", candidate.Address, findErr)
 		}
 		pending = append(pending, candidate)
 	}
 	if len(result.Conflicts) > 0 {
-		return result, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
+		return result, nil, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
 	}
 
 	var enabledCount int
@@ -72,7 +108,7 @@ func (s *Store) ImportAliases(
 		  AND (enabled = TRUE OR (enabled = FALSE AND last_sync_error = ?))`,
 		accountID, domain.AppleAliasConfirmationPending,
 	).Scan(&enabledCount); err != nil {
-		return domain.AliasImportResult{}, fmt.Errorf("count enabled and confirmation-pending aliases before import: %w", err)
+		return domain.AliasImportResult{}, nil, fmt.Errorf("count enabled and confirmation-pending aliases before import: %w", err)
 	}
 
 	type insertion struct {
@@ -97,26 +133,38 @@ func (s *Store) ImportAliases(
 	now := s.now()
 	createdEnabled := false
 	createdByAddress := make(map[string]domain.Alias, len(insertions))
+	credentialsByAddress := make(map[string]domain.AliasImportCredential, len(insertions))
 	for _, item := range insertions {
 		candidate := item.candidate
 		enabled := item.enabled
+		credentialMode := domain.AliasCredentialModeLegacy
+		initialHash := append([]byte(nil), candidate.APIKeyHash...)
+		apiKeyPrefix := candidate.APIKeyPrefix
+		if includeCredentials {
+			credentialMode = domain.AliasCredentialModeV2
+			apiKeyPrefix = ""
+			initialHash, err = provisionalAliasHash(nil)
+			if err != nil {
+				return domain.AliasImportResult{}, nil, fmt.Errorf("create imported alias provisional credential: %w", err)
+			}
+		}
 		var id int64
-		err := s.txQueryRowContext(ctx, tx, `
+		err = s.txQueryRowContext(ctx, tx, `
 			INSERT INTO aliases(
-				account_id, address, label, api_key_hash, api_key_prefix, enabled,
+				account_id, address, label, api_key_hash, api_key_prefix, credential_mode, enabled,
 				last_sync_status, last_sync_error, last_synced_at,
 				last_accessed_at, created_at, updated_at
-			) VALUES(?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, ?, ?)
+			) VALUES(?, ?, ?, ?, ?, ?, ?, ?, '', NULL, NULL, ?, ?)
 			ON CONFLICT(address) DO NOTHING
 			RETURNING id`,
-			accountID, candidate.Address, candidate.Label, candidate.APIKeyHash,
-			candidate.APIKeyPrefix, enabled, domain.SyncStatusPending,
+			accountID, candidate.Address, candidate.Label, initialHash, apiKeyPrefix,
+			credentialMode, enabled, domain.SyncStatusPending,
 			timestamp(now), timestamp(now),
 		).Scan(&id)
 		if err == sql.ErrNoRows {
 			existing, findErr := s.getAliasByAddressTx(ctx, tx, candidate.Address)
 			if findErr != nil {
-				return domain.AliasImportResult{}, fmt.Errorf(
+				return domain.AliasImportResult{}, nil, fmt.Errorf(
 					"read concurrent owner of alias %q: %w", candidate.Address, findErr,
 				)
 			}
@@ -132,16 +180,30 @@ func (s *Store) ImportAliases(
 				ExistingAccountID:    existing.AccountID,
 				ExistingAccountEmail: existing.AccountEmail,
 			})
-			return result, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
+			return result, nil, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
 		}
 		if err != nil {
-			return domain.AliasImportResult{}, fmt.Errorf("import alias %q: %w", candidate.Address, err)
+			return domain.AliasImportResult{}, nil, fmt.Errorf("import alias %q: %w", candidate.Address, err)
+		}
+		var material domain.AliasCredentialMaterial
+		if includeCredentials {
+			material, err = s.installGeneratedAliasCredentialsTx(ctx, tx, id, 1, true)
+			if err != nil {
+				return domain.AliasImportResult{}, nil, fmt.Errorf("create imported alias %q credentials: %w", candidate.Address, err)
+			}
 		}
 		created, err := s.getAliasByIDTx(ctx, tx, id)
 		if err != nil {
-			return domain.AliasImportResult{}, fmt.Errorf("read imported alias %q: %w", candidate.Address, err)
+			return domain.AliasImportResult{}, nil, fmt.Errorf("read imported alias %q: %w", candidate.Address, err)
 		}
 		createdByAddress[candidate.Address] = created
+		if includeCredentials {
+			rawKey, revealErr := s.credentialRevealFactory(id, material.Ciphertext)
+			if revealErr != nil {
+				return domain.AliasImportResult{}, nil, fmt.Errorf("reveal imported alias %q API key: %w", candidate.Address, revealErr)
+			}
+			credentialsByAddress[candidate.Address] = domain.AliasImportCredential{Alias: created, APIKey: rawKey}
+		}
 		if enabled {
 			createdEnabled = true
 		} else if candidate.Active {
@@ -155,21 +217,27 @@ func (s *Store) ImportAliases(
 			result.Created = append(result.Created, created)
 		}
 	}
+	issued := make([]domain.AliasImportCredential, 0, len(result.Created))
+	for _, created := range result.Created {
+		if credential, ok := credentialsByAddress[domain.NormalizeEmail(created.Address)]; ok {
+			issued = append(issued, credential)
+		}
+	}
 	if createdEnabled {
 		if _, err := s.txExecContext(ctx, tx,
 			`DELETE FROM imap_sync_states WHERE account_id = ?`, accountID,
 		); err != nil {
-			return domain.AliasImportResult{}, fmt.Errorf("reset IMAP cursor after alias import: %w", err)
+			return domain.AliasImportResult{}, nil, fmt.Errorf("reset IMAP cursor after alias import: %w", err)
 		}
 		if _, err := s.bumpAccountVersionTx(ctx, tx, accountID, accountVersion); err != nil {
-			return domain.AliasImportResult{}, fmt.Errorf("advance account version after alias import: %w", err)
+			return domain.AliasImportResult{}, nil, fmt.Errorf("advance account version after alias import: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return domain.AliasImportResult{}, fmt.Errorf("commit alias import: %w", err)
+		return domain.AliasImportResult{}, nil, fmt.Errorf("commit alias import: %w", err)
 	}
-	return result, nil
+	return result, issued, nil
 }
 
 func normalizeAliasImportCandidates(candidates []domain.AliasImportCandidate) ([]domain.AliasImportCandidate, error) {
@@ -184,14 +252,8 @@ func normalizeAliasImportCandidates(candidates []domain.AliasImportCandidate) ([
 		if _, exists := seen[candidate.Address]; exists {
 			return nil, fmt.Errorf("import aliases: duplicate candidate address %q", candidate.Address)
 		}
-		if len(candidate.APIKeyHash) == 0 {
-			return nil, fmt.Errorf("import aliases: candidate %q has empty api key hash", candidate.Address)
-		}
-		candidate.APIKeyPrefix = strings.TrimSpace(candidate.APIKeyPrefix)
-		if candidate.APIKeyPrefix == "" {
-			return nil, fmt.Errorf("import aliases: candidate %q has empty api key prefix", candidate.Address)
-		}
 		candidate.Label = strings.TrimSpace(sanitizePostgresText(candidate.Label))
+		candidate.APIKeyPrefix = strings.TrimSpace(sanitizePostgresText(candidate.APIKeyPrefix))
 		candidate.APIKeyHash = append([]byte(nil), candidate.APIKeyHash...)
 		seen[candidate.Address] = struct{}{}
 		normalized = append(normalized, candidate)

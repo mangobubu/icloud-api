@@ -37,27 +37,31 @@ type failureCall struct {
 type fakeRepo struct {
 	mu sync.Mutex
 
-	accounts   []domain.Account
-	aliases    map[int64][]domain.Alias
-	states     map[int64]domain.IMAPSyncState
-	stateErrs  map[int64]error
-	getErrs    map[int64]error
-	listFn     func(context.Context) ([]domain.Account, error)
-	applyErr   error
-	failureErr error
-	failureFn  func(context.Context, int64, time.Time, string, time.Time) error
-	applies    []applyCall
-	failures   []failureCall
-	getCalls   int
+	accounts     []domain.Account
+	aliases      map[int64][]domain.Alias
+	positions    map[int64]map[int64]domain.MailboxSnapshotPosition
+	positionErrs map[int64]error
+	states       map[int64]domain.IMAPSyncState
+	stateErrs    map[int64]error
+	getErrs      map[int64]error
+	listFn       func(context.Context) ([]domain.Account, error)
+	applyErr     error
+	failureErr   error
+	failureFn    func(context.Context, int64, time.Time, string, time.Time) error
+	applies      []applyCall
+	failures     []failureCall
+	getCalls     int
 }
 
 func newFakeRepo(accounts ...domain.Account) *fakeRepo {
 	return &fakeRepo{
-		accounts:  accounts,
-		aliases:   make(map[int64][]domain.Alias),
-		states:    make(map[int64]domain.IMAPSyncState),
-		stateErrs: make(map[int64]error),
-		getErrs:   make(map[int64]error),
+		accounts:     accounts,
+		aliases:      make(map[int64][]domain.Alias),
+		positions:    make(map[int64]map[int64]domain.MailboxSnapshotPosition),
+		positionErrs: make(map[int64]error),
+		states:       make(map[int64]domain.IMAPSyncState),
+		stateErrs:    make(map[int64]error),
+		getErrs:      make(map[int64]error),
 	}
 }
 
@@ -97,6 +101,19 @@ func (f *fakeRepo) ListEnabledAliasesByAccount(_ context.Context, accountID int6
 		}
 	}
 	return enabled, nil
+}
+
+func (f *fakeRepo) ListMailboxSnapshotPositions(_ context.Context, accountID int64) (map[int64]domain.MailboxSnapshotPosition, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.positionErrs[accountID]; err != nil {
+		return nil, err
+	}
+	result := make(map[int64]domain.MailboxSnapshotPosition, len(f.positions[accountID]))
+	for aliasID, position := range f.positions[accountID] {
+		result[aliasID] = position
+	}
+	return result, nil
 }
 
 func (f *fakeRepo) GetIMAPSyncState(_ context.Context, accountID int64) (domain.IMAPSyncState, error) {
@@ -159,9 +176,29 @@ type cipherFunc func(string) (string, error)
 
 func (f cipherFunc) Decrypt(value string) (string, error) { return f(value) }
 
-type fetcherFunc func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error)
+type fetcherFunc func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error)
 
-func (f fetcherFunc) FetchIncremental(ctx context.Context, account domain.Account, password string, aliases []domain.Alias, state *domain.IMAPSyncState, positions map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+func (f fetcherFunc) FetchIncremental(ctx context.Context, account domain.Account, password string, aliases []domain.Alias, state *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	return f(ctx, account, password, aliases, state)
+}
+
+type fetcherWithPositionsFunc func(
+	context.Context,
+	domain.Account,
+	string,
+	[]domain.Alias,
+	*domain.IMAPSyncState,
+	map[int64]domain.MailboxSnapshotPosition,
+) (domain.MailboxSyncResult, error)
+
+func (f fetcherWithPositionsFunc) FetchIncremental(
+	ctx context.Context,
+	account domain.Account,
+	password string,
+	aliases []domain.Alias,
+	state *domain.IMAPSyncState,
+	positions map[int64]domain.MailboxSnapshotPosition,
+) (domain.MailboxSyncResult, error) {
 	return f(ctx, account, password, aliases, state, positions)
 }
 
@@ -200,7 +237,6 @@ func TestQueuedSyncLogsDetailedFlowAcrossPendingBatches(t *testing.T) {
 		_ string,
 		_ []domain.Alias,
 		_ *domain.IMAPSyncState,
-		_ map[int64]domain.MailboxSnapshotPosition,
 	) (domain.MailboxSyncResult, error) {
 		call++
 		for _, update := range []domain.MailboxSyncProgressUpdate{
@@ -309,7 +345,6 @@ func TestAutomaticSyncLogsOneRunAcrossPendingBatches(t *testing.T) {
 		_ string,
 		_ []domain.Alias,
 		_ *domain.IMAPSyncState,
-		_ map[int64]domain.MailboxSnapshotPosition,
 	) (domain.MailboxSyncResult, error) {
 		call++
 		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseConnecting, 5)
@@ -361,7 +396,6 @@ func TestAutomaticContinuationWaitTimeoutDefersWithSameRunID(t *testing.T) {
 		string,
 		[]domain.Alias,
 		*domain.IMAPSyncState,
-		map[int64]domain.MailboxSnapshotPosition,
 	) (domain.MailboxSyncResult, error) {
 		return domain.MailboxSyncResult{
 			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 11, LastUID: 50},
@@ -422,7 +456,6 @@ func TestAutomaticContinuationSlotTimeoutDefersWithSameRunID(t *testing.T) {
 		string,
 		[]domain.Alias,
 		*domain.IMAPSyncState,
-		map[int64]domain.MailboxSnapshotPosition,
 	) (domain.MailboxSyncResult, error) {
 		return domain.MailboxSyncResult{
 			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 11, LastUID: 50},
@@ -483,7 +516,6 @@ func TestAutomaticContinuationDisabledAccountLogsCancellation(t *testing.T) {
 		string,
 		[]domain.Alias,
 		*domain.IMAPSyncState,
-		map[int64]domain.MailboxSnapshotPosition,
 	) (domain.MailboxSyncResult, error) {
 		return domain.MailboxSyncResult{
 			State:     domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 13, LastUID: 50},
@@ -551,7 +583,6 @@ func TestSyncFailureLogIdentifiesStageAndRedactsSecrets(t *testing.T) {
 		_ string,
 		_ []domain.Alias,
 		_ *domain.IMAPSyncState,
-		_ map[int64]domain.MailboxSnapshotPosition,
 	) (domain.MailboxSyncResult, error) {
 		domain.ReportMailboxSyncProgress(ctx, domain.MailboxSyncPhaseAuthenticating, 10)
 		return domain.MailboxSyncResult{}, fmt.Errorf(
@@ -614,13 +645,14 @@ func TestSyncAccountPassesCursorAndAppliesOnce(t *testing.T) {
 	wantState := domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 7, LastUID: 41}
 	repo.states[account.ID] = wantState
 	wantResult := domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{
-			10: {AliasID: 10, UIDValidity: 7, UID: 42, SnapshotState: domain.SnapshotFound},
-		},
+		ArchivedMessages: []domain.ArchivedMessage{{
+			AccountID: account.ID, UIDValidity: 7, UID: 42,
+			InternalDate: accountVersion, AliasIDs: []int64{10},
+		}},
 		State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 7, LastUID: 42},
 	}
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(_ context.Context, gotAccount domain.Account, password string, aliases []domain.Alias, state *domain.IMAPSyncState, positions map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, gotAccount domain.Account, password string, aliases []domain.Alias, state *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		if gotAccount.ID != account.ID || password != "app-password" {
 			t.Fatalf("抓取参数错误: account=%#v password=%q", gotAccount, password)
@@ -630,9 +662,6 @@ func TestSyncAccountPassesCursorAndAppliesOnce(t *testing.T) {
 		}
 		if state == nil || !reflect.DeepEqual(*state, wantState) {
 			t.Fatalf("增量游标 = %#v, want %#v", state, wantState)
-		}
-		if positions != nil {
-			t.Fatalf("mailbox snapshot positions = %#v, want nil", positions)
 		}
 		return wantResult, nil
 	})
@@ -663,11 +692,45 @@ func TestSyncAccountPassesCursorAndAppliesOnce(t *testing.T) {
 	}
 }
 
+func TestSyncAccountPassesLegacySnapshotPositionsToFetcher(t *testing.T) {
+	account := domain.Account{ID: 91, Enabled: true, PasswordCiphertext: "encrypted"}
+	legacy := domain.Alias{
+		ID: 910, AccountID: account.ID, Address: "legacy@icloud.com",
+		Enabled: true, CredentialMode: domain.AliasCredentialModeLegacy,
+	}
+	repo := newFakeRepo(account)
+	repo.aliases[account.ID] = []domain.Alias{legacy}
+	want := map[int64]domain.MailboxSnapshotPosition{
+		legacy.ID: {AliasID: legacy.ID, UIDValidity: 7, UID: 41},
+	}
+	repo.positions[account.ID] = want
+	fetcher := fetcherWithPositionsFunc(func(
+		_ context.Context,
+		_ domain.Account,
+		_ string,
+		_ []domain.Alias,
+		_ *domain.IMAPSyncState,
+		positions map[int64]domain.MailboxSnapshotPosition,
+	) (domain.MailboxSyncResult, error) {
+		if !reflect.DeepEqual(positions, want) {
+			t.Fatalf("legacy snapshot positions = %#v, want %#v", positions, want)
+		}
+		return domain.MailboxSyncResult{
+			State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 7, LastUID: 41},
+		}, nil
+	})
+	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
+
+	if err := manager.SyncAccount(context.Background(), account.ID); err != nil {
+		t.Fatalf("sync legacy positions: %v", err)
+	}
+}
+
 func TestSyncAccountPassesNilCursorWhenStateIsMissing(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	stateWasNil := false
-	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, state *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, state *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		stateWasNil = state == nil
 		return domain.MailboxSyncResult{State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 3, LastUID: 9}}, nil
 	})
@@ -689,8 +752,8 @@ func TestSyncAccountAppliesEmptyIncrementalResultForFreshness(t *testing.T) {
 	repo := newFakeRepo(account)
 	state := domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 8, LastUID: 99}
 	repo.states[account.ID] = state
-	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
-		return domain.MailboxSyncResult{Messages: map[int64]domain.LatestMessage{}, State: state}, nil
+	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
+		return domain.MailboxSyncResult{State: state}, nil
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
 
@@ -712,12 +775,11 @@ func TestSyncAccountReturnsPendingAfterCommittingOneBoundedBatch(t *testing.T) {
 	previous := domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 8, LastUID: 99}
 	repo.states[account.ID] = previous
 	result := domain.MailboxSyncResult{
-		Messages: map[int64]domain.LatestMessage{},
-		State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 8, LastUID: 112},
-		HasMore:  true,
+		State:   domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 8, LastUID: 112},
+		HasMore: true,
 	}
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, state *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, state *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		if state == nil || !reflect.DeepEqual(*state, previous) {
 			t.Fatalf("cursor = %#v, want %#v", state, previous)
@@ -750,15 +812,14 @@ func TestQueueAccountSyncReturnsImmediatelyAndDeduplicates(t *testing.T) {
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		if fetchCalls == 1 {
 			close(started)
 		}
 		<-release
 		return domain.MailboxSyncResult{
-			Messages: map[int64]domain.LatestMessage{},
-			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
+			State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
 		}, nil
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
@@ -805,12 +866,11 @@ func TestQueueAccountSyncShutdownWaitsForWorker(t *testing.T) {
 	release := make(chan struct{})
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		close(started)
 		<-release
 		return domain.MailboxSyncResult{
-			Messages: map[int64]domain.LatestMessage{},
-			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
+			State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
 		}, nil
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
@@ -847,11 +907,10 @@ func TestQueueAccountSyncWaitsForResourcesWithoutDropping(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	started := make(chan struct{})
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		close(started)
 		return domain.MailboxSyncResult{
-			Messages: map[int64]domain.LatestMessage{},
-			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
+			State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
 		}, nil
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
@@ -889,12 +948,11 @@ func TestQueueAccountSyncContinuesPendingBatches(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		return domain.MailboxSyncResult{
-			Messages: map[int64]domain.LatestMessage{},
-			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1, LastUID: uint32(fetchCalls)},
-			HasMore:  fetchCalls == 1,
+			State:   domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1, LastUID: uint32(fetchCalls)},
+			HasMore: fetchCalls == 1,
 		}, nil
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
@@ -923,7 +981,7 @@ func TestQueuedManualSyncProgressSpansPendingBatches(t *testing.T) {
 	var callsMu sync.Mutex
 	calls := 0
 	firstProgress := make(chan domain.MailboxSyncProgress, 1)
-	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		callsMu.Lock()
 		calls++
 		call := calls
@@ -985,7 +1043,7 @@ func TestSyncAccountFailureUsesOneBulkRecord(t *testing.T) {
 		repo.aliases[account.ID] = append(repo.aliases[account.ID], domain.Alias{ID: id, AccountID: account.ID, Enabled: true})
 	}
 	wantErr := errors.New("context deadline exceeded")
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		return domain.MailboxSyncResult{}, wantErr
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
@@ -1029,7 +1087,7 @@ func TestSyncAccountApplyFailureUsesBulkRecord(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	repo.applyErr = errors.New("transaction failed")
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		return domain.MailboxSyncResult{State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 2, LastUID: 4}}, nil
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
@@ -1049,7 +1107,7 @@ func TestSyncAccountCursorReadFailureUsesBulkRecord(t *testing.T) {
 	wantErr := errors.New("read cursor failed")
 	repo.stateErrs[account.ID] = wantErr
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		return domain.MailboxSyncResult{}, nil
 	})
@@ -1092,7 +1150,7 @@ func TestSyncAccountWithTimeoutCancelsFetcherAndRecordsFailure(t *testing.T) {
 		recordContextActive = ctx.Err() == nil
 		return nil
 	}
-	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		<-ctx.Done()
 		return domain.MailboxSyncResult{}, ctx.Err()
 	})
@@ -1117,7 +1175,7 @@ func TestSyncAccountWithTimeoutStartsFreshWorkBudgetAfterQueueing(t *testing.T) 
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	remainingBudget := make(chan time.Duration, 1)
-	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			remainingBudget <- 0
@@ -1202,7 +1260,7 @@ func TestSyncAllStartsFreshWorkBudgetAfterSlotQueueing(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	remainingBudget := make(chan time.Duration, 1)
-	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			remainingBudget <- 0
@@ -1332,7 +1390,7 @@ func TestAccountLockSerializesConfigurationWithSync(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	fetchStarted := make(chan struct{}, 1)
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchStarted <- struct{}{}
 		return domain.MailboxSyncResult{}, nil
 	})
@@ -1375,11 +1433,10 @@ func TestSyncAllSkipsBusyAccountWithoutBlockingOtherAccounts(t *testing.T) {
 	other := domain.Account{ID: 2, Enabled: true, PasswordCiphertext: "encrypted-2"}
 	repo := newFakeRepo(busy, other)
 	fetched := make(chan int64, 2)
-	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetched <- account.ID
 		return domain.MailboxSyncResult{
-			Messages: map[int64]domain.LatestMessage{},
-			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
+			State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
 		}, nil
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
@@ -1443,7 +1500,7 @@ func TestManualAndPeriodicSyncsShareGlobalConcurrencyWithoutBlockingOnAccountLoc
 	var activeMu sync.Mutex
 	active := 0
 	maxActive := 0
-	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		activeMu.Lock()
 		active++
 		if active > maxActive {
@@ -1464,8 +1521,7 @@ func TestManualAndPeriodicSyncsShareGlobalConcurrencyWithoutBlockingOnAccountLoc
 			<-releasePeriodic
 		}
 		return domain.MailboxSyncResult{
-			Messages: map[int64]domain.LatestMessage{},
-			State:    domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
+			State: domain.IMAPSyncState{AccountID: account.ID, UIDValidity: 1},
 		}, nil
 	})
 	manager := New(repo, cipherFunc(fixedCipher), fetcher, discardLogger(), time.Minute, 1)
@@ -1659,7 +1715,7 @@ func TestRunDrainsPendingBatchesBeforeWaiting(t *testing.T) {
 	callEvents := make(chan int, 4)
 	var callsMu sync.Mutex
 	calls := 0
-	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		callsMu.Lock()
 		calls++
 		call := calls
@@ -1726,7 +1782,7 @@ func TestRunAutomaticProgressSpansPendingBatches(t *testing.T) {
 	var callsMu sync.Mutex
 	calls := 0
 	firstProgress := make(chan domain.MailboxSyncProgress, 1)
-	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(ctx context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		callsMu.Lock()
 		calls++
 		call := calls
@@ -1795,7 +1851,7 @@ func TestRunDrainsPendingBatchesFairlyAcrossAccounts(t *testing.T) {
 	var callsMu sync.Mutex
 	calls := make(map[int64]int)
 	order := make([]int64, 0, 4)
-	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		callsMu.Lock()
 		calls[account.ID]++
 		call := calls[account.ID]
@@ -1851,7 +1907,7 @@ func TestRunDoesNotResyncCaughtUpAccountDuringContinuation(t *testing.T) {
 	repo := newFakeRepo(accounts...)
 	var callsMu sync.Mutex
 	calls := make(map[int64]int)
-	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		callsMu.Lock()
 		calls[account.ID]++
 		call := calls[account.ID]
@@ -1896,7 +1952,7 @@ func TestRunContinuesOtherPendingAfterOrdinaryFailure(t *testing.T) {
 	repo := newFakeRepo(accounts...)
 	var callsMu sync.Mutex
 	calls := make(map[int64]int)
-	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, account domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		callsMu.Lock()
 		calls[account.ID]++
 		call := calls[account.ID]
@@ -1941,12 +1997,12 @@ func TestRunRetriesTransientIMAPFailureBeforePollInterval(t *testing.T) {
 	repo := newFakeRepo(account)
 	var callsMu sync.Mutex
 	calls := 0
-	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		callsMu.Lock()
 		defer callsMu.Unlock()
 		calls++
 		if calls == 1 {
-			return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
+			return domain.MailboxSyncResult{}, errors.New("fetch new messages: imap: connection closed")
 		}
 		return domain.MailboxSyncResult{
 			State: domain.IMAPSyncState{AccountID: got.ID, UIDValidity: 1, LastUID: 1},
@@ -1986,7 +2042,7 @@ func TestRunDefersRetryWhenAccountLockRemainsBusy(t *testing.T) {
 	repo := newFakeRepo(account)
 	logs := applog.New(100)
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		if fetchCalls == 1 {
 			return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
@@ -2076,7 +2132,7 @@ func TestRunDefersRetryWhenAccountListingExceedsRetryWindow(t *testing.T) {
 	}
 	logs := applog.New(100)
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(_ context.Context, _ domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
 	})
@@ -2130,7 +2186,7 @@ func TestRunDefersRetryWhenRetryWindowExpiresDuringMailboxWork(t *testing.T) {
 	logs := applog.New(100)
 	fetchCalls := 0
 	retryStarted := make(chan struct{})
-	fetcher := fetcherFunc(func(ctx context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(ctx context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		if fetchCalls == 1 {
 			return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
@@ -2192,7 +2248,7 @@ func TestRunFinishesPendingProgressWhenRetryWindowEnds(t *testing.T) {
 	logs := applog.New(100)
 	fetchCalls := 0
 	retryStarted := make(chan struct{})
-	fetcher := fetcherFunc(func(ctx context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(ctx context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		if fetchCalls == 1 {
 			return domain.MailboxSyncResult{}, errors.New("fetch latest messages: imap: connection closed")
@@ -2252,7 +2308,7 @@ func TestRunDoesNotFastRetryPermanentIMAPFailure(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		return domain.MailboxSyncResult{}, errors.New("IMAP authentication rejected")
 	})
@@ -2305,7 +2361,7 @@ func TestRunPreservesPendingContinuationWhileAccountBusy(t *testing.T) {
 		secondFetchStarted := make(chan struct{})
 		var callsMu sync.Mutex
 		calls := 0
-		fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 			callsMu.Lock()
 			calls++
 			call := calls
@@ -2420,7 +2476,7 @@ func TestRunPreservesPendingContinuationWhileAccountBusy(t *testing.T) {
 		}
 		repo := newFakeRepo(account)
 		fetchCalls := 0
-		fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState, _ map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+		fetcher := fetcherFunc(func(_ context.Context, got domain.Account, _ string, _ []domain.Alias, _ *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 			fetchCalls++
 			return domain.MailboxSyncResult{
 				State: domain.IMAPSyncState{AccountID: got.ID, UIDValidity: 1, LastUID: 1},
@@ -2470,7 +2526,7 @@ func TestRunStopsOnCanceledContextWithoutWaiting(t *testing.T) {
 	account := domain.Account{ID: 1, Enabled: true, PasswordCiphertext: "encrypted"}
 	repo := newFakeRepo(account)
 	fetchCalls := 0
-	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState, map[int64]domain.MailboxSnapshotPosition) (domain.MailboxSyncResult, error) {
+	fetcher := fetcherFunc(func(context.Context, domain.Account, string, []domain.Alias, *domain.IMAPSyncState) (domain.MailboxSyncResult, error) {
 		fetchCalls++
 		return domain.MailboxSyncResult{}, nil
 	})

@@ -87,48 +87,52 @@ func TestAppleSessionCipherUsesDedicatedContext(t *testing.T) {
 	}
 }
 
-func TestPendingAliasAPIKeyCipherUsesDedicatedContext(t *testing.T) {
+func TestAliasCredentialBundleUsesDedicatedContextAndStableHashes(t *testing.T) {
 	box, err := NewCipher(bytes.Repeat([]byte{0x29}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rawKey := "icm_background-created-secret"
-	encrypted, err := box.EncryptPendingAliasAPIKey(rawKey)
+	credentials, material, err := NewAliasCredentialMaterial(box, 42, 3)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(encrypted, "ak1.") || strings.Contains(encrypted, rawKey) {
-		t.Fatalf("pending API key ciphertext has an invalid envelope: %q", encrypted)
+	if material.Version != 3 || !strings.HasPrefix(material.Ciphertext, "mc1.") ||
+		strings.Contains(material.Ciphertext, credentials.APIKey) {
+		t.Fatalf("alias credential material = %#v", material)
 	}
-	got, err := box.DecryptPendingAliasAPIKey(encrypted)
-	if err != nil || got != rawKey {
-		t.Fatalf("decrypt pending API key = %q, %v", got, err)
+	got, err := box.DecryptAliasCredentials(42, material.Ciphertext)
+	if err != nil || got != credentials {
+		t.Fatalf("decrypt alias credentials = %#v, %v", got, err)
 	}
-	if _, err := box.Decrypt(encrypted); err == nil {
-		t.Fatal("pending API key ciphertext was accepted as an IMAP credential")
+	if _, err := box.DecryptAliasCredentials(43, material.Ciphertext); err == nil {
+		t.Fatal("alias credential ciphertext was accepted for another alias")
 	}
-	if _, err := box.DecryptAppleSession(encrypted); err == nil {
-		t.Fatal("pending API key ciphertext was accepted as an Apple session")
+	if _, err := box.Decrypt(material.Ciphertext); err == nil {
+		t.Fatal("alias credential ciphertext was accepted as an account IMAP credential")
 	}
-	sessionCiphertext, err := box.EncryptAppleSession(`{"session":"secret"}`)
-	if err != nil {
-		t.Fatal(err)
+	if !HashEqual(material.APIKeyHash, HashToken(credentials.APIKey)) ||
+		!HashEqual(material.IMAPPasswordHash, HashToken(credentials.IMAPPassword)) ||
+		!HashEqual(material.RefreshTokenHash, HashToken(credentials.RefreshToken)) ||
+		material.OAuthClientID != credentials.ClientID {
+		t.Fatal("credential lookup material does not match the encrypted bundle")
 	}
-	if _, err := box.DecryptPendingAliasAPIKey(sessionCiphertext); err == nil {
-		t.Fatal("Apple session ciphertext was accepted as a pending API key")
+	for name, value := range map[string]string{
+		"api_key": credentials.APIKey, "imap_password": credentials.IMAPPassword,
+		"client_id": credentials.ClientID, "refresh_token": credentials.RefreshToken,
+	} {
+		if len(value) < 28 || strings.ContainsAny(value, " \t\r\n") {
+			t.Fatalf("%s has invalid generated format: %q", name, value)
+		}
 	}
 }
 
-func TestAPIKeyUsesHighEntropyAndStableHash(t *testing.T) {
+func TestNewAPIKeyProducesLegacyCompatibleMaterial(t *testing.T) {
 	raw, hash, prefix, err := NewAPIKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(raw) < 40 || prefix != raw[:12] {
-		t.Fatalf("API Key 格式异常: %q", raw)
-	}
-	if !HashEqual(hash, HashToken(raw)) {
-		t.Fatal("API Key 哈希不一致")
+	if !validGeneratedToken(raw, "icm_", 32) || len(hash) != 32 || prefix != raw[:12] || !HashEqual(hash, HashToken(raw)) {
+		t.Fatalf("generated API key material = raw:%q hash_len:%d prefix:%q", raw, len(hash), prefix)
 	}
 }
 
@@ -183,6 +187,77 @@ func TestDirectLinkTokenIsDeterministicVersionedAndBoundToCurrentAPIKeyHash(t *t
 	}
 	if otherAliasToken == token {
 		t.Fatal("different aliases received the same direct-link token")
+	}
+}
+
+func TestV2URLTokensArePurposeBoundAndRejectCrossUse(t *testing.T) {
+	box, err := NewCipher(bytes.Repeat([]byte{0x37}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKeyHash := HashToken("icm_purpose-bound-key")
+	otpToken, err := box.OTPToken(42, apiKeyHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentToken, err := box.RecentMailToken(42, apiKeyHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyToken, err := box.DirectLinkToken(42, apiKeyHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otpToken == recentToken || otpToken == legacyToken || recentToken == legacyToken {
+		t.Fatalf("purpose-bound tokens are not distinct: otp=%q recent=%q legacy=%q", otpToken, recentToken, legacyToken)
+	}
+	if aliasID, ok := OTPTokenAliasID(otpToken); !ok || aliasID != 42 {
+		t.Fatalf("OTP token identity = %d, %t; want 42, true", aliasID, ok)
+	}
+	if aliasID, ok := RecentMailTokenAliasID(recentToken); !ok || aliasID != 42 {
+		t.Fatalf("recent-mail token identity = %d, %t; want 42, true", aliasID, ok)
+	}
+	if !box.VerifyOTPToken(otpToken, 42, apiKeyHash) ||
+		!box.VerifyRecentMailToken(recentToken, 42, apiKeyHash) {
+		t.Fatal("purpose-bound token did not verify for its intended route")
+	}
+	if box.VerifyOTPToken(recentToken, 42, apiKeyHash) ||
+		box.VerifyOTPToken(legacyToken, 42, apiKeyHash) ||
+		box.VerifyRecentMailToken(otpToken, 42, apiKeyHash) ||
+		box.VerifyRecentMailToken(legacyToken, 42, apiKeyHash) ||
+		box.VerifyDirectLinkToken(otpToken, 42, apiKeyHash) ||
+		box.VerifyDirectLinkToken(recentToken, 42, apiKeyHash) {
+		t.Fatal("a URL token verified outside its intended purpose/version")
+	}
+	if _, ok := OTPTokenAliasID(recentToken); ok {
+		t.Fatal("recent-mail token was parsed as an OTP token")
+	}
+	if _, ok := RecentMailTokenAliasID(otpToken); ok {
+		t.Fatal("OTP token was parsed as a recent-mail token")
+	}
+	if _, ok := DirectLinkTokenAliasID(otpToken); ok {
+		t.Fatal("OTP token was parsed as a legacy direct-link token")
+	}
+
+	// A caller cannot turn an OTP token into a recent-mail token by changing
+	// only the public envelope version; the MAC context is purpose-specific.
+	payload, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimPrefix(otpToken, directLinkTokenPrefix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload[len(directLinkTokenMagic)] = recentMailTokenVersion
+	versionRewritten := directLinkTokenPrefix + base64.RawURLEncoding.EncodeToString(payload)
+	if aliasID, ok := RecentMailTokenAliasID(versionRewritten); !ok || aliasID != 42 {
+		t.Fatalf("rewritten token envelope = %d, %t; want parseable untrusted alias", aliasID, ok)
+	}
+	if box.VerifyRecentMailToken(versionRewritten, 42, apiKeyHash) {
+		t.Fatal("OTP MAC verified after rewriting its envelope as recent-mail")
+	}
+
+	rotatedHash := HashToken("icm_purpose-bound-rotated-key")
+	if box.VerifyOTPToken(otpToken, 42, rotatedHash) ||
+		box.VerifyRecentMailToken(recentToken, 42, rotatedHash) {
+		t.Fatal("purpose-bound token remained valid after API key rotation")
 	}
 }
 

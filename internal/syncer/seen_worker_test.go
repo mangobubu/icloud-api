@@ -426,6 +426,81 @@ func TestSeenWorkerBlockedAccountDoesNotDelayHealthyAccount(t *testing.T) {
 	}
 }
 
+func TestSeenWorkerBoundsConcurrentAccountProcessing(t *testing.T) {
+	const (
+		accountCount = 64
+		workerCount  = 4
+	)
+	accounts := make(map[int64]domain.Account, accountCount)
+	tasks := make([]domain.SeenTask, 0, accountCount)
+	for id := int64(1); id <= accountCount; id++ {
+		accounts[id] = domain.Account{ID: id, Enabled: true, PasswordCiphertext: "password"}
+		tasks = append(tasks, domain.SeenTask{AccountID: id, UIDValidity: 10, UID: 1})
+	}
+	repo := &seenWorkerRepo{accounts: accounts, tasks: tasks}
+	release := make(chan struct{})
+	reachedLimit := make(chan struct{})
+	var (
+		mu        sync.Mutex
+		active    int
+		maximum   int
+		reachOnce sync.Once
+	)
+	marker := &seenMarkerStub{fn: func(ctx context.Context, _ seenMarkerCall) error {
+		mu.Lock()
+		active++
+		if active > maximum {
+			maximum = active
+		}
+		if active == workerCount {
+			reachOnce.Do(func() { close(reachedLimit) })
+		}
+		mu.Unlock()
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		mu.Lock()
+		active--
+		mu.Unlock()
+		return nil
+	}}
+	worker := newSeenWorkerForTest(repo, marker, &seenLockerStub{})
+	worker.accountWorkers = workerCount
+	result := make(chan error, 1)
+	go func() {
+		_, err := worker.processPending(context.Background())
+		result <- err
+	}()
+
+	select {
+	case <-reachedLimit:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("worker did not reach configured account concurrency")
+	}
+	mu.Lock()
+	peak := maximum
+	mu.Unlock()
+	if peak != workerCount {
+		close(release)
+		t.Fatalf("peak account concurrency = %d, want %d", peak, workerCount)
+	}
+	close(release)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("process pending seen tasks: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded worker pool did not finish")
+	}
+	if calls := marker.snapshot(); len(calls) != accountCount {
+		t.Fatalf("marker calls = %d, want %d", len(calls), accountCount)
+	}
+}
+
 func TestSeenWorkerDisabledAccountPrefixDoesNotStarveLaterAccount(t *testing.T) {
 	const disabledAccounts = 256
 	accounts := make(map[int64]domain.Account, disabledAccounts+1)

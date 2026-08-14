@@ -77,12 +77,11 @@ func TestMailboxWritesAdvanceAccountVersionOneNanosecond(t *testing.T) {
 		t.Fatalf("create account: %v", err)
 	}
 	alias, err := db.CreateAlias(ctx, domain.Alias{
-		AccountID:    account.ID,
-		Address:      "mailbox-version-alias@icloud.com",
-		Label:        "Mailbox version alias",
-		APIKeyHash:   []byte("mailbox-version-hash"),
-		APIKeyPrefix: "test",
-		Enabled:      true,
+		AccountID:  account.ID,
+		Address:    "mailbox-version-alias@icloud.com",
+		Label:      "Mailbox version alias",
+		APIKeyHash: []byte("mailbox-version-hash"),
+		Enabled:    true,
 	})
 	if err != nil {
 		t.Fatalf("create alias: %v", err)
@@ -111,7 +110,6 @@ func TestMailboxWritesAdvanceAccountVersionOneNanosecond(t *testing.T) {
 	syncedAt := fixed
 	assertMailboxVersionStep("apply mailbox sync", fixed, func(expected time.Time) error {
 		return db.ApplyMailboxSync(ctx, account.ID, expected, []domain.Alias{alias}, domain.MailboxSyncResult{
-			Messages: map[int64]domain.LatestMessage{},
 			State: domain.IMAPSyncState{
 				AccountID: account.ID, UIDValidity: 700, LastUID: 0, UpdatedAt: fixed,
 			},
@@ -123,13 +121,6 @@ func TestMailboxWritesAdvanceAccountVersionOneNanosecond(t *testing.T) {
 		return db.RecordMailboxSyncFailure(ctx, account.ID, expected, "temporary failure", fixed)
 	})
 
-	assertMailboxVersionStep("reset alias snapshot", fixed.Add(-2*time.Hour), func(time.Time) error {
-		return db.ResetAliasSnapshot(ctx, alias.ID)
-	})
-
-	assertMailboxVersionStep("reset account snapshots", fixed.Add(-3*time.Hour), func(time.Time) error {
-		return db.ResetAccountAliasSnapshots(ctx, account.ID)
-	})
 }
 
 func openAccountVersionTestStore(t *testing.T) *Store {

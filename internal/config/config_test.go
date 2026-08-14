@@ -1,7 +1,6 @@
 package config
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -127,28 +126,16 @@ func TestMasterKeyFileDefaultDoesNotDependOnDatabaseURL(t *testing.T) {
 	}
 }
 
-func TestOAuthTokenConfiguration(t *testing.T) {
+func TestLegacyOAuthTokenConfiguration(t *testing.T) {
 	clearConfigEnvironment(t)
-	t.Setenv("ICLOUD_API_OAUTH_TOKEN", "  0123456789abcdef0123456789abcdef  ")
+	const token = "legacy-oauth-token-012345678901234567890123456789"
+	t.Setenv("ICLOUD_API_OAUTH_TOKEN", token)
 	cfg, err := Load()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy OAuth token should be accepted: %v", err)
 	}
-	if cfg.OAuthToken != "0123456789abcdef0123456789abcdef" {
-		t.Fatalf("OAuth 令牌 = %q, want 已去除首尾空白的配置值", cfg.OAuthToken)
-	}
-}
-
-func TestOAuthTokenLengthValidation(t *testing.T) {
-	for _, value := range []string{"too-short", strings.Repeat("x", 4097), strings.Repeat("x", 31) + " " + strings.Repeat("y", 31)} {
-		t.Run(fmt.Sprintf("length_%d", len(value)), func(t *testing.T) {
-			clearConfigEnvironment(t)
-			t.Setenv("ICLOUD_API_OAUTH_TOKEN", value)
-			_, err := Load()
-			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_OAUTH_TOKEN") {
-				t.Fatalf("ICLOUD_API_OAUTH_TOKEN 长度错误 = %v", err)
-			}
-		})
+	if cfg.OAuthToken != token {
+		t.Fatalf("OAuth token = %q, want configured token", cfg.OAuthToken)
 	}
 }
 
@@ -220,12 +207,12 @@ func TestSyncTimeoutDefault(t *testing.T) {
 			cfg.SyncTimeout,
 		)
 	}
-	if cfg.MaxMessageBytes != 1<<20 || cfg.MaxBodyBytes != 512<<10 {
+	if cfg.MaxMessageBytes != 100<<20 || cfg.MaxBodyBytes != 512<<10 {
 		t.Fatalf(
 			"default mail byte limits = message:%d body:%d, want %d/%d",
 			cfg.MaxMessageBytes,
 			cfg.MaxBodyBytes,
-			1<<20,
+			100<<20,
 			512<<10,
 		)
 	}

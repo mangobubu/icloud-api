@@ -324,13 +324,13 @@ func TestAdminAPIApplicationLogsDoNotRecordSuccessfulPollingRequests(t *testing.
 	if len(page.Items) != 3 {
 		t.Fatalf("non-successful-polling request logs = %#v, want 3 entries", page.Items)
 	}
-	if page.Items[0].Fields["method"] != http.MethodPost || page.Items[0].Fields["path"] != adminAPIApplicationLogsPath {
+	if page.Items[0].Fields["method"] != http.MethodPost || page.Items[0].Fields["path"] != "/<admin-prefix>/admin/api/v1/logs" {
 		t.Fatalf("same-path POST log = %#v", page.Items[0])
 	}
-	if page.Items[1].Fields["method"] != http.MethodGet || page.Items[1].Fields["path"] != "/admin/api/v1/audit" {
+	if page.Items[1].Fields["method"] != http.MethodGet || page.Items[1].Fields["path"] != "/<admin-prefix>/admin/api/v1/audit" {
 		t.Fatalf("other-path GET log = %#v", page.Items[1])
 	}
-	if page.Items[2].Fields["method"] != http.MethodGet || page.Items[2].Fields["path"] != adminAPIApplicationLogsPath || page.Items[2].Fields["status"] != "400" {
+	if page.Items[2].Fields["method"] != http.MethodGet || page.Items[2].Fields["path"] != "/<admin-prefix>/admin/api/v1/logs" || page.Items[2].Fields["status"] != "400" {
 		t.Fatalf("failed application log poll = %#v", page.Items[2])
 	}
 }

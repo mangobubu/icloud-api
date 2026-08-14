@@ -1,8 +1,8 @@
 const sectionBasePaths = [
-  ["aliases", "/admin/aliases"],
-  ["audit", "/admin/audit"],
-  ["logs", "/admin/logs"],
-  ["security", "/admin/security"],
+  ["aliases", "/aliases"],
+  ["audit", "/audit"],
+  ["logs", "/logs"],
+  ["security", "/security"],
 ];
 
 function matchesPath(path, basePath) {
@@ -11,9 +11,9 @@ function matchesPath(path, basePath) {
 
 export function getActiveAdminSection(path) {
   if (
-    path === "/admin" ||
-    path === "/admin/" ||
-    matchesPath(path, "/admin/accounts")
+    path === "" ||
+    path === "/" ||
+    matchesPath(path, "/accounts")
   ) {
     return "accounts";
   }

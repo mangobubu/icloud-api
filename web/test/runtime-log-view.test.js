@@ -18,7 +18,7 @@ test("all logs view is routed and exposed in admin navigation", async () => {
 
   assert.match(router, /path:\s*"logs"[\s\S]{0,100}name:\s*"logs"/);
   assert.match(router, /import\("\.\.\/views\/LogsView\.vue"\)/);
-  assert.match(layout, /to:\s*"\/admin\/logs"[\s\S]{0,100}label:\s*"全部日志"/);
+  assert.match(layout, /to:\s*\{\s*name:\s*"logs"\s*\}[\s\S]{0,100}label:\s*"全部日志"/);
 });
 
 test("all logs view supports filters, selectable pages, batched all-items loading, live refresh, and responsive records", async () => {

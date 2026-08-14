@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const schemaVersion = 6
+const schemaVersion = 7
 
 // Migrate applies schema changes transactionally. Repeated calls are safe.
 func (s *Store) Migrate(ctx context.Context) error {
@@ -37,54 +37,72 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = schemaV6
-		migrationName = "schema v6"
+		statements = schemaV7
+		migrationName = "schema v7"
 	case 1:
 		statements = append([]string{}, migrateV1ToV2...)
 		statements = append(statements, migrateV2ToV3...)
 		statements = append(statements, migrateV3ToV4...)
 		statements = append(statements, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
-		migrationName = "migration v1 to v6"
+		statements = append(statements, migrateV6ToV7...)
+		migrationName = "migration v1 to v7"
 	case 2:
 		statements = append([]string{}, migrateV2ToV3...)
 		statements = append(statements, migrateV3ToV4...)
 		statements = append(statements, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
-		migrationName = "migration v2 to v6"
+		statements = append(statements, migrateV6ToV7...)
+		migrationName = "migration v2 to v7"
 	case 3:
 		statements = append([]string{}, migrateV3ToV4...)
 		statements = append(statements, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
-		migrationName = "migration v3 to v6"
+		statements = append(statements, migrateV6ToV7...)
+		migrationName = "migration v3 to v7"
 	case 4:
 		statements = append([]string{}, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
-		migrationName = "migration v4 to v6"
+		statements = append(statements, migrateV6ToV7...)
+		migrationName = "migration v4 to v7"
 	case 5:
 		statements, err = sqliteV5CompatibilityMigration(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("inspect SQLite schema v5 compatibility: %w", err)
 		}
-		migrationName = "migration v5 to v6"
+		statements = append(statements, migrateV6ToV7...)
+		migrationName = "migration v5 to v7"
+	case 6:
+		for _, statement := range sqliteLegacyCompatibilityRepair {
+			if _, err := s.txExecContext(ctx, tx, statement); err != nil {
+				return fmt.Errorf("repair SQLite legacy compatibility schema: %w", err)
+			}
+		}
+		statements = append([]string{}, migrateV6ToV7...)
+		migrationName = "migration v6 to v7"
 	case schemaVersion:
-		migrationName = "schema v6 convergence"
+		migrationName = "schema v7 convergence"
 	}
 	for _, statement := range statements {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
 			return fmt.Errorf("apply %s: %w", migrationName, err)
 		}
 	}
+	if err := convergeSQLiteAliasCredentialMode(ctx, tx); err != nil {
+		return fmt.Errorf("converge sqlite alias credential schema: %w", err)
+	}
 	for _, statement := range sqliteSchemaConvergence {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
 			return fmt.Errorf("converge sqlite schema: %w", err)
 		}
 	}
+	// Keep validating the durable v6 compatibility tables after repairing them;
+	// this catches malformed hand-edited databases before workers issue writes.
 	if err := s.convergeSQLiteV6Schema(ctx, tx); err != nil {
-		return fmt.Errorf("converge sqlite schema v6: %w", err)
+		return fmt.Errorf("converge sqlite legacy compatibility schema: %w", err)
 	}
 	if current != schemaVersion {
-		if _, err := s.txExecContext(ctx, tx, "PRAGMA user_version = 6"); err != nil {
+		if _, err := s.txExecContext(ctx, tx, "PRAGMA user_version = 7"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}
@@ -124,22 +142,33 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = postgresSchemaV6
-		migrationName = "postgres schema v6"
+		statements = postgresSchemaV7
+		migrationName = "postgres schema v7"
 	case 3:
 		statements = append([]string{}, postgresMigrateV3ToV4...)
 		statements = append(statements, postgresMigrateV4ToV5...)
 		statements = append(statements, postgresMigrateV5ToV6...)
-		migrationName = "postgres migration v3 to v6"
+		statements = append(statements, postgresMigrateV6ToV7...)
+		migrationName = "postgres migration v3 to v7"
 	case 4:
 		statements = append([]string{}, postgresMigrateV4ToV5...)
 		statements = append(statements, postgresMigrateV5ToV6...)
-		migrationName = "postgres migration v4 to v6"
+		statements = append(statements, postgresMigrateV6ToV7...)
+		migrationName = "postgres migration v4 to v7"
 	case 5:
-		statements = postgresV5CompatibilityMigration
-		migrationName = "postgres migration v5 to v6"
+		statements = append([]string{}, postgresV5CompatibilityMigration...)
+		statements = append(statements, postgresMigrateV6ToV7...)
+		migrationName = "postgres migration v5 to v7"
+	case 6:
+		for _, statement := range postgresLegacyCompatibilityRepair {
+			if _, err := s.txExecContext(ctx, tx, statement); err != nil {
+				return fmt.Errorf("repair PostgreSQL legacy compatibility schema: %w", err)
+			}
+		}
+		statements = append([]string{}, postgresMigrateV6ToV7...)
+		migrationName = "postgres migration v6 to v7"
 	case schemaVersion:
-		migrationName = "postgres schema v6 convergence"
+		migrationName = "postgres schema v7 convergence"
 	default:
 		return fmt.Errorf("postgres schema version %d has no migration path to version %d", current, schemaVersion)
 	}
@@ -155,6 +184,11 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 			schemaVersion, timestamp(s.now()),
 		); err != nil {
 			return fmt.Errorf("set postgres schema version: %w", err)
+		}
+	}
+	for _, statement := range postgresAliasCredentialModeConvergence {
+		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
+			return fmt.Errorf("converge postgres alias credential schema: %w", err)
 		}
 	}
 	for _, statement := range postgresSchemaConvergence {
@@ -316,6 +350,51 @@ const sqliteCreateIMAPSeenTasks = `CREATE TABLE imap_seen_tasks (
 const sqliteCreateIMAPSeenTasksAccountCreatedIndex = `CREATE INDEX imap_seen_tasks_account_created_idx
 	ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`
 
+// These idempotent statements run before the v6-to-v7 archive copy as well as
+// during normal v7 convergence. They cover a process that was interrupted
+// after an earlier release removed one of the legacy tables but before it
+// recorded a durable migration boundary.
+var sqliteLegacyCompatibilityRepair = []string{
+	`CREATE TABLE IF NOT EXISTS latest_messages (
+		alias_id INTEGER PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		message_id TEXT NOT NULL DEFAULT '',
+		internal_date INTEGER NOT NULL,
+		header_date INTEGER,
+		from_json TEXT NOT NULL DEFAULT '[]',
+		to_json TEXT NOT NULL DEFAULT '[]',
+		cc_json TEXT NOT NULL DEFAULT '[]',
+		subject TEXT NOT NULL DEFAULT '',
+		text_body TEXT NOT NULL DEFAULT '',
+		html_body TEXT NOT NULL DEFAULT '',
+		attachments_json TEXT NOT NULL DEFAULT '[]',
+		body_truncated INTEGER NOT NULL DEFAULT 0 CHECK(body_truncated IN (0, 1)),
+		synced_at INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS pending_alias_api_keys (
+		alias_id INTEGER PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		api_key_ciphertext TEXT NOT NULL CHECK(length(trim(api_key_ciphertext)) > 0),
+		created_at INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS consumed_messages (
+		alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		consumed_at INTEGER NOT NULL,
+		PRIMARY KEY(alias_id, uid_validity, uid)
+	)`,
+	`CREATE TABLE IF NOT EXISTS imap_seen_tasks (
+		account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY(account_id, uid_validity, uid)
+	)`,
+	`CREATE INDEX IF NOT EXISTS imap_seen_tasks_account_created_idx
+		ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
+}
+
 var migrateV4ToV5 = []string{
 	sqliteCreateAliasCreationSchedules,
 	`CREATE INDEX alias_creation_schedules_due_idx
@@ -333,10 +412,229 @@ var migrateV5ToV6 = []string{
 
 var schemaV6 = append(append([]string{}, schemaV5...), migrateV5ToV6...)
 
+var migrateV6ToV7 = []string{
+	`ALTER TABLE aliases ADD COLUMN credential_ciphertext TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE aliases ADD COLUMN imap_password_hash BLOB NOT NULL DEFAULT X''`,
+	`ALTER TABLE aliases ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE aliases ADD COLUMN refresh_token_hash BLOB NOT NULL DEFAULT X''`,
+	`ALTER TABLE aliases ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE aliases ADD COLUMN credential_mode TEXT NOT NULL DEFAULT 'legacy'
+		CHECK(credential_mode IN ('legacy', 'v2'))`,
+	`ALTER TABLE aliases ADD COLUMN mailbox_uid_validity INTEGER NOT NULL DEFAULT 1
+		CHECK(mailbox_uid_validity BETWEEN 1 AND 4294967295)`,
+	`ALTER TABLE aliases ADD COLUMN mailbox_uid_next INTEGER NOT NULL DEFAULT 1
+		CHECK(mailbox_uid_next BETWEEN 1 AND 4294967295)`,
+	`CREATE UNIQUE INDEX aliases_oauth_client_id_idx
+		ON aliases(oauth_client_id) WHERE oauth_client_id <> ''`,
+	`CREATE INDEX aliases_imap_password_hash_idx ON aliases(imap_password_hash)`,
+	`CREATE TABLE archived_messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		upstream_uid INTEGER NOT NULL CHECK(upstream_uid BETWEEN 1 AND 4294967295),
+		message_id TEXT NOT NULL DEFAULT '',
+		internal_date INTEGER NOT NULL,
+		header_date INTEGER,
+		from_json TEXT NOT NULL DEFAULT '[]',
+		to_json TEXT NOT NULL DEFAULT '[]',
+		cc_json TEXT NOT NULL DEFAULT '[]',
+		subject TEXT NOT NULL DEFAULT '',
+		content_path TEXT NOT NULL DEFAULT '',
+		content_bytes INTEGER NOT NULL DEFAULT 0 CHECK(content_bytes >= 0),
+		content_sha256 TEXT NOT NULL DEFAULT '',
+		content_state TEXT NOT NULL DEFAULT 'metadata_only',
+		body_truncated INTEGER NOT NULL DEFAULT 0 CHECK(body_truncated IN (0, 1)),
+		synced_at INTEGER NOT NULL,
+		created_at INTEGER NOT NULL,
+		UNIQUE(account_id, uid_validity, upstream_uid)
+	)`,
+	`CREATE INDEX archived_messages_retention_idx
+		ON archived_messages(content_state, internal_date, id)`,
+	`CREATE TABLE alias_messages (
+		alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		message_id INTEGER NOT NULL REFERENCES archived_messages(id) ON DELETE CASCADE,
+		mailbox_uid INTEGER NOT NULL CHECK(mailbox_uid BETWEEN 1 AND 4294967295),
+		otp TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY(alias_id, message_id),
+		UNIQUE(alias_id, mailbox_uid)
+	)`,
+	`CREATE INDEX alias_messages_alias_uid_idx
+		ON alias_messages(alias_id, mailbox_uid DESC)`,
+	`CREATE INDEX alias_messages_alias_otp_idx
+		ON alias_messages(alias_id, created_at DESC, message_id DESC) WHERE otp <> ''`,
+	`INSERT OR IGNORE INTO archived_messages(
+		account_id, uid_validity, upstream_uid, message_id, internal_date, header_date,
+		from_json, to_json, cc_json, subject, content_path, content_bytes,
+		content_sha256, content_state, body_truncated, synced_at, created_at
+	)
+	SELECT al.account_id, lm.uid_validity, lm.uid, lm.message_id, lm.internal_date,
+		lm.header_date, lm.from_json, lm.to_json, lm.cc_json, lm.subject,
+		'', 0, '', 'metadata_only', 0, lm.synced_at, lm.synced_at
+	FROM latest_messages lm
+	JOIN aliases al ON al.id = lm.alias_id`,
+	`INSERT OR IGNORE INTO alias_messages(alias_id, message_id, mailbox_uid, otp, created_at)
+	SELECT lm.alias_id, archived.id, 1, '', lm.internal_date
+	FROM latest_messages lm
+	JOIN aliases al ON al.id = lm.alias_id
+	JOIN archived_messages archived
+	  ON archived.account_id = al.account_id
+	 AND archived.uid_validity = lm.uid_validity
+	 AND archived.upstream_uid = lm.uid`,
+	`UPDATE aliases SET mailbox_uid_next = 2
+		WHERE id IN (SELECT alias_id FROM alias_messages)`,
+}
+
+var schemaV7 = append(append([]string{}, schemaV6...), migrateV6ToV7...)
+
 var sqliteSchemaConvergence = []string{
+	// Keep the v1 mailbox snapshot and state tables available for existing
+	// clients. These IF NOT EXISTS statements also repair databases that were
+	// left at schema v7 by an earlier, destructive archive migration.
+	`CREATE TABLE IF NOT EXISTS latest_messages (
+		alias_id INTEGER PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		message_id TEXT NOT NULL DEFAULT '',
+		internal_date INTEGER NOT NULL,
+		header_date INTEGER,
+		from_json TEXT NOT NULL DEFAULT '[]',
+		to_json TEXT NOT NULL DEFAULT '[]',
+		cc_json TEXT NOT NULL DEFAULT '[]',
+		subject TEXT NOT NULL DEFAULT '',
+		text_body TEXT NOT NULL DEFAULT '',
+		html_body TEXT NOT NULL DEFAULT '',
+		attachments_json TEXT NOT NULL DEFAULT '[]',
+		body_truncated INTEGER NOT NULL DEFAULT 0 CHECK(body_truncated IN (0, 1)),
+		synced_at INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS pending_alias_api_keys (
+		alias_id INTEGER PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		api_key_ciphertext TEXT NOT NULL CHECK(length(trim(api_key_ciphertext)) > 0),
+		created_at INTEGER NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS consumed_messages (
+		alias_id INTEGER NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		consumed_at INTEGER NOT NULL,
+		PRIMARY KEY(alias_id, uid_validity, uid)
+	)`,
+	`CREATE TABLE IF NOT EXISTS imap_seen_tasks (
+		account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity INTEGER NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid INTEGER NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY(account_id, uid_validity, uid)
+	)`,
+	`CREATE INDEX IF NOT EXISTS imap_seen_tasks_account_created_idx
+		ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
 	`CREATE INDEX IF NOT EXISTS aliases_account_address_idx ON aliases(account_id, address, id)`,
 	`CREATE INDEX IF NOT EXISTS aliases_enabled_account_address_idx ON aliases(account_id, enabled, address, id)`,
 	`CREATE INDEX IF NOT EXISTS alias_creation_schedules_due_idx ON alias_creation_schedules(enabled, next_run_at, account_id)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS aliases_oauth_client_id_idx
+		ON aliases(oauth_client_id) WHERE oauth_client_id <> ''`,
+	`CREATE INDEX IF NOT EXISTS aliases_imap_password_hash_idx ON aliases(imap_password_hash)`,
+	`CREATE INDEX IF NOT EXISTS archived_messages_retention_idx
+		ON archived_messages(content_state, internal_date, id)`,
+	`CREATE INDEX IF NOT EXISTS alias_messages_alias_uid_idx
+		ON alias_messages(alias_id, mailbox_uid DESC)`,
+	`CREATE INDEX IF NOT EXISTS alias_messages_alias_otp_idx
+		ON alias_messages(alias_id, created_at DESC, message_id DESC) WHERE otp <> ''`,
+}
+
+// sqliteAliasCredentialModeConvergence is deliberately implemented as a
+// small inspection helper rather than an ALTER TABLE ... IF NOT EXISTS
+// statement: SQLite has no portable form of that syntax. This also lets a
+// v7 database created before credential modes were introduced converge in
+// place without changing its user_version.
+func convergeSQLiteAliasCredentialMode(ctx context.Context, tx *sql.Tx) error {
+	credentialModePresent := false
+	columns := []struct {
+		name       string
+		definition string
+	}{
+		{name: "api_key_prefix", definition: `TEXT NOT NULL DEFAULT ''`},
+		{name: "credential_ciphertext", definition: `TEXT NOT NULL DEFAULT ''`},
+		{name: "imap_password_hash", definition: `BLOB NOT NULL DEFAULT X''`},
+		{name: "oauth_client_id", definition: `TEXT NOT NULL DEFAULT ''`},
+		{name: "refresh_token_hash", definition: `BLOB NOT NULL DEFAULT X''`},
+		{name: "credential_version", definition: `INTEGER NOT NULL DEFAULT 0`},
+		{name: "credential_mode", definition: `TEXT NOT NULL DEFAULT 'legacy' CHECK(credential_mode IN ('legacy', 'v2'))`},
+		{name: "mailbox_uid_validity", definition: `INTEGER NOT NULL DEFAULT 1 CHECK(mailbox_uid_validity BETWEEN 1 AND 4294967295)`},
+		{name: "mailbox_uid_next", definition: `INTEGER NOT NULL DEFAULT 1 CHECK(mailbox_uid_next BETWEEN 1 AND 4294967295)`},
+	}
+	for _, column := range columns {
+		var present bool
+		if err := tx.QueryRowContext(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM pragma_table_info('aliases')
+				WHERE name = ? COLLATE NOCASE
+			)`, column.name).Scan(&present); err != nil {
+			return fmt.Errorf("inspect aliases %s column: %w", column.name, err)
+		}
+		if present {
+			if column.name == "credential_mode" {
+				credentialModePresent = true
+			}
+			continue
+		}
+		statement := `ALTER TABLE aliases ADD COLUMN ` + column.name + ` ` + column.definition
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("add aliases %s column: %w", column.name, err)
+		}
+	}
+	if !credentialModePresent {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE aliases
+			SET credential_mode = 'v2'
+			WHERE credential_version > 0
+			  AND length(trim(credential_ciphertext)) > 0
+			  AND length(api_key_hash) = 32
+			  AND length(imap_password_hash) = 32
+			  AND length(trim(oauth_client_id)) > 0
+			  AND length(refresh_token_hash) = 32`); err != nil {
+			return fmt.Errorf("classify pre-mode v7 alias credentials: %w", err)
+		}
+	}
+	return nil
+}
+
+var postgresAliasCredentialModeConvergence = []string{
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS api_key_prefix TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS credential_ciphertext TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS imap_password_hash BYTEA NOT NULL DEFAULT decode('', 'hex')`,
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS oauth_client_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS refresh_token_hash BYTEA NOT NULL DEFAULT decode('', 'hex')`,
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS credential_version BIGINT NOT NULL DEFAULT 0`,
+	`DO $migration$
+	DECLARE
+		credential_mode_missing BOOLEAN;
+	BEGIN
+		SELECT NOT EXISTS(
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = 'aliases'
+			  AND column_name = 'credential_mode'
+		) INTO credential_mode_missing;
+		IF credential_mode_missing THEN
+			ALTER TABLE aliases ADD COLUMN credential_mode TEXT NOT NULL DEFAULT 'legacy'
+				CHECK(credential_mode IN ('legacy', 'v2'));
+			UPDATE aliases
+			SET credential_mode = 'v2'
+			WHERE credential_version > 0
+			  AND length(trim(credential_ciphertext)) > 0
+			  AND octet_length(api_key_hash) = 32
+			  AND octet_length(imap_password_hash) = 32
+			  AND length(trim(oauth_client_id)) > 0
+			  AND octet_length(refresh_token_hash) = 32;
+		END IF;
+	END;
+	$migration$`,
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS mailbox_uid_validity BIGINT NOT NULL DEFAULT 1
+		CHECK(mailbox_uid_validity BETWEEN 1 AND 4294967295)`,
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS mailbox_uid_next BIGINT NOT NULL DEFAULT 1
+		CHECK(mailbox_uid_next BETWEEN 1 AND 4294967295)`,
 }
 
 // Both the main branch and an earlier release candidate used version 5 for
@@ -1038,7 +1336,127 @@ var postgresMigrateV5ToV6 = []string{
 		ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
 }
 
+var postgresLegacyCompatibilityRepair = []string{
+	`CREATE TABLE IF NOT EXISTS latest_messages (
+		alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		message_id TEXT NOT NULL DEFAULT '',
+		internal_date BIGINT NOT NULL,
+		header_date BIGINT,
+		from_json TEXT NOT NULL DEFAULT '[]',
+		to_json TEXT NOT NULL DEFAULT '[]',
+		cc_json TEXT NOT NULL DEFAULT '[]',
+		subject TEXT NOT NULL DEFAULT '',
+		text_body TEXT NOT NULL DEFAULT '',
+		html_body TEXT NOT NULL DEFAULT '',
+		attachments_json TEXT NOT NULL DEFAULT '[]',
+		body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+		synced_at BIGINT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS pending_alias_api_keys (
+		alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		api_key_ciphertext TEXT NOT NULL CHECK(length(trim(api_key_ciphertext)) > 0),
+		created_at BIGINT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS consumed_messages (
+		alias_id BIGINT NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		consumed_at BIGINT NOT NULL,
+		PRIMARY KEY(alias_id, uid_validity, uid)
+	)`,
+	`CREATE TABLE IF NOT EXISTS imap_seen_tasks (
+		account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY(account_id, uid_validity, uid)
+	)`,
+	`CREATE INDEX IF NOT EXISTS imap_seen_tasks_account_created_idx
+		ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
+}
+
 var postgresSchemaV6 = append(append([]string{}, postgresSchemaV5...), postgresMigrateV5ToV6...)
+
+var postgresMigrateV6ToV7 = []string{
+	`ALTER TABLE aliases ADD COLUMN credential_ciphertext TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE aliases ADD COLUMN imap_password_hash BYTEA NOT NULL DEFAULT decode('', 'hex')`,
+	`ALTER TABLE aliases ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''`,
+	`ALTER TABLE aliases ADD COLUMN refresh_token_hash BYTEA NOT NULL DEFAULT decode('', 'hex')`,
+	`ALTER TABLE aliases ADD COLUMN credential_version BIGINT NOT NULL DEFAULT 0`,
+	`ALTER TABLE aliases ADD COLUMN credential_mode TEXT NOT NULL DEFAULT 'legacy'
+		CHECK(credential_mode IN ('legacy', 'v2'))`,
+	`ALTER TABLE aliases ADD COLUMN mailbox_uid_validity BIGINT NOT NULL DEFAULT 1
+		CHECK(mailbox_uid_validity BETWEEN 1 AND 4294967295)`,
+	`ALTER TABLE aliases ADD COLUMN mailbox_uid_next BIGINT NOT NULL DEFAULT 1
+		CHECK(mailbox_uid_next BETWEEN 1 AND 4294967295)`,
+	`CREATE UNIQUE INDEX aliases_oauth_client_id_idx
+		ON aliases(oauth_client_id) WHERE oauth_client_id <> ''`,
+	`CREATE INDEX aliases_imap_password_hash_idx ON aliases(imap_password_hash)`,
+	`CREATE TABLE archived_messages (
+		id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+		account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		upstream_uid BIGINT NOT NULL CHECK(upstream_uid BETWEEN 1 AND 4294967295),
+		message_id TEXT NOT NULL DEFAULT '',
+		internal_date BIGINT NOT NULL,
+		header_date BIGINT,
+		from_json TEXT NOT NULL DEFAULT '[]',
+		to_json TEXT NOT NULL DEFAULT '[]',
+		cc_json TEXT NOT NULL DEFAULT '[]',
+		subject TEXT NOT NULL DEFAULT '',
+		content_path TEXT NOT NULL DEFAULT '',
+		content_bytes BIGINT NOT NULL DEFAULT 0 CHECK(content_bytes >= 0),
+		content_sha256 TEXT NOT NULL DEFAULT '',
+		content_state TEXT NOT NULL DEFAULT 'metadata_only',
+		body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+		synced_at BIGINT NOT NULL,
+		created_at BIGINT NOT NULL,
+		UNIQUE(account_id, uid_validity, upstream_uid)
+	)`,
+	`CREATE INDEX archived_messages_retention_idx
+		ON archived_messages(content_state, internal_date, id)`,
+	`CREATE TABLE alias_messages (
+		alias_id BIGINT NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		message_id BIGINT NOT NULL REFERENCES archived_messages(id) ON DELETE CASCADE,
+		mailbox_uid BIGINT NOT NULL CHECK(mailbox_uid BETWEEN 1 AND 4294967295),
+		otp TEXT NOT NULL DEFAULT '',
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY(alias_id, message_id),
+		UNIQUE(alias_id, mailbox_uid)
+	)`,
+	`CREATE INDEX alias_messages_alias_uid_idx
+		ON alias_messages(alias_id, mailbox_uid DESC)`,
+	`CREATE INDEX alias_messages_alias_otp_idx
+		ON alias_messages(alias_id, created_at DESC, message_id DESC) WHERE otp <> ''`,
+	`INSERT INTO archived_messages(
+		account_id, uid_validity, upstream_uid, message_id, internal_date, header_date,
+		from_json, to_json, cc_json, subject, content_path, content_bytes,
+		content_sha256, content_state, body_truncated, synced_at, created_at
+	)
+	SELECT DISTINCT ON (al.account_id, lm.uid_validity, lm.uid)
+		al.account_id, lm.uid_validity, lm.uid, lm.message_id, lm.internal_date,
+		lm.header_date, lm.from_json, lm.to_json, lm.cc_json, lm.subject,
+		'', 0, '', 'metadata_only', FALSE, lm.synced_at, lm.synced_at
+	FROM latest_messages lm
+	JOIN aliases al ON al.id = lm.alias_id
+	ORDER BY al.account_id, lm.uid_validity, lm.uid, lm.alias_id
+	ON CONFLICT(account_id, uid_validity, upstream_uid) DO NOTHING`,
+	`INSERT INTO alias_messages(alias_id, message_id, mailbox_uid, otp, created_at)
+	SELECT lm.alias_id, archived.id, 1, '', lm.internal_date
+	FROM latest_messages lm
+	JOIN aliases al ON al.id = lm.alias_id
+	JOIN archived_messages archived
+	  ON archived.account_id = al.account_id
+	 AND archived.uid_validity = lm.uid_validity
+	 AND archived.upstream_uid = lm.uid
+	ON CONFLICT(alias_id, message_id) DO NOTHING`,
+	`UPDATE aliases SET mailbox_uid_next = 2
+		WHERE id IN (SELECT alias_id FROM alias_messages)`,
+}
+
+var postgresSchemaV7 = append(append([]string{}, postgresSchemaV6...), postgresMigrateV6ToV7...)
 
 // Version 5 was released with two distinct feature-table layouts. These
 // idempotent statements preserve either layout while filling its missing half.
@@ -1115,11 +1533,56 @@ var postgresMigrateV3ToV4 = []string{
 }
 
 var postgresSchemaConvergence = []string{
+	`CREATE TABLE IF NOT EXISTS latest_messages (
+		alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		message_id TEXT NOT NULL DEFAULT '',
+		internal_date BIGINT NOT NULL,
+		header_date BIGINT,
+		from_json TEXT NOT NULL DEFAULT '[]',
+		to_json TEXT NOT NULL DEFAULT '[]',
+		cc_json TEXT NOT NULL DEFAULT '[]',
+		subject TEXT NOT NULL DEFAULT '',
+		text_body TEXT NOT NULL DEFAULT '',
+		html_body TEXT NOT NULL DEFAULT '',
+		attachments_json TEXT NOT NULL DEFAULT '[]',
+		body_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+		synced_at BIGINT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS pending_alias_api_keys (
+		alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
+		api_key_ciphertext TEXT NOT NULL CHECK(length(trim(api_key_ciphertext)) > 0),
+		created_at BIGINT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS consumed_messages (
+		alias_id BIGINT NOT NULL REFERENCES aliases(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		consumed_at BIGINT NOT NULL,
+		PRIMARY KEY(alias_id, uid_validity, uid)
+	)`,
+	`CREATE TABLE IF NOT EXISTS imap_seen_tasks (
+		account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),
+		uid BIGINT NOT NULL CHECK(uid BETWEEN 1 AND 4294967295),
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY(account_id, uid_validity, uid)
+	)`,
+	`CREATE INDEX IF NOT EXISTS imap_seen_tasks_account_created_idx
+		ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
 	`CREATE INDEX IF NOT EXISTS admin_sessions_admin_id_idx ON admin_sessions(admin_id)`,
 	`CREATE INDEX IF NOT EXISTS accounts_enabled_email_idx ON accounts(email, id) WHERE enabled`,
 	`CREATE INDEX IF NOT EXISTS aliases_account_address_idx ON aliases(account_id, address, id)`,
 	`CREATE INDEX IF NOT EXISTS aliases_enabled_account_address_idx ON aliases(account_id, address, id) WHERE enabled`,
 	`CREATE INDEX IF NOT EXISTS alias_creation_schedules_due_idx ON alias_creation_schedules(enabled, next_run_at, account_id)`,
-	`CREATE INDEX IF NOT EXISTS imap_seen_tasks_account_created_idx
-		ON imap_seen_tasks(account_id, created_at, uid_validity, uid)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS aliases_oauth_client_id_idx
+		ON aliases(oauth_client_id) WHERE oauth_client_id <> ''`,
+	`CREATE INDEX IF NOT EXISTS aliases_imap_password_hash_idx ON aliases(imap_password_hash)`,
+	`CREATE INDEX IF NOT EXISTS archived_messages_retention_idx
+		ON archived_messages(content_state, internal_date, id)`,
+	`CREATE INDEX IF NOT EXISTS alias_messages_alias_uid_idx
+		ON alias_messages(alias_id, mailbox_uid DESC)`,
+	`CREATE INDEX IF NOT EXISTS alias_messages_alias_otp_idx
+		ON alias_messages(alias_id, created_at DESC, message_id DESC) WHERE otp <> ''`,
 }

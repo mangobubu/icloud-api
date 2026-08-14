@@ -10,45 +10,37 @@ import (
 	"icloud-api/internal/store"
 )
 
-func TestMigrateV2ToV6(t *testing.T) {
+func TestMigrateV2ToV7(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	databasePath := filepath.Join(t.TempDir(), "legacy-v2.db")
-	current, err := store.Open(databasePath)
+	legacy, err := sql.Open("sqlite", databasePath)
 	if err != nil {
-		t.Fatalf("create current database: %v", err)
+		t.Fatalf("open v2 fixture: %v", err)
 	}
-	account := createAccount(t, ctx, current, "Legacy v2", "legacy-v2@icloud.com")
-	if _, err := current.DB().ExecContext(ctx, `DROP TABLE imap_seen_tasks`); err != nil {
-		_ = current.Close()
-		t.Fatalf("remove v6 seen queue from fixture: %v", err)
+	for _, statement := range legacyV1Schema {
+		if _, err := legacy.ExecContext(ctx, statement); err != nil {
+			_ = legacy.Close()
+			t.Fatalf("create v2 fixture: %v", err)
+		}
 	}
-	if _, err := current.DB().ExecContext(ctx, `DROP TABLE consumed_messages`); err != nil {
-		_ = current.Close()
-		t.Fatalf("remove v6 consumption table from fixture: %v", err)
+	for _, statement := range []string{
+		`ALTER TABLE admins ADD COLUMN password_version INTEGER NOT NULL DEFAULT 1 CHECK(password_version >= 1)`,
+		`ALTER TABLE admin_sessions ADD COLUMN password_version INTEGER NOT NULL DEFAULT 1 CHECK(password_version >= 1)`,
+		`INSERT INTO accounts(
+			id, name, email, imap_host, imap_port, imap_username, password_ciphertext,
+			enabled, last_sync_status, last_sync_error, created_at, updated_at
+		) VALUES(1, 'Legacy v2', 'legacy-v2@icloud.com', 'imap.mail.me.com', 993,
+			'legacy-v2@icloud.com', 'ciphertext', 1, 'pending', '', 1, 1)`,
+		`PRAGMA user_version = 2`,
+	} {
+		if _, err := legacy.ExecContext(ctx, statement); err != nil {
+			_ = legacy.Close()
+			t.Fatalf("prepare v2 fixture with %q: %v", statement, err)
+		}
 	}
-	if _, err := current.DB().ExecContext(ctx, `DROP TABLE imap_sync_states`); err != nil {
-		_ = current.Close()
-		t.Fatalf("remove v4 table from fixture: %v", err)
-	}
-	if _, err := current.DB().ExecContext(ctx, `DROP TABLE apple_web_sessions`); err != nil {
-		_ = current.Close()
-		t.Fatalf("remove v3 table from fixture: %v", err)
-	}
-	if _, err := current.DB().ExecContext(ctx, `DROP TABLE pending_alias_api_keys`); err != nil {
-		_ = current.Close()
-		t.Fatalf("remove v6 pending key table from fixture: %v", err)
-	}
-	if _, err := current.DB().ExecContext(ctx, `DROP TABLE alias_creation_schedules`); err != nil {
-		_ = current.Close()
-		t.Fatalf("remove v6 schedule table from fixture: %v", err)
-	}
-	if _, err := current.DB().ExecContext(ctx, `PRAGMA user_version = 2`); err != nil {
-		_ = current.Close()
-		t.Fatalf("mark fixture as v2: %v", err)
-	}
-	if err := current.Close(); err != nil {
+	if err := legacy.Close(); err != nil {
 		t.Fatalf("close v2 fixture: %v", err)
 	}
 
@@ -66,18 +58,18 @@ func TestMigrateV2ToV6(t *testing.T) {
 	if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("schema version = %d, want 6", version)
+	if version != 7 {
+		t.Fatalf("schema version = %d, want 7", version)
 	}
-	retained, err := migrated.GetAccount(ctx, account.ID)
+	retained, err := migrated.GetAccount(ctx, 1)
 	if err != nil {
 		t.Fatalf("read retained v2 account: %v", err)
 	}
-	if retained.Email != account.Email {
-		t.Fatalf("retained account email = %q, want %q", retained.Email, account.Email)
+	if retained.Email != "legacy-v2@icloud.com" {
+		t.Fatalf("retained account email = %q", retained.Email)
 	}
 	if _, err := migrated.UpsertAppleWebSession(ctx, domain.AppleWebSession{
-		AccountID: account.ID, Ciphertext: "as1.fixture", AppleID: account.Email,
+		AccountID: 1, Ciphertext: "as1.fixture", AppleID: retained.Email,
 		Region: "US", Authenticated: true,
 	}); err != nil {
 		t.Fatalf("use migrated apple web sessions table: %v", err)
