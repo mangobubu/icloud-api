@@ -46,7 +46,7 @@ test("directory synchronization publishes the authoritative credential-bearing a
   assert.match(syncBody, /const result = await syncAccountAliases/);
   assert.match(syncBody, /aliases\.value = result\.aliases/);
   assert.match(syncBody, /syncAccountAliasCount\(\)/);
-  assert.match(syncBody, /完整凭证已显示在列表中/);
+  assert.match(syncBody, /可通过列表中的复制操作导出完整凭证/);
   assert.doesNotMatch(syncBody, /pending|acknowledge|oneTime|batchSecrets/i);
 });
 
@@ -75,7 +75,7 @@ test("successful alias creation and deletion update the displayed alias count", 
 
   assert.match(addAlias, /aliases\.value = \[\.\.\.aliases\.value, result\.alias\]\.sort/);
   assert.match(addAlias, /syncAccountAliasCount\(\)/);
-  assert.match(addAlias, /整套凭证已签发并常驻显示/);
+  assert.match(addAlias, /整套凭证已签发，可通过列表中的复制操作导出/);
   assert.match(removeAlias, /aliases\.value\s*=\s*aliases\.value\.filter/);
   assert.match(removeAlias, /syncAccountAliasCount\(\)/);
 });

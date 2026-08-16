@@ -44,9 +44,6 @@ test("account detail exposes automatic alias creation with persistent credential
   assert.doesNotMatch(source, /clearAliasAutoCreationKeys/);
   assert.doesNotMatch(source, /pendingAutoKeys|batchSecrets|OneTimeSecret/);
 
-  for (const field of ["apiKey", "imapPassword", "clientId", "refreshToken"]) {
-    assert.match(source, new RegExp(`\\{\\{ (?:row|alias)\\.${field} \\}\\}`));
-  }
   assert.match(source, /copyAliasCredentials\(row, ALIAS_EXPORT_OTP\)/);
   assert.match(source, /copyAliasCredentials\(row, ALIAS_EXPORT_IMAP\)/);
   assert.match(
@@ -75,6 +72,31 @@ test("account detail exposes automatic alias creation with persistent credential
     formatAutoCreationError(" unknown upstream detail "),
     " unknown upstream detail ",
   );
+});
+
+test("account detail hides alias credential fields while retaining export actions", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const template = source.slice(
+    source.indexOf("<template>"),
+    source.indexOf("<script setup>"),
+  );
+  const columnsMatch = source.match(
+    /const aliasColumns = Object\.freeze\(\[([\s\S]*?)\]\);/,
+  );
+  assert.ok(columnsMatch, "missing account alias columns");
+
+  for (const field of ["apiKey", "imapPassword", "clientId", "refreshToken"]) {
+    assert.doesNotMatch(columnsMatch[1], new RegExp(`key: "${field}"`));
+    assert.doesNotMatch(template, new RegExp(`column\.key === '${field}'`));
+  }
+  for (const label of ["API Key", "IMAP 密码", "client ID", "刷新令牌"]) {
+    assert.doesNotMatch(template, new RegExp(`<dt>${label}</dt>`));
+  }
+
+  assert.match(template, /copyAliasCredentials\(row, ALIAS_EXPORT_OTP\)/);
+  assert.match(template, /copyAliasCredentials\(row, ALIAS_EXPORT_IMAP\)/);
+  assert.match(template, /copyAliasCredentials\(alias, ALIAS_EXPORT_OTP\)/);
+  assert.match(template, /copyAliasCredentials\(alias, ALIAS_EXPORT_IMAP\)/);
 });
 
 test("account detail exposes the custom random mailbox generator separately", async () => {

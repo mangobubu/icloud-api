@@ -252,7 +252,7 @@
                 </el-tag>
               </div>
               <p>
-                每小时 5 个 · 随机间隔 · 最短 5 分钟。签发后的完整凭证会常驻显示在邮箱列表中。
+                每小时 5 个 · 随机间隔 · 最短 5 分钟。签发后可通过邮箱列表中的复制操作导出完整凭证。
               </p>
             </div>
             <div class="auto-creation-panel__actions">
@@ -354,7 +354,7 @@
             @close="randomAliasError = null"
           />
           <p class="field-help">
-            可直接输入生成数量，单次最多 1000 个；系统会拒绝重复地址，生成后的完整凭证会显示在下方列表。
+            可直接输入生成数量，单次最多 1000 个；系统会拒绝重复地址，可通过下方列表中的复制操作导出完整凭证。
           </p>
         </div>
 
@@ -376,22 +376,6 @@
                   <strong>{{ row.address }}</strong>
                   <small>{{ row.label || "未填写用途备注" }}</small>
                 </div>
-              </template>
-              <template v-else-if="column.key === 'apiKey'">
-                <code v-if="row.apiKey" class="credential-value">{{ row.apiKey }}</code>
-                <code v-else class="credential-value">{{ row.apiKeyPrefix || "-" }}</code>
-              </template>
-              <template v-else-if="column.key === 'imapPassword'">
-                <code v-if="row.imapPassword" class="credential-value">{{ row.imapPassword }}</code>
-                <code v-else class="credential-value">-</code>
-              </template>
-              <template v-else-if="column.key === 'clientId'">
-                <code v-if="row.clientId" class="credential-value">{{ row.clientId }}</code>
-                <code v-else class="credential-value">-</code>
-              </template>
-              <template v-else-if="column.key === 'refreshToken'">
-                <code v-if="row.refreshToken" class="credential-value">{{ row.refreshToken }}</code>
-                <code v-else class="credential-value">-</code>
               </template>
               <template v-else-if="column.key === 'latestReceivedAt'">
                 {{ formatTime(row.latestReceivedAt) }}
@@ -491,34 +475,6 @@
               <SyncStatus v-else :item="alias" details />
             </header>
             <dl class="mobile-kv-list">
-              <div>
-                <dt>API Key</dt>
-                <dd>
-                  <code v-if="alias.apiKey" class="credential-value">{{ alias.apiKey }}</code>
-                  <code v-else class="credential-value">{{ alias.apiKeyPrefix || "-" }}</code>
-                </dd>
-              </div>
-              <div>
-                <dt>IMAP 密码</dt>
-                <dd>
-                  <code v-if="alias.imapPassword" class="credential-value">{{ alias.imapPassword }}</code>
-                  <code v-else class="credential-value">-</code>
-                </dd>
-              </div>
-              <div>
-                <dt>client ID</dt>
-                <dd>
-                  <code v-if="alias.clientId" class="credential-value">{{ alias.clientId }}</code>
-                  <code v-else class="credential-value">-</code>
-                </dd>
-              </div>
-              <div>
-                <dt>刷新令牌</dt>
-                <dd>
-                  <code v-if="alias.refreshToken" class="credential-value">{{ alias.refreshToken }}</code>
-                  <code v-else class="credential-value">-</code>
-                </dd>
-              </div>
               <div>
                 <dt>最新邮件</dt>
                 <dd>{{ formatTime(alias.latestReceivedAt) }}</dd>
@@ -801,30 +757,6 @@ const aliasColumns = Object.freeze([
     width: 230,
     minWidth: 230,
     flexGrow: 1,
-  },
-  {
-    key: "apiKey",
-    title: "API Key",
-    width: 260,
-    minWidth: 260,
-  },
-  {
-    key: "imapPassword",
-    title: "IMAP 密码",
-    width: 260,
-    minWidth: 260,
-  },
-  {
-    key: "clientId",
-    title: "client ID",
-    width: 190,
-    minWidth: 190,
-  },
-  {
-    key: "refreshToken",
-    title: "刷新令牌",
-    width: 260,
-    minWidth: 260,
   },
   {
     key: "latestReceivedAt",
@@ -1456,7 +1388,7 @@ async function performAliasesSync() {
       ? `，其中 ${result.summary.importedDisabledCount} 个因本地容量暂未启用`
       : "";
     const createdNotice = result.summary.createdCount
-      ? `，新增 ${result.summary.createdCount} 个，完整凭证已显示在列表中`
+      ? `，新增 ${result.summary.createdCount} 个，可通过列表中的复制操作导出完整凭证`
       : "，没有新增地址";
     successMessage(
       `隐私邮箱同步完成，Apple 共 ${result.summary.total} 个地址${createdNotice}${capacityNotice}。`,
@@ -1542,7 +1474,7 @@ async function addAlias() {
     syncAccountAliasCount();
     Object.assign(aliasForm, { address: "", label: "" });
     aliasFormRef.value?.resetFields();
-    successMessage("隐私邮箱已添加，整套凭证已签发并常驻显示。");
+    successMessage("隐私邮箱已添加，整套凭证已签发，可通过列表中的复制操作导出。");
   } catch (error) {
     sessionInvalid = isSessionInvalid(error);
     if (!isCurrentAccount(accountId)) return;
@@ -1592,7 +1524,7 @@ async function generateRandomAliases() {
         left.address.localeCompare(right.address) || left.id - right.id,
     );
     syncAccountAliasCount();
-    successMessage(`已生成 ${generated.length} 个随机邮箱，完整凭证已显示在列表中。`);
+    successMessage(`已生成 ${generated.length} 个随机邮箱，可通过列表中的复制操作导出完整凭证。`);
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;
     randomAliasError.value = error;
@@ -1619,7 +1551,7 @@ async function rotateKey(alias) {
     await ElMessageBox.confirm(
       rotateCompleteBundle
         ? "轮换后旧 API Key、取码链接、IMAP 密码、refresh token 和访问令牌会同时失效。继续吗？"
-        : "轮换后旧 API Key 和旧直达链接会失效；邮件消费状态和 IMAP 已读状态保持不变。新 Key 仅在当前页面显示，请立即保存。继续吗？",
+        : "轮换后旧 API Key 和旧直达链接会失效；邮件消费状态和 IMAP 已读状态保持不变。新凭证请通过列表中的复制操作导出并保存。继续吗？",
       `${aliasRotationLabel(alias)}：${alias.address}`,
       {
         type: "warning",
@@ -1642,7 +1574,7 @@ async function rotateKey(alias) {
     successMessage(
       rotateCompleteBundle
         ? "整套凭证已轮换，所有旧凭证与访问令牌均已失效。"
-        : "API Key 已轮换，请立即保存页面中的新 Key；消费和邮件状态保持不变。",
+        : "API Key 已轮换，请通过列表中的复制操作导出并保存新凭证；消费和邮件状态保持不变。",
     );
   } catch (error) {
     if (confirmationCancelled(error)) return;
