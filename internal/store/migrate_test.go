@@ -104,8 +104,8 @@ func TestMigrateV1ToV7PreservesSnapshotMetadataOnly(t *testing.T) {
 	if err := db.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatalf("read migrated schema version: %v", err)
 	}
-	if schemaVersion != 7 {
-		t.Fatalf("schema version = %d, want 7", schemaVersion)
+	if schemaVersion != 8 {
+		t.Fatalf("schema version = %d, want 8", schemaVersion)
 	}
 
 	var adminPasswordVersion, sessionPasswordVersion int64

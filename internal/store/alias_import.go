@@ -20,7 +20,7 @@ func (s *Store) ImportAliases(
 	accountID int64,
 	candidates []domain.AliasImportCandidate,
 ) (domain.AliasImportResult, error) {
-	result, _, err := s.importAliases(ctx, accountID, candidates, false)
+	result, _, err := s.importAliases(ctx, accountID, candidates, false, false, domain.MailboxTypeICloud)
 	return result, err
 }
 
@@ -31,7 +31,31 @@ func (s *Store) ImportAliasesWithCredentials(
 	accountID int64,
 	candidates []domain.AliasImportCandidate,
 ) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
-	return s.importAliases(ctx, accountID, candidates, true)
+	return s.importAliases(ctx, accountID, candidates, true, false, domain.MailboxTypeICloud)
+}
+
+// ImportAliasesWithCredentialsStrict is the all-or-nothing variant used by
+// generated address batches. Any address that already exists causes the
+// transaction to roll back, so a retry can never leave a partially committed
+// batch behind.
+func (s *Store) ImportAliasesWithCredentialsStrict(
+	ctx context.Context,
+	accountID int64,
+	candidates []domain.AliasImportCandidate,
+) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
+	return s.importAliases(ctx, accountID, candidates, true, true, "")
+}
+
+// ImportCustomAliasesWithCredentialsStrict adds the account state and suffix
+// checks required by the local random generator. Those checks run after the
+// account row has been locked, so a concurrent mode/suffix/enable change is
+// serialized with the all-or-nothing batch insert.
+func (s *Store) ImportCustomAliasesWithCredentialsStrict(
+	ctx context.Context,
+	accountID int64,
+	candidates []domain.AliasImportCandidate,
+) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
+	return s.importAliases(ctx, accountID, candidates, true, true, domain.MailboxTypeCustom)
 }
 
 func (s *Store) importAliases(
@@ -39,6 +63,8 @@ func (s *Store) importAliases(
 	accountID int64,
 	candidates []domain.AliasImportCandidate,
 	includeCredentials bool,
+	strict bool,
+	requiredMailboxType string,
 ) (domain.AliasImportResult, []domain.AliasImportCredential, error) {
 	if includeCredentials && s.credentialFactory == nil {
 		return domain.AliasImportResult{}, nil, fmt.Errorf("import aliases: v2 credential factory is not configured")
@@ -61,7 +87,12 @@ func (s *Store) importAliases(
 		}
 	}
 
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	var tx *sql.Tx
+	if requiredMailboxType == domain.MailboxTypeCustom {
+		tx, err = s.beginAddressNamespaceTx(ctx)
+	} else {
+		tx, err = s.db.BeginTx(ctx, &sql.TxOptions{})
+	}
 	if err != nil {
 		return domain.AliasImportResult{}, nil, fmt.Errorf("begin alias import: %w", err)
 	}
@@ -70,6 +101,39 @@ func (s *Store) importAliases(
 	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, accountID)
 	if err != nil {
 		return domain.AliasImportResult{}, nil, fmt.Errorf("lock account for alias import: %w", err)
+	}
+	if requiredMailboxType != "" {
+		state, stateErr := s.readAccountMailboxStateTx(ctx, tx, accountID)
+		if stateErr != nil {
+			return domain.AliasImportResult{}, nil, fmt.Errorf("read account mailbox before alias import: %w", stateErr)
+		}
+		if state.MailboxType != requiredMailboxType {
+			if requiredMailboxType == domain.MailboxTypeCustom {
+				return domain.AliasImportResult{}, nil, ErrCustomMailboxRequired
+			}
+			return domain.AliasImportResult{}, nil, ErrICloudMailboxRequired
+		}
+		if requiredMailboxType == domain.MailboxTypeCustom {
+			if !state.Enabled {
+				return domain.AliasImportResult{}, nil, ErrAccountDisabled
+			}
+			identityConflict, conflictErr := s.aliasImportAccountEmailConflictTx(ctx, tx, normalized)
+			if conflictErr != nil {
+				return domain.AliasImportResult{}, nil, fmt.Errorf("check account email before alias import: %w", conflictErr)
+			}
+			if identityConflict {
+				return domain.AliasImportResult{}, nil, ErrAliasIdentityConflict
+			}
+			for _, candidate := range normalized {
+				if candidate.Address == domain.NormalizeEmail(state.IMAPUsername) {
+					return domain.AliasImportResult{}, nil, ErrAliasIdentityConflict
+				}
+				at := strings.LastIndexByte(candidate.Address, '@')
+				if at <= 0 || candidate.Address[at+1:] != state.EmailSuffix {
+					return domain.AliasImportResult{}, nil, ErrAliasSuffixMismatch
+				}
+			}
+		}
 	}
 
 	result := domain.AliasImportResult{
@@ -82,6 +146,9 @@ func (s *Store) importAliases(
 		existing, findErr := s.getAliasByAddressTx(ctx, tx, candidate.Address)
 		switch {
 		case findErr == nil && existing.AccountID == accountID:
+			if strict {
+				return result, nil, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
+			}
 			result.Existing = append(result.Existing, existing)
 			continue
 		case findErr == nil:
@@ -109,6 +176,17 @@ func (s *Store) importAliases(
 		accountID, domain.AppleAliasConfirmationPending,
 	).Scan(&enabledCount); err != nil {
 		return domain.AliasImportResult{}, nil, fmt.Errorf("count enabled and confirmation-pending aliases before import: %w", err)
+	}
+	if strict {
+		requestedEnabled := 0
+		for _, candidate := range pending {
+			if candidate.Active {
+				requestedEnabled++
+			}
+		}
+		if requestedEnabled > domain.MaxEnabledAliasesPerAccount-enabledCount {
+			return domain.AliasImportResult{}, nil, ErrAliasLimit
+		}
 	}
 
 	type insertion struct {
@@ -169,6 +247,9 @@ func (s *Store) importAliases(
 				)
 			}
 			if existing.AccountID == accountID {
+				if strict {
+					return result, nil, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
+				}
 				result.Existing = append(result.Existing, existing)
 				continue
 			}
@@ -238,6 +319,30 @@ func (s *Store) importAliases(
 		return domain.AliasImportResult{}, nil, fmt.Errorf("commit alias import: %w", err)
 	}
 	return result, issued, nil
+}
+
+func (s *Store) aliasImportAccountEmailConflictTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	candidates []domain.AliasImportCandidate,
+) (bool, error) {
+	if len(candidates) == 0 {
+		return false, nil
+	}
+	args := make([]any, 0, len(candidates))
+	placeholders := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		args = append(args, candidate.Address)
+		placeholders = append(placeholders, "?")
+	}
+	var conflict bool
+	err := s.txQueryRowContext(ctx, tx, `
+		SELECT EXISTS(
+			SELECT 1 FROM accounts
+			WHERE email IN (`+strings.Join(placeholders, ", ")+`)
+		)`, args...,
+	).Scan(&conflict)
+	return conflict, err
 }
 
 func normalizeAliasImportCandidates(candidates []domain.AliasImportCandidate) ([]domain.AliasImportCandidate, error) {

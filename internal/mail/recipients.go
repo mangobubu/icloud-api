@@ -29,6 +29,16 @@ var weakRecipientHeaderFields = []string{
 	"Apparently-To",
 }
 
+// Custom mailbox delivery agents do not share iCloud's routing contract.
+// Select the first header tier that is present and never fall through when
+// that tier is malformed or cannot be mapped to enabled aliases.
+var customRecipientHeaderTiers = [][]string{
+	{"X-Original-To"},
+	{"Original-Recipient"},
+	{"Envelope-To", "X-Envelope-To", "X-Forwarded-To"},
+	{"Delivered-To"},
+}
+
 type icloudHMERoute struct {
 	privateAddress string
 	forwardAddress string
@@ -128,16 +138,16 @@ func normalizeAliasAddress(value string) (string, bool) {
 }
 
 func matchingAliasIDs(header stdmail.Header, aliases map[string][]int64, allowWeak bool) []int64 {
-	return matchingAliasIDsForAccount(header, aliases, "", allowWeak)
+	return matchingAliasIDsForAccount(header, aliases, domain.Account{}, allowWeak)
 }
 
 func matchingAliasIDsForAccount(
 	header stdmail.Header,
 	aliases map[string][]int64,
-	accountEmail string,
+	account domain.Account,
 	allowWeak bool,
 ) []int64 {
-	aliasID, determinate := classifyRecipientAlias(header, aliases, accountEmail, allowWeak)
+	aliasID, determinate := classifyRecipientAlias(header, aliases, account, allowWeak)
 	if !determinate || aliasID == 0 {
 		return nil
 	}
@@ -147,13 +157,28 @@ func matchingAliasIDsForAccount(
 func classifyRecipientAlias(
 	header stdmail.Header,
 	aliases map[string][]int64,
-	accountEmail string,
+	account domain.Account,
 	allowWeak bool,
 ) (int64, bool) {
+	switch domain.NormalizeMailboxType(account.MailboxType) {
+	case domain.MailboxTypeCustom:
+		aliasIDs, determinate := classifyCustomRecipientAliases(header, aliases, allowWeak)
+		if !determinate || len(aliasIDs) != 1 {
+			return 0, false
+		}
+		return aliasIDs[0], true
+	case domain.MailboxTypeICloud:
+		// Continue with the historical iCloud routing contract below. Empty
+		// mailbox types normalize to iCloud for legacy in-memory accounts.
+	default:
+		return 0, false
+	}
+
 	route, present, valid := parseICloudHMERoute(header)
 	if present {
-		if !valid || domain.NormalizeEmail(accountEmail) == "" ||
-			route.forwardAddress != domain.NormalizeEmail(accountEmail) ||
+		accountEmail := domain.NormalizeEmail(account.Email)
+		if !valid || accountEmail == "" ||
+			route.forwardAddress != accountEmail ||
 			!hmeRouteMatchesVisibleRecipient(header, route) ||
 			!hmeRouteMatchesOriginalRecipient(header, route) ||
 			hmeRouteHasConflictingAlias(header, route, aliases) {
@@ -167,6 +192,57 @@ func classifyRecipientAlias(
 		return 0, false
 	}
 	return aliasIDForAddress(addresses[0], aliases)
+}
+
+func classifyCustomRecipientAliases(
+	header stdmail.Header,
+	aliases map[string][]int64,
+	allowWeak bool,
+) ([]int64, bool) {
+	addresses, valid := customRecipientAddresses(header, allowWeak)
+	if !valid {
+		return nil, false
+	}
+	if len(addresses) == 0 {
+		return nil, true
+	}
+
+	seenIDs := make(map[int64]string, len(addresses))
+	for _, address := range addresses {
+		aliasIDs := aliases[address]
+		if len(aliasIDs) != 1 || aliasIDs[0] <= 0 {
+			return nil, false
+		}
+		aliasID := aliasIDs[0]
+		if previousAddress, duplicate := seenIDs[aliasID]; duplicate && previousAddress != address {
+			return nil, false
+		}
+		seenIDs[aliasID] = address
+	}
+
+	result := make([]int64, 0, len(seenIDs))
+	for aliasID := range seenIDs {
+		result = append(result, aliasID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
+	return result, true
+}
+
+func customRecipientAddresses(header stdmail.Header, allowWeak bool) ([]string, bool) {
+	for _, fields := range customRecipientHeaderTiers {
+		if hasAnyHeader(header, fields) {
+			addresses, valid := addressesFromHeaders(header, fields)
+			return addresses, valid && len(addresses) > 0
+		}
+	}
+	if !allowWeak {
+		return nil, true
+	}
+	if !hasAnyHeader(header, weakRecipientHeaderFields) {
+		return nil, true
+	}
+	addresses, valid := addressesFromHeaders(header, weakRecipientHeaderFields)
+	return addresses, valid && len(addresses) > 0
 }
 
 func aliasIDForAddress(address string, aliases map[string][]int64) (int64, bool) {

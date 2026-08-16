@@ -16,13 +16,37 @@ func TestPostgresAdminSessionAdminIDIndexMigrationStructure(t *testing.T) {
 	t.Parallel()
 
 	const freshIndex = "create index admin_sessions_admin_id_idx on admin_sessions(admin_id)"
-	if !containsNormalizedSQL(postgresSchemaV7, freshIndex) {
+	if !containsNormalizedSQL(postgresSchemaV8, freshIndex) {
 		t.Fatalf("fresh PostgreSQL schema is missing %q", freshIndex)
 	}
 
 	const convergenceIndex = "create index if not exists admin_sessions_admin_id_idx on admin_sessions(admin_id)"
 	if !containsNormalizedSQL(postgresSchemaConvergence, convergenceIndex) {
 		t.Fatalf("PostgreSQL v4 convergence is missing %q", convergenceIndex)
+	}
+}
+
+func TestPostgresV8CustomMailboxSchemaIncludesUniqueSuffixIndex(t *testing.T) {
+	t.Parallel()
+	for _, path := range []struct {
+		name       string
+		statements []string
+	}{
+		{name: "fresh v8", statements: postgresSchemaV8},
+		{name: "v7 to v8", statements: postgresMigrateV7ToV8},
+		{name: "v8 convergence", statements: postgresSchemaConvergence},
+	} {
+		t.Run(path.name, func(t *testing.T) {
+			joined := normalizeSQL(strings.Join(path.statements, " "))
+			for _, wanted := range []string{
+				"create table if not exists account_mailbox_settings",
+				"create unique index if not exists account_mailbox_settings_custom_suffix_idx on account_mailbox_settings(lower(email_suffix)) where mailbox_type = 'custom'",
+			} {
+				if !strings.Contains(joined, wanted) {
+					t.Errorf("%s is missing %q", path.name, wanted)
+				}
+			}
+		})
 	}
 }
 
@@ -42,7 +66,7 @@ func TestPostgresQueryIndexesMigrationStructure(t *testing.T) {
 		statements  []string
 		ifNotExists bool
 	}{
-		{"fresh v7", postgresSchemaV7, false},
+		{"fresh v8", postgresSchemaV8, false},
 		{"v3 to v4", postgresMigrateV3ToV4, true},
 		{"v4 convergence", postgresSchemaConvergence, true},
 	}
@@ -71,7 +95,7 @@ func TestPostgresArchiveMigrationStructure(t *testing.T) {
 		name       string
 		statements []string
 	}{
-		{"fresh v7", postgresSchemaV7},
+		{"fresh v8", postgresSchemaV8},
 		{"v6 to v7", postgresMigrateV6ToV7},
 	} {
 		t.Run(path.name, func(t *testing.T) {
@@ -102,7 +126,7 @@ func TestPostgresArchiveMigrationStructure(t *testing.T) {
 		})
 	}
 
-	fresh := normalizeSQL(strings.Join(postgresSchemaV7, " "))
+	fresh := normalizeSQL(strings.Join(postgresSchemaV8, " "))
 	for _, wanted := range []string{
 		"api_key_prefix text not null",
 		"create table latest_messages",
@@ -111,7 +135,7 @@ func TestPostgresArchiveMigrationStructure(t *testing.T) {
 		"create table imap_seen_tasks",
 	} {
 		if !strings.Contains(fresh, wanted) {
-			t.Errorf("fresh v7 PostgreSQL schema is missing compatibility structure %q", wanted)
+			t.Errorf("fresh v8 PostgreSQL schema is missing compatibility structure %q", wanted)
 		}
 	}
 	const convergenceIndex = `create index if not exists archived_messages_retention_idx on archived_messages(content_state, internal_date, id)`

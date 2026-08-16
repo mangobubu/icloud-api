@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const schemaVersion = 7
+const schemaVersion = 8
 
 // Migrate applies schema changes transactionally. Repeated calls are safe.
 func (s *Store) Migrate(ctx context.Context) error {
@@ -37,8 +37,8 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = schemaV7
-		migrationName = "schema v7"
+		statements = schemaV8
+		migrationName = "schema v8"
 	case 1:
 		statements = append([]string{}, migrateV1ToV2...)
 		statements = append(statements, migrateV2ToV3...)
@@ -46,32 +46,37 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 		statements = append(statements, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
 		statements = append(statements, migrateV6ToV7...)
-		migrationName = "migration v1 to v7"
+		statements = append(statements, migrateV7ToV8...)
+		migrationName = "migration v1 to v8"
 	case 2:
 		statements = append([]string{}, migrateV2ToV3...)
 		statements = append(statements, migrateV3ToV4...)
 		statements = append(statements, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
 		statements = append(statements, migrateV6ToV7...)
-		migrationName = "migration v2 to v7"
+		statements = append(statements, migrateV7ToV8...)
+		migrationName = "migration v2 to v8"
 	case 3:
 		statements = append([]string{}, migrateV3ToV4...)
 		statements = append(statements, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
 		statements = append(statements, migrateV6ToV7...)
-		migrationName = "migration v3 to v7"
+		statements = append(statements, migrateV7ToV8...)
+		migrationName = "migration v3 to v8"
 	case 4:
 		statements = append([]string{}, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
 		statements = append(statements, migrateV6ToV7...)
-		migrationName = "migration v4 to v7"
+		statements = append(statements, migrateV7ToV8...)
+		migrationName = "migration v4 to v8"
 	case 5:
 		statements, err = sqliteV5CompatibilityMigration(ctx, tx)
 		if err != nil {
 			return fmt.Errorf("inspect SQLite schema v5 compatibility: %w", err)
 		}
 		statements = append(statements, migrateV6ToV7...)
-		migrationName = "migration v5 to v7"
+		statements = append(statements, migrateV7ToV8...)
+		migrationName = "migration v5 to v8"
 	case 6:
 		for _, statement := range sqliteLegacyCompatibilityRepair {
 			if _, err := s.txExecContext(ctx, tx, statement); err != nil {
@@ -79,9 +84,13 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 			}
 		}
 		statements = append([]string{}, migrateV6ToV7...)
-		migrationName = "migration v6 to v7"
+		statements = append(statements, migrateV7ToV8...)
+		migrationName = "migration v6 to v8"
+	case 7:
+		statements = append([]string{}, migrateV7ToV8...)
+		migrationName = "migration v7 to v8"
 	case schemaVersion:
-		migrationName = "schema v7 convergence"
+		migrationName = "schema v8 convergence"
 	}
 	for _, statement := range statements {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
@@ -102,7 +111,7 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 		return fmt.Errorf("converge sqlite legacy compatibility schema: %w", err)
 	}
 	if current != schemaVersion {
-		if _, err := s.txExecContext(ctx, tx, "PRAGMA user_version = 7"); err != nil {
+		if _, err := s.txExecContext(ctx, tx, "PRAGMA user_version = 8"); err != nil {
 			return fmt.Errorf("set schema version: %w", err)
 		}
 	}
@@ -142,23 +151,26 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = postgresSchemaV7
-		migrationName = "postgres schema v7"
+		statements = postgresSchemaV8
+		migrationName = "postgres schema v8"
 	case 3:
 		statements = append([]string{}, postgresMigrateV3ToV4...)
 		statements = append(statements, postgresMigrateV4ToV5...)
 		statements = append(statements, postgresMigrateV5ToV6...)
 		statements = append(statements, postgresMigrateV6ToV7...)
-		migrationName = "postgres migration v3 to v7"
+		statements = append(statements, postgresMigrateV7ToV8...)
+		migrationName = "postgres migration v3 to v8"
 	case 4:
 		statements = append([]string{}, postgresMigrateV4ToV5...)
 		statements = append(statements, postgresMigrateV5ToV6...)
 		statements = append(statements, postgresMigrateV6ToV7...)
-		migrationName = "postgres migration v4 to v7"
+		statements = append(statements, postgresMigrateV7ToV8...)
+		migrationName = "postgres migration v4 to v8"
 	case 5:
 		statements = append([]string{}, postgresV5CompatibilityMigration...)
 		statements = append(statements, postgresMigrateV6ToV7...)
-		migrationName = "postgres migration v5 to v7"
+		statements = append(statements, postgresMigrateV7ToV8...)
+		migrationName = "postgres migration v5 to v8"
 	case 6:
 		for _, statement := range postgresLegacyCompatibilityRepair {
 			if _, err := s.txExecContext(ctx, tx, statement); err != nil {
@@ -166,9 +178,13 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 			}
 		}
 		statements = append([]string{}, postgresMigrateV6ToV7...)
-		migrationName = "postgres migration v6 to v7"
+		statements = append(statements, postgresMigrateV7ToV8...)
+		migrationName = "postgres migration v6 to v8"
+	case 7:
+		statements = append([]string{}, postgresMigrateV7ToV8...)
+		migrationName = "postgres migration v7 to v8"
 	case schemaVersion:
-		migrationName = "postgres schema v7 convergence"
+		migrationName = "postgres schema v8 convergence"
 	default:
 		return fmt.Errorf("postgres schema version %d has no migration path to version %d", current, schemaVersion)
 	}
@@ -487,7 +503,41 @@ var migrateV6ToV7 = []string{
 
 var schemaV7 = append(append([]string{}, schemaV6...), migrateV6ToV7...)
 
+var migrateV7ToV8 = []string{
+	`CREATE TABLE IF NOT EXISTS account_mailbox_settings (
+		account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		mailbox_type TEXT NOT NULL DEFAULT 'icloud'
+			CHECK(mailbox_type IN ('icloud', 'custom')),
+		email_suffix TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS account_mailbox_settings_type_idx
+		ON account_mailbox_settings(mailbox_type, account_id)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS account_mailbox_settings_custom_suffix_idx
+		ON account_mailbox_settings(email_suffix COLLATE NOCASE)
+		WHERE mailbox_type = 'custom'`,
+}
+
+var schemaV8 = append(append([]string{}, schemaV7...), migrateV7ToV8...)
+
 var sqliteSchemaConvergence = []string{
+	// Mailbox settings live in a side table so upgrading an existing v7
+	// database never rewrites the heavily used accounts table. Missing rows are
+	// interpreted as the historical iCloud mode by account reads.
+	`CREATE TABLE IF NOT EXISTS account_mailbox_settings (
+		account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		mailbox_type TEXT NOT NULL DEFAULT 'icloud'
+			CHECK(mailbox_type IN ('icloud', 'custom')),
+		email_suffix TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS account_mailbox_settings_type_idx
+		ON account_mailbox_settings(mailbox_type, account_id)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS account_mailbox_settings_custom_suffix_idx
+		ON account_mailbox_settings(email_suffix COLLATE NOCASE)
+		WHERE mailbox_type = 'custom'`,
 	// Keep the v1 mailbox snapshot and state tables available for existing
 	// clients. These IF NOT EXISTS statements also repair databases that were
 	// left at schema v7 by an earlier, destructive archive migration.
@@ -1458,6 +1508,24 @@ var postgresMigrateV6ToV7 = []string{
 
 var postgresSchemaV7 = append(append([]string{}, postgresSchemaV6...), postgresMigrateV6ToV7...)
 
+var postgresMigrateV7ToV8 = []string{
+	`CREATE TABLE IF NOT EXISTS account_mailbox_settings (
+		account_id BIGINT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		mailbox_type TEXT NOT NULL DEFAULT 'icloud'
+			CHECK(mailbox_type IN ('icloud', 'custom')),
+		email_suffix TEXT NOT NULL DEFAULT '',
+		created_at BIGINT NOT NULL,
+		updated_at BIGINT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS account_mailbox_settings_type_idx
+		ON account_mailbox_settings(mailbox_type, account_id)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS account_mailbox_settings_custom_suffix_idx
+		ON account_mailbox_settings(LOWER(email_suffix))
+		WHERE mailbox_type = 'custom'`,
+}
+
+var postgresSchemaV8 = append(append([]string{}, postgresSchemaV7...), postgresMigrateV7ToV8...)
+
 // Version 5 was released with two distinct feature-table layouts. These
 // idempotent statements preserve either layout while filling its missing half.
 var postgresV5CompatibilityMigration = []string{
@@ -1533,6 +1601,22 @@ var postgresMigrateV3ToV4 = []string{
 }
 
 var postgresSchemaConvergence = []string{
+	// See the SQLite convergence note above. This side table is intentionally
+	// created with IF NOT EXISTS so convergence can repair an interrupted v8
+	// migration without a destructive accounts-table rewrite.
+	`CREATE TABLE IF NOT EXISTS account_mailbox_settings (
+		account_id BIGINT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+		mailbox_type TEXT NOT NULL DEFAULT 'icloud'
+			CHECK(mailbox_type IN ('icloud', 'custom')),
+		email_suffix TEXT NOT NULL DEFAULT '',
+		created_at BIGINT NOT NULL,
+		updated_at BIGINT NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS account_mailbox_settings_type_idx
+		ON account_mailbox_settings(mailbox_type, account_id)`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS account_mailbox_settings_custom_suffix_idx
+		ON account_mailbox_settings(LOWER(email_suffix))
+		WHERE mailbox_type = 'custom'`,
 	`CREATE TABLE IF NOT EXISTS latest_messages (
 		alias_id BIGINT PRIMARY KEY REFERENCES aliases(id) ON DELETE CASCADE,
 		uid_validity BIGINT NOT NULL CHECK(uid_validity BETWEEN 1 AND 4294967295),

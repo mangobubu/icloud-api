@@ -58,8 +58,8 @@ func TestMigrateV2ToV7(t *testing.T) {
 	if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 7 {
-		t.Fatalf("schema version = %d, want 7", version)
+	if version != 8 {
+		t.Fatalf("schema version = %d, want 8", version)
 	}
 	retained, err := migrated.GetAccount(ctx, 1)
 	if err != nil {

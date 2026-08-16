@@ -54,7 +54,7 @@ func TestPostgresV7ArchiveMigrationStructure(t *testing.T) {
 		})
 	}
 
-	fresh := normalizeSQL(strings.Join(postgresSchemaV7, " "))
+	fresh := normalizeSQL(strings.Join(postgresSchemaV8, " "))
 	convergenceSQL := normalizeSQL(strings.Join(postgresSchemaConvergence, " "))
 	credentialConvergenceSQL := normalizeSQL(strings.Join(postgresAliasCredentialModeConvergence, " "))
 	for _, statement := range []string{
@@ -97,7 +97,7 @@ func TestPostgresV7ArchiveMigrationStructure(t *testing.T) {
 	}
 }
 
-func TestPostgresRestoreSupportsV4ThroughV7AndStrictlyValidatesV7(t *testing.T) {
+func TestPostgresRestoreSupportsV4ThroughV8AndStrictlyValidatesExtensions(t *testing.T) {
 	t.Parallel()
 
 	scriptPath := filepath.Join("..", "..", "docker", "postgres-entrypoint.sh")
@@ -129,12 +129,22 @@ func TestPostgresRestoreSupportsV4ThroughV7AndStrictlyValidatesV7(t *testing.T) 
 		`optional_required_foreign_keys="alias_creation_schedules:alias_creation_schedules_account_id_fkey pending_alias_api_keys:pending_alias_api_keys_alias_id_fkey consumed_messages:consumed_messages_alias_id_fkey imap_seen_tasks:imap_seen_tasks_account_id_fkey archived_messages:archived_messages_account_id_fkey alias_messages:alias_messages_alias_id_fkey alias_messages:alias_messages_message_id_fkey"`,
 		`optional_required_indexes="alias_creation_schedules_due_idx aliases_oauth_client_id_idx aliases_imap_password_hash_idx archived_messages_retention_idx alias_messages_alias_uid_idx alias_messages_alias_otp_idx"`,
 		`optional_required_indexes="alias_creation_schedules_due_idx imap_seen_tasks_account_created_idx aliases_oauth_client_id_idx aliases_imap_password_hash_idx archived_messages_retention_idx alias_messages_alias_uid_idx alias_messages_alias_otp_idx"`,
-		`$optional_required_tables; do`,
-		`restored_schema_version NOT IN (4, 5, 6, 7)`,
+		`restored_schema_version NOT IN (4, 5, 6, 7, 8)`,
 		`restored_schema_version = 4`,
 		`restored_schema_version = 5`,
 		`restored_schema_version = 6`,
 		`restored_schema_version = 7`,
+		`restored_schema_version = 8`,
+		`pg_catalog.to_regclass('public.account_mailbox_settings') IS NOT NULL`,
+		`mailbox_required_tables="account_mailbox_settings"`,
+		`mailbox_required_constraints="account_mailbox_settings:account_mailbox_settings_pkey"`,
+		`mailbox_required_foreign_keys="account_mailbox_settings:account_mailbox_settings_account_id_fkey"`,
+		`mailbox_required_indexes="account_mailbox_settings_type_idx account_mailbox_settings_custom_suffix_idx"`,
+		`$optional_required_tables $mailbox_required_tables; do`,
+		`$6 == "public" && $7 == required_table { found_data = 1 }`,
+		`die "恢复归档缺少项目必需表或数据段：public.$required_table"`,
+		`('v8', 'account_mailbox_settings', 'account_mailbox_settings_custom_suffix_idx')`,
+		`RAISE EXCEPTION 'restored schema v8 is missing required compatibility or mailbox tables'`,
 		`archive_table_count`,
 		`optional_required_sequences="archived_messages_id_seq"`,
 		`restored_schema_version BETWEEN 4 AND 6`,
@@ -150,7 +160,7 @@ func TestPostgresRestoreSupportsV4ThroughV7AndStrictlyValidatesV7(t *testing.T) 
 		`pg_catalog.to_regclass('public.consumed_messages') IS NOT NULL`,
 		`pg_catalog.to_regclass('public.imap_seen_tasks') IS NOT NULL`,
 		`RAISE EXCEPTION 'restored schema v7 has an unrecognized compatibility-table set'`,
-		`restored_schema_version = 7 AND
+		`restored_schema_version IN (7, 8) AND
 			 pg_catalog.to_regclass('public.latest_messages') IS NOT NULL`,
 		`('message', 'latest_messages', 'latest_messages_pkey', ARRAY['alias_id']::TEXT[])`,
 		`('message', 'latest_messages', 'latest_messages_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[])`,
@@ -161,6 +171,10 @@ func TestPostgresRestoreSupportsV4ThroughV7AndStrictlyValidatesV7(t *testing.T) 
 		`('seen', 'consumed_messages', 'consumed_messages_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[])`,
 		`('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[])`,
 		`('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_created_idx', ARRAY['account_id', 'created_at', 'uid_validity', 'uid']::TEXT[])`,
+		`('mailbox', 'account_mailbox_settings', 'account_mailbox_settings_pkey', ARRAY['account_id']::TEXT[])`,
+		`('mailbox', 'account_mailbox_settings', 'account_mailbox_settings_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[])`,
+		`('mailbox', 'account_mailbox_settings', 'account_mailbox_settings_type_idx', ARRAY['mailbox_type', 'account_id']::TEXT[])`,
+		`required.extension_group <> 'mailbox' OR restored_schema_version = 8`,
 		`ARRAY['account_id']::TEXT[]`,
 		`ARRAY['alias_id']::TEXT[]`,
 		`ARRAY['alias_id', 'uid_validity', 'uid']::TEXT[]`,
@@ -173,6 +187,16 @@ func TestPostgresRestoreSupportsV4ThroughV7AndStrictlyValidatesV7(t *testing.T) 
 		`index_metadata.indexprs IS NULL`,
 		`ARRAY['enabled', 'next_run_at', 'account_id']::TEXT[]`,
 		`ARRAY['account_id', 'created_at', 'uid_validity', 'uid']::TEXT[]`,
+		`index_state.relname = 'account_mailbox_settings_custom_suffix_idx'`,
+		`AND index_metadata.indisunique`,
+		`AND index_metadata.indnkeyatts = 1`,
+		`AND index_metadata.indnatts = 1`,
+		`AND index_metadata.indpred IS NOT NULL`,
+		`AND index_metadata.indexprs IS NOT NULL`,
+		`) = ARRAY[0]::SMALLINT[]`,
+		`) = 'loweremail_suffix'`,
+		`) = 'mailbox_type=''custom''::text'`,
+		`RAISE EXCEPTION 'restored schema has invalid index account_mailbox_settings.account_mailbox_settings_custom_suffix_idx'`,
 	}
 	for _, fragment := range wanted {
 		if !strings.Contains(script, fragment) {
@@ -197,10 +221,10 @@ func TestPostgresRestoreSupportsV4ThroughV7AndStrictlyValidatesV7(t *testing.T) 
 	}
 }
 
-func TestPostgresMigrationExecutesV0V3V4V5V6V7Paths(t *testing.T) {
+func TestPostgresMigrationExecutesV0V3V4V5V6V7V8Paths(t *testing.T) {
 	t.Parallel()
 
-	freshAdmin := postgresSchemaV7[0]
+	freshAdmin := postgresSchemaV8[0]
 	syncState := postgresMigrateV3ToV4[len(postgresMigrateV3ToV4)-2]
 	autoSchedule := postgresMigrateV4ToV5[0]
 	consumedMessages := postgresMigrateV5ToV6[0]
@@ -208,6 +232,7 @@ func TestPostgresMigrationExecutesV0V3V4V5V6V7Paths(t *testing.T) {
 	compatAutoSchedule := postgresV5CompatibilityMigration[1]
 	compatConsumedMessages := postgresV5CompatibilityMigration[3]
 	archiveTable := postgresMigrateV6ToV7[10]
+	mailboxSettingsTable := postgresMigrateV7ToV8[0]
 	archiveIndexConvergence := `CREATE INDEX IF NOT EXISTS archived_messages_retention_idx
 		ON archived_messages(content_state, internal_date, id)`
 
@@ -217,20 +242,21 @@ func TestPostgresMigrationExecutesV0V3V4V5V6V7Paths(t *testing.T) {
 		unwanted          []string
 		wantVersionUpdate bool
 	}{
-		{0, []string{freshAdmin, syncState, autoSchedule, consumedMessages, archiveTable}, nil, true},
-		{3, []string{syncState, autoSchedule, consumedMessages, archiveTable}, []string{freshAdmin}, true},
-		{4, []string{autoSchedule, consumedMessages, archiveTable}, []string{freshAdmin, syncState}, true},
-		{5, []string{compatValidation, compatAutoSchedule, compatConsumedMessages, archiveTable}, []string{freshAdmin, syncState, autoSchedule, consumedMessages}, true},
+		{0, []string{freshAdmin, syncState, autoSchedule, consumedMessages, archiveTable, mailboxSettingsTable}, nil, true},
+		{3, []string{syncState, autoSchedule, consumedMessages, archiveTable, mailboxSettingsTable}, []string{freshAdmin}, true},
+		{4, []string{autoSchedule, consumedMessages, archiveTable, mailboxSettingsTable}, []string{freshAdmin, syncState}, true},
+		{5, []string{compatValidation, compatAutoSchedule, compatConsumedMessages, archiveTable, mailboxSettingsTable}, []string{freshAdmin, syncState, autoSchedule, consumedMessages}, true},
 		// Compatibility-table repair statements are part of v7 convergence and
 		// therefore may execute even when the source is already v6 or v7.
-		{6, []string{archiveTable}, []string{freshAdmin, syncState, autoSchedule, consumedMessages, compatValidation, compatAutoSchedule}, true},
-		{7, nil, []string{freshAdmin, syncState, autoSchedule, consumedMessages, compatValidation, compatAutoSchedule, archiveTable}, false},
+		{6, []string{archiveTable, mailboxSettingsTable}, []string{freshAdmin, syncState, autoSchedule, consumedMessages, compatValidation, compatAutoSchedule}, true},
+		{7, []string{mailboxSettingsTable}, []string{freshAdmin, syncState, autoSchedule, consumedMessages, compatValidation, compatAutoSchedule, archiveTable}, true},
+		{8, nil, []string{freshAdmin, syncState, autoSchedule, consumedMessages, compatValidation, compatAutoSchedule, archiveTable}, false},
 	}
 	for _, path := range paths {
 		path := path
 		t.Run(fmt.Sprintf("v%d", path.version), func(t *testing.T) {
 			capture := &postgresMigrationCaptureDriver{version: path.version}
-			driverName := fmt.Sprintf("icloud-api-postgres-v7-path-%p", capture)
+			driverName := fmt.Sprintf("icloud-api-postgres-v8-path-%p", capture)
 			sql.Register(driverName, capture)
 			raw, err := sql.Open(driverName, "")
 			if err != nil {

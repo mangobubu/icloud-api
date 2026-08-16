@@ -43,7 +43,21 @@
           />
         </el-form-item>
 
-        <el-form-item label="iCloud 主号邮箱" prop="email">
+        <el-form-item label="邮箱类型" prop="mailboxType">
+          <el-select
+            v-model="form.mailboxType"
+            style="width: 100%"
+            :disabled="emailLocked"
+          >
+            <el-option label="iCloud 隐私邮箱" value="icloud" />
+            <el-option label="自定义邮箱" value="custom" />
+          </el-select>
+          <p class="field-help">
+            iCloud 规则和自动创建计划保持不变；自定义邮箱可按后缀批量生成地址。
+          </p>
+        </el-form-item>
+
+        <el-form-item v-if="!isCustomMailbox" label="iCloud 主号邮箱" prop="email">
           <el-input
             v-model="form.email"
             type="email"
@@ -56,10 +70,26 @@
           </p>
         </el-form-item>
 
+        <el-form-item
+          v-if="isCustomMailbox"
+          label="邮箱后缀"
+          prop="emailSuffix"
+        >
+          <el-input
+            v-model="form.emailSuffix"
+            placeholder="example.com 或 @example.com"
+            autocomplete="off"
+            :readonly="emailLocked"
+          />
+          <p class="field-help">
+            随机邮箱会按 8–12 位英文数字 + @后缀生成，不受 iCloud 每小时规则限制。
+          </p>
+        </el-form-item>
+
         <el-form-item label="IMAP 用户名" prop="imapUsername">
           <el-input
             v-model="form.imapUsername"
-            placeholder="通常填写完整 iCloud 邮箱"
+            :placeholder="isCustomMailbox ? '填写邮箱服务器的登录用户名' : '通常填写完整 iCloud 邮箱'"
             autocomplete="username"
           />
         </el-form-item>
@@ -86,7 +116,12 @@
           <p class="field-help">默认使用 imap.mail.me.com:993（TLS）。</p>
         </el-form-item>
 
-        <el-form-item class="form-span" label="App 专用密码" prop="imapPassword">
+        <el-form-item
+          v-if="!isCustomMailbox"
+          class="form-span"
+          label="App 专用密码"
+          prop="imapPassword"
+        >
           <el-input
             v-model="form.imapPassword"
             type="password"
@@ -95,6 +130,22 @@
             autocomplete="new-password"
           />
           <p class="field-help">专用密码只会加密保存，后续不会回显。</p>
+        </el-form-item>
+
+        <el-form-item
+          v-else
+          class="form-span"
+          label="IMAP 密码"
+          prop="imapPassword"
+        >
+          <el-input
+            v-model="form.imapPassword"
+            type="password"
+            show-password
+            :placeholder="isEdit ? '留空则保留当前密码' : '填写邮箱服务器的 IMAP 密码'"
+            autocomplete="new-password"
+          />
+          <p class="field-help">IMAP 密码只会加密保存，后续不会回显。</p>
         </el-form-item>
 
         <el-form-item v-if="isEdit" class="form-span account-enabled-field">
@@ -168,11 +219,14 @@ const submitLock = createActionLock();
 let viewActive = true;
 
 const isEdit = computed(() => route.name === "account-edit");
+const isCustomMailbox = computed(() => form.mailboxType === "custom");
 const emailLocked = computed(() => isEdit.value && aliasCount.value > 0);
 
 const form = reactive({
   name: "",
   email: "",
+  mailboxType: "icloud",
+  emailSuffix: "",
   imapHost: DEFAULT_IMAP_HOST,
   imapPort: DEFAULT_IMAP_PORT,
   imapUsername: "",
@@ -191,11 +245,49 @@ function runeLength(value) {
 function validateEmail(_, value, callback) {
   const normalized = String(value || "").trim();
   if (!normalized) {
+    if (isCustomMailbox.value) {
+      callback();
+      return;
+    }
     callback(new Error("请填写 iCloud 主号邮箱"));
     return;
   }
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
     callback(new Error("邮箱地址格式不正确"));
+    return;
+  }
+  callback();
+}
+
+function validateMailboxType(_, value, callback) {
+  if (!["icloud", "custom"].includes(String(value || "").trim())) {
+    callback(new Error("请选择邮箱类型"));
+    return;
+  }
+  callback();
+}
+
+function normalizeSuffix(value) {
+  return String(value || "").trim().replace(/^@+/, "").toLowerCase();
+}
+
+function validateEmailSuffix(_, value, callback) {
+  if (!isCustomMailbox.value) {
+    callback();
+    return;
+  }
+  const normalized = normalizeSuffix(value);
+  if (!normalized) {
+    callback(new Error("请填写邮箱后缀"));
+    return;
+  }
+  if (
+    normalized.length > 241 ||
+    !/^(?=.{1,241}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/.test(
+      normalized,
+    )
+  ) {
+    callback(new Error("邮箱后缀格式不正确"));
     return;
   }
   callback();
@@ -210,8 +302,16 @@ function validateName(_, value, callback) {
 }
 
 function validatePassword(_, value, callback) {
-  if (!isEdit.value && !String(value || "").trim()) {
-    callback(new Error("请填写 App 专用密码"));
+  const password = String(value ?? "");
+  const passwordMissing = isCustomMailbox.value
+    ? password.length === 0
+    : !password.trim();
+  if (!isEdit.value && passwordMissing) {
+    callback(
+      new Error(
+        isCustomMailbox.value ? "请填写 IMAP 密码" : "请填写 App 专用密码",
+      ),
+    );
     return;
   }
   callback();
@@ -237,7 +337,11 @@ function validateIMAPPort(_, value, callback) {
 
 const rules = {
   name: [{ validator: validateName, trigger: "blur" }],
+  mailboxType: [{ validator: validateMailboxType, trigger: "change" }],
   email: [{ validator: validateEmail, trigger: ["blur", "change"] }],
+  emailSuffix: [
+    { validator: validateEmailSuffix, trigger: ["blur", "change"] },
+  ],
   imapHost: [{ validator: validateIMAPHost, trigger: ["blur", "change"] }],
   imapPort: [{ validator: validateIMAPPort, trigger: ["blur", "change"] }],
   imapUsername: [
@@ -250,6 +354,8 @@ function resetForm() {
   Object.assign(form, {
     name: "",
     email: "",
+    mailboxType: "icloud",
+    emailSuffix: "",
     imapHost: DEFAULT_IMAP_HOST,
     imapPort: DEFAULT_IMAP_PORT,
     imapUsername: "",
@@ -277,7 +383,9 @@ async function loadAccount() {
     );
     Object.assign(form, {
       name: account.name,
-      email: account.email,
+      email: account.mailboxType === "custom" ? "" : account.email,
+      mailboxType: account.mailboxType || "icloud",
+      emailSuffix: account.emailSuffix || "",
       imapHost: imapEndpoint.host,
       imapPort: imapEndpoint.port,
       imapUsername: account.imapUsername,
@@ -308,12 +416,19 @@ async function submit() {
     const imapEndpoint = normalizeIMAPEndpoint(form.imapHost, form.imapPort);
     const payload = {
       name: form.name.trim(),
-      email: form.email.trim(),
+      mailbox_type: form.mailboxType,
       imap_host: imapEndpoint.host,
       imap_port: imapEndpoint.port,
       imap_username: form.imapUsername.trim(),
-      imap_password: form.imapPassword.trim(),
+      imap_password: isCustomMailbox.value
+        ? form.imapPassword
+        : form.imapPassword.trim(),
     };
+    if (isCustomMailbox.value) {
+      payload.email_suffix = normalizeSuffix(form.emailSuffix);
+    } else {
+      payload.email = form.email.trim();
+    }
     const account = isEdit.value
       ? await updateAccount(
           submittedAccountId,

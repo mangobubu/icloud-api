@@ -82,6 +82,16 @@ func (s *Store) createAutoAliasCandidate(
 	if err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("lock account for automatic alias creation: %w", err)
 	}
+	state, err := s.readAccountMailboxStateTx(ctx, tx, alias.AccountID)
+	if err != nil {
+		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("read account before automatic alias creation: %w", err)
+	}
+	if !state.Enabled {
+		return domain.Alias{}, domain.AppleWebSession{}, ErrAccountDisabled
+	}
+	if state.MailboxType != domain.MailboxTypeICloud {
+		return domain.Alias{}, domain.AppleWebSession{}, ErrICloudMailboxRequired
+	}
 	if alias.Enabled {
 		if err := s.requireEnabledAliasCapacity(ctx, tx, alias.AccountID); err != nil {
 			return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("create automatic alias: %w", err)
@@ -230,6 +240,16 @@ func (s *Store) ConfirmPendingAutoAlias(
 	accountVersion, err := s.lockAccountVersionForUpdate(ctx, tx, session.AccountID)
 	if err != nil {
 		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("lock account for pending automatic alias confirmation: %w", err)
+	}
+	state, err := s.readAccountMailboxStateTx(ctx, tx, session.AccountID)
+	if err != nil {
+		return domain.Alias{}, domain.AppleWebSession{}, fmt.Errorf("read account before pending automatic alias confirmation: %w", err)
+	}
+	if !state.Enabled {
+		return domain.Alias{}, domain.AppleWebSession{}, ErrAccountDisabled
+	}
+	if state.MailboxType != domain.MailboxTypeICloud {
+		return domain.Alias{}, domain.AppleWebSession{}, ErrICloudMailboxRequired
 	}
 
 	var enabled bool

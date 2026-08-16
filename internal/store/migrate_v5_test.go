@@ -13,13 +13,13 @@ import (
 	"icloud-api/internal/store"
 )
 
-func TestSQLiteFreshSchemaV7IncludesLegacyCompatibilityTables(t *testing.T) {
+func TestSQLiteFreshSchemaV8IncludesMailboxAndLegacyCompatibilityTables(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "fresh-v7.db"))
+	db, err := store.Open(filepath.Join(t.TempDir(), "fresh-v8.db"))
 	if err != nil {
-		t.Fatalf("create fresh v7 database: %v", err)
+		t.Fatalf("create fresh v8 database: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
@@ -27,17 +27,21 @@ func TestSQLiteFreshSchemaV7IncludesLegacyCompatibilityTables(t *testing.T) {
 	if err := db.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read fresh schema version: %v", err)
 	}
-	if version != 7 {
-		t.Fatalf("fresh schema version = %d, want 7", version)
+	if version != 8 {
+		t.Fatalf("fresh schema version = %d, want 8", version)
 	}
 
 	for _, table := range []string{
 		"archived_messages", "alias_messages", "alias_creation_schedules",
 		"latest_messages", "pending_alias_api_keys", "consumed_messages", "imap_seen_tasks",
+		"account_mailbox_settings",
 	} {
 		if !sqliteObjectExists(t, ctx, db.DB(), "table", table) {
-			t.Errorf("fresh v7 schema is missing table %s", table)
+			t.Errorf("fresh v8 schema is missing table %s", table)
 		}
+	}
+	if !sqliteObjectExists(t, ctx, db.DB(), "index", "account_mailbox_settings_custom_suffix_idx") {
+		t.Error("fresh v8 schema is missing the custom mailbox suffix unique index")
 	}
 
 	columns := sqliteTableColumns(t, ctx, db.DB(), "aliases")
@@ -46,7 +50,7 @@ func TestSQLiteFreshSchemaV7IncludesLegacyCompatibilityTables(t *testing.T) {
 		"refresh_token_hash", "credential_version", "mailbox_uid_validity", "mailbox_uid_next",
 	} {
 		if !columns[column] {
-			t.Errorf("fresh v7 aliases table is missing column %s", column)
+			t.Errorf("fresh v8 aliases table is missing column %s", column)
 		}
 	}
 }
@@ -316,8 +320,8 @@ func TestMigrateV6ToV7PreservesSharedSnapshotAndLegacyState(t *testing.T) {
 	if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read migrated schema version: %v", err)
 	}
-	if version != 7 {
-		t.Fatalf("migrated schema version = %d, want 7", version)
+	if version != 8 {
+		t.Fatalf("migrated schema version = %d, want 8", version)
 	}
 	if err := migrated.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM archived_messages`).Scan(&archivedCount); err != nil {
 		t.Fatalf("count migrated archive messages: %v", err)
@@ -473,8 +477,8 @@ func TestMigrateHistoricalV5LayoutsToV7(t *testing.T) {
 			if err := migrated.DB().QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 				t.Fatal(err)
 			}
-			if version != 7 || !sqliteObjectExists(t, ctx, migrated.DB(), "table", "archived_messages") {
-				t.Fatalf("historical v5 layout did not converge to v7; version=%d", version)
+			if version != 8 || !sqliteObjectExists(t, ctx, migrated.DB(), "table", "archived_messages") {
+				t.Fatalf("historical v5 layout did not converge to v8; version=%d", version)
 			}
 			if _, err := migrated.GetAccount(ctx, 1); err != nil {
 				t.Fatalf("historical account was not retained: %v", err)

@@ -16,6 +16,8 @@
 /.review-cache/
 /.tmp-gocache*/
 /.tmp-go-cache*/
+/.tmp-go-mod*/
+/.tmp-go-path*/
 /.tmp/
 **/.gocache/
 **/.DS_Store

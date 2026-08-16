@@ -39,7 +39,10 @@ test("account list and detail share server-driven sync progress", async () => {
   assert.match(detailSource, /const syncActive = computed\(/);
   assert.match(detailSource, /account\.value\?\.syncProgress\?\.active/);
   assert.match(detailSource, /:loading="syncLoading \|\| syncActive"/);
-  assert.match(detailSource, /if \(syncLoading\.value \|\| syncActive\.value\) return/);
+  assert.match(
+    detailSource,
+    /if \(syncLoading\.value \|\| syncActive\.value \|\| randomAliasLoading\.value\) return/,
+  );
   assert.ok(
     (listSource.match(/<SyncStatus :item=/g) || []).length >= 2,
     "desktop and mobile account lists must use the shared sync status",

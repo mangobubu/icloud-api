@@ -117,6 +117,27 @@ export function normalizeAccount(raw = {}) {
     id: firstDefined(raw, "id", "ID"),
     name: firstDefined(raw, "name", "Name") || "",
     email: firstDefined(raw, "email", "Email") || "",
+    mailboxType:
+      firstDefined(
+        raw,
+        "mailbox_type",
+        "mailboxType",
+        "account_type",
+        "accountType",
+        "provider",
+        "Provider",
+        "MailboxType",
+      ) || "icloud",
+    provider:
+      firstDefined(
+        raw,
+        "provider",
+        "Provider",
+        "mailbox_type",
+        "mailboxType",
+      ) || "icloud",
+    emailSuffix:
+      firstDefined(raw, "email_suffix", "emailSuffix", "EmailSuffix") || "",
     imapHost: imapEndpoint.host,
     imapPort: imapEndpoint.port,
     imapUsername:
@@ -484,6 +505,52 @@ export async function updateAccount(id, payload, csrfToken) {
     csrfToken,
   });
   return normalizeAccount(data?.account || data || {});
+}
+
+function normalizeRandomAliasResult(data = {}) {
+  const rawCreated = listFrom(data, "created", "items");
+  const rawAliases = listFrom(data, "aliases");
+  const created = rawCreated.map((item) => {
+    const rawAlias = firstDefined(item, "alias", "Alias") || item;
+    const alias = normalizeAlias(
+      typeof rawAlias === "string" ? { address: rawAlias } : rawAlias,
+    );
+    return {
+      alias,
+      apiKey:
+        firstDefined(item, "api_key", "apiKey", "APIKey") || alias.apiKey,
+      otpUrlPath:
+        firstDefined(
+          item,
+          "otp_url_path",
+          "otpUrlPath",
+          "OTPURLPath",
+          "mail_api_direct_link",
+          "mailApiDirectLink",
+          "MailAPIDirectLink",
+        ) || alias.otpUrlPath || alias.directLinkPath,
+    };
+  });
+  return {
+    created,
+    aliases: (rawAliases.length ? rawAliases : created.map((item) => item.alias)).map(
+      normalizeAlias,
+    ),
+    count:
+      Number(firstDefined(data, "count", "Count")) || created.length,
+  };
+}
+
+export async function createRandomAliases(accountId, payload, csrfToken) {
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(accountId)}/aliases/random`,
+    {
+      method: "POST",
+      body: payload,
+      csrfToken,
+    },
+  );
+  return normalizeRandomAliasResult(data?.data || data || {});
 }
 
 export function deleteAccount(id, csrfToken) {

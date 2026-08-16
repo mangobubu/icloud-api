@@ -16,6 +16,12 @@ const (
 	AliasCredentialModeV2     = "v2"
 
 	MaxEnabledAliasesPerAccount = 1000
+
+	// MailboxType identifies which primary-mailbox contract an account uses.
+	// Existing rows intentionally default to iCloud so the historical Apple
+	// Hide My Email workflow remains unchanged.
+	MailboxTypeICloud = "icloud"
+	MailboxTypeCustom = "custom"
 )
 
 type Admin struct {
@@ -49,6 +55,14 @@ type Account struct {
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
 	AliasCount         int
+	// MailboxType is the account's mailbox integration mode. Empty values on
+	// in-memory legacy records are treated as MailboxTypeICloud by stores and
+	// API boundaries.
+	MailboxType string
+	// EmailSuffix is used by the local random-alias generator for custom
+	// mailboxes. It is deliberately separate from Email, which remains the
+	// legacy iCloud identity used by Apple sessions and external API lookups.
+	EmailSuffix string
 }
 
 // AppleWebSession stores the encrypted Apple web session associated with an

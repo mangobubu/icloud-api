@@ -91,11 +91,11 @@
           <el-option
             v-for="account in accounts"
             :key="account.id"
-            :label="account.email"
+            :label="formatAccountIdentity(account)"
             :value="account.id"
           >
             <div class="primary-stack">
-              <strong>{{ account.email }}</strong>
+              <strong>{{ formatAccountIdentity(account) }}</strong>
               <small>{{ account.name || "未填写备注" }}</small>
             </div>
           </el-option>
@@ -216,7 +216,7 @@
                 type="primary"
                 @click="openAccount(row.accountId)"
               >
-                {{ row.accountEmail || "查看主号" }}
+                {{ formatAliasAccountIdentity(row) || "查看主号" }}
               </el-button>
             </template>
             <template v-else-if="column.key === 'apiKey'">
@@ -318,7 +318,7 @@
           <dl class="mobile-kv-list">
             <div>
               <dt>所属主号</dt>
-              <dd>{{ alias.accountEmail || "-" }}</dd>
+              <dd>{{ formatAliasAccountIdentity(alias) || "-" }}</dd>
             </div>
             <div>
               <dt>API Key</dt>
@@ -516,6 +516,25 @@ function isAliasConfirmationPending(alias) {
     String(alias?.lastSyncError || "").trim() ===
       "APPLE_ALIAS_CONFIRMATION_PENDING"
   );
+}
+
+function formatAccountIdentity(account) {
+  const email = String(account?.email || account?.accountEmail || "");
+  if (account?.mailboxType === "custom") {
+    const suffix = String(account?.emailSuffix || "").replace(/^@+/, "");
+    if (suffix) return `@${suffix}`;
+  }
+  if (account?.mailboxType == null && email.startsWith("custom@")) {
+    return email.slice("custom".length);
+  }
+  return email;
+}
+
+function formatAliasAccountIdentity(alias) {
+  const account = accounts.value.find(
+    (item) => String(item.id) === String(alias?.accountId),
+  );
+  return formatAccountIdentity(account || alias);
 }
 
 function isAliasExportable(alias) {

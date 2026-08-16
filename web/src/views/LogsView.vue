@@ -64,7 +64,7 @@
           <el-option
             v-for="account in accounts"
             :key="account.id"
-            :label="account.email"
+            :label="formatAccountIdentity(account)"
             :value="String(account.id)"
           />
         </el-select>
@@ -358,12 +358,20 @@ const hasAppliedFilters = computed(() =>
   Boolean(filters.level || filters.accountId || appliedKeyword.value),
 );
 
+function formatAccountIdentity(account) {
+  if (account?.mailboxType === "custom") {
+    const suffix = String(account?.emailSuffix || "").replace(/^@+/, "");
+    if (suffix) return `@${suffix}`;
+  }
+  return account?.email || "";
+}
+
 function accountLabel(accountId) {
   if (accountId === null || accountId === undefined || accountId === "") return "-";
   const account = accounts.value.find(
     (item) => String(item.id) === String(accountId),
   );
-  return account?.email || `主号 #${accountId}`;
+  return formatAccountIdentity(account) || `主号 #${accountId}`;
 }
 
 async function loadAccounts({ query = "" } = {}) {

@@ -30,8 +30,24 @@ func (s *Store) UpsertAppleWebSession(
 		return domain.AppleWebSession{}, fmt.Errorf("upsert apple web session: apple id is empty")
 	}
 
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return domain.AppleWebSession{}, fmt.Errorf("begin apple web session upsert: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := s.lockAccountVersionForUpdate(ctx, tx, session.AccountID); err != nil {
+		return domain.AppleWebSession{}, fmt.Errorf("lock account for apple web session upsert: %w", err)
+	}
+	state, err := s.readAccountMailboxStateTx(ctx, tx, session.AccountID)
+	if err != nil {
+		return domain.AppleWebSession{}, fmt.Errorf("read account for apple web session upsert: %w", err)
+	}
+	if state.MailboxType != domain.MailboxTypeICloud {
+		return domain.AppleWebSession{}, ErrICloudMailboxRequired
+	}
+
 	now := s.now()
-	_, err := s.execContext(ctx, `
+	_, err = s.txExecContext(ctx, tx, `
 		INSERT INTO apple_web_sessions(
 			account_id, session_ciphertext, apple_id, region, authenticated,
 			last_validated_at, created_at, updated_at
@@ -50,7 +66,16 @@ func (s *Store) UpsertAppleWebSession(
 	if err != nil {
 		return domain.AppleWebSession{}, fmt.Errorf("upsert apple web session: %w", err)
 	}
-	return s.GetAppleWebSession(ctx, session.AccountID)
+	saved, err := scanAppleWebSession(s.txQueryRowContext(ctx, tx, `
+		SELECT `+appleWebSessionColumns+`
+		FROM apple_web_sessions WHERE account_id = ?`, session.AccountID))
+	if err != nil {
+		return domain.AppleWebSession{}, fmt.Errorf("read apple web session after upsert: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.AppleWebSession{}, fmt.Errorf("commit apple web session upsert: %w", err)
+	}
+	return saved, nil
 }
 
 func (s *Store) GetAppleWebSession(ctx context.Context, accountID int64) (domain.AppleWebSession, error) {

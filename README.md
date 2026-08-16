@@ -30,7 +30,7 @@ iCloud 主号 INBOX
 
 ## 快速启动
 
-要求 Docker Engine、Docker Compose v2，以及可用的 iCloud 主号 App 专用密码。
+要求 Docker Engine、Docker Compose v2。使用 iCloud 模式时，还需要可用的 iCloud 主号 App 专用密码；仅使用自定义邮箱模式时不需要。
 
 ```bash
 docker compose up -d --build --wait
@@ -51,7 +51,9 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 
 使用 `admin` 和首次生成的密码登录随机管理路径，添加 iCloud 主号后同步或手动登记隐私邮箱。公开接口说明位于 <http://127.0.0.1:8080/docs/>，机器可读契约见 [`docs/openapi.yaml`](docs/openapi.yaml)。
 
-每个主号可配置上游隐式 TLS IMAP 主机、端口和登录用户名，默认是 `imap.mail.me.com:993`。已有隐私邮箱后仍可修改这三项，但这代表切换邮箱来源：服务会清除该主号旧来源的同步游标、v1 快照、消费与 `Seen` 状态、v2 归档和 OTP 历史，轮换公开 IMAPS 的 `UIDVALIDITY`，再从新来源建立不回填历史的基线。单纯修改 App 专用密码或重新启用主号只重置同步状态，不删除已有邮件。已有隐私邮箱后主号邮箱地址仍不可修改。
+每个主号可配置上游隐式 TLS IMAP 主机、端口和登录用户名，默认是 `imap.mail.me.com:993`。已有隐私邮箱后仍可修改这三项，但这代表切换邮箱来源：服务会清除该主号旧来源的同步游标、v1 快照、消费与 `Seen` 状态、v2 归档和 OTP 历史，轮换公开 IMAPS 的 `UIDVALIDITY`，再从新来源建立不回填历史的基线。单纯修改 IMAP 密码（iCloud 模式使用 App 专用密码）或重新启用主号只重置同步状态，不删除已有邮件。已有隐私邮箱后主号邮箱地址仍不可修改。
+
+添加主号时也可以选择“自定义邮箱”。自定义模式单独保存邮箱后缀（例如 `example.com`），同一后缀只能配置一个主号；IMAP 密码使用 `imap_password` 提交并按原值加密保存。它不会调用 Apple，也不会改变 iCloud 隐私邮箱原有的每小时自动创建规则。在主号详情中输入生成数量即可批量生成随机地址，格式为 8–12 位小写英文字母和数字加 `@后缀`，同一批次和全局地址表都会阻止重复，地址也不能与主号的 IMAP 登录身份相同。单次最多生成 1000 个，并且仍受本地隐私邮箱容量限制。自定义地址的删除只清理本地记录，不会请求 Apple。
 
 ## 管理端凭证与复制格式
 

@@ -65,6 +65,11 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.GET("/accounts/:id/aliases/auto-create/keys", s.adminAPIGetAliasAutoCreationKeys)
 	protected.DELETE("/accounts/:id/aliases/auto-create/keys", s.adminAPIAcknowledgeAliasAutoCreationKeys)
 	protected.POST("/accounts/:id/aliases", s.adminAPICreateAlias(basePath))
+	// Random local aliases are independent from Apple's Hide My Email plan.
+	// Keep /batch as a compatibility spelling for early custom-mailbox clients.
+	protected.POST("/accounts/:id/aliases/random", s.adminAPICreateRandomAliases(basePath))
+	protected.POST("/accounts/:id/aliases/batch", s.adminAPICreateRandomAliases(basePath))
+	protected.POST("/accounts/:id/aliases/generate", s.adminAPICreateRandomAliases(basePath))
 	protected.POST("/accounts/:id/aliases/sync", s.adminAPISyncAppleAliases)
 
 	protected.GET("/aliases", s.adminAPIListAliases)
@@ -103,6 +108,9 @@ type adminAPIAccountDTO struct {
 	CreatedAt        string                   `json:"created_at"`
 	UpdatedAt        string                   `json:"updated_at"`
 	AliasCount       int                      `json:"alias_count"`
+	MailboxType      string                   `json:"mailbox_type"`
+	Provider         string                   `json:"provider"`
+	EmailSuffix      string                   `json:"email_suffix"`
 	SyncProgress     *adminAPISyncProgressDTO `json:"sync_progress,omitempty"`
 }
 
@@ -191,6 +199,7 @@ type adminAPIOneTimeKeyDTO struct {
 var (
 	errAutoCreationUnavailable     = errors.New("automatic alias creation service is unavailable")
 	errAutoCreationAccountDisabled = errors.New("primary account is disabled")
+	errAutoCreationCustomMailbox   = errors.New("custom mailbox does not support Apple auto creation")
 )
 
 type adminAPILoginRequest struct {
@@ -261,6 +270,11 @@ type adminAPICreateAccountRequest struct {
 	IMAPPassword string                 `json:"imap_password"`
 	IMAPHost     adminAPIOptionalString `json:"imap_host"`
 	IMAPPort     adminAPIOptionalInt    `json:"imap_port"`
+	MailboxType  adminAPIOptionalString `json:"mailbox_type"`
+	AccountType  adminAPIOptionalString `json:"account_type"`
+	Provider     adminAPIOptionalString `json:"provider"`
+	EmailSuffix  adminAPIOptionalString `json:"email_suffix"`
+	CustomEmail  adminAPIOptionalString `json:"custom_email"`
 }
 
 type adminAPIUpdateAccountRequest struct {
@@ -271,6 +285,11 @@ type adminAPIUpdateAccountRequest struct {
 	IMAPHost     adminAPIOptionalString `json:"imap_host"`
 	IMAPPort     adminAPIOptionalInt    `json:"imap_port"`
 	Enabled      *bool                  `json:"enabled"`
+	MailboxType  adminAPIOptionalString `json:"mailbox_type"`
+	AccountType  adminAPIOptionalString `json:"account_type"`
+	Provider     adminAPIOptionalString `json:"provider"`
+	EmailSuffix  adminAPIOptionalString `json:"email_suffix"`
+	CustomEmail  adminAPIOptionalString `json:"custom_email"`
 }
 
 type adminAPICreateAliasRequest struct {
@@ -306,6 +325,9 @@ func adminAPIAccountFromDomain(account domain.Account) adminAPIAccountDTO {
 		CreatedAt:        adminAPITime(account.CreatedAt),
 		UpdatedAt:        adminAPITime(account.UpdatedAt),
 		AliasCount:       account.AliasCount,
+		MailboxType:      domain.NormalizeMailboxType(account.MailboxType),
+		Provider:         domain.NormalizeMailboxType(account.MailboxType),
+		EmailSuffix:      account.EmailSuffix,
 	}
 }
 
@@ -787,9 +809,17 @@ func (s *Server) adminAPICreateAccount(basePath string) gin.HandlerFunc {
 			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
 			return
 		}
-		account, password, message := adminAPIAccountInput(
+		mailboxType, emailSuffix, mailboxMessage := adminAPIMailboxInput(
+			input.MailboxType, input.AccountType, input.Provider, input.EmailSuffix, input.CustomEmail,
+			domain.Account{}, true,
+		)
+		if mailboxMessage != "" {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", mailboxMessage)
+			return
+		}
+		account, password, message := adminAPIAccountInputWithMailbox(
 			input.Name, input.Email, input.IMAPUsername, input.IMAPPassword,
-			host, port, domain.Account{Enabled: true},
+			host, port, domain.Account{Enabled: true, MailboxType: mailboxType, EmailSuffix: emailSuffix},
 		)
 		if message != "" {
 			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", message)
@@ -803,7 +833,7 @@ func (s *Server) adminAPICreateAccount(basePath string) gin.HandlerFunc {
 		account.PasswordCiphertext = encrypted
 		created, err := s.store.CreateAccount(c.Request.Context(), account)
 		if err != nil {
-			if adminAPIUniqueConstraint(err) {
+			if errors.Is(err, store.ErrAliasIdentityConflict) || adminAPIUniqueConstraint(err) {
 				writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_EXISTS", "这个主号已经存在")
 				return
 			}
@@ -855,9 +885,29 @@ func (s *Server) adminAPIUpdateAccount(c *gin.Context) {
 		if readErr != nil {
 			return readErr
 		}
-		account, password, message := adminAPIAccountInput(
+		mailboxType, emailSuffix, mailboxMessage := adminAPIMailboxInput(
+			input.MailboxType, input.AccountType, input.Provider, input.EmailSuffix, input.CustomEmail,
+			existing, false,
+		)
+		if mailboxMessage != "" {
+			validationMessage = mailboxMessage
+			return nil
+		}
+		if domain.NormalizeMailboxType(existing.MailboxType) == domain.MailboxTypeCustom &&
+			mailboxType == domain.MailboxTypeICloud &&
+			(strings.TrimSpace(input.Email) == "" ||
+				domain.NormalizeEmail(input.Email) == domain.NormalizeEmail(existing.Email)) {
+			validationMessage = "切换到 iCloud 模式时请填写 iCloud 主号邮箱"
+			return nil
+		}
+		inputBase := existing
+		if mailboxType != "" {
+			inputBase.MailboxType = mailboxType
+			inputBase.EmailSuffix = emailSuffix
+		}
+		account, password, message := adminAPIAccountInputWithMailbox(
 			input.Name, input.Email, input.IMAPUsername, input.IMAPPassword,
-			host, port, existing,
+			host, port, inputBase,
 		)
 		account.ID = id
 		account.Enabled = *input.Enabled
@@ -885,8 +935,8 @@ func (s *Server) adminAPIUpdateAccount(c *gin.Context) {
 		case errors.Is(err, store.ErrNotFound):
 			writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "主号不存在")
 		case errors.Is(err, store.ErrAccountIdentityLocked):
-			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_IDENTITY_LOCKED", "已有隐私邮箱时不能修改主号邮箱")
-		case adminAPIUniqueConstraint(err):
+			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_IDENTITY_LOCKED", "已有隐私邮箱时不能修改主号邮箱或邮箱模式/后缀")
+		case errors.Is(err, store.ErrAliasIdentityConflict), adminAPIUniqueConstraint(err):
 			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_EXISTS", "这个主号已经存在")
 		default:
 			s.writeAdminAPIInternalError(c, err)
@@ -903,9 +953,39 @@ func (s *Server) adminAPIUpdateAccount(c *gin.Context) {
 }
 
 func adminAPIAccountInput(name, email, username, password string, host *string, port *int, base domain.Account) (domain.Account, string, string) {
+	return adminAPIAccountInputWithMailbox(name, email, username, password, host, port, base)
+}
+
+func adminAPIAccountInputWithMailbox(name, email, username, password string, host *string, port *int, base domain.Account) (domain.Account, string, string) {
 	base.Name = strings.TrimSpace(name)
-	base.Email = domain.NormalizeEmail(email)
+	if strings.TrimSpace(email) != "" {
+		base.Email = domain.NormalizeEmail(email)
+	}
 	base.IMAPUsername = strings.TrimSpace(username)
+	base.MailboxType = domain.NormalizeMailboxType(base.MailboxType)
+	if base.MailboxType == "" {
+		return base, strings.TrimSpace(password), "邮箱类型无效"
+	}
+	if base.MailboxType == domain.MailboxTypeICloud {
+		// Preserve the historical App-specific password normalization for the
+		// unchanged iCloud contract. Generic IMAP passwords are opaque and may
+		// legitimately contain leading or trailing spaces.
+		password = strings.TrimSpace(password)
+	}
+	if base.MailboxType == domain.MailboxTypeCustom {
+		suffix, suffixErr := domain.NormalizeEmailSuffix(base.EmailSuffix)
+		if suffixErr != nil {
+			return base, strings.TrimSpace(password), "自定义邮箱后缀格式不正确"
+		}
+		base.EmailSuffix = suffix
+		// accounts.email remains the legacy unique identity used throughout the
+		// store. Custom mode exposes the suffix instead, so derive a stable,
+		// valid compatibility identity from that suffix rather than coupling
+		// uniqueness to an IMAP username that multiple domains may share.
+		base.Email = "custom@" + suffix
+	} else {
+		base.EmailSuffix = ""
+	}
 	if host != nil {
 		if strings.TrimSpace(*host) == "" {
 			return base, strings.TrimSpace(password), "IMAP 主机不能为空"
@@ -919,7 +999,6 @@ func adminAPIAccountInput(name, email, username, password string, host *string, 
 	} else if base.IMAPPort == 0 {
 		base.IMAPPort = domain.DefaultIMAPPort
 	}
-	password = strings.TrimSpace(password)
 	normalizedHost, normalizedPort, endpointErr := domain.NormalizeIMAPEndpoint(base.IMAPHost, base.IMAPPort)
 	if endpointErr == nil {
 		base.IMAPHost, base.IMAPPort = normalizedHost, normalizedPort
@@ -927,17 +1006,95 @@ func adminAPIAccountInput(name, email, username, password string, host *string, 
 	switch {
 	case utf8.RuneCountInString(base.Name) > 80:
 		return base, password, "备注不能超过 80 个字符"
-	case validateEmail(base.Email) != nil:
+	case base.MailboxType == domain.MailboxTypeICloud && validateEmail(base.Email) != nil:
 		return base, password, "主号邮箱格式不正确"
 	case base.IMAPUsername == "":
 		return base, password, "请填写 IMAP 用户名"
 	case endpointErr != nil:
 		return base, password, "IMAP 服务地址无效: " + endpointErr.Error()
 	case base.PasswordCiphertext == "" && password == "":
-		return base, password, "请填写 App 专用密码"
+		if base.MailboxType == domain.MailboxTypeICloud {
+			// Preserve the historical iCloud contract and diagnostics verbatim.
+			return base, password, "请填写 App 专用密码"
+		}
+		return base, password, "请填写 IMAP 密码"
 	default:
 		return base, password, ""
 	}
+}
+
+// adminAPIMailboxInput resolves the several wire aliases used by early
+// custom-mailbox clients. Missing members on update mean "keep current";
+// create requests default to the historical iCloud contract.
+func adminAPIMailboxInput(
+	mailboxType, accountType, provider, emailSuffix, customEmail adminAPIOptionalString,
+	base domain.Account,
+	creating bool,
+) (string, string, string) {
+	typeValue := ""
+	if mailboxType.Present {
+		typeValue = strings.TrimSpace(mailboxType.Value)
+	}
+	if typeValue == "" && accountType.Present {
+		typeValue = strings.TrimSpace(accountType.Value)
+	}
+	if typeValue == "" && provider.Present {
+		typeValue = strings.TrimSpace(provider.Value)
+	}
+	if typeValue == "" {
+		if (emailSuffix.Present || customEmail.Present) && strings.TrimSpace(func() string {
+			if emailSuffix.Present {
+				return emailSuffix.Value
+			}
+			return customEmail.Value
+		}()) != "" {
+			typeValue = domain.MailboxTypeCustom
+		} else if strings.TrimSpace(base.MailboxType) != "" {
+			typeValue = domain.NormalizeMailboxType(base.MailboxType)
+		} else if creating {
+			typeValue = domain.MailboxTypeICloud
+		} else {
+			// No mailbox member on an update means keep the current mode. The
+			// caller will apply the empty marker after this helper returns.
+			return "", strings.TrimSpace(base.EmailSuffix), ""
+		}
+	}
+	normalizedType := domain.NormalizeMailboxType(typeValue)
+	if normalizedType == "" {
+		return "", "", "邮箱类型必须是 icloud 或 custom"
+	}
+	suffixValue := ""
+	if emailSuffix.Present {
+		suffixValue = emailSuffix.Value
+	} else if customEmail.Present {
+		suffixValue = customEmail.Value
+	} else {
+		suffixValue = base.EmailSuffix
+	}
+	if normalizedType == domain.MailboxTypeCustom {
+		suffix, err := normalizeAdminMailboxSuffix(suffixValue)
+		if err != nil {
+			return "", "", "自定义邮箱后缀格式不正确"
+		}
+		return normalizedType, suffix, ""
+	}
+	return normalizedType, "", ""
+}
+
+// normalizeAdminMailboxSuffix accepts both the documented domain form and a
+// full custom mailbox address supplied by older clients. Only one @ is
+// accepted in the latter form; malformed addresses are still rejected by the
+// domain suffix validator.
+func normalizeAdminMailboxSuffix(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if strings.Count(value, "@") == 1 && !strings.HasPrefix(value, "@") {
+		at := strings.LastIndexByte(value, '@')
+		if at <= 0 || at == len(value)-1 {
+			return "", errors.New("invalid email suffix")
+		}
+		value = value[at:]
+	}
+	return domain.NormalizeEmailSuffix(value)
 }
 
 func (s *Server) adminAPIDeleteAccount(c *gin.Context) {
@@ -1157,6 +1314,9 @@ func (s *Server) adminAPISetAliasAutoCreation(c *gin.Context) {
 			if !account.Enabled {
 				return errAutoCreationAccountDisabled
 			}
+			if domain.NormalizeMailboxType(account.MailboxType) == domain.MailboxTypeCustom {
+				return errAutoCreationCustomMailbox
+			}
 			if s.hmeSync == nil {
 				return errAutoCreationUnavailable
 			}
@@ -1186,6 +1346,8 @@ func (s *Server) adminAPISetAliasAutoCreation(c *gin.Context) {
 			writeAdminAPIError(c, http.StatusServiceUnavailable, "AUTO_CREATION_UNAVAILABLE", "自动创建服务暂不可用")
 		case errors.Is(err, errAutoCreationAccountDisabled):
 			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_DISABLED", "主号已停用，不能开启自动创建")
+		case errors.Is(err, errAutoCreationCustomMailbox):
+			writeAdminAPIError(c, http.StatusConflict, "CUSTOM_MAILBOX_NO_APPLE", "自定义邮箱主号不使用 iCloud 自动创建规则")
 		case errors.Is(err, store.ErrAccountDisabled):
 			writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_DISABLED", "主号已停用，不能开启自动创建")
 		case errors.Is(err, store.ErrNotFound):
@@ -1463,6 +1625,9 @@ func (s *Server) adminAPIDeleteAlias(c *gin.Context) {
 	}
 	if adminAPIAliasConfirmationPending(alias) {
 		writeAdminAPIAliasConfirmationPending(c)
+		return
+	}
+	if s.adminAPIDeleteCustomAlias(c, alias) {
 		return
 	}
 	adminSession := mustSession(c)

@@ -11,6 +11,10 @@ info:
     旧来源的同步游标、兼容快照、消费历史、待处理 `\\Seen` 任务、v2 归档和 OTP 历史，
     轮换公开 IMAPS 的 `UIDVALIDITY`，并将同步状态重置为 `pending`。
 
+    主号也可以使用 `custom` 邮箱模式并保存邮箱后缀。自定义随机邮箱使用 8–12 位
+    ASCII 小写英文字母和数字作为本地部分，批量内和数据库中均禁止重复；该流程不调用 Apple，原 iCloud
+    自动创建计划和限流规则保持不变。
+
     IMAPS 用户名是隐私邮箱地址。客户端可以使用本服务签发的 IMAP 密码登录，
     或通过 `POST /oauth2/v2.0/token` 获取一小时访问令牌后使用 XOAUTH2。
     邮箱只有只读 INBOX，支持 LIST、STATUS、SELECT/EXAMINE、SEARCH、
@@ -236,16 +240,16 @@ paths:
       operationId: listAdminAccounts
       summary: 查询主号列表
       description: |
-        按主号邮箱、ID 升序返回分页列表。`query` 会先去除首尾空白，再对主号邮箱和备注执行
-        不区分大小写的字面量子串匹配；空查询返回全部主号。响应中的 `pagination.total` 是当前
-        查询条件下的主号总数，`has_more` 表示当前页之后是否还有结果。
+        按主号邮箱、ID 升序返回分页列表。`query` 会先去除首尾空白，再对主号邮箱、自定义
+        邮箱后缀和备注执行不区分大小写的字面量子串匹配；空查询返回全部主号。响应中的
+        `pagination.total` 是当前查询条件下的主号总数，`has_more` 表示当前页之后是否还有结果。
       security:
         - adminSession: []
       parameters:
         - name: query
           in: query
           required: false
-          description: 主号邮箱或备注的搜索词；服务会先去除首尾空白，处理后的值最多 200 个字符。
+          description: 主号邮箱、自定义邮箱后缀或备注的搜索词；服务会先去除首尾空白，处理后的值最多 200 个字符。
           schema:
             type: string
         - name: limit
@@ -314,7 +318,8 @@ paths:
       description: |
         添加用于主号级邮件同步的账户。`imap_host` 和 `imap_port` 可分别指定隐式 TLS
         IMAP 服务；省略时分别使用 `imap.mail.me.com` 和 `993`，显式传入 `null` 则返回 400。
-        App 专用密码只会加密保存，不会出现在响应或日志中。
+        iCloud 模式保持原有 Apple 规则；选择 `custom` 后须填写 `email_suffix`，并在主号详情
+        中按数量生成 8–12 位小写英文字母和数字随机邮箱。IMAP 密码只会加密保存，不会出现在响应或日志中。
       security:
         - adminSession: []
       parameters:
@@ -328,6 +333,7 @@ paths:
             example:
               name: 个人主号
               email: owner@icloud.com
+              mailbox_type: icloud
               imap_host: imap.mail.me.com
               imap_port: 993
               imap_username: owner@icloud.com
@@ -413,9 +419,9 @@ paths:
         返回 400。规范化后的 IMAP 主机、端口或用户名实际发生变化后，服务会清除该主号旧邮箱
         来源的同步游标、兼容快照、消费历史、待处理 `\Seen` 任务、v2 归档和 OTP 历史，轮换
         公开 IMAPS 的 `UIDVALIDITY`，并在下次同步确认前把主号及所属隐私邮箱的同步状态重置为
-        `pending`。修改 App 专用密码也会重置同步状态，但保留已有邮件；`imap_password` 省略、
+        `pending`。修改 IMAP 密码（iCloud 模式为 App 专用密码）也会重置同步状态，但保留已有邮件；`imap_password` 省略、
         传 `null` 或传空字符串时均保留当前密码。
-        已有隐私邮箱后，仅主号邮箱不可修改；IMAP 主机、端口和用户名仍可修改。
+        已有隐私邮箱后，仅主号邮箱及邮箱模式/后缀不可修改；IMAP 主机、端口和用户名仍可修改。
       security:
         - adminSession: []
       parameters:
@@ -430,6 +436,7 @@ paths:
             example:
               name: 个人主号
               email: owner@icloud.com
+              mailbox_type: icloud
               imap_host: imap.example.com
               imap_port: 993
               imap_username: owner@icloud.com
@@ -541,6 +548,76 @@ paths:
           $ref: "#/components/responses/OAuthUnavailable"
         "503":
           $ref: "#/components/responses/OAuthUnavailable"
+
+  /api/v1/accounts/{id}/aliases/random:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径
+      - url: https://HOST/admin
+        description: 固定兼容管理 API 入口
+    post:
+      tags:
+        - Admin Accounts
+      operationId: createRandomAliases
+      summary: 批量生成自定义随机邮箱
+      description: |
+        仅适用于 `custom` 邮箱模式。按请求数量生成互不重复的 8–12 位小写英文字母和数字地址，
+        拼接已保存的邮箱后缀；不会调用 Apple 或 iCloud 每小时自动创建计划。单次最多 1000 个，
+        超过本地主号剩余容量时整批拒绝。响应返回完整凭证，并禁止缓存；管理端详情仍可在授权后查看。
+        规范路径和数量字段分别为本路径与 `count`；为兼容早期客户端，也接受同一主号下的
+        `/aliases/batch`、`/aliases/generate` 路径以及 `quantity`、`number` 数量字段。
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAccountID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminRandomAliasRequest"
+      responses:
+        "201":
+          description: 随机邮箱及完整凭证创建成功
+          headers:
+            Location:
+              description: 该主号隐私邮箱列表的管理 API 相对路径。
+              schema:
+                type: string
+                format: uri-reference
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              description: 响应包含完整凭证，禁止缓存。
+              schema:
+                type: string
+                const: no-store
+              example: no-store
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminRandomAliasesResponse"
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminForbidden"
+        "404":
+          $ref: "#/components/responses/AdminNotFound"
+        "409":
+          $ref: "#/components/responses/AdminRandomAliasConflict"
+        "413":
+          $ref: "#/components/responses/AdminRequestTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
 
   /api/v1/accounts/{id}/aliases/auto-create/keys:
     servers:
@@ -780,9 +857,20 @@ components:
       type: object
       additionalProperties: false
       required:
-        - email
+        - mailbox_type
         - imap_username
         - imap_password
+      allOf:
+        - if:
+            properties:
+              mailbox_type:
+                const: custom
+          then:
+            anyOf:
+              - required: [email_suffix]
+              - required: [custom_email]
+          else:
+            required: [email]
       properties:
         name:
           type: string
@@ -791,7 +879,29 @@ components:
         email:
           type: string
           format: email
-          description: iCloud 主号邮箱；保存前会规范化大小写和首尾空白。
+          description: |
+            iCloud 模式下必填并作为主号邮箱；自定义模式应省略，服务会根据邮箱后缀生成内部兼容身份。
+            iCloud 邮箱保存前会规范化大小写和首尾空白。
+        mailbox_type:
+          type: string
+          enum: [icloud, custom]
+          description: 创建时必须显式指定邮箱模式；`icloud` 保持原有 Apple 规则，`custom` 使用自定义邮箱后缀。
+        provider:
+          type: string
+          enum: [icloud, custom]
+          description: 服务端保留的 `mailbox_type` 兼容别名；规范请求仍须显式提供 `mailbox_type`，二者同时提供时以后者为准。
+        account_type:
+          type: string
+          enum: [icloud, custom]
+          description: 服务端保留的 `mailbox_type` 兼容别名；规范请求仍须显式提供 `mailbox_type`。
+        email_suffix:
+          type: string
+          maxLength: 242
+          pattern: '^@?[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+          description: 自定义模式必填的邮箱后缀，可带一个开头的 `@`；规范化后最多 241 字节，统一为小写且不含 `@`，并且不能与其他自定义主号重复。
+        custom_email:
+          type: string
+          description: "`email_suffix` 的兼容别名。"
         imap_host:
           type: string
           minLength: 1
@@ -816,7 +926,7 @@ components:
           type: string
           minLength: 1
           writeOnly: true
-          description: App 专用密码；服务会去除首尾空白并加密保存，不会在响应中返回。
+          description: IMAP 密码；custom 模式按原值加密保存，iCloud 模式保持旧规则并去除首尾空白。不会在响应中返回。
 
     AdminAccountResponse:
       type: object
@@ -840,7 +950,6 @@ components:
       type: object
       additionalProperties: false
       required:
-        - email
         - imap_username
         - enabled
       properties:
@@ -851,7 +960,27 @@ components:
         email:
           type: string
           format: email
-          description: iCloud 主号邮箱；已有隐私邮箱时必须与当前值一致。
+          description: iCloud 模式下的主号邮箱；已有隐私邮箱时必须与当前值一致。
+        mailbox_type:
+          type: string
+          enum: [icloud, custom]
+          description: 邮箱模式；省略时保留当前模式。
+        provider:
+          type: string
+          enum: [icloud, custom]
+          description: "`mailbox_type` 的兼容别名。"
+        account_type:
+          type: string
+          enum: [icloud, custom]
+          description: "`mailbox_type` 的兼容别名。"
+        email_suffix:
+          type: string
+          maxLength: 242
+          pattern: '^@?[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+          description: 自定义模式的邮箱后缀；规范化后最多 241 字节，不得与其他自定义主号重复，已有隐私邮箱时不可修改。
+        custom_email:
+          type: string
+          description: "`email_suffix` 的兼容别名。"
         imap_host:
           type: string
           minLength: 1
@@ -878,7 +1007,7 @@ components:
             - string
             - "null"
           writeOnly: true
-          description: 新 App 专用密码；省略、传 `null` 或传空字符串时保留当前密码。
+          description: 新 IMAP 密码；省略、传 `null` 或传空字符串时保留当前密码。
         enabled:
           type: boolean
           description: 是否启用该主号的邮件同步和所属隐私邮箱 Key。
@@ -938,6 +1067,8 @@ components:
             - ALIAS_CONFIRMATION_PENDING
             - ALIAS_EXISTS
             - ALIAS_LIMIT_REACHED
+            - CUSTOM_MAILBOX_NO_APPLE
+            - CUSTOM_MAILBOX_REQUIRED
             - SYNC_FAILED
             - INTERNAL_ERROR
           description: |
@@ -966,6 +1097,9 @@ components:
         - created_at
         - updated_at
         - alias_count
+        - mailbox_type
+        - provider
+        - email_suffix
       properties:
         id:
           type: integer
@@ -976,6 +1110,7 @@ components:
         email:
           type: string
           format: email
+          description: iCloud 主号邮箱；custom 模式返回由邮箱后缀派生的内部兼容身份，管理界面不显示该值。
         imap_host:
           type: string
           minLength: 1
@@ -1012,6 +1147,16 @@ components:
         alias_count:
           type: integer
           minimum: 0
+        mailbox_type:
+          type: string
+          enum: [icloud, custom]
+        provider:
+          type: string
+          enum: [icloud, custom]
+          description: "`mailbox_type` 的兼容回显字段。"
+        email_suffix:
+          type: string
+          description: 自定义邮箱生成使用的后缀；iCloud 模式为空字符串。
         sync_progress:
           $ref: "#/components/schemas/AdminSyncProgress"
 
@@ -1391,6 +1536,54 @@ components:
             type: integer
             format: int64
             minimum: 1
+    AdminRandomAliasRequest:
+      type: object
+      additionalProperties: false
+      anyOf:
+        - required: [count]
+        - required: [quantity]
+        - required: [number]
+      properties:
+        count:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: 规范数量字段。本次生成数量；同一批次和已有地址均不得重复。
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: 早期客户端兼容数量字段；未提供 `count` 时使用。
+        number:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: 早期客户端兼容数量字段；未提供 `count` 和 `quantity` 时使用。
+        label:
+          type: string
+          maxLength: 100
+          description: 可选用途备注。
+    AdminRandomAliasesResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [created, aliases, count]
+          properties:
+            created:
+              type: array
+              items:
+                $ref: "#/components/schemas/AdminPendingAliasKey"
+            aliases:
+              type: array
+              items:
+                $ref: "#/components/schemas/AdminAlias"
+            count:
+              type: integer
+              minimum: 0
     AdminPendingAliasKeysResponse:
       type: object
       additionalProperties: false
@@ -1616,6 +1809,49 @@ components:
                 error:
                   code: ACCOUNT_IDENTITY_LOCKED
                   message: 已有隐私邮箱时不能修改主号邮箱
+                  request_id: 6oe7j0x3x3pJv9Dv
+
+    AdminRandomAliasConflict:
+      description: 随机邮箱生成因主号停用、容量不足、邮箱模式或后缀变化、地址冲突而整批拒绝
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestID"
+        Cache-Control:
+          $ref: "#/components/headers/AdminNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/AdminAppleErrorResponse"
+          examples:
+            accountDisabled:
+              value:
+                error:
+                  code: ACCOUNT_DISABLED
+                  message: 主号已停用，请先启用主号后再生成邮箱
+                  request_id: 6oe7j0x3x3pJv9Dv
+            aliasLimitReached:
+              value:
+                error:
+                  code: ALIAS_LIMIT_REACHED
+                  message: 此主号最多启用 1000 个隐私邮箱
+                  request_id: 6oe7j0x3x3pJv9Dv
+            customMailboxRequired:
+              value:
+                error:
+                  code: CUSTOM_MAILBOX_REQUIRED
+                  message: 随机邮箱仅适用于自定义邮箱主号
+                  request_id: 6oe7j0x3x3pJv9Dv
+            accountChanged:
+              value:
+                error:
+                  code: ACCOUNT_CHANGED
+                  message: 主号邮箱后缀已发生变化，请刷新后重试
+                  request_id: 6oe7j0x3x3pJv9Dv
+            aliasExists:
+              value:
+                error:
+                  code: ALIAS_EXISTS
+                  message: 生成的邮箱地址发生冲突，请重试
                   request_id: 6oe7j0x3x3pJv9Dv
 
     AdminJSONTooLarge:

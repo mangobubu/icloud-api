@@ -15,7 +15,11 @@ const accountColumns = `
 	a.id, a.name, a.email, a.imap_host, a.imap_port, a.imap_username,
 	a.password_ciphertext, a.enabled, a.last_sync_status, a.last_sync_error,
 	a.last_synced_at, a.created_at, a.updated_at,
-	(SELECT COUNT(*) FROM aliases al WHERE al.account_id = a.id) AS alias_count`
+	(SELECT COUNT(*) FROM aliases al WHERE al.account_id = a.id) AS alias_count,
+	COALESCE((SELECT ams.mailbox_type FROM account_mailbox_settings ams
+		WHERE ams.account_id = a.id), 'icloud') AS mailbox_type,
+	COALESCE((SELECT ams.email_suffix FROM account_mailbox_settings ams
+		WHERE ams.account_id = a.id), '') AS email_suffix`
 
 type AccountListFilter struct {
 	Query  string
@@ -28,22 +32,48 @@ type AccountPage struct {
 	Total int
 }
 
+type accountMailboxState struct {
+	Enabled      bool
+	MailboxType  string
+	EmailSuffix  string
+	Email        string
+	IMAPUsername string
+}
+
 const maxListPageLimit = 1000
 
 func (s *Store) CreateAccount(ctx context.Context, account domain.Account) (domain.Account, error) {
+	mailboxType, mailboxSuffix, mailboxErr := normalizeAccountMailboxSettings(account.MailboxType, account.EmailSuffix)
+	if mailboxErr != nil {
+		return domain.Account{}, fmt.Errorf("create account mailbox settings: %w", mailboxErr)
+	}
+	normalizedEmail := domain.NormalizeEmail(sanitizePostgresText(account.Email))
+	tx, err := s.beginAddressNamespaceTx(ctx)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("begin account creation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	identityConflict, err := s.aliasAddressIdentityConflictTx(ctx, tx, normalizedEmail)
+	if err != nil {
+		return domain.Account{}, fmt.Errorf("check alias address before account creation: %w", err)
+	}
+	if identityConflict {
+		return domain.Account{}, ErrAliasIdentityConflict
+	}
+
 	now := s.now()
 	status := strings.TrimSpace(sanitizePostgresText(account.LastSyncStatus))
 	if status == "" {
 		status = domain.SyncStatusPending
 	}
 	var id int64
-	err := s.queryRowContext(ctx, `
+	err = s.txQueryRowContext(ctx, tx, `
 		INSERT INTO accounts(
 			name, email, imap_host, imap_port, imap_username, password_ciphertext,
 			enabled, last_sync_status, last_sync_error, last_synced_at, created_at, updated_at
 		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id`,
-		strings.TrimSpace(sanitizePostgresText(account.Name)), domain.NormalizeEmail(sanitizePostgresText(account.Email)),
+		strings.TrimSpace(sanitizePostgresText(account.Name)), normalizedEmail,
 		strings.TrimSpace(sanitizePostgresText(account.IMAPHost)), account.IMAPPort,
 		strings.TrimSpace(sanitizePostgresText(account.IMAPUsername)),
 		account.PasswordCiphertext, account.Enabled, status, sanitizePostgresText(account.LastSyncError),
@@ -51,6 +81,12 @@ func (s *Store) CreateAccount(ctx context.Context, account domain.Account) (doma
 	).Scan(&id)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("create account: %w", err)
+	}
+	if err := s.upsertAccountMailboxSettingsTx(ctx, tx, id, mailboxType, mailboxSuffix, timestamp(now)); err != nil {
+		return domain.Account{}, fmt.Errorf("create account mailbox settings: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Account{}, fmt.Errorf("commit account creation: %w", err)
 	}
 	return s.getAccountAfterWrite(id)
 }
@@ -64,7 +100,7 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	unlockArchive := s.lockMailArchiveAccount(account.ID)
 	defer unlockArchive()
 
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
+	tx, err := s.beginAddressNamespaceTx(ctx)
 	if err != nil {
 		return domain.Account{}, fmt.Errorf("begin account update: %w", err)
 	}
@@ -77,13 +113,18 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	var currentPassword string
 	var currentEnabled bool
 	var currentEmail, currentHost, currentUsername string
+	var currentMailboxType, currentEmailSuffix string
 	var currentPort int
 	var hasAliases bool
 	if err := s.txQueryRowContext(ctx, tx, `
 		SELECT password_ciphertext, enabled, email, imap_host, imap_port, imap_username,
-		       EXISTS(SELECT 1 FROM aliases WHERE account_id = accounts.id)
+		       EXISTS(SELECT 1 FROM aliases WHERE account_id = accounts.id),
+		       COALESCE((SELECT mailbox_type FROM account_mailbox_settings
+			WHERE account_id = accounts.id), 'icloud'),
+		       COALESCE((SELECT email_suffix FROM account_mailbox_settings
+			WHERE account_id = accounts.id), '')
 		FROM accounts WHERE id = ?`, account.ID,
-	).Scan(&currentPassword, &currentEnabled, &currentEmail, &currentHost, &currentPort, &currentUsername, &hasAliases); err != nil {
+	).Scan(&currentPassword, &currentEnabled, &currentEmail, &currentHost, &currentPort, &currentUsername, &hasAliases, &currentMailboxType, &currentEmailSuffix); err != nil {
 		if err == sql.ErrNoRows {
 			return domain.Account{}, ErrNotFound
 		}
@@ -92,10 +133,37 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	requestedEmail := domain.NormalizeEmail(sanitizePostgresText(account.Email))
 	requestedHost := strings.TrimSpace(sanitizePostgresText(account.IMAPHost))
 	requestedUsername := strings.TrimSpace(sanitizePostgresText(account.IMAPUsername))
+	requestedMailboxType := domain.NormalizeMailboxType(account.MailboxType)
+	if requestedMailboxType == "" {
+		requestedMailboxType = domain.NormalizeMailboxType(currentMailboxType)
+	}
+	requestedEmailSuffix := strings.TrimSpace(account.EmailSuffix)
+	if requestedEmailSuffix == "" && requestedMailboxType == domain.MailboxTypeCustom {
+		requestedEmailSuffix = currentEmailSuffix
+	}
+	if requestedMailboxType == domain.MailboxTypeCustom {
+		var suffixErr error
+		requestedEmailSuffix, suffixErr = domain.NormalizeEmailSuffix(requestedEmailSuffix)
+		if suffixErr != nil {
+			return domain.Account{}, fmt.Errorf("invalid custom email suffix: %w", suffixErr)
+		}
+	} else {
+		requestedEmailSuffix = ""
+	}
 	emailChanged := requestedEmail != domain.NormalizeEmail(currentEmail)
 	usernameChanged := requestedUsername != strings.TrimSpace(currentUsername)
-	if hasAliases && emailChanged {
+	mailboxSettingsChanged := requestedMailboxType != domain.NormalizeMailboxType(currentMailboxType) || requestedEmailSuffix != currentEmailSuffix
+	if hasAliases && (emailChanged || mailboxSettingsChanged) {
 		return domain.Account{}, ErrAccountIdentityLocked
+	}
+	if emailChanged {
+		identityConflict, conflictErr := s.aliasAddressIdentityConflictTx(ctx, tx, requestedEmail)
+		if conflictErr != nil {
+			return domain.Account{}, fmt.Errorf("check alias address before account update: %w", conflictErr)
+		}
+		if identityConflict {
+			return domain.Account{}, ErrAliasIdentityConflict
+		}
 	}
 
 	now := s.now()
@@ -124,6 +192,9 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	if err := requireAffected(result, "account"); err != nil {
 		return domain.Account{}, err
 	}
+	if err := s.upsertAccountMailboxSettingsTx(ctx, tx, account.ID, requestedMailboxType, requestedEmailSuffix, nextAccountVersion); err != nil {
+		return domain.Account{}, fmt.Errorf("update account mailbox settings: %w", err)
+	}
 	if !account.Enabled {
 		// A disabled primary account must not retain a live background creation
 		// plan. Clearing future slots in this transaction prevents the worker
@@ -135,14 +206,25 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 			return domain.Account{}, fmt.Errorf("disable alias creation after account update: %w", err)
 		}
 	}
+	if requestedMailboxType == domain.MailboxTypeCustom {
+		// A custom mailbox has no Apple Hide My Email session. If an existing
+		// iCloud account is switched to custom mode, withdraw any persisted
+		// Apple schedule before the update becomes visible to the worker.
+		if _, err := s.txExecContext(ctx, tx, `
+			UPDATE alias_creation_schedules
+			SET enabled = FALSE, planned_at_json = '[]', next_run_at = NULL, updated_at = ?
+			WHERE account_id = ?`, timestamp(now), account.ID); err != nil {
+			return domain.Account{}, fmt.Errorf("disable Apple alias creation after custom mailbox switch: %w", err)
+		}
+	}
 
 	passwordChanged := account.PasswordCiphertext != "" && account.PasswordCiphertext != currentPassword
 	reenabled := !currentEnabled && account.Enabled
 	endpointChanged := requestedHost != strings.TrimSpace(currentHost) || account.IMAPPort != currentPort
 	mailboxSourceChanged := endpointChanged || usernameChanged
-	if emailChanged {
+	if emailChanged || requestedMailboxType != domain.NormalizeMailboxType(currentMailboxType) {
 		if _, err := s.txExecContext(ctx, tx, `DELETE FROM apple_web_sessions WHERE account_id = ?`, account.ID); err != nil {
-			return domain.Account{}, fmt.Errorf("delete apple web session after account email change: %w", err)
+			return domain.Account{}, fmt.Errorf("delete apple web session after mailbox identity change: %w", err)
 		}
 	}
 	if passwordChanged || reenabled || mailboxSourceChanged || emailChanged {
@@ -225,6 +307,82 @@ func (s *Store) UpdateAccount(ctx context.Context, account domain.Account) (doma
 	return s.getAccountAfterWrite(account.ID)
 }
 
+func (s *Store) upsertAccountMailboxSettingsTx(ctx context.Context, tx *sql.Tx, accountID int64, mailboxType, suffix string, updatedAt int64) error {
+	mailboxType, suffix, err := normalizeAccountMailboxSettings(mailboxType, suffix)
+	if err != nil {
+		return err
+	}
+	_, err = s.txExecContext(ctx, tx, `
+		INSERT INTO account_mailbox_settings(account_id, mailbox_type, email_suffix, created_at, updated_at)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(account_id) DO UPDATE SET
+			mailbox_type = excluded.mailbox_type,
+			email_suffix = excluded.email_suffix,
+			updated_at = excluded.updated_at`,
+		accountID, mailboxType, suffix, updatedAt, updatedAt,
+	)
+	return err
+}
+
+func (s *Store) aliasAddressIdentityConflictTx(ctx context.Context, tx *sql.Tx, address string) (bool, error) {
+	var conflict bool
+	err := s.txQueryRowContext(ctx, tx, `
+		SELECT EXISTS(
+			SELECT 1 FROM aliases WHERE address = ?
+		)`, address,
+	).Scan(&conflict)
+	return conflict, err
+}
+
+func (s *Store) readAccountMailboxStateTx(ctx context.Context, tx *sql.Tx, accountID int64) (accountMailboxState, error) {
+	var state accountMailboxState
+	if err := s.txQueryRowContext(ctx, tx, `
+		SELECT a.enabled,
+		       COALESCE((SELECT mailbox_type FROM account_mailbox_settings
+		           WHERE account_id = a.id), 'icloud'),
+		       COALESCE((SELECT email_suffix FROM account_mailbox_settings
+		           WHERE account_id = a.id), ''),
+		       a.email, a.imap_username
+		FROM accounts a WHERE a.id = ?`, accountID,
+	).Scan(&state.Enabled, &state.MailboxType, &state.EmailSuffix, &state.Email, &state.IMAPUsername); err != nil {
+		if err == sql.ErrNoRows {
+			return accountMailboxState{}, ErrNotFound
+		}
+		return accountMailboxState{}, err
+	}
+	state.MailboxType = domain.NormalizeMailboxType(state.MailboxType)
+	if state.MailboxType == domain.MailboxTypeCustom {
+		suffix, err := domain.NormalizeEmailSuffix(state.EmailSuffix)
+		if err != nil {
+			return accountMailboxState{}, err
+		}
+		state.EmailSuffix = suffix
+	} else {
+		state.EmailSuffix = ""
+	}
+	return state, nil
+}
+
+func normalizeAccountMailboxSettings(mailboxType, suffix string) (string, string, error) {
+	if strings.TrimSpace(mailboxType) == "" && strings.TrimSpace(suffix) != "" {
+		mailboxType = domain.MailboxTypeCustom
+	}
+	mailboxType = domain.NormalizeMailboxType(mailboxType)
+	if mailboxType == "" {
+		return "", "", errors.New("invalid mailbox type")
+	}
+	if mailboxType == domain.MailboxTypeCustom {
+		normalized, err := domain.NormalizeEmailSuffix(suffix)
+		if err != nil {
+			return "", "", err
+		}
+		suffix = normalized
+	} else {
+		suffix = ""
+	}
+	return mailboxType, suffix, nil
+}
+
 func (s *Store) getAccountAfterWrite(id int64) (domain.Account, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -250,7 +408,7 @@ func (s *Store) ListAccounts(ctx context.Context) ([]domain.Account, error) {
 
 // ListAccountsPage returns one administrator-facing page and the total number
 // of accounts matching Query. Query is a case-insensitive literal substring
-// match against account email and name.
+// match against account email, custom suffix, and name.
 func (s *Store) ListAccountsPage(ctx context.Context, filter AccountListFilter) (AccountPage, error) {
 	if err := validateListPage(filter.Limit, filter.Offset); err != nil {
 		return AccountPage{}, fmt.Errorf("list accounts page: %w", err)
@@ -263,8 +421,10 @@ func (s *Store) ListAccountsPage(ctx context.Context, filter AccountListFilter) 
 		predicate = ` WHERE (
 			LOWER(a.email) LIKE LOWER(?) ESCAPE '!'
 			OR LOWER(a.name) LIKE LOWER(?) ESCAPE '!'
+			OR LOWER(COALESCE((SELECT ams.email_suffix FROM account_mailbox_settings ams
+				WHERE ams.account_id = a.id), '')) LIKE LOWER(?) ESCAPE '!'
 		)`
-		filterArgs = append(filterArgs, pattern, pattern)
+		filterArgs = append(filterArgs, pattern, pattern, pattern)
 	}
 
 	var total int
@@ -434,6 +594,7 @@ func scanAccount(scanner rowScanner) (domain.Account, error) {
 		&account.IMAPUsername, &account.PasswordCiphertext, &enabled,
 		&account.LastSyncStatus, &account.LastSyncError, &lastSyncedAt,
 		&createdAt, &updatedAt, &account.AliasCount,
+		&account.MailboxType, &account.EmailSuffix,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -445,5 +606,13 @@ func scanAccount(scanner rowScanner) (domain.Account, error) {
 	account.LastSyncedAt = timePtr(lastSyncedAt)
 	account.CreatedAt = timeFromTimestamp(createdAt)
 	account.UpdatedAt = timeFromTimestamp(updatedAt)
+	account.MailboxType = domain.NormalizeMailboxType(account.MailboxType)
+	if account.MailboxType == domain.MailboxTypeCustom {
+		if suffix, suffixErr := domain.NormalizeEmailSuffix(account.EmailSuffix); suffixErr == nil {
+			account.EmailSuffix = suffix
+		}
+	} else {
+		account.EmailSuffix = ""
+	}
 	return account, nil
 }

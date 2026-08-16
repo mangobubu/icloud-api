@@ -14,7 +14,7 @@ test("account form exposes editable IMAP host and port with iCloud defaults", as
   const source = await readFile(viewPath, "utf8");
 
   const emailField = source.match(
-    /<el-form-item label="iCloud 主号邮箱" prop="email">([\s\S]*?)<\/el-form-item>/,
+    /<el-form-item[^>]*label="iCloud 主号邮箱"[^>]*prop="email">([\s\S]*?)<\/el-form-item>/,
   )?.[1];
   const imapUsernameField = source.match(
     /<el-form-item label="IMAP 用户名" prop="imapUsername">([\s\S]*?)<\/el-form-item>/,
@@ -94,4 +94,42 @@ test("IMAP validation errors stay in flow before the endpoint hint", async () =>
     styles,
     /\.imap-service-fields \.el-form-item\s*\{[^}]*margin-bottom:\s*0;/s,
   );
+});
+
+test("account form exposes custom mailbox suffix and keeps the iCloud branch", async () => {
+  const source = await readFile(viewPath, "utf8");
+
+  assert.match(source, /label="邮箱类型"/);
+  assert.match(source, /label="邮箱后缀"/);
+  assert.doesNotMatch(source, /<el-form-item v-else label="自定义邮箱"/);
+  assert.match(source, /v-model="form\.emailSuffix"/);
+  assert.match(source, /label="IMAP 密码"/);
+  assert.match(source, /mailbox_type: form\.mailboxType/);
+  assert.match(source, /payload\.email_suffix\s*=/);
+  assert.match(source, /imap_password:\s*isCustomMailbox\.value/);
+  assert.match(source, /邮箱后缀格式不正确/);
+});
+
+test("custom IMAP password preserves whitespace while iCloud rejects whitespace-only input", async () => {
+  const source = await readFile(viewPath, "utf8");
+
+  assert.match(source, /const password = String\(value \?\? ""\)/);
+  assert.match(
+    source,
+    /const passwordMissing = isCustomMailbox\.value\s*\? password\.length === 0\s*:\s*!password\.trim\(\)/,
+  );
+  assert.match(
+    source,
+    /imap_password: isCustomMailbox\.value\s*\? form\.imapPassword\s*:\s*form\.imapPassword\.trim\(\)/,
+  );
+});
+
+test("account normalizer preserves custom mailbox metadata", () => {
+  const account = normalizeAccount({
+    provider: "custom",
+    email_suffix: "example.test",
+  });
+  assert.equal(account.mailboxType, "custom");
+  assert.equal(account.provider, "custom");
+  assert.equal(account.emailSuffix, "example.test");
 });

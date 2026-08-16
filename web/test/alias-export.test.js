@@ -151,3 +151,36 @@ test("all aliases view keeps full credentials visible and supports single, check
     /getAllAliases\(selectedAccountId\.value,\s*\{[\s\S]*query:\s*appliedAliasQuery\.value/,
   );
 });
+
+test("all aliases view displays custom account suffixes without the internal placeholder", async () => {
+  const source = await readFile(aliasesViewPath, "utf8");
+  const identityBody = functionBody(source, "function formatAccountIdentity");
+  const formatAccountIdentity = Function(
+    `"use strict"; return function (account) ${identityBody}`,
+  )();
+
+  assert.equal(
+    formatAccountIdentity({
+      email: "custom@example.test",
+      mailboxType: "custom",
+      emailSuffix: "example.test",
+    }),
+    "@example.test",
+  );
+  assert.equal(
+    formatAccountIdentity({
+      email: "primary@icloud.com",
+      mailboxType: "icloud",
+      emailSuffix: "",
+    }),
+    "primary@icloud.com",
+  );
+  assert.equal(
+    formatAccountIdentity({ accountEmail: "custom@fallback.test" }),
+    "@fallback.test",
+  );
+  assert.match(source, /:label="formatAccountIdentity\(account\)"/);
+  assert.match(source, /\{\{ formatAccountIdentity\(account\) \}\}/);
+  assert.match(source, /\{\{ formatAliasAccountIdentity\(row\) \|\| "查看主号" \}\}/);
+  assert.match(source, /\{\{ formatAliasAccountIdentity\(alias\) \|\| "-" \}\}/);
+});

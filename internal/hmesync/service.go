@@ -83,6 +83,7 @@ type challenge struct {
 type accountIdentity struct {
 	email        string
 	imapUsername string
+	mailboxType  string
 }
 
 type operationLock struct {
@@ -386,6 +387,9 @@ func (s *Service) SyncAliases(ctx context.Context, accountID int64) (SyncResult,
 		}
 		if errors.Is(err, store.ErrAliasOwnershipConflict) {
 			return wrapError(CodeAliasOwnershipConflict, ErrAliasOwnershipConflict, err)
+		}
+		if errors.Is(err, store.ErrICloudMailboxRequired) {
+			return wrapError(CodeAccountChanged, ErrAccountChanged, err)
 		}
 		return err
 	})
@@ -1002,6 +1006,9 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 		if errors.Is(publishErr, store.ErrAliasOwnershipConflict) {
 			return domain.Alias{}, wrapError(CodeAliasOwnershipConflict, ErrAliasOwnershipConflict, publishErr)
 		}
+		if errors.Is(publishErr, store.ErrICloudMailboxRequired) {
+			return domain.Alias{}, wrapError(CodeAccountChanged, ErrAccountChanged, publishErr)
+		}
 		return saved, publishErr
 	}
 	confirmPendingAlias := func(
@@ -1058,7 +1065,11 @@ func (s *Service) CreateAutoAlias(ctx context.Context, accountID int64) (created
 			confirmErr = s.locker.WithAccountLock(operationContext, accountID, confirm)
 		}
 		if confirmErr != nil {
-			confirmErr = wrapPersistenceError(confirmErr)
+			if errors.Is(confirmErr, store.ErrICloudMailboxRequired) {
+				confirmErr = wrapError(CodeAccountChanged, ErrAccountChanged, confirmErr)
+			} else {
+				confirmErr = wrapPersistenceError(confirmErr)
+			}
 		}
 		return saved, confirmErr
 	}
@@ -1553,6 +1564,9 @@ func (s *Service) persistSession(ctx context.Context, accountID int64, expected 
 			return wrapError(CodeAccountChanged, ErrAccountChanged, nil)
 		}
 		saved, err = s.saveSession(ctx, accountID, session)
+		if errors.Is(err, store.ErrICloudMailboxRequired) {
+			return wrapError(CodeAccountChanged, ErrAccountChanged, err)
+		}
 		return err
 	})
 	return saved, err
@@ -1588,7 +1602,7 @@ func (s *Service) saveSession(ctx context.Context, accountID int64, session appl
 	if validatedAt.IsZero() {
 		validatedAt = s.now().UTC()
 	}
-	return s.repo.UpsertAppleWebSession(ctx, domain.AppleWebSession{
+	saved, err := s.repo.UpsertAppleWebSession(ctx, domain.AppleWebSession{
 		AccountID:       accountID,
 		Ciphertext:      ciphertext,
 		AppleID:         strings.TrimSpace(session.AppleID),
@@ -1596,6 +1610,10 @@ func (s *Service) saveSession(ctx context.Context, accountID int64, session appl
 		Authenticated:   true,
 		LastValidatedAt: &validatedAt,
 	})
+	if errors.Is(err, store.ErrICloudMailboxRequired) {
+		return domain.AppleWebSession{}, wrapError(CodeAccountChanged, ErrAccountChanged, err)
+	}
+	return saved, err
 }
 
 func (s *Service) loadSession(ctx context.Context, accountID int64) (domain.AppleWebSession, apple.Session, error) {
@@ -1780,11 +1798,14 @@ func identityOf(account domain.Account) accountIdentity {
 	return accountIdentity{
 		email:        domain.NormalizeEmail(account.Email),
 		imapUsername: strings.TrimSpace(account.IMAPUsername),
+		mailboxType:  domain.NormalizeMailboxType(account.MailboxType),
 	}
 }
 
 func sameIdentity(left, right accountIdentity) bool {
-	return left.email != "" && left.email == right.email && left.imapUsername == right.imapUsername
+	return left.mailboxType == domain.MailboxTypeICloud &&
+		right.mailboxType == domain.MailboxTypeICloud &&
+		left.email != "" && left.email == right.email && left.imapUsername == right.imapUsername
 }
 
 func sessionInfoFromSession(session apple.Session, status string, authenticatedAt, expiresAt *time.Time) SessionInfo {

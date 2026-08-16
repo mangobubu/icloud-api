@@ -5,7 +5,7 @@
   >
     <SectionHeader
       id="accounts-section-title"
-      title="iCloud 主号"
+      title="邮箱主号"
       description="隐私邮箱通过所属主号的 IMAP 收取邮件。"
     >
       <template #actions>
@@ -36,7 +36,7 @@
     <EmptyState
       v-else-if="accounts.length === 0"
       title="还没有主号"
-      description="添加一个 iCloud 主号及其 App 专用密码，然后登记隐私邮箱。"
+      description="添加一个 iCloud 或自定义邮箱主号及其 IMAP 密码，然后登记或生成邮箱。"
     >
       <el-button type="primary" :icon="Plus" @click="openNewAccount">
         添加第一个主号
@@ -68,7 +68,7 @@
           <template #cell="{ column, row }">
             <template v-if="column.key === 'account'">
               <div class="primary-stack">
-                <strong>{{ row.email }}</strong>
+                <strong>{{ row.mailboxType === "custom" ? `@${row.emailSuffix}` : row.email }}</strong>
                 <small>{{ row.name || "未填写备注" }}</small>
               </div>
             </template>
@@ -99,7 +99,7 @@
         <article v-for="account in accounts" :key="account.id" class="mobile-record">
           <header class="mobile-record__header">
             <div class="primary-stack">
-              <strong>{{ account.email }}</strong>
+              <strong>{{ account.mailboxType === "custom" ? `@${account.emailSuffix}` : account.email }}</strong>
               <small>{{ account.name || "未填写备注" }}</small>
             </div>
             <SyncStatus :item="account" />

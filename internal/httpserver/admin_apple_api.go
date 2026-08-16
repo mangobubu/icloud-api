@@ -230,8 +230,13 @@ func (s *Server) adminAPISyncAppleAliases(c *gin.Context) {
 }
 
 func (s *Server) adminAPIAppleAccountExists(c *gin.Context, accountID int64) bool {
-	if _, err := s.store.GetAccount(c.Request.Context(), accountID); err != nil {
+	account, err := s.store.GetAccount(c.Request.Context(), accountID)
+	if err != nil {
 		s.writeAdminAPIStoreReadError(c, err)
+		return false
+	}
+	if domain.NormalizeMailboxType(account.MailboxType) == domain.MailboxTypeCustom {
+		writeAdminAPIError(c, http.StatusConflict, "CUSTOM_MAILBOX_NO_APPLE", "自定义邮箱主号不支持 Apple 隐私邮箱操作")
 		return false
 	}
 	return true

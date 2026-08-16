@@ -26,8 +26,12 @@ var (
 	ErrAliasConfirmationPending = errors.New("alias is awaiting Apple confirmation")
 	ErrAliasCredentialMode      = errors.New("alias credential mode does not support this operation")
 	ErrAliasOwnershipConflict   = errors.New("alias address belongs to another account")
+	ErrAliasIdentityConflict    = errors.New("alias address conflicts with account identity")
+	ErrAliasSuffixMismatch      = errors.New("alias address does not match custom mailbox suffix")
 	ErrAccountIdentityLocked    = errors.New("account identity is locked by aliases")
 	ErrAccountDisabled          = errors.New("primary account is disabled")
+	ErrCustomMailboxRequired    = errors.New("custom mailbox is required")
+	ErrICloudMailboxRequired    = errors.New("iCloud mailbox is required")
 	ErrCredentialsChanged       = errors.New("administrator credentials changed")
 	memoryID                    atomic.Uint64
 )
@@ -38,6 +42,8 @@ const (
 	dialectSQLite dialect = iota
 	dialectPostgres
 )
+
+const addressNamespaceAdvisoryLock = int64(0x49434c4f55444144)
 
 // Store owns the application's persistence layer.
 type Store struct {
@@ -222,6 +228,42 @@ func (s *Store) txQueryContext(ctx context.Context, tx *sql.Tx, query string, ar
 
 func (s *Store) txQueryRowContext(ctx context.Context, tx *sql.Tx, query string, args ...any) *sql.Row {
 	return tx.QueryRowContext(ctx, s.rebind(query), args...)
+}
+
+func (s *Store) beginAddressNamespaceTx(ctx context.Context) (*sql.Tx, error) {
+	options := &sql.TxOptions{}
+	if s.dialect == dialectPostgres {
+		// The conflict query must receive a fresh snapshot after waiting for a
+		// preceding namespace owner to commit.
+		options.Isolation = sql.LevelReadCommitted
+	}
+	tx, err := s.db.BeginTx(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.lockAddressNamespaceTx(ctx, tx); err != nil {
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("lock address namespace: %w", err)
+	}
+	return tx, nil
+}
+
+// lockAddressNamespaceTx serializes the cross-table address namespace shared
+// by accounts.email and custom-generated aliases.address. Callers must acquire
+// this lock before any account row lock so account updates and custom alias
+// generation cannot deadlock while enforcing the shared identity invariant.
+func (s *Store) lockAddressNamespaceTx(ctx context.Context, tx *sql.Tx) error {
+	if s.dialect == dialectPostgres {
+		_, err := s.txExecContext(ctx, tx,
+			`SELECT pg_advisory_xact_lock(?)`, addressNamespaceAdvisoryLock,
+		)
+		return err
+	}
+	// SQLite has one database writer at a time. A no-op UPDATE starts the write
+	// transaction without changing an account row, providing the same ordering
+	// before callers inspect either side of the address namespace.
+	_, err := s.txExecContext(ctx, tx, `UPDATE accounts SET updated_at = updated_at WHERE 0`)
+	return err
 }
 
 // lockAccountForUpdate serializes account-scoped writes across application

@@ -10,6 +10,22 @@ const detailPath = new URL(
 const routerPath = new URL("../src/router/index.js", import.meta.url);
 const layoutPath = new URL("../src/layouts/AdminLayout.vue", import.meta.url);
 
+function functionBody(source, signature) {
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `missing ${signature}`);
+  const opening = source.indexOf("{", start);
+  assert.notEqual(opening, -1, `missing body for ${signature}`);
+  let depth = 0;
+  for (let index = opening; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(opening, index + 1);
+    }
+  }
+  assert.fail(`unterminated body for ${signature}`);
+}
+
 test("all logs view is routed and exposed in admin navigation", async () => {
   const [router, layout] = await Promise.all([
     readFile(routerPath, "utf8"),
@@ -55,6 +71,44 @@ test("all logs view supports filters, selectable pages, batched all-items loadin
   assert.match(source, /:flow-error="detailFlowError"/);
   assert.match(source, /@retry-flow="loadSelectedLogFlow"/);
   assert.match(source, /@media \(max-width: 720px\)/);
+});
+
+test("all logs view displays custom accounts by suffix and keeps iCloud email labels", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const identityBody = functionBody(source, "function formatAccountIdentity");
+  const formatAccountIdentity = Function(
+    `"use strict"; return function (account) ${identityBody}`,
+  )();
+
+  assert.equal(
+    formatAccountIdentity({
+      email: "custom@example.test",
+      mailboxType: "custom",
+      emailSuffix: "example.test",
+    }),
+    "@example.test",
+  );
+  assert.equal(
+    formatAccountIdentity({
+      email: "primary@icloud.com",
+      mailboxType: "icloud",
+      emailSuffix: "",
+    }),
+    "primary@icloud.com",
+  );
+  assert.equal(
+    formatAccountIdentity({
+      email: "custom@unknown.test",
+      mailboxType: "icloud",
+      emailSuffix: "unknown.test",
+    }),
+    "custom@unknown.test",
+  );
+  assert.match(source, /:label="formatAccountIdentity\(account\)"/);
+  assert.match(
+    functionBody(source, "function accountLabel"),
+    /return formatAccountIdentity\(account\) \|\| `主号 #\$\{accountId\}`/,
+  );
 });
 
 test("historical pages stop live refresh and the switch controls the scheduler", async () => {

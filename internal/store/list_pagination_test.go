@@ -63,6 +63,20 @@ func TestListAccountsPageFiltersEmailAndNameCaseInsensitively(t *testing.T) {
 	createAccount(t, ctx, db, "Sales", "billing-special@icloud.com")
 	createAccount(t, ctx, db, "100% Service", "percent@icloud.com")
 	createAccount(t, ctx, db, "Unrelated", "other@icloud.com")
+	custom, err := db.CreateAccount(ctx, domain.Account{
+		Name:               "Custom suffix owner",
+		Email:              "custom-search@identity.invalid",
+		MailboxType:        domain.MailboxTypeCustom,
+		EmailSuffix:        "Tenant.Custom.Test",
+		IMAPHost:           "imap.custom.test",
+		IMAPPort:           993,
+		IMAPUsername:       "shared-login",
+		PasswordCiphertext: "encrypted",
+		Enabled:            true,
+	})
+	if err != nil {
+		t.Fatalf("create custom searchable account: %v", err)
+	}
 
 	tests := []struct {
 		name  string
@@ -72,6 +86,7 @@ func TestListAccountsPageFiltersEmailAndNameCaseInsensitively(t *testing.T) {
 		{name: "name", query: "PRODUCTION", want: "owner@icloud.com"},
 		{name: "email", query: "SPECIAL", want: "billing-special@icloud.com"},
 		{name: "literal wildcard", query: "%", want: "percent@icloud.com"},
+		{name: "custom suffix", query: "CUSTOM.TEST", want: custom.Email},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

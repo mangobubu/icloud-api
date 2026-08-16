@@ -179,7 +179,7 @@ func (f *Fetcher) fetchArchiveIncremental(
 	}
 
 	candidates, err := fetchArchiveCandidateHeaders(
-		client, uids, aliasAddresses, account.Email, settings,
+		client, uids, aliasAddresses, account, settings,
 	)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -672,7 +672,7 @@ func fetchArchiveCandidateHeaders(
 	client *imapclientv2.Client,
 	uids []uint32,
 	aliases map[string][]int64,
-	accountEmail string,
+	account domain.Account,
 	settings fetchSettings,
 ) ([]archiveCandidate, error) {
 	fields := recipientHeaderFieldsForFetch()
@@ -754,7 +754,7 @@ func fetchArchiveCandidateHeaders(
 		if err != nil {
 			continue
 		}
-		candidate.aliasIDs, _ = classifyArchiveRecipientAliases(parsedHeader.Header, aliases, accountEmail, settings.allowWeakRecipientHeaders)
+		candidate.aliasIDs, _ = classifyArchiveRecipientAliases(parsedHeader.Header, aliases, account, settings.allowWeakRecipientHeaders)
 		if len(candidate.aliasIDs) == 0 {
 			continue
 		}
@@ -781,11 +781,21 @@ func fetchArchiveCandidateHeaders(
 func classifyArchiveRecipientAliases(
 	header stdmail.Header,
 	aliases map[string][]int64,
-	accountEmail string,
+	account domain.Account,
 	allowWeak bool,
 ) ([]int64, bool) {
+	switch domain.NormalizeMailboxType(account.MailboxType) {
+	case domain.MailboxTypeCustom:
+		return classifyCustomRecipientAliases(header, aliases, allowWeak)
+	case domain.MailboxTypeICloud:
+		// Continue with the historical iCloud routing contract below. Empty
+		// mailbox types normalize to iCloud for legacy in-memory accounts.
+	default:
+		return nil, false
+	}
+
 	if _, present, _ := parseICloudHMERoute(header); present {
-		aliasID, determinate := classifyRecipientAlias(header, aliases, accountEmail, allowWeak)
+		aliasID, determinate := classifyRecipientAlias(header, aliases, account, allowWeak)
 		if !determinate || aliasID == 0 {
 			return nil, determinate
 		}

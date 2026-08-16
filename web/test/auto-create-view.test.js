@@ -77,6 +77,34 @@ test("account detail exposes automatic alias creation with persistent credential
   );
 });
 
+test("account detail exposes the custom random mailbox generator separately", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const generate = functionBody(source, "async function generateRandomAliases");
+
+  assert.match(source, /自动生成随机邮箱/);
+  assert.match(source, /v-model="randomAliasCount"/);
+  assert.match(source, /createRandomAliases\(/);
+  assert.match(source, /8–12 位随机英文数字/);
+  assert.match(source, /isCustomMailbox/);
+  assert.match(source, /单次最多 1000 个/);
+  assert.match(
+    source,
+    /:disabled="randomAliasLoading \|\| syncLoading \|\| syncActive \|\| !account\.enabled \|\| !account\.emailSuffix"/,
+  );
+  assert.match(generate, /if \(!account\.value\.enabled\)/);
+  assert.match(generate, /主号已停用，不能生成随机邮箱/);
+});
+
+test("custom account deletion identifies the mailbox by its suffix", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const remove = functionBody(source, "async function removeAccount");
+
+  assert.match(remove, /isCustomMailbox\.value/);
+  assert.match(remove, /`@\$\{account\.value\.emailSuffix\}`/);
+  assert.match(remove, /: account\.value\.email/);
+  assert.match(remove, /确定删除主号 \$\{accountIdentity\}/);
+});
+
 test("directory-confirmation aliases remain visibly gated without a key-claim queue", async () => {
   const source = await readFile(viewPath, "utf8");
   const confirmationBody = functionBody(

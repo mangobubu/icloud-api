@@ -438,6 +438,20 @@ case "${1:-}" in
 		' "$restore_toc"; then
 			latest_message_table_count=1
 		fi
+		mailbox_required_tables=""
+		mailbox_required_constraints=""
+		mailbox_required_foreign_keys=""
+		mailbox_required_indexes=""
+		if awk '
+			$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
+				$6 == "account_mailbox_settings" { found = 1 }
+			END { exit(found ? 0 : 1) }
+		' "$restore_toc"; then
+			mailbox_required_tables="account_mailbox_settings"
+			mailbox_required_constraints="account_mailbox_settings:account_mailbox_settings_pkey"
+			mailbox_required_foreign_keys="account_mailbox_settings:account_mailbox_settings_account_id_fkey"
+			mailbox_required_indexes="account_mailbox_settings_type_idx account_mailbox_settings_custom_suffix_idx"
+		fi
 		optional_required_tables=""
 		optional_required_constraints=""
 		optional_required_foreign_keys=""
@@ -499,7 +513,7 @@ case "${1:-}" in
 		for required_table in \
 			schema_migrations app_metadata admins admin_sessions accounts aliases \
 			$message_required_tables audit_logs apple_web_sessions imap_sync_states data_migrations \
-			$optional_required_tables; do
+			$optional_required_tables $mailbox_required_tables; do
 			if ! awk -v required_table="$required_table" '
 				$1 ~ /^[0-9]+;$/ && $4 == "TABLE" && $5 == "public" && \
 					$6 == required_table { found_table = 1 }
@@ -532,7 +546,7 @@ case "${1:-}" in
 			$message_required_constraints audit_logs:audit_logs_pkey \
 			apple_web_sessions:apple_web_sessions_pkey \
 			imap_sync_states:imap_sync_states_pkey data_migrations:data_migrations_pkey \
-			$optional_required_constraints; do
+			$optional_required_constraints $mailbox_required_constraints; do
 			required_constraint_table="${required_constraint%%:*}"
 			required_constraint_name="${required_constraint#*:}"
 			if ! awk \
@@ -552,7 +566,7 @@ case "${1:-}" in
 			audit_logs:audit_logs_admin_id_fkey \
 			apple_web_sessions:apple_web_sessions_account_id_fkey \
 			imap_sync_states:imap_sync_states_account_id_fkey \
-			$optional_required_foreign_keys; do
+			$optional_required_foreign_keys $mailbox_required_foreign_keys; do
 			required_foreign_key_table="${required_foreign_key%%:*}"
 			required_foreign_key_name="${required_foreign_key#*:}"
 			if ! awk \
@@ -571,7 +585,7 @@ case "${1:-}" in
 			accounts_enabled_email_idx aliases_account_id_idx \
 			aliases_account_address_idx aliases_enabled_account_address_idx \
 			audit_logs_created_at_idx audit_logs_admin_id_idx \
-			$optional_required_indexes; do
+			$optional_required_indexes $mailbox_required_indexes; do
 			if ! awk -v required_index="$required_index" '
 				$1 ~ /^[0-9]+;$/ && $4 == "INDEX" && $5 == "public" && \
 					$6 == required_index { found = 1 }
@@ -605,7 +619,7 @@ BEGIN
 	INTO restored_schema_version
 	FROM public.schema_migrations
 	WHERE id = 1;
-	IF restored_schema_version IS NULL OR restored_schema_version NOT IN (4, 5, 6, 7) THEN
+	IF restored_schema_version IS NULL OR restored_schema_version NOT IN (4, 5, 6, 7, 8) THEN
 		RAISE EXCEPTION 'restored schema version % is not supported', restored_schema_version;
 	END IF;
 
@@ -659,6 +673,17 @@ BEGIN
 	) THEN
 		RAISE EXCEPTION 'restored schema v7 has an unrecognized compatibility-table set';
 	END IF;
+	IF restored_schema_version = 8 AND NOT (
+		auto_alias_table_count = 2 AND seen_table_count = 2 AND archive_table_count = 2 AND
+		pg_catalog.to_regclass('public.alias_creation_schedules') IS NOT NULL AND
+		pg_catalog.to_regclass('public.pending_alias_api_keys') IS NOT NULL AND
+		pg_catalog.to_regclass('public.latest_messages') IS NOT NULL AND
+		pg_catalog.to_regclass('public.consumed_messages') IS NOT NULL AND
+		pg_catalog.to_regclass('public.imap_seen_tasks') IS NOT NULL AND
+		pg_catalog.to_regclass('public.account_mailbox_settings') IS NOT NULL
+	) THEN
+		RAISE EXCEPTION 'restored schema v8 is missing required compatibility or mailbox tables';
+	END IF;
 
 	SELECT required.table_name || '.' || required.constraint_name
 	INTO missing_object
@@ -678,6 +703,7 @@ BEGIN
 		('v7', 'archived_messages', 'archived_messages_account_id_uid_validity_upstream_uid_key', 'u'),
 		('v7', 'alias_messages', 'alias_messages_pkey', 'p'),
 		('v7', 'alias_messages', 'alias_messages_alias_id_mailbox_uid_key', 'u'),
+		('v8', 'account_mailbox_settings', 'account_mailbox_settings_pkey', 'p'),
 		('all', 'audit_logs', 'audit_logs_pkey', 'p'),
 		('all', 'apple_web_sessions', 'apple_web_sessions_pkey', 'p'),
 		('all', 'imap_sync_states', 'imap_sync_states_pkey', 'p'),
@@ -688,6 +714,7 @@ BEGIN
 		('v7', 'archived_messages', 'archived_messages_account_id_fkey', 'f'),
 		('v7', 'alias_messages', 'alias_messages_alias_id_fkey', 'f'),
 		('v7', 'alias_messages', 'alias_messages_message_id_fkey', 'f'),
+		('v8', 'account_mailbox_settings', 'account_mailbox_settings_account_id_fkey', 'f'),
 		('all', 'audit_logs', 'audit_logs_admin_id_fkey', 'f'),
 		('all', 'apple_web_sessions', 'apple_web_sessions_account_id_fkey', 'f'),
 		('all', 'imap_sync_states', 'imap_sync_states_account_id_fkey', 'f')
@@ -695,10 +722,11 @@ BEGIN
 	WHERE (required.schema_scope = 'all' OR
 		(required.schema_scope = 'legacy' AND (
 			restored_schema_version BETWEEN 4 AND 6 OR
-			(restored_schema_version = 7 AND
+			(restored_schema_version IN (7, 8) AND
 			 pg_catalog.to_regclass('public.latest_messages') IS NOT NULL)
 		)) OR
-		(required.schema_scope = 'v7' AND restored_schema_version = 7))
+		(required.schema_scope = 'v7' AND restored_schema_version IN (7, 8)) OR
+		(required.schema_scope = 'v8' AND restored_schema_version = 8))
 	AND NOT EXISTS (
 		SELECT 1
 		FROM pg_catalog.pg_constraint AS constraint_state
@@ -731,11 +759,14 @@ BEGIN
 		('v7', 'archived_messages', 'archived_messages_retention_idx'),
 		('v7', 'alias_messages', 'alias_messages_alias_uid_idx'),
 		('v7', 'alias_messages', 'alias_messages_alias_otp_idx'),
+		('v8', 'account_mailbox_settings', 'account_mailbox_settings_type_idx'),
+		('v8', 'account_mailbox_settings', 'account_mailbox_settings_custom_suffix_idx'),
 		('all', 'audit_logs', 'audit_logs_created_at_idx'),
 		('all', 'audit_logs', 'audit_logs_admin_id_idx')
 	) AS required(schema_scope, table_name, index_name)
 	WHERE (required.schema_scope = 'all' OR
-		(required.schema_scope = 'v7' AND restored_schema_version = 7))
+		(required.schema_scope = 'v7' AND restored_schema_version IN (7, 8)) OR
+		(required.schema_scope = 'v8' AND restored_schema_version = 8))
 	AND NOT EXISTS (
 		SELECT 1
 		FROM pg_catalog.pg_class AS index_state
@@ -766,10 +797,12 @@ BEGIN
 		('seen', 'consumed_messages', 'consumed_messages_pkey', ARRAY['alias_id', 'uid_validity', 'uid']::TEXT[]),
 		('seen', 'imap_seen_tasks', 'imap_seen_tasks_pkey', ARRAY['account_id', 'uid_validity', 'uid']::TEXT[]),
 		('archive', 'archived_messages', 'archived_messages_pkey', ARRAY['id']::TEXT[]),
-		('archive', 'alias_messages', 'alias_messages_pkey', ARRAY['alias_id', 'message_id']::TEXT[])
+		('archive', 'alias_messages', 'alias_messages_pkey', ARRAY['alias_id', 'message_id']::TEXT[]),
+		('mailbox', 'account_mailbox_settings', 'account_mailbox_settings_pkey', ARRAY['account_id']::TEXT[])
 	) AS required(extension_group, table_name, constraint_name, key_columns)
 	WHERE pg_catalog.to_regclass('public.' || required.table_name) IS NOT NULL
-		AND (required.extension_group <> 'archive' OR restored_schema_version = 7)
+		AND (required.extension_group <> 'archive' OR restored_schema_version IN (7, 8))
+		AND (required.extension_group <> 'mailbox' OR restored_schema_version = 8)
 		AND NOT EXISTS (
 			SELECT 1
 			FROM pg_catalog.pg_constraint AS constraint_state
@@ -806,10 +839,12 @@ BEGIN
 		('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[]),
 		('archive', 'archived_messages', 'archived_messages_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[]),
 		('archive', 'alias_messages', 'alias_messages_alias_id_fkey', 'aliases', ARRAY['alias_id']::TEXT[], ARRAY['id']::TEXT[]),
-		('archive', 'alias_messages', 'alias_messages_message_id_fkey', 'archived_messages', ARRAY['message_id']::TEXT[], ARRAY['id']::TEXT[])
+		('archive', 'alias_messages', 'alias_messages_message_id_fkey', 'archived_messages', ARRAY['message_id']::TEXT[], ARRAY['id']::TEXT[]),
+		('mailbox', 'account_mailbox_settings', 'account_mailbox_settings_account_id_fkey', 'accounts', ARRAY['account_id']::TEXT[], ARRAY['id']::TEXT[])
 	) AS required(extension_group, table_name, constraint_name, referenced_table, local_columns, referenced_columns)
 	WHERE pg_catalog.to_regclass('public.' || required.table_name) IS NOT NULL
-		AND (required.extension_group <> 'archive' OR restored_schema_version = 7)
+		AND (required.extension_group <> 'archive' OR restored_schema_version IN (7, 8))
+		AND (required.extension_group <> 'mailbox' OR restored_schema_version = 8)
 		AND NOT EXISTS (
 			SELECT 1
 			FROM pg_catalog.pg_constraint AS constraint_state
@@ -853,10 +888,12 @@ BEGIN
 		('seen', 'imap_seen_tasks', 'imap_seen_tasks_account_created_idx', ARRAY['account_id', 'created_at', 'uid_validity', 'uid']::TEXT[]),
 		('archive', 'aliases', 'aliases_imap_password_hash_idx', ARRAY['imap_password_hash']::TEXT[]),
 		('archive', 'archived_messages', 'archived_messages_retention_idx', ARRAY['content_state', 'internal_date', 'id']::TEXT[]),
-		('archive', 'alias_messages', 'alias_messages_alias_uid_idx', ARRAY['alias_id', 'mailbox_uid']::TEXT[])
+		('archive', 'alias_messages', 'alias_messages_alias_uid_idx', ARRAY['alias_id', 'mailbox_uid']::TEXT[]),
+		('mailbox', 'account_mailbox_settings', 'account_mailbox_settings_type_idx', ARRAY['mailbox_type', 'account_id']::TEXT[])
 	) AS required(extension_group, table_name, index_name, key_columns)
 	WHERE pg_catalog.to_regclass('public.' || required.table_name) IS NOT NULL
-		AND (required.extension_group <> 'archive' OR restored_schema_version = 7)
+		AND (required.extension_group <> 'archive' OR restored_schema_version IN (7, 8))
+		AND (required.extension_group <> 'mailbox' OR restored_schema_version = 8)
 		AND NOT EXISTS (
 			SELECT 1
 			FROM pg_catalog.pg_class AS index_state
@@ -892,6 +929,46 @@ BEGIN
 	LIMIT 1;
 	IF missing_object IS NOT NULL THEN
 		RAISE EXCEPTION 'restored schema has invalid index %', missing_object;
+	END IF;
+
+	IF restored_schema_version = 8 AND NOT EXISTS (
+		SELECT 1
+		FROM pg_catalog.pg_class AS index_state
+		JOIN pg_catalog.pg_namespace AS schema_state
+			ON schema_state.oid = index_state.relnamespace
+		JOIN pg_catalog.pg_index AS index_metadata
+			ON index_metadata.indexrelid = index_state.oid
+		JOIN pg_catalog.pg_class AS table_state
+			ON table_state.oid = index_metadata.indrelid
+		JOIN pg_catalog.pg_am AS access_method
+			ON access_method.oid = index_state.relam
+		WHERE schema_state.nspname = 'public'
+			AND table_state.relname = 'account_mailbox_settings'
+			AND index_state.relname = 'account_mailbox_settings_custom_suffix_idx'
+			AND index_state.relkind IN ('i', 'I')
+			AND access_method.amname = 'btree'
+			AND index_metadata.indisvalid
+			AND index_metadata.indisready
+			AND index_metadata.indisunique
+			AND index_metadata.indnkeyatts = 1
+			AND index_metadata.indnatts = 1
+			AND index_metadata.indpred IS NOT NULL
+			AND index_metadata.indexprs IS NOT NULL
+			AND (
+				SELECT array_agg(key_column.attnum ORDER BY key_column.ordinality)
+				FROM unnest(index_metadata.indkey::SMALLINT[]) WITH ORDINALITY
+					AS key_column(attnum, ordinality)
+			) = ARRAY[0]::SMALLINT[]
+			AND regexp_replace(
+				lower(pg_catalog.pg_get_expr(index_metadata.indexprs, index_metadata.indrelid, true)),
+				'[[:space:]()]', '', 'g'
+			) = 'loweremail_suffix'
+			AND regexp_replace(
+				lower(pg_catalog.pg_get_expr(index_metadata.indpred, index_metadata.indrelid, true)),
+				'[[:space:]()]', '', 'g'
+			) = 'mailbox_type=''custom''::text'
+	) THEN
+		RAISE EXCEPTION 'restored schema has invalid index account_mailbox_settings.account_mailbox_settings_custom_suffix_idx';
 	END IF;
 END
 $icloud_api_restore_validation$;

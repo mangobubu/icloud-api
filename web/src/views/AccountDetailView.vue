@@ -135,7 +135,7 @@
             <el-button
               :icon="Refresh"
               :loading="syncLoading || syncActive"
-              :disabled="!account.enabled || syncActive"
+              :disabled="!account.enabled || syncActive || randomAliasLoading"
               @click="syncNow"
             >
               {{ syncActive ? "同步处理中" : "同步邮件" }}
@@ -153,9 +153,17 @@
             <dt>最近同步</dt>
             <dd>{{ formatTime(account.lastSyncedAt, { seconds: true }) }}</dd>
           </div>
-          <div>
+          <div v-if="!isCustomMailbox">
             <dt>主号邮箱</dt>
             <dd>{{ account.email }}</dd>
+          </div>
+          <div v-else>
+            <dt>邮箱类型</dt>
+            <dd>自定义邮箱</dd>
+          </div>
+          <div v-if="isCustomMailbox">
+            <dt>邮箱后缀</dt>
+            <dd>@{{ account.emailSuffix }}</dd>
           </div>
           <div>
             <dt>备注</dt>
@@ -179,11 +187,13 @@
         <SectionHeader
           id="aliases-title"
           title="隐私邮箱"
-          description="从 Apple 拉取 Hide My Email 地址目录；每个本地地址使用独立的完整凭证包。"
+          :description="isCustomMailbox
+            ? '按邮箱后缀生成或手动登记地址；每个地址使用独立的完整凭证包。'
+            : '从 Apple 拉取 Hide My Email 地址目录；每个本地地址使用独立的完整凭证包。'"
         >
           <template #actions>
             <el-button
-              v-if="appleSessionAuthenticated"
+              v-if="!isCustomMailbox && appleSessionAuthenticated"
               :icon="SwitchButton"
               :loading="appleDisconnectLoading"
               :disabled="appleAliasControlsDisabled || aliasesSyncLoading"
@@ -192,6 +202,7 @@
               退出 Apple 登录
             </el-button>
             <el-button
+              v-if="!isCustomMailbox"
               type="primary"
               :icon="Refresh"
               :loading="aliasesSyncLoading"
@@ -203,7 +214,7 @@
           </template>
         </SectionHeader>
 
-        <div class="apple-session-strip">
+        <div v-if="!isCustomMailbox" class="apple-session-strip">
           <div class="apple-session-strip__identity">
             <el-tag :type="appleSessionAuthenticated ? 'success' : 'info'" effect="plain">
               {{ appleSessionAuthenticated ? "Apple 已登录" : "Apple 未登录" }}
@@ -224,7 +235,7 @@
         </div>
 
         <div
-          v-if="autoCreation"
+          v-if="autoCreation && !isCustomMailbox"
           class="auto-creation-panel"
           aria-labelledby="auto-creation-title"
         >
@@ -299,6 +310,52 @@
             <strong>最近错误</strong>
             <span>{{ autoCreationErrorMessage(autoCreation.lastError) }}</span>
           </div>
+        </div>
+
+        <div
+          v-if="isCustomMailbox"
+          class="auto-creation-panel custom-random-panel"
+          aria-labelledby="custom-random-title"
+        >
+          <div class="auto-creation-panel__header">
+            <div class="auto-creation-panel__copy">
+              <div class="auto-creation-panel__title-row">
+                <h3 id="custom-random-title">自动生成随机邮箱</h3>
+                <el-tag type="success" effect="plain" size="small">自定义规则</el-tag>
+              </div>
+              <p>
+                按 8–12 位随机英文数字 + @{{ account.emailSuffix || "后缀" }} 生成，不调用 iCloud 规则，且不会重复已有地址。
+              </p>
+            </div>
+            <div class="auto-creation-panel__actions custom-random-panel__actions">
+              <el-input-number
+                v-model="randomAliasCount"
+                :min="1"
+                :max="1000"
+                :step="1"
+                :controls="false"
+                aria-label="随机邮箱生成数量"
+              />
+              <el-button
+                type="primary"
+                :loading="randomAliasLoading"
+                :disabled="randomAliasLoading || syncLoading || syncActive || !account.enabled || !account.emailSuffix"
+                @click="generateRandomAliases"
+              >
+                生成邮箱
+              </el-button>
+            </div>
+          </div>
+          <RequestAlert
+            v-if="randomAliasError"
+            class="custom-random-panel__error"
+            :error="randomAliasError"
+            closable
+            @close="randomAliasError = null"
+          />
+          <p class="field-help">
+            可直接输入生成数量，单次最多 1000 个；系统会拒绝重复地址，生成后的完整凭证会显示在下方列表。
+          </p>
         </div>
 
         <div
@@ -395,7 +452,10 @@
                       @click="rotateKey(row)"
                     />
                   </el-tooltip>
-                  <el-tooltip content="从 iCloud 永久删除隐私邮箱" placement="top">
+                  <el-tooltip
+                    :content="isCustomMailbox ? '从本地永久删除邮箱' : '从 iCloud 永久删除隐私邮箱'"
+                    placement="top"
+                  >
                     <el-button
                       type="danger"
                       plain
@@ -403,7 +463,7 @@
                       circle
                       :loading="Boolean(deleteLoading[row.id])"
                       :disabled="Boolean(isCopying(row) || toggleLoading[row.id] || rotateLoading[row.id])"
-                      :aria-label="`从 iCloud 永久删除隐私邮箱 ${row.address}`"
+                      :aria-label="`${isCustomMailbox ? '从本地永久删除邮箱' : '从 iCloud 永久删除隐私邮箱'} ${row.address}`"
                       @click="removeAlias(row)"
                     />
                   </el-tooltip>
@@ -529,8 +589,10 @@
           v-else
           class="empty-state--compact"
           level="h3"
-          title="尚未登记隐私邮箱"
-          description="添加一个已经转发到此主号的 Hide My Email 地址。"
+          :title="isCustomMailbox ? '尚未生成邮箱' : '尚未登记隐私邮箱'"
+          :description="isCustomMailbox
+            ? '输入生成数量批量创建，或在下方手动登记一个邮箱地址。'
+            : '添加一个已经转发到此主号的 Hide My Email 地址。'"
         />
 
         <el-form
@@ -625,6 +687,7 @@ import {
 
 import {
   createAlias,
+  createRandomAliases,
   deleteAccount,
   deleteAlias,
   deleteAppleSession,
@@ -687,6 +750,9 @@ const appleLoginFormRef = ref(null);
 const appleVerificationFormRef = ref(null);
 const autoCreation = ref(null);
 const autoCreationLoading = ref(false);
+const randomAliasCount = ref(1);
+const randomAliasLoading = ref(false);
+const randomAliasError = ref(null);
 const aliasSyncSummary = ref(null);
 const copyLoading = reactive({});
 const toggleLoading = reactive({});
@@ -698,11 +764,15 @@ const aliasActionLock = createActionLock();
 const accountDeleteLock = createActionLock();
 const appleDisconnectLock = createActionLock();
 const autoCreationLock = createActionLock();
+const randomAliasLock = createActionLock();
 let viewActive = true;
 let resumeAliasSyncAfterAuth = false;
 let resumeAutoCreationAfterAuth = false;
 
 const syncActive = computed(() => Boolean(account.value?.syncProgress?.active));
+const isCustomMailbox = computed(
+  () => account.value?.mailboxType === "custom",
+);
 
 const aliasForm = reactive({ address: "", label: "" });
 const appleLoginForm = reactive({ appleId: "", password: "", region: "global" });
@@ -798,6 +868,7 @@ function appleVerificationActionLabel() {
 const autoCreationControlDisabled = computed(
   () =>
     autoCreationLoading.value ||
+    randomAliasLoading.value ||
     aliasesSyncLoading.value ||
     appleDisconnectLoading.value ||
     appleAuthLoading.value,
@@ -1034,10 +1105,12 @@ function detailMutationPending() {
     appleAuthLoading.value ||
     appleDisconnectLoading.value ||
     autoCreationLoading.value ||
+    randomAliasLoading.value ||
     createLoading.value ||
     accountDeleteLoading.value ||
     aliasActionLock.hasAny() ||
-    autoCreationLock.hasAny()
+    autoCreationLock.hasAny() ||
+    randomAliasLock.hasAny()
   );
 }
 
@@ -1068,7 +1141,9 @@ async function loadDetail({ silent = false } = {}) {
     autoCreation.value = detail.autoCreation || null;
     loadError.value = null;
     setPageHeader(
-      detail.account.email,
+      detail.account.mailboxType === "custom"
+        ? `@${detail.account.emailSuffix}`
+        : detail.account.email,
       "管理 IMAP 连接、同步状态和所属隐私邮箱",
     );
   } catch (error) {
@@ -1084,7 +1159,7 @@ async function loadDetail({ silent = false } = {}) {
 const liveRefresh = createLiveRefresh(() => loadDetail({ silent: true }));
 
 async function syncNow() {
-  if (syncLoading.value || syncActive.value) return;
+  if (syncLoading.value || syncActive.value || randomAliasLoading.value) return;
   beginDetailMutation();
   const accountId = account.value.id;
   syncLoading.value = true;
@@ -1479,6 +1554,55 @@ async function addAlias() {
   }
 }
 
+async function generateRandomAliases() {
+  if (!account.value) return;
+  if (!account.value.enabled) {
+    randomAliasError.value = new Error("主号已停用，不能生成随机邮箱");
+    return;
+  }
+  if (
+    syncLoading.value ||
+    syncActive.value ||
+    !randomAliasLock.acquire()
+  ) return;
+  const accountId = account.value.id;
+  const count = Number(randomAliasCount.value);
+  if (!Number.isInteger(count) || count < 1 || count > 1000) {
+    randomAliasError.value = new Error("生成数量必须是 1 到 1000 之间的整数");
+    randomAliasLock.release();
+    return;
+  }
+  beginDetailMutation();
+  randomAliasLoading.value = true;
+  randomAliasError.value = null;
+  try {
+    const result = await createRandomAliases(
+      accountId,
+      { count },
+      auth.state.csrfToken,
+    );
+    if (!isCurrentAccount(accountId)) return;
+    const generated = (result.created || [])
+      .map((item) => item?.alias)
+      .filter((item) => item && item.id);
+    const mergedByID = new Map(aliases.value.map((item) => [item.id, item]));
+    for (const item of generated) mergedByID.set(item.id, item);
+    aliases.value = [...mergedByID.values()].sort(
+      (left, right) =>
+        left.address.localeCompare(right.address) || left.id - right.id,
+    );
+    syncAccountAliasCount();
+    successMessage(`已生成 ${generated.length} 个随机邮箱，完整凭证已显示在列表中。`);
+  } catch (error) {
+    if (!isCurrentAccount(accountId)) return;
+    randomAliasError.value = error;
+    showRequestError(error, "随机邮箱生成失败，请稍后重试。");
+  } finally {
+    randomAliasLoading.value = false;
+    randomAliasLock.release();
+  }
+}
+
 async function rotateKey(alias) {
   if (
     isAliasConfirmationPending(alias) ||
@@ -1649,10 +1773,13 @@ async function removeAlias(alias) {
   beginDetailMutation();
   const accountId = account.value.id;
   deleteLoading[alias.id] = true;
+  const customMailbox = isCustomMailbox.value;
   try {
     await ElMessageBox.confirm(
-      "删除后，该隐私邮箱将从 iCloud 永久删除，同时清除本地完整凭证、邮件归档映射及关联记录，且无法恢复。继续吗？",
-      `从 iCloud 永久删除 ${alias.address}`,
+      customMailbox
+        ? "删除后，该邮箱将从本地永久删除，同时清除完整凭证、邮件归档映射及关联记录，且无法恢复。继续吗？"
+        : "删除后，该隐私邮箱将从 iCloud 永久删除，同时清除本地完整凭证、邮件归档映射及关联记录，且无法恢复。继续吗？",
+      `${customMailbox ? "从本地永久删除" : "从 iCloud 永久删除"} ${alias.address}`,
       {
         type: "warning",
         confirmButtonText: "永久删除",
@@ -1666,7 +1793,11 @@ async function removeAlias(alias) {
     if (!isCurrentAccount(accountId)) return;
     aliases.value = aliases.value.filter((item) => item.id !== alias.id);
     syncAccountAliasCount();
-    successMessage("隐私邮箱已从 iCloud 和本地永久删除。");
+    successMessage(
+      customMailbox
+        ? "邮箱已从本地永久删除。"
+        : "隐私邮箱已从 iCloud 和本地永久删除。",
+    );
   } catch (error) {
     if (confirmationCancelled(error)) return;
     if (!isCurrentAccount(accountId)) return;
@@ -1691,11 +1822,13 @@ async function removeAccount() {
   if (!accountDeleteLock.acquire()) return;
   beginDetailMutation();
   const accountId = account.value.id;
-  const accountEmail = account.value.email;
+  const accountIdentity = isCustomMailbox.value
+    ? `@${account.value.emailSuffix}`
+    : account.value.email;
   accountDeleteLoading.value = true;
   try {
     await ElMessageBox.confirm(
-      `确定删除主号 ${accountEmail} 及其全部数据吗？`,
+      `确定删除主号 ${accountIdentity} 及其全部数据吗？`,
       "删除主号",
       {
         type: "warning",
@@ -1736,6 +1869,8 @@ watch(
       appleSession.value = null;
       autoCreation.value = null;
       aliasSyncSummary.value = null;
+      randomAliasCount.value = 1;
+      randomAliasError.value = null;
       loadDetail();
     }
   },
@@ -1751,6 +1886,7 @@ onBeforeUnmount(() => {
   liveRefresh.stop();
   detailGate.deactivate();
   autoCreation.value = null;
+  randomAliasError.value = null;
 });
 </script>
 

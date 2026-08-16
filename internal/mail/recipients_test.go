@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"icloud-api/internal/domain"
 )
 
 func TestRecipientAddresses(t *testing.T) {
@@ -127,7 +129,7 @@ func TestMatchingAliasIDsUsesAppleHMERouteBeforePhysicalRecipient(t *testing.T) 
 	}
 	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
 	for _, allowWeak := range []bool{false, true} {
-		if got := matchingAliasIDsForAccount(header, aliases, "primary@icloud.com", allowWeak); !reflect.DeepEqual(got, []int64{7}) {
+		if got := matchingAliasIDsForAccount(header, aliases, domain.Account{Email: "primary@icloud.com"}, allowWeak); !reflect.DeepEqual(got, []int64{7}) {
 			t.Fatalf("allowWeak=%v HME matching = %#v, want [7]", allowWeak, got)
 		}
 	}
@@ -140,7 +142,7 @@ func TestMatchingAliasIDsHandlesRawAppleHeaderCasing(t *testing.T) {
 		"X-Icloud-Hme":       {`p=private.alias@icloud.com; d=; f=primary@icloud.com; r=to; s=sender@example.com`},
 	}
 	aliases := map[string][]int64{"private.alias@icloud.com": {7}}
-	if got, determinate := classifyRecipientAlias(header, aliases, "PRIMARY@iCloud.com", false); !determinate || got != 7 {
+	if got, determinate := classifyRecipientAlias(header, aliases, domain.Account{Email: "PRIMARY@iCloud.com"}, false); !determinate || got != 7 {
 		t.Fatalf("raw Apple header classification = (%d, %v), want (7, true)", got, determinate)
 	}
 }
@@ -189,7 +191,7 @@ func TestMatchingAliasIDsRejectsInvalidAppleHMERoutes(t *testing.T) {
 			}
 			if got, determinate := classifyRecipientAlias(header, map[string][]int64{
 				"hidden.alias@icloud.com": {7},
-			}, "primary@icloud.com", false); determinate || got != 0 {
+			}, domain.Account{Email: "primary@icloud.com"}, false); determinate || got != 0 {
 				t.Fatalf("classification = (%d, %v), want (0, false)", got, determinate)
 			}
 		})
@@ -206,7 +208,7 @@ func TestMatchingAliasIDsRejectsConflictingRegisteredAliasInAppleHMEHeaders(t *t
 		"hidden.alias@icloud.com": {7},
 		"other.alias@icloud.com":  {8},
 	}
-	if got, determinate := classifyRecipientAlias(header, aliases, "primary@icloud.com", false); determinate || got != 0 {
+	if got, determinate := classifyRecipientAlias(header, aliases, domain.Account{Email: "primary@icloud.com"}, false); determinate || got != 0 {
 		t.Fatalf("conflicting HME classification = (%d, %v), want (0, false)", got, determinate)
 	}
 }
@@ -218,8 +220,250 @@ func TestMatchingAliasIDsAcceptsUnregisteredAppleHMEAddressAsDeterminateOther(t 
 	}
 	if got, determinate := classifyRecipientAlias(header, map[string][]int64{
 		"hidden.alias@icloud.com": {7},
-	}, "primary@icloud.com", false); !determinate || got != 0 {
+	}, domain.Account{Email: "primary@icloud.com"}, false); !determinate || got != 0 {
 		t.Fatalf("unregistered HME classification = (%d, %v), want (0, true)", got, determinate)
+	}
+}
+
+func TestICloudArchiveRecipientClassificationKeepsLegacyContract(t *testing.T) {
+	header := stdmail.Header{
+		"Original-Recipient": {`rfc822; primary@icloud.com`},
+		"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+		icloudHMEHeaderField: {`p=hidden.alias@icloud.com; f=primary@icloud.com; r=to`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+
+	for _, mailboxType := range []string{"", domain.MailboxTypeICloud} {
+		account := domain.Account{MailboxType: mailboxType, Email: "primary@icloud.com"}
+		got, determinate := classifyArchiveRecipientAliases(header, aliases, account, false)
+		if !determinate || !reflect.DeepEqual(got, []int64{7}) {
+			t.Fatalf("mailbox type %q archive classification = (%#v, %v), want ([7], true)", mailboxType, got, determinate)
+		}
+	}
+}
+
+func TestCustomArchiveRecipientMatchesProvidedRawHeaders(t *testing.T) {
+	raw := strings.Join([]string{
+		"Return-Path: <bounces+20216706-0e27-ybl=mgbubu.com@em7877.tm.openai.com>",
+		"Delivered-To: mango@mgbubu.com",
+		"X-Original-To: ybl@mgbubu.com",
+		"From: ChatGPT <noreply@tm.openai.com>",
+		"To: ybl@mgbubu.com",
+		"Subject: Your temporary ChatGPT verification code",
+		"Content-Type: text/html; charset=utf-8",
+		"Content-Transfer-Encoding: quoted-printable",
+		"",
+		"<p>191302</p>",
+	}, "\r\n")
+	message, err := stdmail.ReadMessage(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("parse provided raw message headers: %v", err)
+	}
+	aliases := map[string][]int64{
+		"ybl@mgbubu.com":   {1},
+		"mango@mgbubu.com": {2},
+	}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeCustom,
+		Email:        "custom@mgbubu.com",
+		IMAPUsername: "mango@mgbubu.com",
+	}
+
+	got, determinate := classifyArchiveRecipientAliases(message.Header, aliases, account, false)
+	if !determinate || !reflect.DeepEqual(got, []int64{1}) {
+		t.Fatalf("provided raw header classification = (%#v, %v), want ([1], true)", got, determinate)
+	}
+}
+
+func TestCustomArchiveRecipientHeaderPriority(t *testing.T) {
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeCustom,
+		Email:        "mango@example.com",
+		IMAPUsername: "imap-login-is-not-a-route",
+	}
+	aliases := map[string][]int64{
+		"first@example.com":  {1},
+		"second@example.com": {2},
+		"third@example.com":  {3},
+	}
+	tests := []struct {
+		name   string
+		header stdmail.Header
+		want   []int64
+	}{
+		{
+			name: "X-Original-To wins over physical delivery and visible recipient",
+			header: stdmail.Header{
+				"X-Original-To": {`first@example.com`},
+				"Delivered-To":  {`second@example.com`},
+				"To":            {`first@example.com`},
+			},
+			want: []int64{1},
+		},
+		{
+			name: "Original-Recipient wins over envelope tier",
+			header: stdmail.Header{
+				"Original-Recipient": {`rfc822; first@example.com`},
+				"Envelope-To":        {`second@example.com`},
+				"Delivered-To":       {`third@example.com`},
+			},
+			want: []int64{1},
+		},
+		{
+			name: "envelope tier wins over Delivered-To",
+			header: stdmail.Header{
+				"X-Envelope-To": {`second@example.com`},
+				"Delivered-To":  {`third@example.com`},
+			},
+			want: []int64{2},
+		},
+		{
+			name:   "Delivered-To is the last strong tier",
+			header: stdmail.Header{"Delivered-To": {`third@example.com`}},
+			want:   []int64{3},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, determinate := classifyArchiveRecipientAliases(test.header, aliases, account, false)
+			if !determinate || !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("custom archive classification = (%#v, %v), want (%#v, true)", got, determinate, test.want)
+			}
+		})
+	}
+}
+
+func TestCustomRecipientClassificationIgnoresAppleHMERoute(t *testing.T) {
+	aliases := map[string][]int64{
+		"custom.alias@example.com": {1},
+		"hidden.alias@icloud.com":  {7},
+	}
+	account := domain.Account{
+		MailboxType: domain.MailboxTypeCustom,
+		Email:       "primary@icloud.com",
+	}
+
+	for _, test := range []struct {
+		name string
+		hme  string
+	}{
+		{name: "valid Apple route", hme: `p=hidden.alias@icloud.com; f=primary@icloud.com; r=to`},
+		{name: "malformed Apple route", hme: `not-an-apple-route`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			header := stdmail.Header{
+				"X-Original-To":      {`custom.alias@example.com`},
+				"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+				icloudHMEHeaderField: {test.hme},
+			}
+			if got, determinate := classifyRecipientAlias(header, aliases, account, false); !determinate || got != 1 {
+				t.Fatalf("custom classification = (%d, %v), want (1, true)", got, determinate)
+			}
+			if got, determinate := classifyArchiveRecipientAliases(header, aliases, account, false); !determinate || !reflect.DeepEqual(got, []int64{1}) {
+				t.Fatalf("custom archive classification = (%#v, %v), want ([1], true)", got, determinate)
+			}
+		})
+	}
+}
+
+func TestCustomRecipientClassificationDoesNotFallThroughAuthoritativeTier(t *testing.T) {
+	account := domain.Account{MailboxType: domain.MailboxTypeCustom}
+	tests := []struct {
+		name    string
+		header  stdmail.Header
+		aliases map[string][]int64
+	}{
+		{
+			name: "malformed higher tier",
+			header: stdmail.Header{
+				"X-Original-To": {`<broken`},
+				"Delivered-To":  {`fallback@example.com`},
+				"To":            {`fallback@example.com`},
+			},
+			aliases: map[string][]int64{"fallback@example.com": {1}},
+		},
+		{
+			name: "unregistered higher tier",
+			header: stdmail.Header{
+				"X-Original-To": {`unregistered@example.com`},
+				"Delivered-To":  {`fallback@example.com`},
+			},
+			aliases: map[string][]int64{"fallback@example.com": {1}},
+		},
+		{
+			name: "address maps to multiple aliases",
+			header: stdmail.Header{
+				"X-Original-To": {`ambiguous@example.com`},
+				"Delivered-To":  {`fallback@example.com`},
+			},
+			aliases: map[string][]int64{
+				"ambiguous@example.com": {1, 2},
+				"fallback@example.com":  {3},
+			},
+		},
+		{
+			name: "mixed registered and unregistered addresses",
+			header: stdmail.Header{
+				"X-Original-To": {`registered@example.com, unregistered@example.com`},
+				"Delivered-To":  {`registered@example.com`},
+			},
+			aliases: map[string][]int64{"registered@example.com": {1}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, determinate := classifyArchiveRecipientAliases(test.header, test.aliases, account, true)
+			if determinate || len(got) != 0 {
+				t.Fatalf("unsafe higher tier classification = (%#v, %v), want (nil, false)", got, determinate)
+			}
+		})
+	}
+}
+
+func TestCustomArchiveRecipientSupportsMultipleUniquelyMappedAliases(t *testing.T) {
+	header := stdmail.Header{
+		"X-Original-To": {`first@example.com, second@example.com`},
+		"Delivered-To":  {`physical@example.com`},
+	}
+	aliases := map[string][]int64{
+		"first@example.com":    {2},
+		"second@example.com":   {1},
+		"physical@example.com": {3},
+	}
+	account := domain.Account{MailboxType: domain.MailboxTypeCustom}
+
+	got, determinate := classifyArchiveRecipientAliases(header, aliases, account, false)
+	if !determinate || !reflect.DeepEqual(got, []int64{1, 2}) {
+		t.Fatalf("multi-alias classification = (%#v, %v), want ([1 2], true)", got, determinate)
+	}
+	if got, determinate := classifyRecipientAlias(header, aliases, account, false); determinate || got != 0 {
+		t.Fatalf("single-alias classification accepted multiple routes: (%d, %v)", got, determinate)
+	}
+}
+
+func TestCustomRecipientWeakHeadersRemainPolicyControlled(t *testing.T) {
+	header := stdmail.Header{"To": {`alias@example.com`}}
+	aliases := map[string][]int64{"alias@example.com": {1}}
+	account := domain.Account{MailboxType: domain.MailboxTypeCustom}
+
+	if got, determinate := classifyArchiveRecipientAliases(header, aliases, account, false); !determinate || len(got) != 0 {
+		t.Fatalf("disabled weak headers = (%#v, %v), want (nil, true)", got, determinate)
+	}
+	if got, determinate := classifyArchiveRecipientAliases(header, aliases, account, true); !determinate || !reflect.DeepEqual(got, []int64{1}) {
+		t.Fatalf("enabled weak headers = (%#v, %v), want ([1], true)", got, determinate)
+	}
+}
+
+func TestCustomRecipientDoesNotRouteReturnPathOrReceived(t *testing.T) {
+	header := stdmail.Header{
+		"Return-Path": {`<alias@example.com>`},
+		"Received":    {`from sender.example by mx.example for <alias@example.com>`},
+	}
+	aliases := map[string][]int64{"alias@example.com": {1}}
+	account := domain.Account{MailboxType: domain.MailboxTypeCustom}
+
+	if got, determinate := classifyArchiveRecipientAliases(header, aliases, account, true); !determinate || len(got) != 0 {
+		t.Fatalf("non-routing headers = (%#v, %v), want (nil, true)", got, determinate)
 	}
 }
 
