@@ -6,7 +6,7 @@
     <SectionHeader
       id="aliases-section-title"
       title="全部隐私邮箱"
-      description="完整凭证常驻显示；复制结果一行一个邮箱且不含表头。"
+      description="敏感凭证不在列表展示；可通过复制操作导出取码或 IMAP 凭证。"
     >
       <template #actions>
         <el-button
@@ -219,22 +219,6 @@
                 {{ formatAliasAccountIdentity(row) || "查看主号" }}
               </el-button>
             </template>
-            <template v-else-if="column.key === 'apiKey'">
-              <code v-if="row.apiKey" class="credential-value">{{ row.apiKey }}</code>
-              <code v-else class="credential-value">{{ row.apiKeyPrefix || "-" }}</code>
-            </template>
-            <template v-else-if="column.key === 'imapPassword'">
-              <code v-if="row.imapPassword" class="credential-value">{{ row.imapPassword }}</code>
-              <code v-else class="credential-value">-</code>
-            </template>
-            <template v-else-if="column.key === 'clientId'">
-              <code v-if="row.clientId" class="credential-value">{{ row.clientId }}</code>
-              <code v-else class="credential-value">-</code>
-            </template>
-            <template v-else-if="column.key === 'refreshToken'">
-              <code v-if="row.refreshToken" class="credential-value">{{ row.refreshToken }}</code>
-              <code v-else class="credential-value">-</code>
-            </template>
             <template v-else-if="column.key === 'lastAccessedAt'">
               {{ formatTime(row.lastAccessedAt) }}
             </template>
@@ -319,34 +303,6 @@
             <div>
               <dt>所属主号</dt>
               <dd>{{ formatAliasAccountIdentity(alias) || "-" }}</dd>
-            </div>
-            <div>
-              <dt>API Key</dt>
-              <dd>
-                <code v-if="alias.apiKey" class="credential-value">{{ alias.apiKey }}</code>
-                <code v-else class="credential-value">{{ alias.apiKeyPrefix || "-" }}</code>
-              </dd>
-            </div>
-            <div>
-              <dt>IMAP 密码</dt>
-              <dd>
-                <code v-if="alias.imapPassword" class="credential-value">{{ alias.imapPassword }}</code>
-                <code v-else class="credential-value">-</code>
-              </dd>
-            </div>
-            <div>
-              <dt>client ID</dt>
-              <dd>
-                <code v-if="alias.clientId" class="credential-value">{{ alias.clientId }}</code>
-                <code v-else class="credential-value">-</code>
-              </dd>
-            </div>
-            <div>
-              <dt>刷新令牌</dt>
-              <dd>
-                <code v-if="alias.refreshToken" class="credential-value">{{ alias.refreshToken }}</code>
-                <code v-else class="credential-value">-</code>
-              </dd>
             </div>
             <div>
               <dt>最近调用</dt>
@@ -451,10 +407,6 @@ const aliasColumns = [
   { key: "selection", title: "", width: 52, align: "center", fixed: "left" },
   { key: "address", title: "隐私邮箱", width: 220, flexGrow: 2 },
   { key: "account", title: "所属主号", width: 190, flexGrow: 1 },
-  { key: "apiKey", title: "API Key", width: 260 },
-  { key: "imapPassword", title: "IMAP 密码", width: 260 },
-  { key: "clientId", title: "client ID", width: 190 },
-  { key: "refreshToken", title: "刷新令牌", width: 260 },
   { key: "lastAccessedAt", title: "最近调用", width: 150, flexGrow: 1 },
   { key: "latestReceivedAt", title: "最新邮件", width: 150, flexGrow: 1 },
   { key: "status", title: "状态", width: 134, flexGrow: 1 },
@@ -933,16 +885,6 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.credential-value {
-  display: block;
-  max-width: 100%;
-  overflow-x: auto;
-  color: var(--text-primary);
-  font-size: 12px;
-  white-space: nowrap;
-  user-select: all;
 }
 
 .mobile-alias-selection {

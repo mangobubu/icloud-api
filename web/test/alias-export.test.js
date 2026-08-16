@@ -120,7 +120,7 @@ test("credential export rejects missing fields, injected lines, and foreign OTP 
   );
 });
 
-test("all aliases view keeps full credentials visible and supports single, checked, and all copy", async () => {
+test("all aliases view hides credential fields and supports single, checked, and all copy", async () => {
   const source = await readFile(aliasesViewPath, "utf8");
   const exportableBody = functionBody(source, "function isAliasExportable");
   const isAliasExportable = Function(
@@ -138,7 +138,13 @@ test("all aliases view keeps full credentials visible and supports single, check
   assert.equal(isAliasExportable(complete), true);
   assert.equal(isAliasExportable({ ...complete, refreshToken: "" }), false);
   for (const field of ["apiKey", "imapPassword", "clientId", "refreshToken"]) {
-    assert.match(source, new RegExp(`\\{\\{ (?:row|alias)\\.${field} \\}\\}`));
+    assert.doesNotMatch(
+      source,
+      new RegExp(`\\{\\{ (?:row|alias)\\.${field} \\}\\}`),
+    );
+  }
+  for (const label of ["API Key", "IMAP 密码", "client ID", "刷新令牌"]) {
+    assert.doesNotMatch(source, new RegExp(`<(?:dt|th)[^>]*>\\s*${label}`));
   }
   assert.match(source, /copyAliasLine\(row, ALIAS_EXPORT_OTP\)/);
   assert.match(source, /copyAliasLine\(row, ALIAS_EXPORT_IMAP\)/);
