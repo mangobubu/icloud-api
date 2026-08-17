@@ -9,6 +9,7 @@ require (
 	github.com/jackc/pgx/v5 v5.7.5
 	golang.org/x/crypto v0.41.0
 	golang.org/x/net v0.43.0
+	golang.org/x/text v0.28.0
 	modernc.org/sqlite v1.38.2
 )
 
@@ -46,7 +47,6 @@ require (
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
 	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.66.3 // indirect

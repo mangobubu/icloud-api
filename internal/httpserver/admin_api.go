@@ -72,11 +72,18 @@ func (s *Server) registerAdminAPIRoutes(api *gin.RouterGroup) {
 	protected.POST("/accounts/:id/aliases/generate", s.adminAPICreateRandomAliases(basePath))
 	protected.POST("/accounts/:id/aliases/sync", s.adminAPISyncAppleAliases)
 
+	protected.GET("/groups", s.adminAPIListMailGroups)
+	protected.POST("/groups", s.adminAPICreateMailGroup)
+	protected.PATCH("/groups/:id", s.adminAPIUpdateMailGroup)
+	protected.DELETE("/groups/:id", s.adminAPIDeleteMailGroup)
+
 	protected.GET("/aliases", s.adminAPIListAliases)
+	protected.PATCH("/aliases/group", s.adminAPIMoveAliasesToGroup)
 	protected.GET("/aliases/:id", s.adminAPIGetAlias)
 	protected.POST("/aliases/:id/rotate-key", s.adminAPIRotateAliasKey)
 	protected.POST("/aliases/:id/rotate-credentials", s.adminAPIRotateAliasCredentials)
 	protected.PATCH("/aliases/:id", s.adminAPIUpdateAlias)
+	protected.PATCH("/aliases/:id/group", s.adminAPIMoveAliasToGroup)
 	protected.DELETE("/aliases/:id", s.adminAPIDeleteAlias)
 
 	protected.GET("/audit", s.adminAPIListAuditLogs)
@@ -129,6 +136,8 @@ type adminAPIAliasDTO struct {
 	AccountEmail      string  `json:"account_email"`
 	Address           string  `json:"address"`
 	Label             string  `json:"label"`
+	GroupID           *int64  `json:"group_id"`
+	GroupName         string  `json:"group_name"`
 	APIKeyPrefix      string  `json:"api_key_prefix"`
 	DirectLinkPath    string  `json:"direct_link_path"`
 	APIKey            string  `json:"api_key"`
@@ -189,6 +198,38 @@ type adminAPIAutoCreationRequest struct {
 
 type adminAPIAutoCreationKeysRequest struct {
 	AliasIDs []int64 `json:"alias_ids"`
+}
+
+type adminAPIMailGroupDTO struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	AliasCount int    `json:"alias_count"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+type adminAPIMailGroupRequest struct {
+	Name string `json:"name"`
+}
+
+type adminAPIOptionalInt64 struct {
+	Value   int64
+	Present bool
+	Null    bool
+}
+
+func (v *adminAPIOptionalInt64) UnmarshalJSON(data []byte) error {
+	*v = adminAPIOptionalInt64{Present: true}
+	if strings.TrimSpace(string(data)) == "null" {
+		v.Null = true
+		return nil
+	}
+	return json.Unmarshal(data, &v.Value)
+}
+
+type adminAPIMoveAliasesRequest struct {
+	AliasIDs []int64               `json:"alias_ids"`
+	GroupID  adminAPIOptionalInt64 `json:"group_id"`
 }
 
 type adminAPIOneTimeKeyDTO struct {
@@ -293,12 +334,14 @@ type adminAPIUpdateAccountRequest struct {
 }
 
 type adminAPICreateAliasRequest struct {
-	Address string `json:"address"`
-	Label   string `json:"label"`
+	Address string                `json:"address"`
+	Label   string                `json:"label"`
+	GroupID adminAPIOptionalInt64 `json:"group_id"`
 }
 
 type adminAPIUpdateAliasRequest struct {
-	Enabled *bool `json:"enabled"`
+	Enabled *bool                 `json:"enabled"`
+	GroupID adminAPIOptionalInt64 `json:"group_id"`
 }
 
 func adminAPISessionFromDomain(session domain.Session) adminAPISessionDTO {
@@ -331,6 +374,16 @@ func adminAPIAccountFromDomain(account domain.Account) adminAPIAccountDTO {
 	}
 }
 
+func adminAPIMailGroupFromDomain(group domain.MailGroup) adminAPIMailGroupDTO {
+	return adminAPIMailGroupDTO{
+		ID:         group.ID,
+		Name:       group.Name,
+		AliasCount: group.AliasCount,
+		CreatedAt:  adminAPITime(group.CreatedAt),
+		UpdatedAt:  adminAPITime(group.UpdatedAt),
+	}
+}
+
 func (s *Server) adminAPIAccountFromDomain(account domain.Account) adminAPIAccountDTO {
 	dto := adminAPIAccountFromDomain(account)
 	if s.syncProgress == nil {
@@ -358,6 +411,8 @@ func (s *Server) adminAPIAliasFromDomain(alias domain.Alias) (adminAPIAliasDTO, 
 		AccountEmail:      alias.AccountEmail,
 		Address:           alias.Address,
 		Label:             alias.Label,
+		GroupID:           alias.GroupID,
+		GroupName:         alias.GroupName,
 		APIKeyPrefix:      alias.APIKeyPrefix,
 		CredentialMode:    alias.CredentialMode,
 		CredentialVersion: alias.CredentialVersion,
@@ -1237,6 +1292,11 @@ func (s *Server) adminAPICreateAlias(basePath string) gin.HandlerFunc {
 			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "用途备注不能超过 100 个字符")
 			return
 		}
+		groupID, groupIDValid := parseAdminAPIMailGroupID(input.GroupID)
+		if input.GroupID.Present && (!groupIDValid || groupID == nil) {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "group_id 必须是正整数")
+			return
+		}
 		var alias domain.Alias
 		err := s.withAccountLock(c.Request.Context(), accountID, func() error {
 			var createErr error
@@ -1244,6 +1304,7 @@ func (s *Server) adminAPICreateAlias(basePath string) gin.HandlerFunc {
 				AccountID: accountID,
 				Address:   address,
 				Label:     label,
+				GroupID:   groupID,
 				Enabled:   true,
 			})
 			return createErr
@@ -1254,6 +1315,8 @@ func (s *Server) adminAPICreateAlias(basePath string) gin.HandlerFunc {
 				writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
 			case adminAPIUniqueConstraint(err):
 				writeAdminAPIError(c, http.StatusConflict, "ALIAS_EXISTS", "这个隐私邮箱已经登记")
+			case errors.Is(err, store.ErrMailGroupNotFound):
+				writeAdminAPIError(c, http.StatusNotFound, "GROUP_NOT_FOUND", "邮箱分组不存在")
 			default:
 				s.writeAdminAPIInternalError(c, err)
 			}
@@ -1457,8 +1520,24 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 		}
 		accountID = &parsedID
 	}
+	var groupID *int64
+	groupUngrouped := false
+	if rawGroupID := strings.TrimSpace(c.Query("group_id")); rawGroupID != "" {
+		if strings.EqualFold(rawGroupID, "none") || strings.EqualFold(rawGroupID, "ungrouped") {
+			groupUngrouped = true
+		} else {
+			parsedID, parseErr := strconv.ParseInt(rawGroupID, 10, 64)
+			if parseErr != nil || parsedID < 1 {
+				writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "group_id 必须是正整数")
+				return
+			}
+			groupID = &parsedID
+		}
+	}
 	page, err := s.store.ListAliasesPage(c.Request.Context(), store.AliasListFilter{
 		AccountID: accountID,
+		GroupID:   groupID,
+		Ungrouped: groupUngrouped,
 		Query:     query,
 		Limit:     limit,
 		Offset:    offset,
@@ -1476,6 +1555,173 @@ func (s *Server) adminAPIListAliases(c *gin.Context) {
 		"items":      aliasDTOs,
 		"pagination": adminAPIPagination(limit, offset, page.Total),
 	})
+}
+
+func (s *Server) adminAPIListMailGroups(c *gin.Context) {
+	groups, err := s.store.ListMailGroups(c.Request.Context())
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	items := make([]adminAPIMailGroupDTO, 0, len(groups))
+	for _, group := range groups {
+		items = append(items, adminAPIMailGroupFromDomain(group))
+	}
+	writeAdminAPIData(c, http.StatusOK, gin.H{"items": items, "groups": items})
+}
+
+func (s *Server) adminAPICreateMailGroup(c *gin.Context) {
+	var input adminAPIMailGroupRequest
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	group, err := s.store.CreateMailGroup(c.Request.Context(), input.Name)
+	if err != nil {
+		s.writeAdminAPIMailGroupError(c, err)
+		return
+	}
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "create", "mail_group", strconv.FormatInt(group.ID, 10), "success", "")
+	writeAdminAPIData(c, http.StatusCreated, adminAPIMailGroupFromDomain(group))
+}
+
+func (s *Server) adminAPIUpdateMailGroup(c *gin.Context) {
+	id, ok := adminAPIParseID(c)
+	if !ok {
+		return
+	}
+	var input adminAPIMailGroupRequest
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	group, err := s.store.UpdateMailGroup(c.Request.Context(), id, input.Name)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeAdminAPIError(c, http.StatusNotFound, "GROUP_NOT_FOUND", "邮箱分组不存在")
+			return
+		}
+		s.writeAdminAPIMailGroupError(c, err)
+		return
+	}
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "update", "mail_group", strconv.FormatInt(id, 10), "success", "")
+	writeAdminAPIData(c, http.StatusOK, adminAPIMailGroupFromDomain(group))
+}
+
+func (s *Server) adminAPIDeleteMailGroup(c *gin.Context) {
+	id, ok := adminAPIParseID(c)
+	if !ok {
+		return
+	}
+	if err := s.store.DeleteMailGroup(c.Request.Context(), id); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeAdminAPIError(c, http.StatusNotFound, "GROUP_NOT_FOUND", "邮箱分组不存在")
+			return
+		}
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "delete", "mail_group", strconv.FormatInt(id, 10), "success", "")
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) writeAdminAPIMailGroupError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, store.ErrMailGroupNameRequired):
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "请填写邮箱分组名称")
+	case errors.Is(err, store.ErrMailGroupNameExists):
+		writeAdminAPIError(c, http.StatusConflict, "GROUP_EXISTS", "这个邮箱分组已经存在")
+	case errors.Is(err, store.ErrMailGroupNameTooLong):
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "邮箱分组名称不能超过 100 个字符")
+	default:
+		s.writeAdminAPIInternalError(c, err)
+	}
+}
+
+func parseAdminAPIMailGroupID(input adminAPIOptionalInt64) (*int64, bool) {
+	if !input.Present {
+		return nil, false
+	}
+	if input.Null {
+		return nil, true
+	}
+	if input.Value < 1 {
+		return nil, false
+	}
+	value := input.Value
+	return &value, true
+}
+
+func (s *Server) adminAPIMoveAliasesToGroup(c *gin.Context) {
+	var input adminAPIMoveAliasesRequest
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	if len(input.AliasIDs) == 0 || len(input.AliasIDs) > domain.MaxEnabledAliasesPerAccount {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "请提供要移动的隐私邮箱 ID")
+		return
+	}
+	for _, aliasID := range input.AliasIDs {
+		if aliasID < 1 {
+			writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "隐私邮箱 ID 必须是正整数")
+			return
+		}
+	}
+	groupID, valid := parseAdminAPIMailGroupID(input.GroupID)
+	if !valid {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "group_id 必须是正整数或 null")
+		return
+	}
+	if err := s.store.SetAliasesGroup(c.Request.Context(), input.AliasIDs, groupID); err != nil {
+		s.writeAdminAPIMoveGroupError(c, err)
+		return
+	}
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "move_group", "alias", "batch", "success", strconv.Itoa(len(input.AliasIDs)))
+	c.Status(http.StatusNoContent)
+}
+
+func (s *Server) adminAPIMoveAliasToGroup(c *gin.Context) {
+	id, ok := adminAPIParseID(c)
+	if !ok {
+		return
+	}
+	var input struct {
+		GroupID adminAPIOptionalInt64 `json:"group_id"`
+	}
+	if !decodeAdminAPIJSON(c, &input) {
+		return
+	}
+	groupID, valid := parseAdminAPIMailGroupID(input.GroupID)
+	if !valid {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "group_id 必须是正整数或 null")
+		return
+	}
+	alias, err := s.store.SetAliasGroup(c.Request.Context(), id, groupID)
+	if err != nil {
+		s.writeAdminAPIMoveGroupError(c, err)
+		return
+	}
+	session := mustSession(c)
+	s.audit(c, &session.AdminID, session.Username, "move_group", "alias", strconv.FormatInt(id, 10), "success", "")
+	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
+	if err != nil {
+		s.writeAdminAPIInternalError(c, err)
+		return
+	}
+	writeAdminAPIData(c, http.StatusOK, aliasDTO)
+}
+
+func (s *Server) writeAdminAPIMoveGroupError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
+	case errors.Is(err, store.ErrMailGroupNotFound):
+		writeAdminAPIError(c, http.StatusNotFound, "GROUP_NOT_FOUND", "邮箱分组不存在")
+	default:
+		s.writeAdminAPIInternalError(c, err)
+	}
 }
 
 func (s *Server) adminAPIGetAlias(c *gin.Context) {
@@ -1572,8 +1818,8 @@ func (s *Server) adminAPIUpdateAlias(c *gin.Context) {
 	if !decodeAdminAPIJSON(c, &input) {
 		return
 	}
-	if input.Enabled == nil {
-		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "请明确指定隐私邮箱是否启用")
+	if input.Enabled == nil && !input.GroupID.Present {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "请指定隐私邮箱状态或邮箱分组")
 		return
 	}
 	alias, err := s.store.GetAlias(c.Request.Context(), id)
@@ -1581,30 +1827,40 @@ func (s *Server) adminAPIUpdateAlias(c *gin.Context) {
 		s.writeAdminAPIStoreReadError(c, err)
 		return
 	}
-	if alias.Enabled != *input.Enabled {
-		err = s.withAccountLock(c.Request.Context(), alias.AccountID, func() error {
-			return s.store.SetAliasEnabled(c.Request.Context(), id, *input.Enabled)
+	groupID, groupIDValid := parseAdminAPIMailGroupID(input.GroupID)
+	if input.GroupID.Present && !groupIDValid {
+		writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "group_id 必须是正整数或 null")
+		return
+	}
+	err = s.withAccountLock(c.Request.Context(), alias.AccountID, func() error {
+		var updateErr error
+		alias, updateErr = s.store.UpdateAliasAdminState(c.Request.Context(), id, store.AliasAdminStateUpdate{
+			Enabled:        input.Enabled,
+			GroupID:        groupID,
+			GroupIDPresent: input.GroupID.Present,
 		})
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
-			} else if errors.Is(err, store.ErrAliasLimit) {
-				writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
-			} else if errors.Is(err, store.ErrAliasConfirmationPending) {
-				writeAdminAPIAliasConfirmationPending(c)
-			} else {
-				s.writeAdminAPIInternalError(c, err)
-			}
-			return
+		return updateErr
+	})
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "隐私邮箱不存在")
+		} else if errors.Is(err, store.ErrAliasLimit) {
+			writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
+		} else if errors.Is(err, store.ErrAliasConfirmationPending) {
+			writeAdminAPIAliasConfirmationPending(c)
+		} else if errors.Is(err, store.ErrMailGroupNotFound) {
+			writeAdminAPIError(c, http.StatusNotFound, "GROUP_NOT_FOUND", "邮箱分组不存在")
+		} else {
+			s.writeAdminAPIInternalError(c, err)
 		}
-		alias, err = s.store.GetAlias(c.Request.Context(), id)
-		if err != nil {
-			s.writeAdminAPIStoreReadError(c, err)
-			return
-		}
+		return
 	}
 	session := mustSession(c)
-	s.audit(c, &session.AdminID, session.Username, "toggle", "alias", strconv.FormatInt(id, 10), "success", "")
+	action := "toggle"
+	if input.GroupID.Present {
+		action = "move_group"
+	}
+	s.audit(c, &session.AdminID, session.Username, action, "alias", strconv.FormatInt(id, 10), "success", "")
 	aliasDTO, err := s.adminAPIAliasFromDomain(alias)
 	if err != nil {
 		s.writeAdminAPIInternalError(c, err)

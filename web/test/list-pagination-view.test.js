@@ -94,13 +94,53 @@ test("alias paging resets on filters and supports full batched display/export", 
     source,
     /function handleAccountFilterChange[\s\S]{0,180}appliedAliasQuery\.value = keywordDraft\.value\.trim\(\)/,
   );
+  assert.match(
+    source,
+    /function handleGroupFilterChange[\s\S]{0,220}appliedAliasQuery\.value = keywordDraft\.value\.trim\(\)/,
+  );
   assert.match(source, /query:\s*appliedAliasQuery\.value/);
   assert.match(source, /没有匹配的隐私邮箱/);
   assert.match(source, /:remote-method="searchAccounts"/);
   assert.match(source, /getAccountPage\(\{/);
   assert.match(source, /getAllAliases\(accountId,/);
+  assert.match(
+    source,
+    /v-model="moveTargetGroupId"[\s\S]{0,420}<el-option label="未分组" value="none"/,
+  );
+  assert.match(
+    source,
+    /const targetGroupId = moveTargetGroupId\.value === "none"[\s\S]{0,180}moveAliasesToGroup/,
+  );
+  assert.match(
+    source,
+    /async function moveAlias\([\s\S]{0,900}loadAliases\(\)[\s\S]{0,120}loadGroups\(\)/,
+  );
   assert.match(source, /<ListPagination/);
   assert.match(source, /@size-change="handlePageSizeChange"/);
+});
+
+test("mail group refreshes clear loading state and remain available on mobile", async () => {
+  const [aliases, accountDetail] = await Promise.all([
+    readFile(aliasesPath, "utf8"),
+    readFile(accountDetailPath, "utf8"),
+  ]);
+
+  for (const source of [aliases, accountDetail]) {
+    assert.match(
+      source,
+      /finally\s*\{[\s\S]{0,180}if \(groupsLoadGate\.isCurrent\(ticket, "groups"\)\)[\s\S]{0,120}groupsLoading\.value = false/,
+    );
+    assert.doesNotMatch(
+      source,
+      /finally\s*\{[\s\S]{0,180}!silent && groupsLoadGate\.isCurrent/,
+    );
+  }
+  assert.match(accountDetail, /class="mobile-alias-group-select"/);
+  assert.match(accountDetail, /!aliasActionLock\.acquire\(alias\.id\)/);
+  assert.match(
+    aliases,
+    /if \(editingGroupId\.value === group\.id\)\s*\{\s*cancelGroupEdit\(\)/,
+  );
 });
 
 test("audit records pass page offsets and support full batched display", async () => {

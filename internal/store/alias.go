@@ -13,7 +13,8 @@ import (
 )
 
 const aliasColumns = `
-	al.id, al.account_id, ac.email, al.address, al.label, al.api_key_hash,
+	al.id, al.account_id, ac.email, al.address, al.label,
+	al.group_id, COALESCE(mg.name, ''), al.api_key_hash,
 	al.api_key_prefix, al.credential_mode, al.credential_ciphertext, al.imap_password_hash,
 	al.oauth_client_id, al.refresh_token_hash, al.credential_version,
 	al.mailbox_uid_validity, al.mailbox_uid_next,
@@ -26,10 +27,13 @@ const aliasColumns = `
 
 const aliasJoins = `
 	FROM aliases al
-	JOIN accounts ac ON ac.id = al.account_id`
+	JOIN accounts ac ON ac.id = al.account_id
+	LEFT JOIN mail_groups mg ON mg.id = al.group_id`
 
 type AliasListFilter struct {
 	AccountID *int64
+	GroupID   *int64
+	Ungrouped bool
 	Query     string
 	Limit     int
 	Offset    int
@@ -38,6 +42,16 @@ type AliasListFilter struct {
 type AliasPage struct {
 	Items []domain.Alias
 	Total int
+}
+
+// AliasAdminStateUpdate describes the optional administrator-facing alias
+// fields that must be applied together. GroupIDPresent distinguishes an
+// omitted group from an explicit nil value, which removes the alias from its
+// current group.
+type AliasAdminStateUpdate struct {
+	Enabled        *bool
+	GroupID        *int64
+	GroupIDPresent bool
 }
 
 func (s *Store) CreateAlias(ctx context.Context, alias domain.Alias) (domain.Alias, error) {
@@ -75,16 +89,26 @@ func (s *Store) CreateAlias(ctx context.Context, alias domain.Alias) (domain.Ali
 			return domain.Alias{}, fmt.Errorf("create alias: %w", err)
 		}
 	}
+	var groupID any
+	if alias.GroupID != nil {
+		if *alias.GroupID < 1 {
+			return domain.Alias{}, errors.New("create alias: group ID must be positive")
+		}
+		if err := s.lockMailGroupForMove(ctx, tx, *alias.GroupID); err != nil {
+			return domain.Alias{}, fmt.Errorf("create alias: %w", err)
+		}
+		groupID = *alias.GroupID
+	}
 	var id int64
 	err = s.txQueryRowContext(ctx, tx, `
 		INSERT INTO aliases(
-			account_id, address, label, api_key_hash, api_key_prefix, credential_mode, enabled,
+			account_id, address, label, group_id, api_key_hash, api_key_prefix, credential_mode, enabled,
 			last_sync_status, last_sync_error, last_synced_at,
 			last_accessed_at, created_at, updated_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING id`,
 		alias.AccountID, domain.NormalizeEmail(sanitizePostgresText(alias.Address)),
-		strings.TrimSpace(sanitizePostgresText(alias.Label)),
+		strings.TrimSpace(sanitizePostgresText(alias.Label)), groupID,
 		initialHash, strings.TrimSpace(sanitizePostgresText(alias.APIKeyPrefix)),
 		credentialMode, alias.Enabled,
 		status, syncError, nullableTimestamp(alias.LastSyncedAt),
@@ -155,7 +179,8 @@ func aliasCredentialMode(alias domain.Alias) (string, error) {
 // ownership are immutable; moving an alias requires deleting and recreating it.
 func (s *Store) UpdateAlias(ctx context.Context, alias domain.Alias) (domain.Alias, error) {
 	label := strings.TrimSpace(alias.Label)
-	if err := s.updateAliasState(ctx, alias.ID, &label, alias.Enabled); err != nil {
+	enabled := alias.Enabled
+	if err := s.updateAliasState(ctx, alias.ID, &label, &enabled, nil, false); err != nil {
 		return domain.Alias{}, fmt.Errorf("update alias: %w", err)
 	}
 	return s.getAliasAfterWrite(alias.ID)
@@ -196,6 +221,19 @@ func (s *Store) ListAliasesPage(ctx context.Context, filter AliasListFilter) (Al
 		}
 		predicates = append(predicates, `al.account_id = ?`)
 		filterArgs = append(filterArgs, *filter.AccountID)
+	}
+	if filter.GroupID != nil {
+		if *filter.GroupID < 1 {
+			return AliasPage{}, errors.New("list aliases page: group ID must be positive")
+		}
+		predicates = append(predicates, `al.group_id = ?`)
+		filterArgs = append(filterArgs, *filter.GroupID)
+	}
+	if filter.Ungrouped {
+		if filter.GroupID != nil {
+			return AliasPage{}, errors.New("list aliases page: group ID and ungrouped filter are mutually exclusive")
+		}
+		predicates = append(predicates, `al.group_id IS NULL`)
 	}
 	if query := strings.TrimSpace(sanitizePostgresText(filter.Query)); query != "" {
 		pattern := "%" + escapeLikePattern(query) + "%"
@@ -405,13 +443,47 @@ func (s *Store) UpdateAliasSyncStatus(ctx context.Context, id int64, status, syn
 }
 
 func (s *Store) SetAliasEnabled(ctx context.Context, id int64, enabled bool) error {
-	if err := s.updateAliasState(ctx, id, nil, enabled); err != nil {
+	if err := s.updateAliasState(ctx, id, nil, &enabled, nil, false); err != nil {
 		return fmt.Errorf("update alias state: %w", err)
 	}
 	return nil
 }
 
-func (s *Store) updateAliasState(ctx context.Context, id int64, label *string, enabled bool) error {
+// UpdateAliasAdminState atomically applies an optional enabled state and an
+// optional group assignment. In particular, a failed group assignment cannot
+// leave the enabled state partially committed.
+func (s *Store) UpdateAliasAdminState(
+	ctx context.Context,
+	id int64,
+	update AliasAdminStateUpdate,
+) (domain.Alias, error) {
+	if update.Enabled == nil && !update.GroupIDPresent {
+		return domain.Alias{}, errors.New("update alias admin state: no changes requested")
+	}
+	if err := s.updateAliasState(
+		ctx,
+		id,
+		nil,
+		update.Enabled,
+		update.GroupID,
+		update.GroupIDPresent,
+	); err != nil {
+		return domain.Alias{}, fmt.Errorf("update alias admin state: %w", err)
+	}
+	return s.getAliasAfterWrite(id)
+}
+
+func (s *Store) updateAliasState(
+	ctx context.Context,
+	id int64,
+	label *string,
+	enabled *bool,
+	groupID *int64,
+	groupIDPresent bool,
+) error {
+	if groupIDPresent && groupID != nil && *groupID < 1 {
+		return errors.New("group ID must be positive")
+	}
 	var accountID int64
 	if err := s.queryRowContext(ctx,
 		`SELECT account_id FROM aliases WHERE id = ?`, id,
@@ -442,17 +514,27 @@ func (s *Store) updateAliasState(ctx context.Context, id int64, label *string, e
 		}
 		return fmt.Errorf("read alias state: %w", err)
 	}
-	if !currentEnabled && lastSyncError == domain.AppleAliasConfirmationPending {
+	if groupIDPresent && groupID != nil {
+		if err := s.lockMailGroupForMove(ctx, tx, *groupID); err != nil {
+			return err
+		}
+	}
+	if !currentEnabled && lastSyncError == domain.AppleAliasConfirmationPending &&
+		(label != nil || (enabled != nil && *enabled)) {
 		return ErrAliasConfirmationPending
 	}
-	reenabled := enabled && !currentEnabled
-	clearReservedMarker := !enabled && currentEnabled && lastSyncError == domain.AppleAliasConfirmationPending
+	targetEnabled := currentEnabled
+	if enabled != nil {
+		targetEnabled = *enabled
+	}
+	reenabled := targetEnabled && !currentEnabled
+	clearReservedMarker := enabled != nil && !targetEnabled && currentEnabled && lastSyncError == domain.AppleAliasConfirmationPending
 	if reenabled {
 		if err := s.requireEnabledAliasCapacity(ctx, tx, accountID); err != nil {
 			return err
 		}
 	}
-	if enabled != currentEnabled {
+	if targetEnabled != currentEnabled {
 		if _, err := s.bumpAccountVersionTx(ctx, tx, accountID, accountVersion); err != nil {
 			return fmt.Errorf("advance account version after alias state change: %w", err)
 		}
@@ -465,8 +547,18 @@ func (s *Store) updateAliasState(ctx context.Context, id int64, label *string, e
 		updates = append(updates, "label = ?")
 		args = append(args, *label)
 	}
-	updates = append(updates, "enabled = ?")
-	args = append(args, enabled)
+	if enabled != nil {
+		updates = append(updates, "enabled = ?")
+		args = append(args, targetEnabled)
+	}
+	if groupIDPresent {
+		var value any
+		if groupID != nil {
+			value = *groupID
+		}
+		updates = append(updates, "group_id = ?")
+		args = append(args, value)
+	}
 	if reenabled {
 		updates = append(updates,
 			"last_sync_status = ?",
@@ -521,11 +613,13 @@ func (s *Store) requireEnabledAliasCapacity(ctx context.Context, tx *sql.Tx, acc
 func scanAlias(scanner rowScanner) (domain.Alias, error) {
 	var alias domain.Alias
 	var enabled bool
+	var groupID sql.NullInt64
 	var mailboxUIDValidity, mailboxUIDNext int64
 	var lastSyncedAt, lastAccessedAt, latestReceivedAt sql.NullInt64
 	var createdAt, updatedAt int64
 	err := scanner.Scan(
 		&alias.ID, &alias.AccountID, &alias.AccountEmail, &alias.Address, &alias.Label,
+		&groupID, &alias.GroupName,
 		&alias.APIKeyHash, &alias.APIKeyPrefix, &alias.CredentialMode, &alias.CredentialCiphertext,
 		&alias.IMAPPasswordHash, &alias.OAuthClientID, &alias.RefreshTokenHash,
 		&alias.CredentialVersion, &mailboxUIDValidity, &mailboxUIDNext,
@@ -540,6 +634,13 @@ func scanAlias(scanner rowScanner) (domain.Alias, error) {
 		return domain.Alias{}, fmt.Errorf("scan alias: %w", err)
 	}
 	alias.Enabled = enabled
+	if groupID.Valid {
+		value := groupID.Int64
+		if value < 1 {
+			return domain.Alias{}, fmt.Errorf("scan alias: invalid group ID")
+		}
+		alias.GroupID = &value
+	}
 	if mailboxUIDValidity < 1 || mailboxUIDValidity > int64(^uint32(0)) ||
 		mailboxUIDNext < 1 || mailboxUIDNext > int64(^uint32(0)) {
 		return domain.Alias{}, fmt.Errorf("scan alias: invalid mailbox UID state")

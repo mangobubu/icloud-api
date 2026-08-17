@@ -224,6 +224,14 @@ func TestPostgresRestoreSupportsV4ThroughV8AndStrictlyValidatesExtensions(t *tes
 func TestPostgresMigrationExecutesV0V3V4V5V6V7V8Paths(t *testing.T) {
 	t.Parallel()
 
+	mailGroupTable := normalizeSQL(postgresMailGroupSchema[0])
+	if !strings.Contains(mailGroupTable, "name text not null, name_key text not null") {
+		t.Fatalf("PostgreSQL mail group schema does not store a plain normalized name key: %s", mailGroupTable)
+	}
+	if strings.Contains(mailGroupTable, "name citext") {
+		t.Fatalf("PostgreSQL mail group schema still relies on CITEXT name uniqueness: %s", mailGroupTable)
+	}
+
 	freshAdmin := postgresSchemaV8[0]
 	syncState := postgresMigrateV3ToV4[len(postgresMigrateV3ToV4)-2]
 	autoSchedule := postgresMigrateV4ToV5[0]
@@ -235,6 +243,12 @@ func TestPostgresMigrationExecutesV0V3V4V5V6V7V8Paths(t *testing.T) {
 	mailboxSettingsTable := postgresMigrateV7ToV8[0]
 	archiveIndexConvergence := `CREATE INDEX IF NOT EXISTS archived_messages_retention_idx
 		ON archived_messages(content_state, internal_date, id)`
+	mailGroupLegacyNameConstraintDrop := `ALTER TABLE mail_groups
+		DROP CONSTRAINT IF EXISTS mail_groups_name_key`
+	mailGroupNameKeyIndex := `CREATE UNIQUE INDEX IF NOT EXISTS mail_groups_name_key_uidx
+		ON mail_groups(name_key)`
+	mailGroupNameKeyNotNull := `ALTER TABLE mail_groups
+		ALTER COLUMN name_key SET NOT NULL`
 
 	paths := []struct {
 		version           int
@@ -281,6 +295,15 @@ func TestPostgresMigrationExecutesV0V3V4V5V6V7V8Paths(t *testing.T) {
 			}
 			if !containsNormalizedSQL(capture.statements, archiveIndexConvergence) {
 				t.Errorf("PostgreSQL v%d path did not converge the archive retention index", path.version)
+			}
+			for _, statement := range []string{
+				mailGroupLegacyNameConstraintDrop,
+				mailGroupNameKeyIndex,
+				mailGroupNameKeyNotNull,
+			} {
+				if !containsNormalizedSQL(capture.statements, statement) {
+					t.Errorf("PostgreSQL v%d path did not converge mail group name keys", path.version)
+				}
 			}
 
 			updatedVersion := false
@@ -347,10 +370,14 @@ func (c *postgresMigrationCaptureConn) QueryContext(
 	query string,
 	_ []driver.NamedValue,
 ) (driver.Rows, error) {
-	if !strings.Contains(normalizeSQL(query), "select version from schema_migrations") {
-		return nil, fmt.Errorf("unexpected PostgreSQL migration query: %s", query)
+	normalized := normalizeSQL(query)
+	if strings.Contains(normalized, "select version from schema_migrations") {
+		return &postgresMigrationVersionRows{version: int64(c.capture.version)}, nil
 	}
-	return &postgresMigrationVersionRows{version: int64(c.capture.version)}, nil
+	if normalized == "select id, name, name_key from mail_groups order by id" {
+		return &postgresMigrationEmptyMailGroupRows{}, nil
+	}
+	return nil, fmt.Errorf("unexpected PostgreSQL migration query: %s", query)
 }
 
 type postgresMigrationCaptureTx struct{}
@@ -374,6 +401,14 @@ func (r *postgresMigrationVersionRows) Next(values []driver.Value) error {
 	values[0] = r.version
 	return nil
 }
+
+type postgresMigrationEmptyMailGroupRows struct{}
+
+func (*postgresMigrationEmptyMailGroupRows) Columns() []string {
+	return []string{"id", "name", "name_key"}
+}
+func (*postgresMigrationEmptyMailGroupRows) Close() error              { return nil }
+func (*postgresMigrationEmptyMailGroupRows) Next([]driver.Value) error { return io.EOF }
 
 func postgresMigrationStatementIndex(statements []string, wanted string) int {
 	wanted = normalizeSQL(wanted)

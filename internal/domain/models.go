@@ -109,11 +109,16 @@ type PendingAliasAPIKey struct {
 }
 
 type Alias struct {
-	ID                   int64
-	AccountID            int64
-	AccountEmail         string
-	Address              string
-	Label                string
+	ID           int64
+	AccountID    int64
+	AccountEmail string
+	Address      string
+	Label        string
+	// GroupID and GroupName describe the optional administrator-defined
+	// mailbox group. A nil GroupID means that the alias is currently
+	// ungrouped; GroupName is populated by list/detail queries for display.
+	GroupID              *int64
+	GroupName            string
 	APIKeyHash           []byte
 	APIKeyPrefix         string
 	CredentialMode       string
@@ -132,6 +137,17 @@ type Alias struct {
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 	LatestReceivedAt     *time.Time
+}
+
+// MailGroup is an administrator-defined collection of privacy mailboxes.
+// Groups are global to the installation so one category can contain aliases
+// belonging to different primary accounts.
+type MailGroup struct {
+	ID         int64
+	Name       string
+	AliasCount int
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // AliasCredentials is the complete administrator-visible credential bundle

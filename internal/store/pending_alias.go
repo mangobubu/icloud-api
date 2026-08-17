@@ -110,11 +110,13 @@ func scanPendingAliasAPIKey(scanner rowScanner) (domain.PendingAliasAPIKey, erro
 	var pending domain.PendingAliasAPIKey
 	var alias domain.Alias
 	var enabled bool
+	var groupID sql.NullInt64
 	var mailboxUIDValidity, mailboxUIDNext int64
 	var lastSyncedAt, lastAccessedAt, latestReceivedAt sql.NullInt64
 	var createdAt, updatedAt, pendingCreatedAt int64
 	if err := scanner.Scan(
 		&alias.ID, &alias.AccountID, &alias.AccountEmail, &alias.Address, &alias.Label,
+		&groupID, &alias.GroupName,
 		&alias.APIKeyHash, &alias.APIKeyPrefix, &alias.CredentialMode, &alias.CredentialCiphertext,
 		&alias.IMAPPasswordHash, &alias.OAuthClientID, &alias.RefreshTokenHash,
 		&alias.CredentialVersion, &mailboxUIDValidity, &mailboxUIDNext,
@@ -132,6 +134,13 @@ func scanPendingAliasAPIKey(scanner rowScanner) (domain.PendingAliasAPIKey, erro
 		return domain.PendingAliasAPIKey{}, fmt.Errorf("scan pending automatic alias key: invalid mailbox UID state")
 	}
 	alias.Enabled = enabled
+	if groupID.Valid {
+		value := groupID.Int64
+		if value < 1 {
+			return domain.PendingAliasAPIKey{}, fmt.Errorf("scan pending automatic alias key: invalid group ID")
+		}
+		alias.GroupID = &value
+	}
 	alias.MailboxUIDValidity = uint32(mailboxUIDValidity)
 	alias.MailboxUIDNext = uint32(mailboxUIDNext)
 	alias.LastSyncedAt = timePtr(lastSyncedAt)

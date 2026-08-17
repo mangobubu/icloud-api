@@ -25,6 +25,27 @@
         >
           勾选 IMAP
         </el-button>
+        <el-select
+          v-if="selectedAliasIds.length"
+          v-model="moveTargetGroupId"
+          class="alias-group-bulk-select"
+          :loading="groupsLoading || movingAliases"
+          :disabled="movingAliases"
+          placeholder="移动到分组"
+          aria-label="将勾选的隐私邮箱移动到分组"
+          @change="moveSelectedAliases"
+        >
+          <el-option label="未分组" value="none" />
+          <el-option
+            v-for="group in groups"
+            :key="group.id"
+            :label="group.name"
+            :value="String(group.id)"
+          />
+        </el-select>
+        <el-button :icon="FolderAdd" @click="openGroupDialog()">
+          管理分组
+        </el-button>
         <el-button
           type="primary"
           :icon="CopyDocument"
@@ -55,6 +76,61 @@
         </el-tooltip>
       </template>
     </SectionHeader>
+
+    <el-dialog
+      v-model="groupDialogVisible"
+      title="管理邮箱分组"
+      width="min(520px, calc(100vw - 28px))"
+      :close-on-click-modal="false"
+    >
+      <el-form class="dialog-form" @submit.prevent="saveGroup">
+        <el-form-item :label="editingGroupId ? '重命名分组' : '新建分组'">
+          <el-input
+            v-model="groupNameDraft"
+            maxlength="100"
+            show-word-limit
+            placeholder="例如：工作、购物、注册"
+            @keyup.enter="saveGroup"
+          />
+        </el-form-item>
+        <div class="dialog-actions dialog-actions--end">
+          <el-button
+            type="primary"
+            :loading="groupSaving"
+            :disabled="!groupNameDraft.trim()"
+            @click="saveGroup"
+          >
+            {{ editingGroupId ? "保存名称" : "新建分组" }}
+          </el-button>
+          <el-button
+            v-if="editingGroupId"
+            :disabled="groupSaving"
+            @click="cancelGroupEdit"
+          >
+            取消编辑
+          </el-button>
+        </div>
+      </el-form>
+
+      <el-divider />
+      <div v-if="groups.length" class="mail-group-list">
+        <div v-for="group in groups" :key="group.id" class="mail-group-row">
+          <div class="mail-group-row__identity">
+            <strong>{{ group.name }}</strong>
+            <small>{{ group.aliasCount }} 个邮箱</small>
+          </div>
+          <div class="mail-group-row__actions">
+            <el-button link type="primary" :icon="EditPen" :disabled="groupSaving" @click="editGroup(group)">
+              重命名
+            </el-button>
+            <el-button link type="danger" :icon="Delete" :disabled="groupDeletingId === group.id" @click="removeGroup(group)">
+              删除
+            </el-button>
+          </div>
+        </div>
+      </div>
+      <EmptyState v-else level="h3" title="还没有分组" description="创建分组后即可把隐私邮箱移动进去。" />
+    </el-dialog>
 
     <div class="alias-list-filters" role="search" aria-label="筛选全部隐私邮箱">
       <label class="alias-list-filter alias-list-filter--query">
@@ -102,6 +178,27 @@
         </el-select>
       </label>
 
+      <label class="alias-list-filter">
+        <span>邮箱分组</span>
+        <el-select
+          v-model="selectedGroupFilter"
+          clearable
+          :loading="groupsLoading"
+          placeholder="全部分组"
+          aria-label="按邮箱分组筛选"
+          @change="handleGroupFilterChange"
+        >
+          <el-option label="全部分组" value="" />
+          <el-option label="未分组" value="none" />
+          <el-option
+            v-for="group in groups"
+            :key="group.id"
+            :label="`${group.name}（${group.aliasCount}）`"
+            :value="String(group.id)"
+          />
+        </el-select>
+      </label>
+
       <div class="alias-list-filter-actions">
         <el-button type="primary" :icon="Search" @click="applyAliasSearch">
           查询
@@ -116,12 +213,12 @@
       </div>
     </div>
 
-    <RequestAlert
-      v-if="accountsLoadError"
-      :error="accountsLoadError"
-      closable
-      @close="accountsLoadError = null"
-    />
+      <RequestAlert
+        v-if="accountsLoadError || groupsError"
+        :error="accountsLoadError || groupsError"
+        closable
+        @close="accountsLoadError = null; groupsError = null"
+      />
 
     <div v-if="loading && aliases.length === 0" class="data-panel loading-panel">
       <el-skeleton :rows="6" animated />
@@ -135,22 +232,22 @@
     <EmptyState
       v-else-if="aliases.length === 0"
       :title="
-        appliedAliasQuery
+        appliedAliasQuery || appliedGroupId
           ? '没有匹配的隐私邮箱'
           : selectedAccountId
             ? '该主号暂无隐私邮箱'
             : '还没有隐私邮箱'
       "
       :description="
-        appliedAliasQuery
-          ? '请尝试其他关键词，或调整所属主号筛选。'
+        appliedAliasQuery || appliedGroupId
+          ? '请尝试其他关键词，或调整所属主号和邮箱分组筛选。'
           : selectedAccountId
             ? '请选择其他主号，或进入该主号详情页添加地址。'
             : '进入某个主号详情页添加地址。'
       "
     >
       <el-button
-        v-if="appliedAliasQuery"
+        v-if="appliedAliasQuery || appliedGroupId"
         :icon="RefreshLeft"
         @click="resetAliasFilters"
       >
@@ -187,10 +284,10 @@
           <template #header-cell="{ column }">
             <el-checkbox
               v-if="column.key === 'selection'"
-              :model-value="allExportableAliasesSelected"
+              :model-value="allAliasesSelected"
               :indeterminate="someExportableAliasesSelected"
-              :disabled="exportableAliases.length === 0"
-              aria-label="勾选本页可导出的隐私邮箱"
+              :disabled="aliases.length === 0"
+              aria-label="勾选本页隐私邮箱"
               @change="setAllAliasesSelected"
             />
             <template v-else>{{ column.title }}</template>
@@ -199,7 +296,7 @@
             <el-checkbox
               v-if="column.key === 'selection'"
               :model-value="isAliasSelected(row.id)"
-              :disabled="!isAliasExportable(row)"
+              :disabled="false"
               :aria-label="`勾选 ${row.address}`"
               @change="setAliasSelected(row, $event)"
             />
@@ -218,6 +315,24 @@
               >
                 {{ formatAliasAccountIdentity(row) || "查看主号" }}
               </el-button>
+            </template>
+            <template v-else-if="column.key === 'group'">
+              <el-select
+                class="alias-group-select"
+                :model-value="row.groupId == null ? '' : String(row.groupId)"
+                :loading="Boolean(movingAliasIds[row.id])"
+                :disabled="Boolean(movingAliasIds[row.id])"
+                aria-label="选择隐私邮箱分组"
+                @change="moveAlias(row, $event)"
+              >
+                <el-option label="未分组" value="" />
+                <el-option
+                  v-for="group in groups"
+                  :key="group.id"
+                  :label="group.name"
+                  :value="String(group.id)"
+                />
+              </el-select>
             </template>
             <template v-else-if="column.key === 'lastAccessedAt'">
               {{ formatTime(row.lastAccessedAt) }}
@@ -280,7 +395,7 @@
               <el-checkbox
                 class="mobile-alias-selection__checkbox"
                 :model-value="isAliasSelected(alias.id)"
-                :disabled="!isAliasExportable(alias)"
+                :disabled="false"
                 :aria-label="`勾选 ${alias.address}`"
                 @change="setAliasSelected(alias, $event)"
               />
@@ -312,6 +427,10 @@
               <dt>最新邮件</dt>
               <dd>{{ formatTime(alias.latestReceivedAt) }}</dd>
             </div>
+            <div>
+              <dt>分组</dt>
+              <dd>{{ alias.groupName || "未分组" }}</dd>
+            </div>
           </dl>
           <footer class="mobile-record__actions mobile-record__actions--direct-link">
             <el-button
@@ -338,6 +457,22 @@
             >
               复制旧直达链接
             </el-button>
+            <el-select
+              class="mobile-alias-group-select"
+              :model-value="alias.groupId == null ? '' : String(alias.groupId)"
+              :loading="Boolean(movingAliasIds[alias.id])"
+              :disabled="Boolean(movingAliasIds[alias.id])"
+              aria-label="选择隐私邮箱分组"
+              @change="moveAlias(alias, $event)"
+            >
+              <el-option label="未分组" value="" />
+              <el-option
+                v-for="group in groups"
+                :key="group.id"
+                :label="group.name"
+                :value="String(group.id)"
+              />
+            </el-select>
             <el-button
               :icon="Setting"
               :aria-label="`管理 ${alias.address} 所属主号`"
@@ -365,22 +500,36 @@
 <script setup>
 import {
   CopyDocument,
+  Delete,
+  EditPen,
+  FolderAdd,
   Refresh,
   RefreshLeft,
   Search,
   Setting,
 } from "@element-plus/icons-vue";
-import { ElMessage } from "element-plus";
+import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { useRouter } from "vue-router";
 
-import { getAccountPage, getAliasPage, getAllAliases } from "../api/admin.js";
+import {
+  createMailGroup,
+  deleteMailGroup,
+  getAccountPage,
+  getAliasPage,
+  getAllAliases,
+  getMailGroups,
+  moveAliasToGroup,
+  moveAliasesToGroup,
+  updateMailGroup,
+} from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
 import ListPagination from "../components/ListPagination.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncStatus from "../components/SyncStatus.vue";
 import VirtualDataTable from "../components/VirtualDataTable.vue";
+import { useAuth } from "../stores/auth.js";
 import {
   createActionLock,
   createLatestRequestGate,
@@ -401,12 +550,14 @@ import {
 } from "../utils/pagination.js";
 
 const router = useRouter();
+const auth = useAuth();
 const ACCOUNT_OPTION_LIMIT = 50;
 const pageSize = ref(DEFAULT_PAGE_SIZE);
 const aliasColumns = [
   { key: "selection", title: "", width: 52, align: "center", fixed: "left" },
   { key: "address", title: "隐私邮箱", width: 220, flexGrow: 2 },
   { key: "account", title: "所属主号", width: 190, flexGrow: 1 },
+  { key: "group", title: "分组", width: 150, flexGrow: 1 },
   { key: "lastAccessedAt", title: "最近调用", width: 150, flexGrow: 1 },
   { key: "latestReceivedAt", title: "最新邮件", width: 150, flexGrow: 1 },
   { key: "status", title: "状态", width: 134, flexGrow: 1 },
@@ -415,6 +566,19 @@ const aliasColumns = [
 const aliases = ref([]);
 const accounts = ref([]);
 const selectedAccountId = ref("");
+const selectedGroupFilter = ref("");
+const appliedGroupId = ref("");
+const moveTargetGroupId = ref("");
+const groups = ref([]);
+const groupsLoading = ref(false);
+const groupsError = ref(null);
+const groupDialogVisible = ref(false);
+const groupNameDraft = ref("");
+const editingGroupId = ref(null);
+const groupSaving = ref(false);
+const groupDeletingId = ref(null);
+const movingAliases = ref(false);
+const movingAliasIds = reactive({});
 const keywordDraft = ref("");
 const appliedAliasQuery = ref("");
 const currentPage = ref(1);
@@ -429,6 +593,7 @@ const copyLoading = reactive({});
 const copyLock = createActionLock();
 const aliasLoadGate = createLatestRequestGate();
 const accountsLoadGate = createLatestRequestGate();
+const groupsLoadGate = createLatestRequestGate();
 let accountSearchTimer = null;
 let aliasAbortController = null;
 let viewActive = true;
@@ -440,26 +605,27 @@ const selectedAliases = computed(() => {
   );
 });
 
-const exportableAliases = computed(() => aliases.value.filter(isAliasExportable));
-
-const allExportableAliasesSelected = computed(() =>
-  exportableAliases.value.length > 0 &&
-  exportableAliases.value.every((alias) => isAliasSelected(alias.id)),
+const allAliasesSelected = computed(
+  () => aliases.value.length > 0 && aliases.value.every((alias) => isAliasSelected(alias.id)),
 );
 
+// Keep the established selector name for view/test compatibility. Selection
+// now includes every mailbox so legacy aliases can also be moved in bulk.
 const someExportableAliasesSelected = computed(() => {
-  const selectedCount = exportableAliases.value.filter((alias) =>
-    isAliasSelected(alias.id),
-  ).length;
-  return selectedCount > 0 && selectedCount < exportableAliases.value.length;
+  const selectedCount = aliases.value.filter((alias) => isAliasSelected(alias.id)).length;
+  return selectedCount > 0 && selectedCount < aliases.value.length;
 });
 
 const hasActiveFilters = computed(() =>
-  Boolean(selectedAccountId.value || keywordDraft.value.trim()),
+  Boolean(
+    selectedAccountId.value ||
+      selectedGroupFilter.value ||
+      keywordDraft.value.trim(),
+  ),
 );
 
 const hasAppliedFilters = computed(() =>
-  Boolean(selectedAccountId.value || appliedAliasQuery.value),
+  Boolean(selectedAccountId.value || appliedGroupId.value || appliedAliasQuery.value),
 );
 
 function isAliasConfirmationPending(alias) {
@@ -558,12 +724,35 @@ function searchAccounts(query) {
   }, query ? 220 : 0);
 }
 
+async function loadGroups({ silent = false } = {}) {
+  const ticket = groupsLoadGate.begin("groups");
+  if (!silent) {
+    groupsLoading.value = true;
+    groupsError.value = null;
+  }
+  try {
+    const nextGroups = await getMailGroups();
+    if (!groupsLoadGate.isCurrent(ticket, "groups")) return;
+    groups.value = nextGroups;
+    groupsError.value = null;
+  } catch (error) {
+    if (!silent && groupsLoadGate.isCurrent(ticket, "groups")) {
+      groupsError.value = error;
+    }
+  } finally {
+    if (groupsLoadGate.isCurrent(ticket, "groups")) {
+      groupsLoading.value = false;
+    }
+  }
+}
+
 async function loadAliases({ silent = false } = {}) {
   const accountId = selectedAccountId.value;
   const query = appliedAliasQuery.value;
+  const groupId = appliedGroupId.value;
   const page = currentPage.value;
   const selectedPageSize = pageSize.value;
-  const requestKey = `${accountId}\u0000${query}\u0000${page}\u0000${selectedPageSize}`;
+  const requestKey = `${accountId}\u0000${groupId}\u0000${query}\u0000${page}\u0000${selectedPageSize}`;
   const ticket = aliasLoadGate.begin(requestKey);
   aliasAbortController?.abort();
   const abortController = new AbortController();
@@ -577,6 +766,7 @@ async function loadAliases({ silent = false } = {}) {
       ? {
           items: await getAllAliases(accountId, {
             query,
+            groupId,
             signal: abortController.signal,
           }),
         }
@@ -584,9 +774,10 @@ async function loadAliases({ silent = false } = {}) {
           limit: selectedPageSize,
           offset: (page - 1) * selectedPageSize,
           query,
+          groupId,
           signal: abortController.signal,
         });
-    const currentKey = `${selectedAccountId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`;
+    const currentKey = `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`;
     if (!aliasLoadGate.isCurrent(ticket, currentKey)) return;
     const nextTotal = Math.max(0, Number(result?.total) || 0);
     const nextAliases = Array.isArray(result?.items) ? result.items : [];
@@ -604,9 +795,7 @@ async function loadAliases({ silent = false } = {}) {
     }
     aliases.value = nextAliases;
     total.value = resolvedTotal;
-    const availableAliasIds = new Set(
-      nextAliases.filter(isAliasExportable).map((alias) => alias.id),
-    );
+    const availableAliasIds = new Set(nextAliases.map((alias) => alias.id));
     selectedAliasIds.value = selectedAliasIds.value.filter((id) =>
       availableAliasIds.has(id),
     );
@@ -616,7 +805,7 @@ async function loadAliases({ silent = false } = {}) {
       error?.name !== "AbortError" &&
       aliasLoadGate.isCurrent(
         ticket,
-        `${selectedAccountId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
+        `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
       ) &&
       !silent
     ) {
@@ -627,7 +816,7 @@ async function loadAliases({ silent = false } = {}) {
       aliasAbortController === abortController &&
       aliasLoadGate.isCurrent(
         ticket,
-        `${selectedAccountId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
+        `${selectedAccountId.value}\u0000${appliedGroupId.value}\u0000${appliedAliasQuery.value}\u0000${currentPage.value}\u0000${pageSize.value}`,
       )
     ) {
       loading.value = false;
@@ -640,6 +829,13 @@ async function loadAliases({ silent = false } = {}) {
 
 function clearAliasSelection() {
   selectedAliasIds.value = [];
+}
+
+function beginAliasMutation() {
+  aliasLoadGate.invalidate();
+  groupsLoadGate.invalidate();
+  aliasAbortController?.abort();
+  groupsLoading.value = false;
 }
 
 function reloadAliasesForFilters() {
@@ -664,11 +860,20 @@ function handleAccountFilterChange(value) {
   reloadAliasesForFilters();
 }
 
+function handleGroupFilterChange(value) {
+  selectedGroupFilter.value = value == null ? "" : String(value);
+  appliedGroupId.value = selectedGroupFilter.value;
+  appliedAliasQuery.value = keywordDraft.value.trim();
+  reloadAliasesForFilters();
+}
+
 function resetAliasFilters() {
   if (!hasActiveFilters.value && !hasAppliedFilters.value) return;
   keywordDraft.value = "";
   appliedAliasQuery.value = "";
   selectedAccountId.value = "";
+  selectedGroupFilter.value = "";
+  appliedGroupId.value = "";
   reloadAliasesForFilters();
 }
 
@@ -697,7 +902,10 @@ function handlePageSizeChange(value) {
 }
 
 const liveRefresh = createLiveRefresh(() => {
-  return loadAliases({ silent: true });
+  return Promise.all([
+    loadAliases({ silent: true }),
+    loadGroups({ silent: true }),
+  ]);
 });
 
 function isAliasSelected(id) {
@@ -705,7 +913,6 @@ function isAliasSelected(id) {
 }
 
 function setAliasSelected(alias, selected) {
-  if (!isAliasExportable(alias)) return;
   const selectedIds = new Set(selectedAliasIds.value);
   if (selected) {
     selectedIds.add(alias.id);
@@ -716,9 +923,7 @@ function setAliasSelected(alias, selected) {
 }
 
 function setAllAliasesSelected(selected) {
-  selectedAliasIds.value = selected
-    ? exportableAliases.value.map((alias) => alias.id)
-    : [];
+  selectedAliasIds.value = selected ? aliases.value.map((alias) => alias.id) : [];
 }
 
 async function copyAliases(items, format, scope) {
@@ -749,6 +954,7 @@ function copyAllAliases(format) {
   exportingAll.value = true;
   getAllAliases(selectedAccountId.value, {
     query: appliedAliasQuery.value,
+    groupId: appliedGroupId.value === "none" ? "none" : appliedGroupId.value,
   })
     .then((items) => {
       if (viewActive) {
@@ -819,6 +1025,145 @@ async function copyLegacyDirectLink(alias) {
   }
 }
 
+function openGroupDialog(group = null) {
+  editingGroupId.value = group?.id ?? null;
+  groupNameDraft.value = group?.name || "";
+  groupDialogVisible.value = true;
+}
+
+function editGroup(group) {
+  openGroupDialog(group);
+}
+
+function cancelGroupEdit() {
+  editingGroupId.value = null;
+  groupNameDraft.value = "";
+}
+
+async function saveGroup() {
+  const name = groupNameDraft.value.trim();
+  if (!name || groupSaving.value) return;
+  beginAliasMutation();
+  groupSaving.value = true;
+  try {
+    if (editingGroupId.value) {
+      const updated = await updateMailGroup(
+        editingGroupId.value,
+        name,
+        auth.state.csrfToken,
+      );
+      groups.value = groups.value
+        .map((group) => (group.id === updated.id ? updated : group))
+        .sort((left, right) => left.name.localeCompare(right.name));
+      successMessage("邮箱分组名称已更新。");
+    } else {
+      const created = await createMailGroup(name, auth.state.csrfToken);
+      groups.value = [...groups.value, created].sort((left, right) =>
+        left.name.localeCompare(right.name),
+      );
+      successMessage("邮箱分组已创建。");
+    }
+    cancelGroupEdit();
+    await loadAliases();
+  } catch (error) {
+    showRequestError(error, "邮箱分组保存失败，请稍后重试。");
+  } finally {
+    groupSaving.value = false;
+  }
+}
+
+async function removeGroup(group) {
+  if (!group || groupDeletingId.value) return;
+  try {
+    await ElMessageBox.confirm(
+      group.aliasCount
+        ? `删除“${group.name}”后，其中 ${group.aliasCount} 个邮箱会变为未分组。继续吗？`
+        : `确定删除分组“${group.name}”吗？`,
+      "删除邮箱分组",
+      {
+        type: "warning",
+        confirmButtonText: "删除",
+        cancelButtonText: "取消",
+        confirmButtonClass: "el-button--danger",
+        autofocus: false,
+      },
+    );
+  } catch {
+    return;
+  }
+  groupDeletingId.value = group.id;
+  beginAliasMutation();
+  try {
+    await deleteMailGroup(group.id, auth.state.csrfToken);
+    groups.value = groups.value.filter((item) => item.id !== group.id);
+    if (editingGroupId.value === group.id) {
+      cancelGroupEdit();
+    }
+    if (selectedGroupFilter.value === String(group.id)) {
+      selectedGroupFilter.value = "";
+      appliedGroupId.value = "";
+      reloadAliasesForFilters();
+    } else {
+      await loadAliases();
+    }
+    successMessage("邮箱分组已删除，邮箱已恢复为未分组。");
+  } catch (error) {
+    showRequestError(error, "邮箱分组删除失败，请稍后重试。");
+  } finally {
+    groupDeletingId.value = null;
+  }
+}
+
+async function moveSelectedAliases(groupValue) {
+  if (!selectedAliasIds.value.length || movingAliases.value) return;
+  beginAliasMutation();
+  movingAliases.value = true;
+  moveTargetGroupId.value = groupValue == null ? "" : String(groupValue);
+  const targetGroupId = moveTargetGroupId.value === "none"
+    ? null
+    : moveTargetGroupId.value;
+  try {
+    await moveAliasesToGroup(
+      selectedAliasIds.value,
+      targetGroupId || null,
+      auth.state.csrfToken,
+    );
+    clearAliasSelection();
+    await Promise.all([loadAliases(), loadGroups()]);
+    successMessage("已将勾选的隐私邮箱移动到所选分组。");
+  } catch (error) {
+    showRequestError(error, "邮箱分组移动失败，请稍后重试。");
+  } finally {
+    movingAliases.value = false;
+    moveTargetGroupId.value = "";
+  }
+}
+
+async function moveAlias(alias, groupValue) {
+  if (!alias || movingAliasIds[alias.id]) return;
+  beginAliasMutation();
+  movingAliasIds[alias.id] = true;
+  try {
+    const updated = await moveAliasToGroup(
+      alias.id,
+      groupValue === "" || groupValue == null ? null : groupValue,
+      auth.state.csrfToken,
+    );
+    aliases.value = aliases.value.map((item) =>
+      item.id === updated.id ? updated : item,
+    );
+    await Promise.all([
+      loadAliases(),
+      loadGroups(),
+    ]);
+    successMessage("隐私邮箱分组已更新。");
+  } catch (error) {
+    showRequestError(error, "隐私邮箱分组移动失败，请稍后重试。");
+  } finally {
+    delete movingAliasIds[alias.id];
+  }
+}
+
 function openAccounts() {
   router.push({ name: "accounts" });
 }
@@ -829,6 +1174,7 @@ function openAccount(id) {
 
 onMounted(() => {
   loadAccounts();
+  loadGroups();
   loadAliases();
   liveRefresh.start({ immediate: false });
 });
@@ -841,6 +1187,7 @@ onBeforeUnmount(() => {
   }
   aliasLoadGate.deactivate();
   accountsLoadGate.deactivate();
+  groupsLoadGate.deactivate();
   aliasAbortController?.abort();
   liveRefresh.stop();
 });
@@ -849,13 +1196,63 @@ onBeforeUnmount(() => {
 <style scoped>
 .alias-list-filters {
   display: grid;
-  grid-template-columns: minmax(260px, 1.4fr) minmax(220px, 1fr) auto;
+  grid-template-columns: minmax(220px, 1.3fr) minmax(180px, 1fr) minmax(180px, 1fr) auto;
   align-items: end;
   gap: 14px;
   padding: 16px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;
+}
+
+.alias-group-bulk-select {
+  width: 150px;
+}
+
+.alias-group-select {
+  width: 132px;
+}
+
+.mobile-alias-group-select {
+  min-width: 132px;
+}
+
+.mail-group-list {
+  display: grid;
+  gap: 8px;
+}
+
+.mail-group-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.mail-group-row__identity {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.mail-group-row__identity strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mail-group-row__identity small {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.mail-group-row__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 4px;
 }
 
 .alias-list-filter {
@@ -909,7 +1306,7 @@ onBeforeUnmount(() => {
 
 @media (max-width: 1080px) {
   .alias-list-filters {
-    grid-template-columns: minmax(260px, 1.25fr) minmax(220px, 1fr);
+    grid-template-columns: minmax(220px, 1.25fr) minmax(180px, 1fr);
   }
 
   .alias-list-filter-actions {

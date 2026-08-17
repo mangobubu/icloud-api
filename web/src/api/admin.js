@@ -200,6 +200,8 @@ export function normalizeAlias(raw = {}) {
     "lastSyncErrorLog",
     "LastSyncErrorLog",
   );
+  const groupIDRaw = firstDefined(raw, "group_id", "groupId", "GroupID");
+  const groupIDNumber = Number(groupIDRaw);
 
   return {
     id: firstDefined(raw, "id", "ID"),
@@ -208,6 +210,12 @@ export function normalizeAlias(raw = {}) {
       firstDefined(raw, "account_email", "accountEmail", "AccountEmail") || "",
     address: firstDefined(raw, "address", "Address") || "",
     label: firstDefined(raw, "label", "Label") || "",
+    groupId:
+      groupIDRaw === null || groupIDRaw === undefined || !Number.isFinite(groupIDNumber) || groupIDNumber < 1
+        ? null
+        : Math.trunc(groupIDNumber),
+    groupName:
+      firstDefined(raw, "group_name", "groupName", "GroupName") || "",
     apiKey: firstDefined(raw, "api_key", "apiKey", "APIKey") || "",
     apiKeyPrefix:
       firstDefined(raw, "api_key_prefix", "apiKeyPrefix", "APIKeyPrefix") ||
@@ -467,6 +475,36 @@ export function getAllAccounts(options = {}) {
   return collectOffsetPages(getAccountPage, options);
 }
 
+export async function getMailGroups() {
+  const data = await apiRequest("/groups");
+  return listFrom(data, "groups", "items").map(normalizeMailGroup);
+}
+
+export async function createMailGroup(name, csrfToken) {
+  const data = await apiRequest("/groups", {
+    method: "POST",
+    body: { name },
+    csrfToken,
+  });
+  return normalizeMailGroup(data?.group || data || {});
+}
+
+export async function updateMailGroup(id, name, csrfToken) {
+  const data = await apiRequest(`/groups/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: { name },
+    csrfToken,
+  });
+  return normalizeMailGroup(data?.group || data || {});
+}
+
+export function deleteMailGroup(id, csrfToken) {
+  return apiRequest(`/groups/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    csrfToken,
+  });
+}
+
 export async function getAccount(id) {
   const data = await apiRequest(`/accounts/${encodeURIComponent(id)}`);
   return normalizeAccountDetail(data);
@@ -505,6 +543,20 @@ export async function updateAccount(id, payload, csrfToken) {
     csrfToken,
   });
   return normalizeAccount(data?.account || data || {});
+}
+
+export function normalizeMailGroup(raw = {}) {
+  return {
+    id: firstDefined(raw, "id", "ID"),
+    name: firstDefined(raw, "name", "Name") || "",
+    aliasCount:
+      Number(firstDefined(raw, "alias_count", "aliasCount", "AliasCount")) ||
+      0,
+    createdAt:
+      firstDefined(raw, "created_at", "createdAt", "CreatedAt") || null,
+    updatedAt:
+      firstDefined(raw, "updated_at", "updatedAt", "UpdatedAt") || null,
+  };
 }
 
 function normalizeRandomAliasResult(data = {}) {
@@ -779,12 +831,33 @@ export function getAliases(accountId = "", options = {}) {
 export async function getAliasPage(accountId = "", options = {}) {
   const query = listQuery(options, {
     account_id: accountId,
+    group_id: options.groupId,
     query: options.query,
   });
   const data = await apiRequest(`/aliases?${query}`, {
     signal: options.signal,
   });
   return normalizeListPage(data, normalizeAlias, ["aliases", "items"], options);
+}
+
+export async function moveAliasToGroup(id, groupId, csrfToken) {
+  const data = await apiRequest(`/aliases/${encodeURIComponent(id)}/group`, {
+    method: "PATCH",
+    body: { group_id: groupId == null ? null : Number(groupId) },
+    csrfToken,
+  });
+  return normalizeAlias(data?.alias || data || {});
+}
+
+export function moveAliasesToGroup(ids, groupId, csrfToken) {
+  return apiRequest("/aliases/group", {
+    method: "PATCH",
+    body: {
+      alias_ids: ids,
+      group_id: groupId == null ? null : Number(groupId),
+    },
+    csrfToken,
+  });
 }
 
 export function getAllAliases(accountId = "", options = {}) {
@@ -809,6 +882,15 @@ export async function setAliasEnabled(id, enabled, csrfToken) {
   const data = await apiRequest(`/aliases/${encodeURIComponent(id)}`, {
     method: "PATCH",
     body: { enabled },
+    csrfToken,
+  });
+  return normalizeAlias(data?.alias || data || {});
+}
+
+export async function updateAliasGroup(id, groupId, csrfToken) {
+  const data = await apiRequest(`/aliases/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: { group_id: groupId == null ? null : Number(groupId) },
     csrfToken,
   });
   return normalizeAlias(data?.alias || data || {});

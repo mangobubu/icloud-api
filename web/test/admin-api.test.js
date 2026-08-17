@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createMailGroup,
   deleteAlias,
+  deleteMailGroup,
   deleteAppleSession,
   getAutoCreateLogRun,
   getAccount,
@@ -12,17 +14,21 @@ import {
   getAccounts,
   getAliasPage,
   getAllAliases,
+  getMailGroups,
   getAllRuntimeLogs,
   getAliases,
   getAuditLogs,
   getRuntimeLogRun,
   getRuntimeLogs,
   loginAppleSession,
+  moveAliasToGroup,
+  moveAliasesToGroup,
   normalizeAutoCreation,
   rotateAlias,
   setAliasAutoCreation,
   syncAccount,
   syncAccountAliases,
+  updateMailGroup,
   verifyAppleSession,
 } from "../src/api/admin.js";
 
@@ -538,6 +544,74 @@ test("alias pages apply search and primary-account filters before server paginat
     { total: page.total, limit: page.limit, offset: page.offset, hasMore: page.hasMore },
     { total: 81, limit: 50, offset: 50, hasMore: false },
   );
+});
+
+test("mail groups normalize counts and send authenticated mutations", async () => {
+  const requests = [];
+  const responses = [
+    { items: [{ id: 3, name: "工作", alias_count: 2 }] },
+    { id: 4, name: "购物", alias_count: 0 },
+    { id: 4, name: "订单", alias_count: 0 },
+    null,
+  ];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url, "https://admin.invalid"), options });
+    const value = responses.shift();
+    if (value === null) return new Response(null, { status: 204 });
+    return jsonResponse(value);
+  };
+
+  const groups = await getMailGroups();
+  const created = await createMailGroup("购物", "csrf-token");
+  const updated = await updateMailGroup(4, "订单", "csrf-token");
+  await deleteMailGroup(4, "csrf-token");
+
+  assert.deepEqual(groups.map((group) => [group.id, group.name, group.aliasCount]), [
+    [3, "工作", 2],
+  ]);
+  assert.equal(created.name, "购物");
+  assert.equal(updated.name, "订单");
+  assert.deepEqual(
+    requests.map((request) => [request.url.pathname, request.options.method]),
+    [
+      ["/admin/api/v1/groups", "GET"],
+      ["/admin/api/v1/groups", "POST"],
+      ["/admin/api/v1/groups/4", "PATCH"],
+      ["/admin/api/v1/groups/4", "DELETE"],
+    ],
+  );
+  assert.equal(requests[1].options.headers.get("X-CSRF-Token"), "csrf-token");
+  assert.deepEqual(JSON.parse(requests[2].options.body), { name: "订单" });
+});
+
+test("alias group filters and moves preserve explicit ungrouping", async () => {
+  const requests = [];
+  globalThis.fetch = async (url, options) => {
+    requests.push({ url: new URL(url, "https://admin.invalid"), options });
+    if (options.method === "PATCH" && /\/aliases\/9\/group$/.test(url)) {
+      return jsonResponse({
+        id: 9,
+        address: "private@icloud.com",
+        group_id: 7,
+        group_name: "注册",
+      });
+    }
+    if (options.method === "PATCH") return new Response(null, { status: 204 });
+    return jsonResponse({ items: [], pagination: { total: 0, limit: 20, offset: 0 } });
+  };
+
+  await getAliasPage("", { groupId: "none" });
+  const moved = await moveAliasToGroup(9, 7, "csrf-token");
+  await moveAliasesToGroup([9, 10], null, "csrf-token");
+
+  assert.equal(requests[0].url.searchParams.get("group_id"), "none");
+  assert.equal(moved.groupId, 7);
+  assert.equal(moved.groupName, "注册");
+  assert.deepEqual(JSON.parse(requests[1].options.body), { group_id: 7 });
+  assert.deepEqual(JSON.parse(requests[2].options.body), {
+    alias_ids: [9, 10],
+    group_id: null,
+  });
 });
 
 test("full alias export preserves search across every server page", async () => {

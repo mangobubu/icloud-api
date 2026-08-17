@@ -8,6 +8,9 @@ import (
 	"strings"
 )
 
+// Keep the durable schema version at v8 for compatibility with deployments
+// that already recorded v8. Mail groups are additive and are converged in
+// place below, so upgrading does not force an unnecessary version boundary.
 const schemaVersion = 8
 
 // Migrate applies schema changes transactionally. Repeated calls are safe.
@@ -37,7 +40,7 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = schemaV8
+		statements = append([]string{}, schemaV8WithMailGroups...)
 		migrationName = "schema v8"
 	case 1:
 		statements = append([]string{}, migrateV1ToV2...)
@@ -47,6 +50,7 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 		statements = append(statements, migrateV5ToV6...)
 		statements = append(statements, migrateV6ToV7...)
 		statements = append(statements, migrateV7ToV8...)
+		statements = append(statements, sqliteMailGroupSchema...)
 		migrationName = "migration v1 to v8"
 	case 2:
 		statements = append([]string{}, migrateV2ToV3...)
@@ -55,6 +59,7 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 		statements = append(statements, migrateV5ToV6...)
 		statements = append(statements, migrateV6ToV7...)
 		statements = append(statements, migrateV7ToV8...)
+		statements = append(statements, sqliteMailGroupSchema...)
 		migrationName = "migration v2 to v8"
 	case 3:
 		statements = append([]string{}, migrateV3ToV4...)
@@ -62,12 +67,14 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 		statements = append(statements, migrateV5ToV6...)
 		statements = append(statements, migrateV6ToV7...)
 		statements = append(statements, migrateV7ToV8...)
+		statements = append(statements, sqliteMailGroupSchema...)
 		migrationName = "migration v3 to v8"
 	case 4:
 		statements = append([]string{}, migrateV4ToV5...)
 		statements = append(statements, migrateV5ToV6...)
 		statements = append(statements, migrateV6ToV7...)
 		statements = append(statements, migrateV7ToV8...)
+		statements = append(statements, sqliteMailGroupSchema...)
 		migrationName = "migration v4 to v8"
 	case 5:
 		statements, err = sqliteV5CompatibilityMigration(ctx, tx)
@@ -76,6 +83,7 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 		}
 		statements = append(statements, migrateV6ToV7...)
 		statements = append(statements, migrateV7ToV8...)
+		statements = append(statements, sqliteMailGroupSchema...)
 		migrationName = "migration v5 to v8"
 	case 6:
 		for _, statement := range sqliteLegacyCompatibilityRepair {
@@ -85,9 +93,11 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 		}
 		statements = append([]string{}, migrateV6ToV7...)
 		statements = append(statements, migrateV7ToV8...)
+		statements = append(statements, sqliteMailGroupSchema...)
 		migrationName = "migration v6 to v8"
 	case 7:
 		statements = append([]string{}, migrateV7ToV8...)
+		statements = append(statements, sqliteMailGroupSchema...)
 		migrationName = "migration v7 to v8"
 	case schemaVersion:
 		migrationName = "schema v8 convergence"
@@ -99,6 +109,9 @@ func (s *Store) migrateSQLite(ctx context.Context) error {
 	}
 	if err := convergeSQLiteAliasCredentialMode(ctx, tx); err != nil {
 		return fmt.Errorf("converge sqlite alias credential schema: %w", err)
+	}
+	if err := s.convergeSQLiteMailGroupSchema(ctx, tx); err != nil {
+		return fmt.Errorf("converge sqlite mail group schema: %w", err)
 	}
 	for _, statement := range sqliteSchemaConvergence {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
@@ -151,7 +164,7 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 	var migrationName string
 	switch current {
 	case 0:
-		statements = postgresSchemaV8
+		statements = append([]string{}, postgresSchemaV8WithMailGroups...)
 		migrationName = "postgres schema v8"
 	case 3:
 		statements = append([]string{}, postgresMigrateV3ToV4...)
@@ -159,17 +172,20 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 		statements = append(statements, postgresMigrateV5ToV6...)
 		statements = append(statements, postgresMigrateV6ToV7...)
 		statements = append(statements, postgresMigrateV7ToV8...)
+		statements = append(statements, postgresMailGroupSchema...)
 		migrationName = "postgres migration v3 to v8"
 	case 4:
 		statements = append([]string{}, postgresMigrateV4ToV5...)
 		statements = append(statements, postgresMigrateV5ToV6...)
 		statements = append(statements, postgresMigrateV6ToV7...)
 		statements = append(statements, postgresMigrateV7ToV8...)
+		statements = append(statements, postgresMailGroupSchema...)
 		migrationName = "postgres migration v4 to v8"
 	case 5:
 		statements = append([]string{}, postgresV5CompatibilityMigration...)
 		statements = append(statements, postgresMigrateV6ToV7...)
 		statements = append(statements, postgresMigrateV7ToV8...)
+		statements = append(statements, postgresMailGroupSchema...)
 		migrationName = "postgres migration v5 to v8"
 	case 6:
 		for _, statement := range postgresLegacyCompatibilityRepair {
@@ -179,9 +195,11 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 		}
 		statements = append([]string{}, postgresMigrateV6ToV7...)
 		statements = append(statements, postgresMigrateV7ToV8...)
+		statements = append(statements, postgresMailGroupSchema...)
 		migrationName = "postgres migration v6 to v8"
 	case 7:
 		statements = append([]string{}, postgresMigrateV7ToV8...)
+		statements = append(statements, postgresMailGroupSchema...)
 		migrationName = "postgres migration v7 to v8"
 	case schemaVersion:
 		migrationName = "postgres schema v8 convergence"
@@ -206,6 +224,9 @@ func (s *Store) migratePostgres(ctx context.Context) error {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
 			return fmt.Errorf("converge postgres alias credential schema: %w", err)
 		}
+	}
+	if err := s.convergePostgresMailGroupSchema(ctx, tx); err != nil {
+		return fmt.Errorf("converge postgres mail group schema: %w", err)
 	}
 	for _, statement := range postgresSchemaConvergence {
 		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
@@ -521,6 +542,23 @@ var migrateV7ToV8 = []string{
 
 var schemaV8 = append(append([]string{}, schemaV7...), migrateV7ToV8...)
 
+// Mail groups are an additive v8 convergence feature. The group table is
+// global to the installation; aliases keep a nullable foreign key so existing
+// rows stay ungrouped and deleting a group never deletes an address.
+var sqliteMailGroupSchema = []string{
+	`CREATE TABLE IF NOT EXISTS mail_groups (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		name_key TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`,
+	`ALTER TABLE aliases ADD COLUMN group_id INTEGER REFERENCES mail_groups(id) ON DELETE SET NULL`,
+	`CREATE INDEX IF NOT EXISTS aliases_group_id_idx ON aliases(group_id, address, id)`,
+}
+
+var schemaV8WithMailGroups = append(append([]string{}, schemaV8...), sqliteMailGroupSchema...)
+
 var sqliteSchemaConvergence = []string{
 	// Mailbox settings live in a side table so upgrading an existing v7
 	// database never rewrites the heavily used accounts table. Missing rows are
@@ -646,6 +684,162 @@ func convergeSQLiteAliasCredentialMode(ctx context.Context, tx *sql.Tx) error {
 			  AND length(refresh_token_hash) = 32`); err != nil {
 			return fmt.Errorf("classify pre-mode v7 alias credentials: %w", err)
 		}
+	}
+	return nil
+}
+
+// convergeSQLiteMailGroupSchema repairs databases that were interrupted after
+// the migration transaction created only one half of the group schema. SQLite has
+// no ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so inspect the catalog first.
+func (s *Store) convergeSQLiteMailGroupSchema(ctx context.Context, tx *sql.Tx) error {
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS mail_groups (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		name_key TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("create mail groups table: %w", err)
+	}
+	var present bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM pragma_table_info('aliases')
+			WHERE name = 'group_id' COLLATE NOCASE
+		)`).Scan(&present); err != nil {
+		return fmt.Errorf("inspect aliases group_id column: %w", err)
+	}
+	if !present {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE aliases ADD COLUMN group_id INTEGER REFERENCES mail_groups(id) ON DELETE SET NULL`); err != nil {
+			return fmt.Errorf("add aliases group_id column: %w", err)
+		}
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM pragma_table_info('mail_groups')
+			WHERE name = 'name_key' COLLATE NOCASE
+		)`).Scan(&present); err != nil {
+		return fmt.Errorf("inspect mail_groups name_key column: %w", err)
+	}
+	if !present {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE mail_groups ADD COLUMN name_key TEXT`); err != nil {
+			return fmt.Errorf("add mail_groups name_key column: %w", err)
+		}
+	}
+	if err := s.convergeMailGroupNameKeys(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS aliases_group_id_idx ON aliases(group_id, address, id)`); err != nil {
+		return fmt.Errorf("create aliases group index: %w", err)
+	}
+	return nil
+}
+
+type mailGroupNameKeyMigrationRow struct {
+	id      int64
+	name    string
+	nameKey sql.NullString
+}
+
+// convergeMailGroupNameKeys backfills keys in Go so SQLite and PostgreSQL use
+// exactly the same Unicode normalization and casing rules. Detect collisions
+// before mutating anything to return an actionable migration error.
+func (s *Store) convergeMailGroupNameKeys(ctx context.Context, tx *sql.Tx) error {
+	rows, err := s.txQueryContext(ctx, tx,
+		`SELECT id, name, name_key FROM mail_groups ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("read mail groups for name key migration: %w", err)
+	}
+	groups := make([]mailGroupNameKeyMigrationRow, 0)
+	for rows.Next() {
+		var group mailGroupNameKeyMigrationRow
+		if err := rows.Scan(&group.id, &group.name, &group.nameKey); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan mail group for name key migration: %w", err)
+		}
+		groups = append(groups, group)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate mail groups for name key migration: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close mail group name key migration rows: %w", err)
+	}
+
+	seen := make(map[string]mailGroupNameKeyMigrationRow, len(groups))
+	changed := false
+	for index := range groups {
+		key := mailGroupNameKey(groups[index].name)
+		if previous, exists := seen[key]; exists {
+			return fmt.Errorf(
+				"mail group name normalization conflict: %q (id %d) and %q (id %d) resolve to the same name key; rename one group before retrying migration",
+				previous.name, previous.id, groups[index].name, groups[index].id,
+			)
+		}
+		seen[key] = groups[index]
+		if !groups[index].nameKey.Valid || groups[index].nameKey.String != key {
+			changed = true
+		}
+		groups[index].nameKey = sql.NullString{String: key, Valid: true}
+	}
+
+	if changed {
+		// A partially applied earlier migration may already have this index and
+		// stale keys. Rebuilding it inside the transaction avoids update-order
+		// conflicts while preserving atomicity on failure.
+		if _, err := s.txExecContext(ctx, tx,
+			`DROP INDEX IF EXISTS mail_groups_name_key_uidx`); err != nil {
+			return fmt.Errorf("drop stale mail group name key index: %w", err)
+		}
+		for _, group := range groups {
+			if _, err := s.txExecContext(ctx, tx,
+				`UPDATE mail_groups SET name_key = ? WHERE id = ?`, group.nameKey.String, group.id); err != nil {
+				return fmt.Errorf("backfill mail group %d name key: %w", group.id, err)
+			}
+		}
+	}
+	if _, err := s.txExecContext(ctx, tx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS mail_groups_name_key_uidx ON mail_groups(name_key)`); err != nil {
+		return fmt.Errorf("create mail group name key unique index: %w", err)
+	}
+	if s.dialect == dialectSQLite {
+		for _, statement := range []string{
+			`CREATE TRIGGER IF NOT EXISTS mail_groups_name_key_not_null_insert
+				BEFORE INSERT ON mail_groups
+				WHEN NEW.name_key IS NULL
+				BEGIN
+					SELECT RAISE(ABORT, 'mail_groups.name_key must not be NULL');
+				END`,
+			`CREATE TRIGGER IF NOT EXISTS mail_groups_name_key_not_null_update
+				BEFORE UPDATE OF name_key ON mail_groups
+				WHEN NEW.name_key IS NULL
+				BEGIN
+					SELECT RAISE(ABORT, 'mail_groups.name_key must not be NULL');
+				END`,
+		} {
+			if _, err := s.txExecContext(ctx, tx, statement); err != nil {
+				return fmt.Errorf("enforce non-null mail group name keys: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) convergePostgresMailGroupSchema(ctx context.Context, tx *sql.Tx) error {
+	for _, statement := range postgresMailGroupSchema {
+		if _, err := s.txExecContext(ctx, tx, statement); err != nil {
+			return err
+		}
+	}
+	if err := s.convergeMailGroupNameKeys(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := s.txExecContext(ctx, tx,
+		`ALTER TABLE mail_groups ALTER COLUMN name_key SET NOT NULL`); err != nil {
+		return fmt.Errorf("enforce non-null mail group name keys: %w", err)
 	}
 	return nil
 }
@@ -1525,6 +1719,24 @@ var postgresMigrateV7ToV8 = []string{
 }
 
 var postgresSchemaV8 = append(append([]string{}, postgresSchemaV7...), postgresMigrateV7ToV8...)
+
+var postgresMailGroupSchema = []string{
+	`CREATE TABLE IF NOT EXISTS mail_groups (
+		id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+		name TEXT NOT NULL,
+		name_key TEXT NOT NULL,
+		created_at BIGINT NOT NULL,
+		updated_at BIGINT NOT NULL
+	)`,
+	`ALTER TABLE mail_groups ADD COLUMN IF NOT EXISTS name_key TEXT`,
+	// Older builds used a CITEXT UNIQUE column. Its generated constraint would
+	// otherwise retain PostgreSQL/locale-specific comparison semantics.
+	`ALTER TABLE mail_groups DROP CONSTRAINT IF EXISTS mail_groups_name_key`,
+	`ALTER TABLE aliases ADD COLUMN IF NOT EXISTS group_id BIGINT REFERENCES mail_groups(id) ON DELETE SET NULL`,
+	`CREATE INDEX IF NOT EXISTS aliases_group_id_idx ON aliases(group_id, address, id)`,
+}
+
+var postgresSchemaV8WithMailGroups = append(append([]string{}, postgresSchemaV8...), postgresMailGroupSchema...)
 
 // Version 5 was released with two distinct feature-table layouts. These
 // idempotent statements preserve either layout while filling its missing half.

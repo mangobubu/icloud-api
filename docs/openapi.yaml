@@ -502,6 +502,251 @@ paths:
           $ref: "#/components/responses/AdminInternalError"
 
 
+  /api/v1/groups:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
+    get:
+      tags: [Administration]
+      operationId: listMailGroups
+      summary: 查询邮箱分组
+      description: 返回全局邮箱分组及每个分组包含的隐私邮箱数量。
+      security:
+        - adminSession: []
+      responses:
+        "200":
+          description: 邮箱分组列表
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMailGroupListResponse"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+    post:
+      tags: [Administration]
+      operationId: createMailGroup
+      summary: 创建邮箱分组
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminMailGroupRequest"
+      responses:
+        "201":
+          description: 邮箱分组创建成功
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMailGroupResponse"
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "409":
+          $ref: "#/components/responses/AdminMailGroupConflict"
+        "413":
+          $ref: "#/components/responses/AdminRequestTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
+  /api/v1/groups/{id}:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
+    patch:
+      tags: [Administration]
+      operationId: updateMailGroup
+      summary: 重命名邮箱分组
+      security:
+        - adminSession: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminMailGroupRequest"
+      responses:
+        "200":
+          description: 邮箱分组已重命名
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminMailGroupResponse"
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminMailGroupNotFound"
+        "409":
+          $ref: "#/components/responses/AdminMailGroupConflict"
+        "413":
+          $ref: "#/components/responses/AdminRequestTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+    delete:
+      tags: [Administration]
+      operationId: deleteMailGroup
+      summary: 删除邮箱分组
+      description: 删除分组后，组内隐私邮箱会保留并恢复为未分组。
+      security:
+        - adminSession: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      responses:
+        "204":
+          description: 邮箱分组已删除
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminMailGroupNotFound"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
+  /api/v1/aliases/group:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
+    patch:
+      tags: [Administration]
+      operationId: moveAliasesToGroup
+      summary: 批量移动隐私邮箱到分组
+      description: "group_id 传 null 可将邮箱恢复为未分组。"
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdminMoveAliasesToGroupRequest"
+      responses:
+        "204":
+          description: 移动成功
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAliasOrMailGroupNotFound"
+        "413":
+          $ref: "#/components/responses/AdminRequestTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
+  /api/v1/aliases/{id}/group:
+    servers:
+      - url: https://HOST/{admin_path}
+        description: 首选的安装级随机管理 API 前缀；将 admin_path 替换为 keys 卷中值去掉首尾斜杠后的形式
+        variables:
+          admin_path:
+            default: 00000000000000000000000000000000/admin
+            description: 首次启动生成并持久化的管理路径，替换时去掉文件值的开头和结尾斜杠
+      - url: https://HOST/admin
+        description: 升级前客户端使用的固定兼容入口；认证、CSRF 和限流规则相同
+    patch:
+      tags: [Administration]
+      operationId: moveAliasToGroup
+      summary: 移动单个隐私邮箱到分组
+      security:
+        - adminSession: []
+      parameters:
+        - $ref: "#/components/parameters/AdminAliasID"
+        - $ref: "#/components/parameters/AdminCSRFToken"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [group_id]
+              properties:
+                group_id:
+                  oneOf:
+                    - type: integer
+                      format: int64
+                      minimum: 1
+                    - type: "null"
+      responses:
+        "200":
+          description: 隐私邮箱分组已更新
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAliasResponse"
+        "400":
+          $ref: "#/components/responses/AdminBadRequest"
+        "401":
+          $ref: "#/components/responses/AdminAuthUnauthorized"
+        "403":
+          $ref: "#/components/responses/AdminCSRFForbidden"
+        "404":
+          $ref: "#/components/responses/AdminAliasOrMailGroupNotFound"
+        "413":
+          $ref: "#/components/responses/AdminRequestTooLarge"
+        "415":
+          $ref: "#/components/responses/AdminUnsupportedMediaType"
+        "500":
+          $ref: "#/components/responses/AdminInternalError"
+
   /oauth2/v2.0/token:
     post:
       summary: 用 refresh token 换取 IMAPS XOAUTH2 访问令牌
@@ -1653,6 +1898,16 @@ components:
           format: email
         label:
           type: string
+        group_id:
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 1
+            - type: "null"
+          description: 可选邮箱分组；null 表示未分组。
+        group_name:
+          type: string
+          description: 分组名称；未分组时为空字符串。
         api_key_prefix:
           type: string
         direct_link_path:
@@ -1684,6 +1939,82 @@ components:
           minimum: 0
         enabled:
           type: boolean
+    AdminMailGroup:
+      type: object
+      additionalProperties: false
+      required: [id, name, alias_count, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+          minimum: 1
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        alias_count:
+          type: integer
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    AdminMailGroupRequest:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+    AdminMailGroupResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/AdminMailGroup"
+    AdminMailGroupListResponse:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/AdminMailGroup"
+            groups:
+              type: array
+              description: items 的兼容别名。
+              items:
+                $ref: "#/components/schemas/AdminMailGroup"
+    AdminMoveAliasesToGroupRequest:
+      type: object
+      additionalProperties: false
+      required: [alias_ids, group_id]
+      properties:
+        alias_ids:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            type: integer
+            format: int64
+            minimum: 1
+        group_id:
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 1
+            - type: "null"
     APIErrorEnvelope:
       type: object
       additionalProperties: false
@@ -1984,8 +2315,26 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminMailGroupNotFound:
+      description: 邮箱分组不存在或路径 ID 无效（`GROUP_NOT_FOUND` 或 `NOT_FOUND`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminAliasOrMailGroupNotFound:
+      description: 隐私邮箱或目标邮箱分组不存在（`NOT_FOUND` 或 `GROUP_NOT_FOUND`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
     AdminAliasConflict:
       description: alias 等待 Apple 确认或不支持所请求的凭证轮换模式（`ALIAS_CONFIRMATION_PENDING` 或 `ALIAS_CREDENTIAL_MODE_UNSUPPORTED`）。
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/APIErrorEnvelope"
+    AdminMailGroupConflict:
+      description: 邮箱分组名称已存在（`GROUP_EXISTS`）。
       content:
         application/json:
           schema:

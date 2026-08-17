@@ -124,6 +124,12 @@
         closable
         @close="loadError = null"
       />
+      <RequestAlert
+        v-if="groupsError"
+        :error="groupsError"
+        closable
+        @close="groupsError = null"
+      />
 
       <section class="section-block" aria-labelledby="connection-title">
         <SectionHeader
@@ -377,6 +383,24 @@
                   <small>{{ row.label || "未填写用途备注" }}</small>
                 </div>
               </template>
+              <template v-else-if="column.key === 'group'">
+                <el-select
+                  class="alias-group-select"
+                  :model-value="row.groupId == null ? '' : String(row.groupId)"
+                  :loading="groupsLoading || Boolean(groupMoveLoading[row.id])"
+                  :disabled="groupsLoading || isAliasActionBusy(row)"
+                  aria-label="选择隐私邮箱分组"
+                  @change="moveAliasToGroup(row, $event)"
+                >
+                  <el-option label="未分组" value="" />
+                  <el-option
+                    v-for="group in groups"
+                    :key="group.id"
+                    :label="group.name"
+                    :value="String(group.id)"
+                  />
+                </el-select>
+              </template>
               <template v-else-if="column.key === 'latestReceivedAt'">
                 {{ formatTime(row.latestReceivedAt) }}
               </template>
@@ -396,7 +420,7 @@
                   v-if="!isAliasConfirmationPending(row)"
                   :model-value="row.enabled"
                   :loading="Boolean(toggleLoading[row.id])"
-                  :disabled="Boolean(isCopying(row) || rotateLoading[row.id] || deleteLoading[row.id])"
+                  :disabled="isAliasActionBusy(row)"
                   :aria-label="`启用隐私邮箱 ${row.address}`"
                   @change="(enabled) => toggleAlias(row, enabled)"
                 />
@@ -410,12 +434,14 @@
                     size="small"
                     :icon="CopyDocument"
                     :loading="Boolean(copyLoading[`${row.id}:otp`])"
+                    :disabled="isAliasActionBusy(row)"
                     @click="copyAliasCredentials(row, ALIAS_EXPORT_OTP)"
                   >取码</el-button>
                   <el-button
                     size="small"
                     :icon="CopyDocument"
                     :loading="Boolean(copyLoading[`${row.id}:imap`])"
+                    :disabled="isAliasActionBusy(row)"
                     @click="copyAliasCredentials(row, ALIAS_EXPORT_IMAP)"
                     v-if="isAliasV2(row)"
                   >IMAP</el-button>
@@ -424,6 +450,7 @@
                     size="small"
                     :icon="CopyDocument"
                     :loading="Boolean(copyLoading[`${row.id}:legacy-link`])"
+                    :disabled="isAliasActionBusy(row)"
                     @click="copyLegacyDirectLink(row)"
                   >旧直达</el-button>
                   <el-tooltip :content="aliasRotationLabel(row)" placement="top">
@@ -431,7 +458,7 @@
                       :icon="Key"
                       circle
                       :loading="Boolean(rotateLoading[row.id])"
-                      :disabled="Boolean(isCopying(row) || toggleLoading[row.id] || deleteLoading[row.id])"
+                      :disabled="isAliasActionBusy(row)"
                       :aria-label="`${aliasRotationLabel(row)}：${row.address}`"
                       @click="rotateKey(row)"
                     />
@@ -446,7 +473,7 @@
                       :icon="Delete"
                       circle
                       :loading="Boolean(deleteLoading[row.id])"
-                      :disabled="Boolean(isCopying(row) || toggleLoading[row.id] || rotateLoading[row.id])"
+                      :disabled="isAliasActionBusy(row)"
                       :aria-label="`${isCustomMailbox ? '从本地永久删除邮箱' : '从 iCloud 永久删除隐私邮箱'} ${row.address}`"
                       @click="removeAlias(row)"
                     />
@@ -479,13 +506,34 @@
                 <dt>最新邮件</dt>
                 <dd>{{ formatTime(alias.latestReceivedAt) }}</dd>
               </div>
+              <div>
+                <dt>分组</dt>
+                <dd>
+                  <el-select
+                    class="mobile-alias-group-select"
+                    :model-value="alias.groupId == null ? '' : String(alias.groupId)"
+                    :loading="groupsLoading || Boolean(groupMoveLoading[alias.id])"
+                    :disabled="groupsLoading || isAliasActionBusy(alias)"
+                    aria-label="选择隐私邮箱分组"
+                    @change="moveAliasToGroup(alias, $event)"
+                  >
+                    <el-option label="未分组" value="" />
+                    <el-option
+                      v-for="group in groups"
+                      :key="group.id"
+                      :label="group.name"
+                      :value="String(group.id)"
+                    />
+                  </el-select>
+                </dd>
+              </div>
               <div v-if="!isAliasConfirmationPending(alias)">
                 <dt>启用</dt>
                 <dd>
                   <el-switch
                     :model-value="alias.enabled"
                     :loading="Boolean(toggleLoading[alias.id])"
-                    :disabled="Boolean(isCopying(alias) || rotateLoading[alias.id] || deleteLoading[alias.id])"
+                    :disabled="isAliasActionBusy(alias)"
                     :aria-label="`启用隐私邮箱 ${alias.address}`"
                     @change="(enabled) => toggleAlias(alias, enabled)"
                   />
@@ -499,6 +547,7 @@
               <el-button
                 :icon="CopyDocument"
                 :loading="Boolean(copyLoading[`${alias.id}:otp`])"
+                :disabled="isAliasActionBusy(alias)"
                 @click="copyAliasCredentials(alias, ALIAS_EXPORT_OTP)"
               >
                 复制取码格式
@@ -506,6 +555,7 @@
               <el-button
                 :icon="CopyDocument"
                 :loading="Boolean(copyLoading[`${alias.id}:imap`])"
+                :disabled="isAliasActionBusy(alias)"
                 @click="copyAliasCredentials(alias, ALIAS_EXPORT_IMAP)"
                 v-if="isAliasV2(alias)"
               >
@@ -515,6 +565,7 @@
                 v-else-if="isLegacyDirectLinkAvailable(alias)"
                 :icon="CopyDocument"
                 :loading="Boolean(copyLoading[`${alias.id}:legacy-link`])"
+                :disabled="isAliasActionBusy(alias)"
                 @click="copyLegacyDirectLink(alias)"
               >
                 复制旧直达链接
@@ -522,7 +573,7 @@
               <el-button
                 :icon="Key"
                 :loading="Boolean(rotateLoading[alias.id])"
-                :disabled="Boolean(isCopying(alias) || toggleLoading[alias.id] || deleteLoading[alias.id])"
+                :disabled="isAliasActionBusy(alias)"
                 @click="rotateKey(alias)"
               >
                 {{ aliasRotationLabel(alias) }}
@@ -532,7 +583,7 @@
                 plain
                 :icon="Delete"
                 :loading="Boolean(deleteLoading[alias.id])"
-                :disabled="Boolean(isCopying(alias) || toggleLoading[alias.id] || rotateLoading[alias.id])"
+                :disabled="isAliasActionBusy(alias)"
                 @click="removeAlias(alias)"
               >
                 永久删除
@@ -648,7 +699,9 @@ import {
   deleteAlias,
   deleteAppleSession,
   getAccount,
+  getMailGroups,
   loginAppleSession,
+  moveAliasToGroup as moveAliasToGroupRequest,
   rotateAlias,
   setAliasAutoCreation,
   setAliasEnabled,
@@ -688,6 +741,10 @@ const router = useRouter();
 const auth = useAuth();
 const account = ref(null);
 const aliases = ref([]);
+const groups = ref([]);
+const groupsLoading = ref(false);
+const groupsError = ref(null);
+const groupMoveLoading = reactive({});
 const appleSession = ref(null);
 const loading = ref(false);
 const loadError = ref(null);
@@ -715,6 +772,7 @@ const toggleLoading = reactive({});
 const rotateLoading = reactive({});
 const deleteLoading = reactive({});
 const detailGate = createLatestRequestGate();
+const groupsLoadGate = createLatestRequestGate();
 const createLock = createActionLock();
 const aliasActionLock = createActionLock();
 const accountDeleteLock = createActionLock();
@@ -756,6 +814,13 @@ const aliasColumns = Object.freeze([
     title: "隐私邮箱",
     width: 230,
     minWidth: 230,
+    flexGrow: 1,
+  },
+  {
+    key: "group",
+    title: "分组",
+    width: 150,
+    minWidth: 150,
     flexGrow: 1,
   },
   {
@@ -1040,6 +1105,7 @@ function detailMutationPending() {
     randomAliasLoading.value ||
     createLoading.value ||
     accountDeleteLoading.value ||
+    Object.keys(groupMoveLoading).length > 0 ||
     aliasActionLock.hasAny() ||
     autoCreationLock.hasAny() ||
     randomAliasLock.hasAny()
@@ -1048,6 +1114,30 @@ function detailMutationPending() {
 
 function beginDetailMutation() {
   detailGate.invalidate();
+}
+
+async function loadMailGroups({ silent = false } = {}) {
+  const ticket = groupsLoadGate.begin("groups");
+  if (!silent) {
+    groupsLoading.value = true;
+    groupsError.value = null;
+  }
+  try {
+    const nextGroups = await getMailGroups();
+    if (!groupsLoadGate.isCurrent(ticket, "groups")) return false;
+    groups.value = nextGroups;
+    groupsError.value = null;
+    return true;
+  } catch (error) {
+    if (!silent && groupsLoadGate.isCurrent(ticket, "groups")) {
+      groupsError.value = error;
+    }
+    return false;
+  } finally {
+    if (groupsLoadGate.isCurrent(ticket, "groups")) {
+      groupsLoading.value = false;
+    }
+  }
 }
 
 async function loadDetail({ silent = false } = {}) {
@@ -1068,6 +1158,7 @@ async function loadDetail({ silent = false } = {}) {
     if (!detailGate.isCurrent(ticket, detailRouteKey())) return;
     account.value = detail.account;
     aliases.value = detail.aliases;
+    void loadMailGroups({ silent });
     syncAccountAliasCount();
     appleSession.value = detail.appleSession;
     autoCreation.value = detail.autoCreation || null;
@@ -1601,6 +1692,17 @@ function isCopying(alias) {
   );
 }
 
+function isAliasActionBusy(alias) {
+  const id = alias?.id;
+  return Boolean(
+    isCopying(alias) ||
+      toggleLoading[id] ||
+      rotateLoading[id] ||
+      deleteLoading[id] ||
+      groupMoveLoading[id],
+  );
+}
+
 async function copyAliasCredentials(alias, format) {
   const loadingKey = `${alias?.id}:${format}`;
   if (
@@ -1691,6 +1793,31 @@ async function toggleAlias(alias, enabled) {
     showRequestError(error, "隐私邮箱状态更新失败，请稍后重试。");
   } finally {
     delete toggleLoading[alias.id];
+    aliasActionLock.release(alias.id);
+  }
+}
+
+async function moveAliasToGroup(alias, groupValue) {
+  if (!alias || !aliasActionLock.acquire(alias.id)) return;
+  beginDetailMutation();
+  groupMoveLoading[alias.id] = true;
+  const accountId = account.value?.id;
+  try {
+    const updated = await moveAliasToGroupRequest(
+      alias.id,
+      groupValue === "" || groupValue == null ? null : groupValue,
+      auth.state.csrfToken,
+    );
+    if (!isCurrentAccount(accountId)) return;
+    replaceAlias(updated);
+    await loadMailGroups();
+    successMessage("隐私邮箱分组已更新。");
+  } catch (error) {
+    if (isCurrentAccount(accountId)) {
+      showRequestError(error, "隐私邮箱分组移动失败，请稍后重试。");
+    }
+  } finally {
+    delete groupMoveLoading[alias.id];
     aliasActionLock.release(alias.id);
   }
 }
@@ -1817,6 +1944,7 @@ onBeforeUnmount(() => {
   viewActive = false;
   liveRefresh.stop();
   detailGate.deactivate();
+  groupsLoadGate.deactivate();
   autoCreation.value = null;
   randomAliasError.value = null;
 });
@@ -1831,5 +1959,13 @@ onBeforeUnmount(() => {
   font-size: 12px;
   white-space: nowrap;
   user-select: all;
+}
+
+.alias-group-select {
+  width: 132px;
+}
+
+.mobile-alias-group-select {
+  min-width: 150px;
 }
 </style>

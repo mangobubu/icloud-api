@@ -49,7 +49,7 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 
 `admin-path` 的值形如 `/<32位小写十六进制>/admin/`。管理界面、静态资源和前端路由跟随这个随机前缀，管理 API 的首选入口是去掉该值结尾 `/` 后再拼接 `/api/v1`。OpenAPI 的 `{admin_path}` 变量则使用去掉首尾 `/` 的值。为兼容升级前客户端，同一套 JSON 管理 API 也保留在固定 `/admin/api/v1`；固定 `/admin` 不提供管理界面。登录成功会为两个 API 路径签发同一会话的受限 Cookie，两个入口都执行相同的登录限流、会话认证和 CSRF 校验。管理响应默认使用 `Cache-Control: no-store, private`，返回明文凭证的处理器会覆盖为 `no-store`。随机路径只能降低未授权扫描噪声，不应被当作访问控制边界。
 
-使用 `admin` 和首次生成的密码登录随机管理路径，添加 iCloud 主号后同步或手动登记隐私邮箱。公开接口说明位于 <http://127.0.0.1:8080/docs/>，机器可读契约见 [`docs/openapi.yaml`](docs/openapi.yaml)。
+使用 `admin` 和首次生成的密码登录随机管理路径，添加 iCloud 主号后同步或手动登记隐私邮箱。管理端支持创建邮箱分组，并在“全部隐私邮箱”或主号详情中把单个、勾选的隐私邮箱移动到所选分组；删除分组不会删除邮箱，只会将其恢复为未分组。公开接口说明位于 <http://127.0.0.1:8080/docs/>，机器可读契约见 [`docs/openapi.yaml`](docs/openapi.yaml)。
 
 每个主号可配置上游隐式 TLS IMAP 主机、端口和登录用户名，默认是 `imap.mail.me.com:993`。已有隐私邮箱后仍可修改这三项，但这代表切换邮箱来源：服务会清除该主号旧来源的同步游标、v1 快照、消费与 `Seen` 状态、v2 归档和 OTP 历史，轮换公开 IMAPS 的 `UIDVALIDITY`，再从新来源建立不回填历史的基线。单纯修改 IMAP 密码（iCloud 模式使用 App 专用密码）或重新启用主号只重置同步状态，不删除已有邮件。已有隐私邮箱后主号邮箱地址仍不可修改。
 
