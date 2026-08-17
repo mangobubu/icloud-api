@@ -812,7 +812,7 @@ paths:
       description: |
         仅适用于 `custom` 邮箱模式。按请求数量生成互不重复的 8–12 位小写英文字母和数字地址，
         拼接已保存的邮箱后缀；不会调用 Apple 或 iCloud 每小时自动创建计划。单次最多 1000 个，
-        超过本地主号剩余容量时整批拒绝。响应返回完整凭证，并禁止缓存；管理端详情仍可在授权后查看。
+        可多次分批请求，`custom` 主号的累计数量不设上限。响应返回完整凭证，并禁止缓存；管理端详情仍可在授权后查看。
         规范路径和数量字段分别为本路径与 `count`；为兼容早期客户端，也接受同一主号下的
         `/aliases/batch`、`/aliases/generate` 路径以及 `quantity`、`number` 数量字段。
       security:
@@ -2143,7 +2143,7 @@ components:
                   request_id: 6oe7j0x3x3pJv9Dv
 
     AdminRandomAliasConflict:
-      description: 随机邮箱生成因主号停用、容量不足、邮箱模式或后缀变化、地址冲突而整批拒绝
+      description: 随机邮箱生成因主号停用、邮箱模式或后缀变化、地址冲突而整批拒绝
       headers:
         X-Request-ID:
           $ref: "#/components/headers/RequestID"
@@ -2159,12 +2159,6 @@ components:
                 error:
                   code: ACCOUNT_DISABLED
                   message: 主号已停用，请先启用主号后再生成邮箱
-                  request_id: 6oe7j0x3x3pJv9Dv
-            aliasLimitReached:
-              value:
-                error:
-                  code: ALIAS_LIMIT_REACHED
-                  message: 此主号最多启用 1000 个隐私邮箱
                   request_id: 6oe7j0x3x3pJv9Dv
             customMailboxRequired:
               value:

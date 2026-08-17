@@ -200,9 +200,97 @@ func TestStrictAliasImportRejectsWholeBatchAtCapacity(t *testing.T) {
 	if !errors.Is(err, store.ErrAliasLimit) {
 		t.Fatalf("strict over-capacity error = %v, want alias limit", err)
 	}
+	_, err = db.CreateAlias(ctx, domain.Alias{
+		AccountID:  account.ID,
+		Address:    "create-one-more@icloud.com",
+		Label:      "create over capacity",
+		APIKeyHash: []byte("create-over-capacity-hash"),
+		Enabled:    true,
+	})
+	if !errors.Is(err, store.ErrAliasLimit) {
+		t.Fatalf("create over-capacity error = %v, want alias limit", err)
+	}
+	disabled, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID:  account.ID,
+		Address:    "disabled-at-capacity@icloud.com",
+		Label:      "disabled at capacity",
+		APIKeyHash: []byte("disabled-at-capacity-hash"),
+		Enabled:    false,
+	})
+	if err != nil {
+		t.Fatalf("create disabled alias at capacity: %v", err)
+	}
+	if err := db.SetAliasEnabled(ctx, disabled.ID, true); !errors.Is(err, store.ErrAliasLimit) {
+		t.Fatalf("re-enable over-capacity error = %v, want alias limit", err)
+	}
+	disabled, err = db.GetAlias(ctx, disabled.ID)
+	if err != nil || disabled.Enabled {
+		t.Fatalf("alias after rejected re-enable = %#v, err=%v; want disabled", disabled, err)
+	}
 	aliases, listErr := db.ListAliasesByAccount(ctx, account.ID)
-	if listErr != nil || len(aliases) != domain.MaxEnabledAliasesPerAccount {
+	if listErr != nil || len(aliases) != domain.MaxEnabledAliasesPerAccount+1 {
 		t.Fatalf("aliases after over-capacity batch = %d, err=%v", len(aliases), listErr)
+	}
+}
+
+func TestCustomMailboxAllowsMoreThanEnabledAliasLimitAcrossStorePaths(t *testing.T) {
+	ctx := context.Background()
+	db := openTestStore(t)
+	configureStrictImportCredentials(t, db)
+	account := createCustomImportAccount(t, ctx, db, "unlimited.test", true)
+
+	disabled, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID:  account.ID,
+		Address:    "reenable@unlimited.test",
+		Label:      "re-enable after bulk import",
+		APIKeyHash: []byte("custom-disabled-hash"),
+		Enabled:    false,
+	})
+	if err != nil {
+		t.Fatalf("create disabled custom alias: %v", err)
+	}
+
+	const overLimit = domain.MaxEnabledAliasesPerAccount + 1
+	candidates := make([]domain.AliasImportCandidate, 0, overLimit)
+	for index := 0; index < overLimit; index++ {
+		candidates = append(candidates, domain.AliasImportCandidate{
+			Address: fmt.Sprintf("unlimited-%04d@unlimited.test", index),
+			Active:  true,
+		})
+	}
+	result, issued, err := db.ImportCustomAliasesWithCredentialsStrict(ctx, account.ID, candidates)
+	if err != nil || len(result.Created) != overLimit || len(issued) != overLimit || result.ImportedDisabledCount != 0 {
+		t.Fatalf(
+			"custom over-limit import created=%d issued=%d disabled=%d err=%v",
+			len(result.Created), len(issued), result.ImportedDisabledCount, err,
+		)
+	}
+
+	created, err := db.CreateAlias(ctx, domain.Alias{
+		AccountID:  account.ID,
+		Address:    "created-after-limit@unlimited.test",
+		Label:      "created after limit",
+		APIKeyHash: []byte("custom-create-after-limit-hash"),
+		Enabled:    true,
+	})
+	if err != nil || !created.Enabled {
+		t.Fatalf("create custom alias after limit = %#v, err=%v", created, err)
+	}
+	if err := db.SetAliasEnabled(ctx, disabled.ID, true); err != nil {
+		t.Fatalf("re-enable custom alias after limit: %v", err)
+	}
+
+	generic, genericIssued, err := db.ImportAliasesWithCredentialsStrict(ctx, account.ID, []domain.AliasImportCandidate{{
+		Address: "generic-after-limit@unlimited.test", Active: true,
+	}})
+	if err != nil || len(generic.Created) != 1 || len(genericIssued) != 1 || !generic.Created[0].Enabled {
+		t.Fatalf("generic strict custom import = %#v, issued=%d, err=%v", generic, len(genericIssued), err)
+	}
+
+	enabled, err := db.ListEnabledAliasesByAccount(ctx, account.ID)
+	wantEnabled := overLimit + 3
+	if err != nil || len(enabled) != wantEnabled {
+		t.Fatalf("enabled custom aliases = %d, err=%v; want %d", len(enabled), err, wantEnabled)
 	}
 }
 

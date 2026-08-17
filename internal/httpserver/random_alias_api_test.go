@@ -158,3 +158,84 @@ func TestAdminAPICreateCustomAccountAndRandomAliases(t *testing.T) {
 		t.Fatalf("stored custom IMAP password preserved=%t err=%v", password == "  imap-secret  ", err)
 	}
 }
+
+func TestAdminAPIRandomAliasesAllowCustomAccountBeyondICloudCapacity(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "unlimited-custom-admin", "unused-password")
+	account, err := env.store.CreateAccount(ctx, domain.Account{
+		Name:               "Unlimited custom mailbox",
+		Email:              "unlimited-custom@identity.invalid",
+		MailboxType:        domain.MailboxTypeCustom,
+		EmailSuffix:        "unlimited.test",
+		IMAPHost:           "imap.unlimited.test",
+		IMAPPort:           993,
+		IMAPUsername:       "reader@unlimited.test",
+		PasswordCiphertext: "encrypted",
+		Enabled:            true,
+	})
+	if err != nil {
+		t.Fatalf("create unlimited custom account: %v", err)
+	}
+
+	tx, err := env.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin capacity fixture: %v", err)
+	}
+	statement, err := tx.PrepareContext(ctx, `
+		INSERT INTO aliases(
+			account_id, address, label, api_key_hash, api_key_prefix, enabled,
+			last_sync_status, last_sync_error, created_at, updated_at
+		) VALUES(?, ?, '', ?, 'capacity', TRUE, 'pending', '', 1, 1)`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("prepare capacity fixture: %v", err)
+	}
+	for index := 0; index < domain.MaxEnabledAliasesPerAccount; index++ {
+		address := fmt.Sprintf("existing-%04d@unlimited.test", index)
+		hash := []byte(fmt.Sprintf("unlimited-capacity-hash-%04d", index))
+		if _, err := statement.ExecContext(ctx, account.ID, address, hash); err != nil {
+			_ = statement.Close()
+			_ = tx.Rollback()
+			t.Fatalf("insert capacity fixture %d: %v", index, err)
+		}
+	}
+	if err := statement.Close(); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("close capacity fixture statement: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit capacity fixture: %v", err)
+	}
+
+	response := env.request(t, http.MethodPost,
+		fmt.Sprintf("/admin/api/v1/accounts/%d/aliases/random", account.ID),
+		adminAPITestJSON(t, map[string]any{"count": 1}),
+		"application/json", []*http.Cookie{sessionCookie}, csrf,
+	)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("random alias beyond iCloud capacity status = %d; body=%s", response.Code, response.Body.String())
+	}
+	aliases, err := env.store.ListAliasesByAccount(ctx, account.ID)
+	if err != nil {
+		t.Fatalf("list custom aliases beyond iCloud capacity: %v", err)
+	}
+	if len(aliases) != domain.MaxEnabledAliasesPerAccount+1 {
+		t.Fatalf("custom alias count = %d, want %d", len(aliases), domain.MaxEnabledAliasesPerAccount+1)
+	}
+}
+
+func TestAdminAPIRandomAliasesRetainPerRequestBatchLimit(t *testing.T) {
+	t.Parallel()
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "random-batch-limit-admin", "unused-password")
+
+	response := env.request(t, http.MethodPost, "/admin/api/v1/accounts/1/aliases/random",
+		adminAPITestJSON(t, map[string]any{"count": randomAliasMaxCount + 1}),
+		"application/json", []*http.Cookie{sessionCookie}, csrf,
+	)
+	if response.Code != http.StatusBadRequest || adminAPITestErrorCode(t, response) != "VALIDATION_FAILED" {
+		t.Fatalf("over-size random alias batch response = %d; body=%s", response.Code, response.Body.String())
+	}
+}

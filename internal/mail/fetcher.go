@@ -151,6 +151,10 @@ func (f *Fetcher) settings() fetchSettings {
 func prepareAliases(account domain.Account, aliases []domain.Alias, maxAliases int) (map[string][]int64, error) {
 	byAddress := make(map[string][]int64)
 	seenIDs := make(map[int64]struct{})
+	// The fixed capacity belongs to the iCloud Hide My Email workflow. Custom
+	// mailboxes deliberately have no cumulative alias limit, so their complete
+	// enabled set must remain routable after it grows beyond that capacity.
+	limitEnabledAliases := domain.NormalizeMailboxType(account.MailboxType) != domain.MailboxTypeCustom
 	for _, alias := range aliases {
 		if !alias.Enabled {
 			continue
@@ -164,7 +168,7 @@ func prepareAliases(account domain.Account, aliases []domain.Alias, maxAliases i
 		if _, exists := seenIDs[alias.ID]; exists {
 			return nil, fmt.Errorf("%w: duplicate ID %d", ErrInvalidAlias, alias.ID)
 		}
-		if len(seenIDs) >= maxAliases {
+		if limitEnabledAliases && maxAliases > 0 && len(seenIDs) >= maxAliases {
 			return nil, ErrTooManyAliases
 		}
 		seenIDs[alias.ID] = struct{}{}

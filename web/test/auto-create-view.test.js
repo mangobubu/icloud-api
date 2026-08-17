@@ -109,6 +109,8 @@ test("account detail exposes the custom random mailbox generator separately", as
   assert.match(source, /8–12 位随机英文数字/);
   assert.match(source, /isCustomMailbox/);
   assert.match(source, /单次最多 1000 个/);
+  assert.match(source, /可多次分批生成/);
+  assert.match(source, /自定义邮箱主号的累计数量不设上限/);
   assert.match(
     source,
     /:disabled="randomAliasLoading \|\| syncLoading \|\| syncActive \|\| !account\.enabled \|\| !account\.emailSuffix"/,

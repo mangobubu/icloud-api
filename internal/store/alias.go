@@ -595,6 +595,14 @@ func (s *Store) updateAliasState(
 }
 
 func (s *Store) requireEnabledAliasCapacity(ctx context.Context, tx *sql.Tx, accountID int64) error {
+	state, err := s.readAccountMailboxStateTx(ctx, tx, accountID)
+	if err != nil {
+		return fmt.Errorf("read account mailbox before alias capacity check: %w", err)
+	}
+	if !mailboxHasEnabledAliasLimit(state.MailboxType) {
+		return nil
+	}
+
 	var count int
 	if err := s.txQueryRowContext(ctx, tx, `
 		SELECT COUNT(*) FROM aliases
@@ -608,6 +616,10 @@ func (s *Store) requireEnabledAliasCapacity(ctx context.Context, tx *sql.Tx, acc
 		return ErrAliasLimit
 	}
 	return nil
+}
+
+func mailboxHasEnabledAliasLimit(mailboxType string) bool {
+	return domain.NormalizeMailboxType(mailboxType) != domain.MailboxTypeCustom
 }
 
 func scanAlias(scanner rowScanner) (domain.Alias, error) {

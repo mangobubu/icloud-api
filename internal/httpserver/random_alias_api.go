@@ -19,9 +19,12 @@ import (
 const (
 	randomAliasMinLength = 8
 	randomAliasMaxLength = 12
-	randomAliasMaxCount  = domain.MaxEnabledAliasesPerAccount
-	randomAliasAlphabet  = "abcdefghijklmnopqrstuvwxyz0123456789"
-	randomAliasAttempts  = 8
+	// Keep one request bounded so credential generation and the no-store
+	// response stay manageable. This is a batch-size limit, not an account
+	// capacity limit: custom mailboxes may call the endpoint repeatedly.
+	randomAliasMaxCount = 1000
+	randomAliasAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	randomAliasAttempts = 8
 )
 
 // adminAPIRandomAliasRequest accepts a few count spellings used by management
@@ -120,22 +123,6 @@ func (s *Server) adminAPICreateRandomAliases(basePath string) gin.HandlerFunc {
 			if domain.NormalizeMailboxType(account.MailboxType) != domain.MailboxTypeCustom {
 				return errRandomAliasRequiresCustomMailbox
 			}
-			// Count confirmation-pending aliases as occupied capacity, matching
-			// the ordinary manual/Apple creation limit.
-			aliases, err := s.store.ListAliasesByAccount(c.Request.Context(), accountID)
-			if err != nil {
-				return err
-			}
-			occupied := 0
-			for _, alias := range aliases {
-				if alias.Enabled || strings.TrimSpace(alias.LastSyncError) == domain.AppleAliasConfirmationPending {
-					occupied++
-				}
-			}
-			if count > domain.MaxEnabledAliasesPerAccount-occupied {
-				return store.ErrAliasLimit
-			}
-
 			suffix := account.EmailSuffix
 			suffix, err = domain.NormalizeEmailSuffix(suffix)
 			if err != nil {
@@ -209,8 +196,6 @@ func (s *Server) adminAPICreateRandomAliases(basePath string) gin.HandlerFunc {
 				writeAdminAPIError(c, http.StatusNotFound, "NOT_FOUND", "主号不存在")
 			case errors.Is(err, store.ErrAccountDisabled):
 				writeAdminAPIError(c, http.StatusConflict, "ACCOUNT_DISABLED", "主号已停用，请先启用主号后再生成邮箱")
-			case errors.Is(err, store.ErrAliasLimit):
-				writeAdminAPIError(c, http.StatusConflict, "ALIAS_LIMIT_REACHED", fmt.Sprintf("此主号最多启用 %d 个隐私邮箱", domain.MaxEnabledAliasesPerAccount))
 			case errors.Is(err, errInvalidRandomAliasSuffix):
 				writeAdminAPIError(c, http.StatusBadRequest, "VALIDATION_FAILED", "邮箱后缀格式不正确")
 			case errors.Is(err, errRandomAliasRequiresCustomMailbox):

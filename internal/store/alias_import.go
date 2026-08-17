@@ -102,11 +102,11 @@ func (s *Store) importAliases(
 	if err != nil {
 		return domain.AliasImportResult{}, nil, fmt.Errorf("lock account for alias import: %w", err)
 	}
+	state, stateErr := s.readAccountMailboxStateTx(ctx, tx, accountID)
+	if stateErr != nil {
+		return domain.AliasImportResult{}, nil, fmt.Errorf("read account mailbox before alias import: %w", stateErr)
+	}
 	if requiredMailboxType != "" {
-		state, stateErr := s.readAccountMailboxStateTx(ctx, tx, accountID)
-		if stateErr != nil {
-			return domain.AliasImportResult{}, nil, fmt.Errorf("read account mailbox before alias import: %w", stateErr)
-		}
 		if state.MailboxType != requiredMailboxType {
 			if requiredMailboxType == domain.MailboxTypeCustom {
 				return domain.AliasImportResult{}, nil, ErrCustomMailboxRequired
@@ -168,16 +168,19 @@ func (s *Store) importAliases(
 		return result, nil, fmt.Errorf("import aliases: %w", ErrAliasOwnershipConflict)
 	}
 
+	limitEnabledAliases := mailboxHasEnabledAliasLimit(state.MailboxType)
 	var enabledCount int
-	if err := s.txQueryRowContext(ctx, tx, `
-		SELECT COUNT(*) FROM aliases
-		WHERE account_id = ?
-		  AND (enabled = TRUE OR (enabled = FALSE AND last_sync_error = ?))`,
-		accountID, domain.AppleAliasConfirmationPending,
-	).Scan(&enabledCount); err != nil {
-		return domain.AliasImportResult{}, nil, fmt.Errorf("count enabled and confirmation-pending aliases before import: %w", err)
+	if limitEnabledAliases {
+		if err := s.txQueryRowContext(ctx, tx, `
+			SELECT COUNT(*) FROM aliases
+			WHERE account_id = ?
+			  AND (enabled = TRUE OR (enabled = FALSE AND last_sync_error = ?))`,
+			accountID, domain.AppleAliasConfirmationPending,
+		).Scan(&enabledCount); err != nil {
+			return domain.AliasImportResult{}, nil, fmt.Errorf("count enabled and confirmation-pending aliases before import: %w", err)
+		}
 	}
-	if strict {
+	if strict && limitEnabledAliases {
 		requestedEnabled := 0
 		for _, candidate := range pending {
 			if candidate.Active {
@@ -195,7 +198,7 @@ func (s *Store) importAliases(
 	}
 	insertions := make([]insertion, 0, len(pending))
 	for _, candidate := range pending {
-		enabled := candidate.Active && enabledCount < domain.MaxEnabledAliasesPerAccount
+		enabled := candidate.Active && (!limitEnabledAliases || enabledCount < domain.MaxEnabledAliasesPerAccount)
 		if enabled {
 			enabledCount++
 		}
