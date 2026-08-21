@@ -368,7 +368,15 @@
                   @click="copyAliasLine(row, ALIAS_EXPORT_IMAP)"
                 >IMAP</el-button>
                 <el-button
-                  v-else-if="isLegacyDirectLinkAvailable(row)"
+                  v-if="isAliasReceiveAvailable(row)"
+                  size="small"
+                  type="primary"
+                  plain
+                  :icon="Message"
+                  @click="openAliasInbox(row)"
+                >收件</el-button>
+                <el-button
+                  v-if="isLegacyDirectLinkAvailable(row)"
                   size="small"
                   :icon="CopyDocument"
                   :loading="Boolean(copyLoading[`${row.id}:legacy-link`])"
@@ -450,7 +458,16 @@
               复制 IMAP 格式
             </el-button>
             <el-button
-              v-else-if="isLegacyDirectLinkAvailable(alias)"
+              v-if="isAliasReceiveAvailable(alias)"
+              type="primary"
+              plain
+              :icon="Message"
+              @click="openAliasInbox(alias)"
+            >
+              收件
+            </el-button>
+            <el-button
+              v-if="isLegacyDirectLinkAvailable(alias)"
               :icon="CopyDocument"
               :loading="Boolean(copyLoading[`${alias.id}:legacy-link`])"
               @click="copyLegacyDirectLink(alias)"
@@ -503,6 +520,7 @@ import {
   Delete,
   EditPen,
   FolderAdd,
+  Message,
   Refresh,
   RefreshLeft,
   Search,
@@ -537,6 +555,7 @@ import {
 import {
   ALIAS_EXPORT_IMAP,
   ALIAS_EXPORT_OTP,
+  buildAliasReceiveLink,
   buildAliasExportText,
 } from "../utils/aliasExport.js";
 import { buildRecentMailDirectLink, copyText } from "../utils/clipboard.js";
@@ -561,7 +580,7 @@ const aliasColumns = [
   { key: "lastAccessedAt", title: "最近调用", width: 150, flexGrow: 1 },
   { key: "latestReceivedAt", title: "最新邮件", width: 150, flexGrow: 1 },
   { key: "status", title: "状态", width: 134, flexGrow: 1 },
-  { key: "actions", title: "复制 / 管理", width: 260, align: "right", fixed: "right" },
+  { key: "actions", title: "复制 / 收件 / 管理", width: 320, align: "right", fixed: "right" },
 ];
 const aliases = ref([]);
 const accounts = ref([]);
@@ -671,6 +690,13 @@ function isLegacyDirectLinkAvailable(alias) {
     !isAliasConfirmationPending(alias) &&
       alias?.credentialMode === "legacy" &&
       alias?.directLinkPath,
+  );
+}
+
+function isAliasReceiveAvailable(alias) {
+  return Boolean(
+    !isAliasConfirmationPending(alias) &&
+      (alias?.otpUrlPath || alias?.directLinkPath || alias?.legacyDirectLinkPath),
   );
 }
 
@@ -1022,6 +1048,24 @@ async function copyLegacyDirectLink(alias) {
   } finally {
     delete copyLoading[lockKey];
     copyLock.release(lockKey);
+  }
+}
+
+function openAliasInbox(alias) {
+  if (!isAliasReceiveAvailable(alias)) return;
+  try {
+    const openedWindow = window.open(
+      buildAliasReceiveLink(alias),
+      "_blank",
+      "noopener,noreferrer",
+    );
+    if (openedWindow) openedWindow.opener = null;
+  } catch {
+    ElMessage({
+      type: "error",
+      message: "取码链接打开失败，请刷新页面后重试。",
+      grouping: true,
+    });
   }
 }
 

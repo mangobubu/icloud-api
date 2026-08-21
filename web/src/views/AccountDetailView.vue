@@ -119,7 +119,7 @@
       </el-dialog>
 
       <RequestAlert
-        v-if="loadError"
+        v-if="loadError && aliases.length"
         :error="loadError"
         closable
         @close="loadError = null"
@@ -365,8 +365,29 @@
         </div>
 
         <div
+          v-if="loading && aliases.length === 0"
+          class="data-panel loading-panel"
+        >
+          <el-skeleton :rows="6" animated />
+        </div>
+
+        <div
+          v-if="!loading && loadError && aliases.length === 0"
+          class="load-failed"
+        >
+          <RequestAlert :error="loadError" />
+          <el-button :icon="Refresh" @click="loadDetail">
+            重新加载邮箱列表
+          </el-button>
+        </div>
+
+        <div
           v-if="aliases.length"
           class="data-panel desktop-data-table account-alias-table"
+          :class="{
+            'desktop-data-table--force': pageSize > 100 || pageSize === ALL_PAGE_SIZE,
+          }"
+          :aria-busy="loading"
         >
           <VirtualDataTable
             :columns="aliasColumns"
@@ -484,7 +505,11 @@
           </VirtualDataTable>
         </div>
 
-        <div v-if="aliases.length" class="mobile-record-list">
+        <div
+          v-if="aliases.length && pageSize > ALL_PAGE_SIZE && pageSize <= 100"
+          class="mobile-record-list"
+          :aria-busy="loading"
+        >
           <article v-for="alias in aliases" :key="alias.id" class="mobile-record">
             <header class="mobile-record__header">
               <div class="primary-stack">
@@ -593,13 +618,23 @@
         </div>
 
         <EmptyState
-          v-else
+          v-if="!loading && !loadError && aliases.length === 0"
           class="empty-state--compact"
           level="h3"
           :title="isCustomMailbox ? '尚未生成邮箱' : '尚未登记隐私邮箱'"
           :description="isCustomMailbox
             ? '输入生成数量批量创建，或在下方手动登记一个邮箱地址。'
             : '添加一个已经转发到此主号的 Hide My Email 地址。'"
+          />
+
+        <ListPagination
+          :page="currentPage"
+          :page-size="pageSize"
+          :total="total"
+          :loading="loading"
+          aria-label="主号隐私邮箱列表分页"
+          @change="handlePageChange"
+          @size-change="handlePageSizeChange"
         />
 
         <el-form
@@ -699,6 +734,7 @@ import {
   deleteAlias,
   deleteAppleSession,
   getAccount,
+  getAllAliases,
   getMailGroups,
   loginAppleSession,
   moveAliasToGroup as moveAliasToGroupRequest,
@@ -710,6 +746,7 @@ import {
   verifyAppleSession,
 } from "../api/admin.js";
 import EmptyState from "../components/EmptyState.vue";
+import ListPagination from "../components/ListPagination.vue";
 import RequestAlert from "../components/RequestAlert.vue";
 import SectionHeader from "../components/SectionHeader.vue";
 import SyncErrorLogDialog from "../components/SyncErrorLogDialog.vue";
@@ -735,12 +772,20 @@ import {
 import { formatTime } from "../utils/format.js";
 import { formatIMAPEndpoint } from "../utils/imap.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
+import {
+  ALL_PAGE_SIZE,
+  DEFAULT_PAGE_SIZE,
+  normalizePageSize,
+} from "../utils/pagination.js";
 
 const route = useRoute();
 const router = useRouter();
 const auth = useAuth();
 const account = ref(null);
 const aliases = ref([]);
+const currentPage = ref(1);
+const pageSize = ref(DEFAULT_PAGE_SIZE);
+const total = ref(0);
 const groups = ref([]);
 const groupsLoading = ref(false);
 const groupsError = ref(null);
@@ -779,6 +824,7 @@ const accountDeleteLock = createActionLock();
 const appleDisconnectLock = createActionLock();
 const autoCreationLock = createActionLock();
 const randomAliasLock = createActionLock();
+let detailAbortController = null;
 let viewActive = true;
 let resumeAliasSyncAfterAuth = false;
 let resumeAutoCreationAfterAuth = false;
@@ -1082,11 +1128,12 @@ const aliasRules = {
   label: [{ validator: validateAliasLabel, trigger: "blur" }],
 };
 
-function syncAccountAliasCount() {
-  if (!account.value) return;
-  const count = Array.isArray(aliases.value) ? aliases.value.length : 0;
-  if (account.value.aliasCount === count) return;
-  account.value = { ...account.value, aliasCount: count };
+function detailRequestKey(
+  accountId = detailRouteKey(),
+  page = currentPage.value,
+  selectedPageSize = pageSize.value,
+) {
+  return `${accountId}\u0000${page}\u0000${selectedPageSize}`;
 }
 
 function replaceAlias(updated) {
@@ -1114,6 +1161,8 @@ function detailMutationPending() {
 
 function beginDetailMutation() {
   detailGate.invalidate();
+  detailAbortController?.abort();
+  loading.value = false;
 }
 
 async function loadMailGroups({ silent = false } = {}) {
@@ -1145,21 +1194,69 @@ async function loadDetail({ silent = false } = {}) {
     silent &&
     (loading.value || detailMutationPending())
   ) {
-    return;
+    return false;
   }
   const accountId = detailRouteKey();
-  const ticket = detailGate.begin(accountId);
+  const page = currentPage.value;
+  const selectedPageSize = pageSize.value;
+  const requestKey = detailRequestKey(accountId, page, selectedPageSize);
+  const ticket = detailGate.begin(requestKey);
+  detailAbortController?.abort();
+  const abortController = new AbortController();
+  detailAbortController = abortController;
   if (!silent) {
     loading.value = true;
     loadError.value = null;
   }
   try {
-    const detail = await getAccount(accountId);
-    if (!detailGate.isCurrent(ticket, detailRouteKey())) return;
-    account.value = detail.account;
-    aliases.value = detail.aliases;
+    let detail;
+    let nextAliases;
+    if (selectedPageSize === ALL_PAGE_SIZE) {
+      [detail, nextAliases] = await Promise.all([
+        getAccount(accountId, {
+          limit: DEFAULT_PAGE_SIZE,
+          offset: 0,
+          signal: abortController.signal,
+        }),
+        getAllAliases(accountId, { signal: abortController.signal }),
+      ]);
+    } else {
+      detail = await getAccount(accountId, {
+        limit: selectedPageSize,
+        offset: (page - 1) * selectedPageSize,
+        signal: abortController.signal,
+      });
+      nextAliases = Array.isArray(detail?.aliases) ? detail.aliases : [];
+    }
+    if (
+      !viewActive ||
+      !detailGate.isCurrent(ticket, detailRequestKey())
+    ) {
+      return false;
+    }
+    const allItems = selectedPageSize === ALL_PAGE_SIZE;
+    const reportedTotal = Number(detail?.pagination?.total);
+    const resolvedTotal = allItems
+      ? nextAliases.length
+      : Number.isFinite(reportedTotal) && reportedTotal >= 0
+        ? Math.trunc(reportedTotal)
+        : Math.max(Number(detail?.account?.aliasCount) || 0, nextAliases.length);
+    const lastPage = allItems
+      ? 1
+      : Math.max(1, Math.ceil(resolvedTotal / selectedPageSize));
+    if (!allItems && page > lastPage) {
+      currentPage.value = lastPage;
+      aliases.value = [];
+      total.value = resolvedTotal;
+      loadError.value = null;
+      return await loadDetail({ silent });
+    }
+    account.value = allItems
+      ? { ...detail.account, aliasCount: resolvedTotal }
+      : detail.account;
+    aliases.value = nextAliases;
+    total.value = resolvedTotal;
     void loadMailGroups({ silent });
-    syncAccountAliasCount();
     appleSession.value = detail.appleSession;
     autoCreation.value = detail.autoCreation || null;
     loadError.value = null;
@@ -1169,14 +1266,53 @@ async function loadDetail({ silent = false } = {}) {
         : detail.account.email,
       "管理 IMAP 连接、同步状态和所属隐私邮箱",
     );
+    return true;
   } catch (error) {
-    if (silent || !detailGate.isCurrent(ticket, detailRouteKey())) return;
+    abortController.abort();
+    if (
+      error?.name === "AbortError" ||
+      silent ||
+      !detailGate.isCurrent(ticket, detailRequestKey())
+    ) {
+      return false;
+    }
     loadError.value = error;
+    return false;
   } finally {
-    if (!silent && detailGate.isCurrent(ticket, detailRouteKey())) {
+    if (
+      !silent &&
+      detailAbortController === abortController &&
+      detailGate.isCurrent(ticket, detailRequestKey())
+    ) {
       loading.value = false;
     }
+    if (detailAbortController === abortController) {
+      detailAbortController = null;
+    }
   }
+}
+
+function handlePageChange(page) {
+  if (pageSize.value === ALL_PAGE_SIZE) return;
+  const nextPage = Math.max(1, Number(page) || 1);
+  if (nextPage === currentPage.value) return;
+  currentPage.value = nextPage;
+  aliases.value = [];
+  loadError.value = null;
+  void loadDetail();
+}
+
+function handlePageSizeChange(value) {
+  const nextPageSize = normalizePageSize(value);
+  if (nextPageSize === pageSize.value) return;
+  pageSize.value = nextPageSize;
+  currentPage.value = 1;
+  aliases.value = [];
+  total.value = 0;
+  loadError.value = null;
+  detailGate.invalidate();
+  detailAbortController?.abort();
+  void loadDetail();
 }
 
 const liveRefresh = createLiveRefresh(() => loadDetail({ silent: true }));
@@ -1190,11 +1326,11 @@ async function syncNow() {
     const detail = await syncAccount(accountId, auth.state.csrfToken);
     if (!isCurrentAccount(accountId)) return;
     account.value = detail.account;
-    aliases.value = detail.aliases;
-    syncAccountAliasCount();
     if (detail.autoCreation) {
       autoCreation.value = detail.autoCreation;
     }
+    await loadDetail();
+    if (!isCurrentAccount(accountId)) return;
     if (detail.syncPending) {
       ElMessage({ type: "warning", message: "同步已在后台处理。" });
     } else {
@@ -1468,13 +1604,20 @@ async function performAliasesSync() {
     const result = await syncAccountAliases(accountId, auth.state.csrfToken);
     if (!isCurrentAccount(accountId)) return;
     account.value = result.account;
-    aliases.value = result.aliases;
-    syncAccountAliasCount();
     appleSession.value = result.appleSession || appleSession.value;
     if (result.autoCreation) {
       autoCreation.value = result.autoCreation;
     }
     aliasSyncSummary.value = result.summary;
+    const detailLoaded = await loadDetail();
+    if (!isCurrentAccount(accountId)) return;
+    if (!detailLoaded) {
+      ElMessage({
+        type: "warning",
+        message: "隐私邮箱同步已完成，但邮箱列表刷新失败，请重新加载邮箱列表。",
+      });
+      return;
+    }
     const capacityNotice = result.summary.importedDisabledCount
       ? `，其中 ${result.summary.importedDisabledCount} 个因本地容量暂未启用`
       : "";
@@ -1549,7 +1692,7 @@ async function addAlias() {
     const valid = await aliasFormRef.value?.validate().catch(() => false);
     if (!valid || !isCurrentAccount(accountId)) return;
 
-    const result = await createAlias(
+    await createAlias(
       accountId,
       {
         address: aliasForm.address.trim(),
@@ -1558,11 +1701,8 @@ async function addAlias() {
       auth.state.csrfToken,
     );
     if (!isCurrentAccount(accountId)) return;
-    aliases.value = [...aliases.value, result.alias].sort(
-      (left, right) =>
-        left.address.localeCompare(right.address) || left.id - right.id,
-    );
-    syncAccountAliasCount();
+    await loadDetail();
+    if (!isCurrentAccount(accountId)) return;
     Object.assign(aliasForm, { address: "", label: "" });
     aliasFormRef.value?.resetFields();
     successMessage("隐私邮箱已添加，整套凭证已签发，可通过列表中的复制操作导出。");
@@ -1605,17 +1745,13 @@ async function generateRandomAliases() {
       auth.state.csrfToken,
     );
     if (!isCurrentAccount(accountId)) return;
-    const generated = (result.created || [])
-      .map((item) => item?.alias)
-      .filter((item) => item && item.id);
-    const mergedByID = new Map(aliases.value.map((item) => [item.id, item]));
-    for (const item of generated) mergedByID.set(item.id, item);
-    aliases.value = [...mergedByID.values()].sort(
-      (left, right) =>
-        left.address.localeCompare(right.address) || left.id - right.id,
+    const generatedCount = Math.max(
+      0,
+      Number(result.count) || (Array.isArray(result.created) ? result.created.length : 0),
     );
-    syncAccountAliasCount();
-    successMessage(`已生成 ${generated.length} 个随机邮箱，可通过列表中的复制操作导出完整凭证。`);
+    await loadDetail();
+    if (!isCurrentAccount(accountId)) return;
+    successMessage(`已生成 ${generatedCount} 个随机邮箱，可通过列表中的复制操作导出完整凭证。`);
   } catch (error) {
     if (!isCurrentAccount(accountId)) return;
     randomAliasError.value = error;
@@ -1850,8 +1986,8 @@ async function removeAlias(alias) {
     if (!isCurrentAccount(accountId)) return;
     await deleteAlias(alias.id, auth.state.csrfToken);
     if (!isCurrentAccount(accountId)) return;
-    aliases.value = aliases.value.filter((item) => item.id !== alias.id);
-    syncAccountAliasCount();
+    await loadDetail();
+    if (!isCurrentAccount(accountId)) return;
     successMessage(
       customMailbox
         ? "邮箱已从本地永久删除。"
@@ -1921,10 +2057,13 @@ watch(
   (id, previousId) => {
     if (id && id !== previousId) {
       detailGate.invalidate();
+      detailAbortController?.abort();
       loading.value = false;
       cancelAppleAuth();
       account.value = null;
       aliases.value = [];
+      currentPage.value = 1;
+      total.value = 0;
       appleSession.value = null;
       autoCreation.value = null;
       aliasSyncSummary.value = null;
@@ -1944,6 +2083,7 @@ onBeforeUnmount(() => {
   viewActive = false;
   liveRefresh.stop();
   detailGate.deactivate();
+  detailAbortController?.abort();
   groupsLoadGate.deactivate();
   autoCreation.value = null;
   randomAliasError.value = null;

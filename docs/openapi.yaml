@@ -386,14 +386,34 @@ paths:
         - Admin Accounts
       operationId: getAdminAccount
       summary: 获取主号详情
-      description: 返回主号、所属隐私邮箱、Apple 会话状态和自动创建计划。
+      description: |
+        返回主号、所属隐私邮箱、Apple 会话状态和自动创建计划。`aliases` 只包含当前数据库
+        分页；`pagination.total` 是该主号的隐私邮箱总数，`has_more` 表示当前页之后是否还有结果。
       security:
         - adminSession: []
       parameters:
         - $ref: "#/components/parameters/AdminAccountID"
+        - name: limit
+          in: query
+          required: false
+          description: 本页最多返回的该主号隐私邮箱数。
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          description: 在该主号的隐私邮箱列表中跳过的邮箱数。
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000000
+            default: 0
       responses:
         "200":
-          description: 主号详情
+          description: 主号详情及所属隐私邮箱的当前数据库分页
           headers:
             X-Request-ID:
               $ref: "#/components/headers/RequestID"
@@ -403,6 +423,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AdminAccountDetailResponse"
+        "400":
+          description: limit 或 offset 参数无效
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+            Cache-Control:
+              $ref: "#/components/headers/AdminNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAppleErrorResponse"
+              example:
+                error:
+                  code: VALIDATION_FAILED
+                  message: limit 参数无效
+                  request_id: 6oe7j0x3x3pJv9Dv
         "401":
           $ref: "#/components/responses/AdminAuthUnauthorized"
         "404":
@@ -1408,9 +1444,15 @@ components:
     AdminAccountDetail:
       type: object
       additionalProperties: false
+      description: |
+        `aliases` 与 `pagination` 组成该主号隐私邮箱的一个数据库分页。GET 主号详情使用请求的
+        `limit` 和 `offset`；手动邮件同步及 Apple 隐私邮箱同步响应中嵌入的详情默认只返回
+        前 20 条（limit=20、offset=0）。Apple 同步本次新建的邮箱仍由响应的 `created` 字段单独返回；
+        若同步成功后详情刷新失败，响应还会返回 `detail_stale: true`，表示详情分页是同步前快照。
       required:
         - account
         - aliases
+        - pagination
         - apple_session
         - auto_creation
       properties:
@@ -1418,8 +1460,12 @@ components:
           $ref: "#/components/schemas/AdminAccount"
         aliases:
           type: array
+          description: 该主号在当前数据库分页中的隐私邮箱；不是全量列表。
+          maxItems: 1000
           items:
             $ref: "#/components/schemas/AdminAlias"
+        pagination:
+          $ref: "#/components/schemas/AdminAccountAliasPagination"
         apple_session:
           description: |
             该主号的 Apple Web 会话状态。正常启用目录同步服务时返回对象；
@@ -1461,6 +1507,33 @@ components:
         has_more:
           type: boolean
           description: 当前页之后是否仍有可返回的主号。
+
+    AdminAccountAliasPagination:
+      type: object
+      additionalProperties: false
+      required:
+        - limit
+        - offset
+        - total
+        - has_more
+      properties:
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: 当前详情中 aliases 的每页上限。
+        offset:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: 当前详情中跳过的该主号隐私邮箱数。
+        total:
+          type: integer
+          minimum: 0
+          description: 该主号在数据库中的隐私邮箱总数，不受当前 limit 和 offset 影响。
+        has_more:
+          type: boolean
+          description: 当前页之后是否仍有该主号的隐私邮箱可返回。
 
     AdminSyncProgress:
       type: object

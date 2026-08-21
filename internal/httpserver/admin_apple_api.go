@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -70,8 +69,9 @@ type adminAPIAppleCreatedAliasDTO struct {
 
 type adminAPIAppleSyncResultDTO struct {
 	adminAPIAccountDetailDTO
-	Summary adminAPIAppleSyncSummaryDTO    `json:"summary"`
-	Created []adminAPIAppleCreatedAliasDTO `json:"created"`
+	Summary     adminAPIAppleSyncSummaryDTO    `json:"summary"`
+	Created     []adminAPIAppleCreatedAliasDTO `json:"created"`
+	DetailStale bool                           `json:"detail_stale,omitempty"`
 }
 
 func (s *Server) adminAPIStartAppleAuth(c *gin.Context) {
@@ -204,16 +204,16 @@ func (s *Server) adminAPISyncAppleAliases(c *gin.Context) {
 		s.writeAdminAPIInternalError(c, err)
 		return
 	}
+	detailStale := false
 	if refreshed, refreshErr := s.adminAPIAccountDetail(c.Request.Context(), accountID); refreshErr == nil {
 		detail = refreshed
 	} else {
+		detailStale = true
 		s.logger.Warn("Apple 隐私邮箱同步成功后刷新账户详情失败，使用同步前快照",
 			"request_id", requestID(c),
 		)
 	}
-	detail.Aliases = adminAPIMergeCreatedAliases(detail.Aliases, created)
 	detail.AppleSession = adminAPIAppleSessionFromInfo(result.Session)
-	detail.Account.AliasCount = len(detail.Aliases)
 	summary := adminAPIAppleSyncSummary(result.Summary)
 	auditDetail := "total=" + strconv.Itoa(summary.Total) +
 		" created=" + strconv.Itoa(summary.CreatedCount) +
@@ -226,6 +226,7 @@ func (s *Server) adminAPISyncAppleAliases(c *gin.Context) {
 		adminAPIAccountDetailDTO: detail,
 		Summary:                  summary,
 		Created:                  created,
+		DetailStale:              detailStale,
 	})
 }
 
@@ -335,58 +336,6 @@ func (s *Server) adminAPIAppleCreatedAliases(created []hmesync.CreatedAlias) ([]
 		})
 	}
 	return result, nil
-}
-
-func adminAPIMergeCreatedAliases(existing []adminAPIAliasDTO, created []adminAPIAppleCreatedAliasDTO) []adminAPIAliasDTO {
-	createdIDs := make(map[int64]struct{}, len(created))
-	createdAddresses := make(map[string]struct{}, len(created))
-	for _, item := range created {
-		createdIDs[item.Alias.ID] = struct{}{}
-		createdAddresses[domain.NormalizeEmail(item.Alias.Address)] = struct{}{}
-	}
-
-	result := make([]adminAPIAliasDTO, 0, len(existing)+len(created))
-	seenIDs := make(map[int64]struct{}, len(existing)+len(created))
-	seenAddresses := make(map[string]struct{}, len(existing)+len(created))
-	for _, alias := range existing {
-		address := domain.NormalizeEmail(alias.Address)
-		if _, replaced := createdIDs[alias.ID]; replaced {
-			continue
-		}
-		if _, replaced := createdAddresses[address]; replaced {
-			continue
-		}
-		if _, duplicate := seenIDs[alias.ID]; duplicate {
-			continue
-		}
-		if _, duplicate := seenAddresses[address]; duplicate {
-			continue
-		}
-		seenIDs[alias.ID] = struct{}{}
-		seenAddresses[address] = struct{}{}
-		result = append(result, alias)
-	}
-	for _, item := range created {
-		address := domain.NormalizeEmail(item.Alias.Address)
-		if _, duplicate := seenIDs[item.Alias.ID]; duplicate {
-			continue
-		}
-		if _, duplicate := seenAddresses[address]; duplicate {
-			continue
-		}
-		seenIDs[item.Alias.ID] = struct{}{}
-		seenAddresses[address] = struct{}{}
-		result = append(result, item.Alias)
-	}
-	sort.SliceStable(result, func(left, right int) bool {
-		leftAddress := domain.NormalizeEmail(result[left].Address)
-		rightAddress := domain.NormalizeEmail(result[right].Address)
-		if leftAddress == rightAddress {
-			return result[left].ID < result[right].ID
-		}
-		return leftAddress < rightAddress
-	})
-	return result
 }
 
 type adminAPIAppleError struct {

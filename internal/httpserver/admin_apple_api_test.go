@@ -612,34 +612,8 @@ func TestAdminAPIAppleSyncKeepsCredentialBundleWhenDetailRefreshFails(t *testing
 	path := fmt.Sprintf("/admin/api/v1/accounts/%d/aliases/sync", account.ID)
 	response := env.request(t, http.MethodPost, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"api_key":"icm_`) ||
-		!strings.Contains(response.Body.String(), `"alias_count":1`) {
+		!strings.Contains(response.Body.String(), `"detail_stale":true`) {
 		t.Fatalf("refresh fallback sync response = %d; body=%s", response.Code, response.Body.String())
-	}
-}
-
-func TestAdminAPIMergeCreatedAliasesDeduplicatesNormalizedAddress(t *testing.T) {
-	existing := []adminAPIAliasDTO{
-		{ID: 10, Address: " SAME@PrivateRelay.AppleID.com "},
-		{ID: 11, Address: "other@privaterelay.appleid.com"},
-		{ID: 12, Address: "OTHER@privaterelay.appleid.com"},
-	}
-	created := []adminAPIAppleCreatedAliasDTO{
-		{Alias: adminAPIAliasDTO{ID: 20, Address: "same@privaterelay.appleid.com"}},
-	}
-
-	merged := adminAPIMergeCreatedAliases(existing, created)
-	if len(merged) != 2 {
-		t.Fatalf("merged aliases = %#v, want two normalized addresses", merged)
-	}
-	byAddress := make(map[string]adminAPIAliasDTO, len(merged))
-	for _, alias := range merged {
-		byAddress[domain.NormalizeEmail(alias.Address)] = alias
-	}
-	if same := byAddress["same@privaterelay.appleid.com"]; same.ID != 20 {
-		t.Fatalf("normalized duplicate kept alias ID %d, want created ID 20", same.ID)
-	}
-	if other := byAddress["other@privaterelay.appleid.com"]; other.ID != 11 {
-		t.Fatalf("existing normalized duplicate kept alias ID %d, want first ID 11", other.ID)
 	}
 }
 

@@ -39,43 +39,43 @@ test("automatic creation panel displays the current alias count", async () => {
   );
 });
 
-test("directory synchronization publishes the authoritative credential-bearing alias list", async () => {
+test("directory synchronization refreshes the current server-backed alias page", async () => {
   const source = await readFile(viewPath, "utf8");
   const syncBody = functionBody(source, "async function performAliasesSync");
 
   assert.match(syncBody, /const result = await syncAccountAliases/);
-  assert.match(syncBody, /aliases\.value = result\.aliases/);
-  assert.match(syncBody, /syncAccountAliasCount\(\)/);
+  assert.match(syncBody, /const detailLoaded = await loadDetail\(\)/);
+  assert.match(syncBody, /if \(!detailLoaded\)/);
+  assert.match(syncBody, /邮箱列表刷新失败/);
+  assert.doesNotMatch(syncBody, /aliases\.value = result\.aliases/);
   assert.match(syncBody, /可通过列表中的复制操作导出完整凭证/);
   assert.doesNotMatch(syncBody, /pending|acknowledge|oneTime|batchSecrets/i);
 });
 
-test("alias count synchronizer derives the value from the visible list", async () => {
+test("account alias count is never derived from the visible page length", async () => {
   const source = await readFile(viewPath, "utf8");
-  const body = functionBody(source, "function syncAccountAliasCount");
-  const account = { value: { id: 12, aliasCount: 99 } };
-  const aliases = { value: [{ id: 1 }, { id: 2 }, { id: 3 }] };
-  const sync = Function(
-    "account",
-    "aliases",
-    `"use strict"; return function () ${body}`,
-  )(account, aliases);
 
-  sync();
-  assert.equal(account.value.aliasCount, 3);
-  aliases.value = [];
-  sync();
-  assert.equal(account.value.aliasCount, 0);
+  assert.doesNotMatch(source, /function syncAccountAliasCount/);
+  assert.doesNotMatch(source, /aliasCount:\s*(?:aliases|nextAliases)\.length/);
+  assert.doesNotMatch(source, /account\.value\.aliasCount\s*=/);
+  assert.match(source, /detail\?\.pagination\?\.total/);
+  assert.match(source, /\{\{ account\.aliasCount \}\}/);
 });
 
-test("successful alias creation and deletion update the displayed alias count", async () => {
+test("alias creation, random generation, and deletion refresh the current page", async () => {
   const source = await readFile(viewPath, "utf8");
   const addAlias = functionBody(source, "async function addAlias");
+  const generateRandomAliases = functionBody(
+    source,
+    "async function generateRandomAliases",
+  );
   const removeAlias = functionBody(source, "async function removeAlias");
 
-  assert.match(addAlias, /aliases\.value = \[\.\.\.aliases\.value, result\.alias\]\.sort/);
-  assert.match(addAlias, /syncAccountAliasCount\(\)/);
+  assert.match(addAlias, /await loadDetail\(\)/);
+  assert.doesNotMatch(addAlias, /aliases\.value\s*=/);
   assert.match(addAlias, /整套凭证已签发，可通过列表中的复制操作导出/);
-  assert.match(removeAlias, /aliases\.value\s*=\s*aliases\.value\.filter/);
-  assert.match(removeAlias, /syncAccountAliasCount\(\)/);
+  assert.match(generateRandomAliases, /await loadDetail\(\)/);
+  assert.doesNotMatch(generateRandomAliases, /mergedByID|aliases\.value\s*=/);
+  assert.match(removeAlias, /await loadDetail\(\)/);
+  assert.doesNotMatch(removeAlias, /aliases\.value\s*=\s*aliases\.value\.filter/);
 });

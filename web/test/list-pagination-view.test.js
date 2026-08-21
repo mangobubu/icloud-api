@@ -119,6 +119,44 @@ test("alias paging resets on filters and supports full batched display/export", 
   assert.match(source, /@size-change="handlePageSizeChange"/);
 });
 
+test("account detail aliases use the shared server-backed pagination contract", async () => {
+  const source = await readFile(accountDetailPath, "utf8");
+
+  assert.match(source, /pageSize\s*=\s*ref\(DEFAULT_PAGE_SIZE\)/);
+  assert.match(source, /currentPage\s*=\s*ref\(1\)/);
+  assert.match(source, /total\s*=\s*ref\(0\)/);
+  assert.match(
+    source,
+    /getAccount\(accountId,\s*\{[\s\S]{0,180}limit:\s*selectedPageSize,[\s\S]{0,120}offset:\s*\(page - 1\) \* selectedPageSize/,
+  );
+  assert.match(source, /getAllAliases\(accountId,\s*\{\s*signal:/);
+  assert.match(source, /detail\?\.pagination\?\.total/);
+  assert.match(source, /if \(!allItems && page > lastPage\)/);
+  assert.match(source, /currentPage\.value = lastPage/);
+  assert.match(source, /return await loadDetail\(\{ silent \}\)/);
+  assert.match(source, /detailAbortController\?\.abort\(\)/);
+  assert.match(source, /detailGate\.isCurrent\(ticket, detailRequestKey\(\)\)/);
+  assert.match(source, /<ListPagination/);
+  assert.match(source, /:page="currentPage"/);
+  assert.match(source, /:page-size="pageSize"/);
+  assert.match(source, /:total="total"/);
+  assert.match(source, /@change="handlePageChange"/);
+  assert.match(source, /@size-change="handlePageSizeChange"/);
+  assert.match(
+    source,
+    /v-if="aliases\.length && pageSize > ALL_PAGE_SIZE && pageSize <= 100"/,
+  );
+  assert.match(
+    source,
+    /v-if="!loading && loadError && aliases\.length === 0"[\s\S]{0,220}重新加载邮箱列表/,
+  );
+  assert.match(source, /v-if="!loading && !loadError && aliases\.length === 0"/);
+  assert.match(
+    source,
+    /'desktop-data-table--force': pageSize > 100 \|\| pageSize === ALL_PAGE_SIZE/,
+  );
+});
+
 test("mail group refreshes clear loading state and remain available on mobile", async () => {
   const [aliases, accountDetail] = await Promise.all([
     readFile(aliasesPath, "utf8"),

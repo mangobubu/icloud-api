@@ -173,6 +173,7 @@ type adminAPIAuditLogDTO struct {
 type adminAPIAccountDetailDTO struct {
 	Account      adminAPIAccountDTO       `json:"account"`
 	Aliases      []adminAPIAliasDTO       `json:"aliases"`
+	Pagination   gin.H                    `json:"pagination"`
 	AppleSession *adminAPIAppleSessionDTO `json:"apple_session"`
 	AutoCreation *adminAPIAutoCreationDTO `json:"auto_creation"`
 	SyncPending  bool                     `json:"sync_pending,omitempty"`
@@ -907,7 +908,11 @@ func (s *Server) adminAPIGetAccount(c *gin.Context) {
 	if !ok {
 		return
 	}
-	detail, err := s.adminAPIAccountDetail(c.Request.Context(), id)
+	limit, offset, ok := adminAPIListPage(c)
+	if !ok {
+		return
+	}
+	detail, err := s.adminAPIAccountDetailPage(c.Request.Context(), id, limit, offset)
 	if err != nil {
 		s.writeAdminAPIStoreReadError(c, err)
 		return
@@ -1217,15 +1222,28 @@ func (s *Server) adminAPISyncAccount(c *gin.Context) {
 }
 
 func (s *Server) adminAPIAccountDetail(ctx context.Context, id int64) (adminAPIAccountDetailDTO, error) {
+	return s.adminAPIAccountDetailPage(ctx, id, adminAPIDefaultPageLimit, 0)
+}
+
+func (s *Server) adminAPIAccountDetailPage(
+	ctx context.Context,
+	id int64,
+	limit int,
+	offset int,
+) (adminAPIAccountDetailDTO, error) {
 	account, err := s.store.GetAccount(ctx, id)
 	if err != nil {
 		return adminAPIAccountDetailDTO{}, err
 	}
-	aliases, err := s.store.ListAliasesByAccount(ctx, id)
+	page, err := s.store.ListAliasesPage(ctx, store.AliasListFilter{
+		AccountID: &id,
+		Limit:     limit,
+		Offset:    offset,
+	})
 	if err != nil {
 		return adminAPIAccountDetailDTO{}, err
 	}
-	aliasDTOs, err := s.adminAPIAliasesFromDomain(aliases)
+	aliasDTOs, err := s.adminAPIAliasesFromDomain(page.Items)
 	if err != nil {
 		return adminAPIAccountDetailDTO{}, err
 	}
@@ -1237,9 +1255,12 @@ func (s *Server) adminAPIAccountDetail(ctx context.Context, id int64) (adminAPIA
 	if err != nil {
 		return adminAPIAccountDetailDTO{}, err
 	}
+	accountDTO := s.adminAPIAccountFromDomain(account)
+	accountDTO.AliasCount = page.Total
 	return adminAPIAccountDetailDTO{
-		Account:      s.adminAPIAccountFromDomain(account),
+		Account:      accountDTO,
 		Aliases:      aliasDTOs,
+		Pagination:   adminAPIPagination(limit, offset, page.Total),
 		AppleSession: appleSession,
 		AutoCreation: autoCreation,
 	}, nil

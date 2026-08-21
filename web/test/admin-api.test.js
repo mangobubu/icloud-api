@@ -184,6 +184,44 @@ test("account detail accepts camelCase progress and falls back to the sync error
   assert.equal(detail.account.lastSyncErrorLog, "连接被远端关闭");
 });
 
+test("account detail sends bounded alias pagination and normalizes page metadata", async () => {
+  let request;
+  const controller = new AbortController();
+  globalThis.fetch = async (url, options) => {
+    request = { url: new URL(url, "https://admin.invalid"), options };
+    return jsonResponse({
+      account: {
+        id: 12,
+        email: "owner@icloud.com",
+        alias_count: 137,
+      },
+      aliases: [{ id: 81, address: "page@icloud.com" }],
+      pagination: { total: 137, limit: 50, offset: 100, has_more: true },
+    });
+  };
+
+  const detail = await getAccount(12, {
+    limit: 50,
+    offset: 100,
+    signal: controller.signal,
+  });
+
+  assert.equal(request.url.pathname, "/admin/api/v1/accounts/12");
+  assert.deepEqual(Object.fromEntries(request.url.searchParams), {
+    limit: "50",
+    offset: "100",
+  });
+  assert.equal(request.options.signal, controller.signal);
+  assert.equal(detail.account.aliasCount, 137);
+  assert.deepEqual(detail.aliases.map((alias) => alias.id), [81]);
+  assert.deepEqual(detail.pagination, {
+    total: 137,
+    limit: 50,
+    offset: 100,
+    hasMore: true,
+  });
+});
+
 test("mail sync accepts PascalCase progress and normalizes percentage bounds", async () => {
   const progressCases = [
     {
@@ -216,6 +254,7 @@ test("mail sync accepts PascalCase progress and normalizes percentage bounds", a
           },
         },
         aliases: [],
+        pagination: { total: 41, limit: 20, offset: 20, has_more: true },
         SyncPending: true,
       },
       202,
@@ -230,6 +269,12 @@ test("mail sync accepts PascalCase progress and normalizes percentage bounds", a
     );
     assert.equal(detail.account.lastSyncErrorLog, "完整错误日志");
     assert.equal(detail.syncPending, true);
+    assert.deepEqual(detail.pagination, {
+      total: 41,
+      limit: 20,
+      offset: 20,
+      hasMore: true,
+    });
   }
 });
 
@@ -840,6 +885,7 @@ test("alias directory sync normalizes its summary and persistent credential bund
         imported_disabled_count: 1,
         conflict_count: 1,
       },
+      detail_stale: true,
       created: [
         {
           alias: {
@@ -873,6 +919,7 @@ test("alias directory sync normalizes its summary and persistent credential bund
   });
   assert.equal(result.created[0].apiKey, "api-key");
   assert.equal(result.created[0].otpUrlPath, "/api/v1/otp?token=derived");
+  assert.equal(result.detailStale, true);
   assert.deepEqual(
     {
       address: result.created[0].alias.address,

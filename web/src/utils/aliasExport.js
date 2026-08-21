@@ -14,6 +14,17 @@ function field(value, label) {
   return normalized;
 }
 
+export function buildAliasReceiveLink(
+  alias,
+  origin = globalThis.location?.origin,
+) {
+  const path =
+    alias?.otpUrlPath || alias?.directLinkPath || alias?.legacyDirectLinkPath;
+  return String(path || "").includes("/api/v1/otp")
+    ? buildOTPDirectLink(path, origin)
+    : buildRecentMailDirectLink(path, origin);
+}
+
 export function buildAliasExportLine(
   alias,
   format = ALIAS_EXPORT_OTP,
@@ -21,10 +32,7 @@ export function buildAliasExportLine(
 ) {
   const address = field(alias?.address, "邮箱地址");
   if (format === ALIAS_EXPORT_OTP) {
-    const path = alias?.otpUrlPath || alias?.directLinkPath || alias?.legacyDirectLinkPath;
-    const link = String(path || "").includes("/api/v1/otp")
-      ? buildOTPDirectLink(path, origin)
-      : buildRecentMailDirectLink(path, origin);
+    const link = buildAliasReceiveLink(alias, origin);
     return `${address}-----${link}`;
   }
   if (format === ALIAS_EXPORT_IMAP) {

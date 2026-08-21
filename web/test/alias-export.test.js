@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   ALIAS_EXPORT_IMAP,
   ALIAS_EXPORT_OTP,
+  buildAliasReceiveLink,
   buildAliasExportText,
 } from "../src/utils/aliasExport.js";
 
@@ -48,6 +49,33 @@ test("OTP export uses five hyphens, absolute links, one line per alias, and no h
       "first@icloud.com-----https://mail.example.test:8443/api/v1/otp?token=first-token",
       "second@icloud.com-----https://mail.example.test:8443/api/v1/otp?token=second%2Btoken",
     ].join("\r\n"),
+  );
+});
+
+test("receive links open the OTP endpoint and keep legacy aliases compatible", () => {
+  assert.equal(
+    buildAliasReceiveLink(
+      { otpUrlPath: "/api/v1/otp?token=derived-token" },
+      "https://mail.example.test:8443",
+    ),
+    "https://mail.example.test:8443/api/v1/otp?token=derived-token",
+  );
+  assert.equal(
+    buildAliasReceiveLink(
+      { directLinkPath: "/api/v1/mail/recent?api_key=legacy-token" },
+      "https://mail.example.test:8443",
+    ),
+    "https://mail.example.test:8443/api/v1/mail/recent?api_key=legacy-token",
+  );
+  assert.equal(
+    buildAliasReceiveLink(
+      {
+        legacyDirectLinkPath:
+          "/api/v1/mail/recent?api_key=legacy-fallback-token",
+      },
+      "https://mail.example.test:8443",
+    ),
+    "https://mail.example.test:8443/api/v1/mail/recent?api_key=legacy-fallback-token",
   );
 });
 
@@ -148,6 +176,16 @@ test("all aliases view hides credential fields and supports single, checked, and
   }
   assert.match(source, /copyAliasLine\(row, ALIAS_EXPORT_OTP\)/);
   assert.match(source, /copyAliasLine\(row, ALIAS_EXPORT_IMAP\)/);
+  assert.match(source, /@click="openAliasInbox\(row\)"/);
+  assert.match(source, /@click="openAliasInbox\(alias\)"/);
+  assert.match(
+    functionBody(source, "function isAliasReceiveAvailable"),
+    /!isAliasConfirmationPending\(alias\)/,
+  );
+  assert.match(
+    functionBody(source, "function openAliasInbox"),
+    /window\.open\([\s\S]*buildAliasReceiveLink\(alias\)[\s\S]*"_blank"[\s\S]*"noopener,noreferrer"/,
+  );
   assert.match(source, /copySelectedAliases\(ALIAS_EXPORT_OTP\)/);
   assert.match(source, /copySelectedAliases\(ALIAS_EXPORT_IMAP\)/);
   assert.match(source, /copyAllAliases\(ALIAS_EXPORT_OTP\)/);

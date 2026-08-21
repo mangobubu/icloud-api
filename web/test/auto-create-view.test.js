@@ -175,7 +175,8 @@ test("alias deletion is presented as an irreversible iCloud operation", async ()
   assert.match(remove, /将从 iCloud 永久删除/);
   assert.match(remove, /且无法恢复/);
   assert.match(remove, /await deleteAlias\(alias\.id/);
-  assert.match(remove, /aliases\.value = aliases\.value\.filter/);
+  assert.match(remove, /await loadDetail\(\)/);
+  assert.doesNotMatch(remove, /aliases\.value = aliases\.value\.filter/);
   assert.match(remove, /isAppleSessionInvalid\(error\)/);
   assert.match(remove, /openAppleLogin\(\{ error \}\)/);
   assert.match(remove, /本地记录已保留/);

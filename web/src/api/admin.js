@@ -505,16 +505,53 @@ export function deleteMailGroup(id, csrfToken) {
   });
 }
 
-export async function getAccount(id) {
-  const data = await apiRequest(`/accounts/${encodeURIComponent(id)}`);
-  return normalizeAccountDetail(data);
+export async function getAccount(id, options = {}) {
+  const query = listQuery(options);
+  const data = await apiRequest(
+    `/accounts/${encodeURIComponent(id)}?${query}`,
+    { signal: options.signal },
+  );
+  return normalizeAccountDetail(data, options);
 }
 
-function normalizeAccountDetail(data = {}) {
+function normalizeAccountDetail(data = {}, options = {}) {
   const accountRaw = data?.account || data || {};
+  const account = normalizeAccount(accountRaw);
+  const aliasPage = normalizeListPage(
+    data,
+    normalizeAlias,
+    ["aliases"],
+    options,
+  );
+  const paginationRaw =
+    data && !Array.isArray(data) && typeof data.pagination === "object"
+      ? data.pagination || {}
+      : {};
+  const explicitTotal = Number(
+    firstDefined(paginationRaw, "total", "Total") ??
+      firstDefined(data, "total", "Total"),
+  );
+  const explicitHasMore =
+    firstDefined(paginationRaw, "has_more", "hasMore", "HasMore") ??
+    firstDefined(data, "has_more", "hasMore", "HasMore");
+  const total =
+    Number.isFinite(explicitTotal) && explicitTotal >= 0
+      ? Math.trunc(explicitTotal)
+      : Math.max(account.aliasCount, aliasPage.total);
+  account.aliasCount = total;
+
   return {
-    account: normalizeAccount(accountRaw),
-    aliases: listFrom(data, "aliases").map(normalizeAlias),
+    account,
+    aliases: aliasPage.items,
+    pagination: {
+      total,
+      limit: aliasPage.limit,
+      offset: aliasPage.offset,
+      hasMore:
+        explicitHasMore === undefined
+          ? aliasPage.offset + aliasPage.items.length < total
+          : Boolean(explicitHasMore),
+    },
     appleSession: normalizeAppleSession(
       firstDefined(data, "apple_session", "appleSession", "AppleSession"),
     ),
@@ -792,6 +829,9 @@ export async function syncAccountAliases(accountId, csrfToken) {
     ...normalizeAccountDetail(data),
     summary: normalizeSyncSummary(data.summary),
     created: listFrom(data, "created").map(normalizeCreatedAlias),
+    detailStale: Boolean(
+      firstDefined(data, "detail_stale", "detailStale", "DetailStale"),
+    ),
   };
 }
 
