@@ -793,39 +793,7 @@ func classifyArchiveRecipientAliases(
 	default:
 		return nil, false
 	}
-
-	if _, present, _ := parseICloudHMERoute(header); present {
-		aliasID, determinate := classifyRecipientAlias(header, aliases, account, allowWeak)
-		if !determinate || aliasID == 0 {
-			return nil, determinate
-		}
-		return []int64{aliasID}, true
-	}
-	fields := strongRecipientHeaderFields
-	if !hasAnyHeader(header, fields) {
-		if !allowWeak {
-			return nil, true
-		}
-		fields = weakRecipientHeaderFields
-	}
-	addresses, valid := addressesFromHeaders(header, fields)
-	if !valid {
-		return nil, false
-	}
-	seen := make(map[int64]struct{})
-	for _, address := range addresses {
-		for _, aliasID := range aliases[address] {
-			if aliasID > 0 {
-				seen[aliasID] = struct{}{}
-			}
-		}
-	}
-	result := make([]int64, 0, len(seen))
-	for aliasID := range seen {
-		result = append(result, aliasID)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i] < result[j] })
-	return result, true
+	return classifyICloudRecipientAliases(header, aliases, account, allowWeak)
 }
 
 func fetchArchivedMessage(

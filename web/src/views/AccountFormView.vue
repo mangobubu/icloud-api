@@ -57,6 +57,11 @@
           </p>
         </el-form-item>
 
+        <div class="form-span mailbox-route-summary" role="status">
+          <strong>当前收件规则：{{ receiveRuleLabel }}</strong>
+          <p class="field-help">{{ receiveRuleHelp }}</p>
+        </div>
+
         <el-form-item v-if="!isCustomMailbox" label="iCloud 主号邮箱" prop="email">
           <el-input
             v-model="form.email"
@@ -92,6 +97,9 @@
             :placeholder="isCustomMailbox ? '填写邮箱服务器的登录用户名' : '通常填写完整 iCloud 邮箱'"
             autocomplete="username"
           />
+          <p v-if="!isCustomMailbox" class="field-help">
+            若 iCloud 隐私邮箱转发到第三方邮箱，请填写第三方 IMAP 登录/最终投递邮箱（例如 mango@example.com）；X-Original-To 可能仍是中间转发地址。
+          </p>
         </el-form-item>
 
         <el-form-item class="form-span imap-service-field" label="IMAP 服务">
@@ -117,35 +125,20 @@
         </el-form-item>
 
         <el-form-item
-          v-if="!isCustomMailbox"
           class="form-span"
-          label="App 专用密码"
+          :label="usesGenericIMAPPassword ? 'IMAP 密码' : 'App 专用密码'"
           prop="imapPassword"
         >
           <el-input
             v-model="form.imapPassword"
             type="password"
             show-password
-            :placeholder="isEdit ? '留空则保留当前密码' : '在 Apple 账户中生成的专用密码'"
+            :placeholder="isEdit ? '留空则保留当前密码' : usesGenericIMAPPassword ? '填写邮箱服务器的 IMAP 密码' : '在 Apple 账户中生成的专用密码'"
             autocomplete="new-password"
           />
-          <p class="field-help">专用密码只会加密保存，后续不会回显。</p>
-        </el-form-item>
-
-        <el-form-item
-          v-else
-          class="form-span"
-          label="IMAP 密码"
-          prop="imapPassword"
-        >
-          <el-input
-            v-model="form.imapPassword"
-            type="password"
-            show-password
-            :placeholder="isEdit ? '留空则保留当前密码' : '填写邮箱服务器的 IMAP 密码'"
-            autocomplete="new-password"
-          />
-          <p class="field-help">IMAP 密码只会加密保存，后续不会回显。</p>
+          <p class="field-help">
+            {{ usesGenericIMAPPassword ? "第三方/自定义邮箱的 IMAP 密码只会加密保存，后续不会回显。" : "Apple App 专用密码只会加密保存，后续不会回显。" }}
+          </p>
         </el-form-item>
 
         <el-form-item v-if="isEdit" class="form-span account-enabled-field">
@@ -200,6 +193,7 @@ import { successMessage } from "../utils/feedback.js";
 import {
   DEFAULT_IMAP_HOST,
   DEFAULT_IMAP_PORT,
+  mailboxReceiveRule,
   normalizeIMAPEndpoint,
   validateIMAPHost as validateIMAPHostValue,
   validateIMAPPort as validateIMAPPortValue,
@@ -218,10 +212,6 @@ const loadGate = createLatestRequestGate();
 const submitLock = createActionLock();
 let viewActive = true;
 
-const isEdit = computed(() => route.name === "account-edit");
-const isCustomMailbox = computed(() => form.mailboxType === "custom");
-const emailLocked = computed(() => isEdit.value && aliasCount.value > 0);
-
 const form = reactive({
   name: "",
   email: "",
@@ -232,6 +222,34 @@ const form = reactive({
   imapUsername: "",
   imapPassword: "",
   enabled: true,
+});
+
+const isEdit = computed(() => route.name === "account-edit");
+const isCustomMailbox = computed(() => form.mailboxType === "custom");
+const emailLocked = computed(() => isEdit.value && aliasCount.value > 0);
+const receiveRule = computed(() => mailboxReceiveRule(form));
+const usesGenericIMAPPassword = computed(
+  () => isCustomMailbox.value || receiveRule.value === "icloud-forwarded",
+);
+const receiveRuleLabel = computed(() => {
+  switch (receiveRule.value) {
+    case "custom":
+      return "自定义域名邮箱";
+    case "icloud-forwarded":
+      return "iCloud 隐私邮箱 + 转发第三方 IMAP";
+    default:
+      return "iCloud 隐私邮箱 + iCloud IMAP";
+  }
+});
+const receiveRuleHelp = computed(() => {
+  switch (receiveRule.value) {
+    case "custom":
+      return "按原始投递收件人标头匹配自定义域名地址。";
+    case "icloud-forwarded":
+      return "保留 iCloud 隐私邮箱类型；系统会结合 X-ICLOUD-HME 和转发链路投递标头匹配地址。";
+    default:
+      return "使用 iCloud IMAP 的主号投递标头匹配隐私邮箱。";
+  }
 });
 
 function routeKey(name = route.name, id = route.params.id) {
@@ -303,13 +321,15 @@ function validateName(_, value, callback) {
 
 function validatePassword(_, value, callback) {
   const password = String(value ?? "");
-  const passwordMissing = isCustomMailbox.value
+  const passwordMissing = usesGenericIMAPPassword.value
     ? password.length === 0
     : !password.trim();
   if (!isEdit.value && passwordMissing) {
     callback(
       new Error(
-        isCustomMailbox.value ? "请填写 IMAP 密码" : "请填写 App 专用密码",
+        usesGenericIMAPPassword.value
+          ? "请填写 IMAP 密码"
+          : "请填写 App 专用密码",
       ),
     );
     return;
@@ -420,7 +440,7 @@ async function submit() {
       imap_host: imapEndpoint.host,
       imap_port: imapEndpoint.port,
       imap_username: form.imapUsername.trim(),
-      imap_password: isCustomMailbox.value
+      imap_password: usesGenericIMAPPassword.value
         ? form.imapPassword
         : form.imapPassword.trim(),
     };

@@ -67,3 +67,28 @@ func NormalizeIMAPEndpoint(host string, port int) (string, int, error) {
 
 	return strings.ToLower(host), port, nil
 }
+
+// UsesForwardedICloudIMAP reports whether an iCloud Hide My Email account is
+// reading from a non-default physical mailbox. The mailbox type remains
+// iCloud so Apple alias synchronization continues to work; this only selects
+// the receive-routing and upstream-password contract.
+func UsesForwardedICloudIMAP(account Account) bool {
+	if NormalizeMailboxType(account.MailboxType) != MailboxTypeICloud {
+		return false
+	}
+	accountEmail := NormalizeEmail(account.Email)
+	imapUsername := NormalizeEmail(account.IMAPUsername)
+	if accountEmail != "" && imapUsername != "" && accountEmail != imapUsername {
+		return true
+	}
+	host := strings.TrimSpace(account.IMAPHost)
+	if host == "" {
+		host = DefaultIMAPHost
+	}
+	port := account.IMAPPort
+	if port == 0 {
+		port = DefaultIMAPPort
+	}
+	host, port, err := NormalizeIMAPEndpoint(host, port)
+	return err == nil && (host != DefaultIMAPHost || port != DefaultIMAPPort)
+}

@@ -53,3 +53,59 @@ func TestNormalizeIMAPEndpointRejectsLongHost(t *testing.T) {
 		t.Fatal("expected overlong DNS label to be rejected")
 	}
 }
+
+func TestUsesForwardedICloudIMAP(t *testing.T) {
+	tests := []struct {
+		name    string
+		account Account
+		want    bool
+	}{
+		{
+			name: "direct defaults",
+			account: Account{
+				MailboxType:  MailboxTypeICloud,
+				Email:        "owner@icloud.com",
+				IMAPHost:     DefaultIMAPHost,
+				IMAPPort:     DefaultIMAPPort,
+				IMAPUsername: "owner@icloud.com",
+			},
+		},
+		{
+			name: "third-party host and username",
+			account: Account{
+				MailboxType:  MailboxTypeICloud,
+				Email:        "owner@icloud.com",
+				IMAPHost:     "mgbubu.com",
+				IMAPPort:     993,
+				IMAPUsername: "mango@mgbubu.com",
+			},
+			want: true,
+		},
+		{
+			name: "different username on default host",
+			account: Account{
+				MailboxType:  MailboxTypeICloud,
+				Email:        "owner@icloud.com",
+				IMAPUsername: "forwarded@example.com",
+			},
+			want: true,
+		},
+		{
+			name: "custom mailbox never uses iCloud forwarding route",
+			account: Account{
+				MailboxType:  MailboxTypeCustom,
+				Email:        "custom@example.com",
+				IMAPHost:     "mgbubu.com",
+				IMAPPort:     993,
+				IMAPUsername: "mango@mgbubu.com",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := UsesForwardedICloudIMAP(test.account); got != test.want {
+				t.Fatalf("UsesForwardedICloudIMAP() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}

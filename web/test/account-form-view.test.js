@@ -3,6 +3,10 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import { normalizeAccount } from "../src/api/admin.js";
+import {
+  isForwardedICloudIMAP,
+  mailboxReceiveRule,
+} from "../src/utils/imap.js";
 
 const viewPath = new URL(
   "../src/views/AccountFormView.vue",
@@ -103,25 +107,26 @@ test("account form exposes custom mailbox suffix and keeps the iCloud branch", a
   assert.match(source, /label="邮箱后缀"/);
   assert.doesNotMatch(source, /<el-form-item v-else label="自定义邮箱"/);
   assert.match(source, /v-model="form\.emailSuffix"/);
-  assert.match(source, /label="IMAP 密码"/);
+  assert.match(source, /:label="usesGenericIMAPPassword \? 'IMAP 密码' : 'App 专用密码'"/);
   assert.match(source, /mailbox_type: form\.mailboxType/);
   assert.match(source, /payload\.email_suffix\s*=/);
-  assert.match(source, /imap_password:\s*isCustomMailbox\.value/);
+  assert.match(source, /imap_password:\s*usesGenericIMAPPassword\.value/);
   assert.match(source, /邮箱后缀格式不正确/);
 });
 
-test("custom IMAP password preserves whitespace while iCloud rejects whitespace-only input", async () => {
+test("third-party and custom IMAP passwords preserve whitespace while direct iCloud trims", async () => {
   const source = await readFile(viewPath, "utf8");
 
   assert.match(source, /const password = String\(value \?\? ""\)/);
   assert.match(
     source,
-    /const passwordMissing = isCustomMailbox\.value\s*\? password\.length === 0\s*:\s*!password\.trim\(\)/,
+    /const passwordMissing = usesGenericIMAPPassword\.value\s*\? password\.length === 0\s*:\s*!password\.trim\(\)/,
   );
   assert.match(
     source,
-    /imap_password: isCustomMailbox\.value\s*\? form\.imapPassword\s*:\s*form\.imapPassword\.trim\(\)/,
+    /imap_password: usesGenericIMAPPassword\.value\s*\? form\.imapPassword\s*:\s*form\.imapPassword\.trim\(\)/,
   );
+  assert.match(source, /receiveRule\.value === "icloud-forwarded"/);
 });
 
 test("account normalizer preserves custom mailbox metadata", () => {
@@ -132,4 +137,33 @@ test("account normalizer preserves custom mailbox metadata", () => {
   assert.equal(account.mailboxType, "custom");
   assert.equal(account.provider, "custom");
   assert.equal(account.emailSuffix, "example.test");
+});
+
+test("mailbox receive rules distinguish direct iCloud, forwarded iCloud, and custom", () => {
+  const direct = {
+    mailboxType: "icloud",
+    email: "owner@icloud.com",
+    imapHost: "imap.mail.me.com",
+    imapPort: 993,
+    imapUsername: "owner@icloud.com",
+  };
+  const forwarded = {
+    ...direct,
+    imapHost: "imap.example.com",
+    imapUsername: "mango@example.com",
+  };
+  const custom = {
+    mailboxType: "custom",
+    emailSuffix: "example.com",
+    imapHost: "imap.example.com",
+    imapPort: 993,
+    imapUsername: "mango@example.com",
+  };
+
+  assert.equal(mailboxReceiveRule(direct), "icloud-direct");
+  assert.equal(mailboxReceiveRule(forwarded), "icloud-forwarded");
+  assert.equal(mailboxReceiveRule(custom), "custom");
+  assert.equal(isForwardedICloudIMAP(direct), false);
+  assert.equal(isForwardedICloudIMAP(forwarded), true);
+  assert.equal(isForwardedICloudIMAP(custom), false);
 });

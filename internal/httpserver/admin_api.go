@@ -1026,12 +1026,6 @@ func adminAPIAccountInputWithMailbox(name, email, username, password string, hos
 	if base.MailboxType == "" {
 		return base, strings.TrimSpace(password), "邮箱类型无效"
 	}
-	if base.MailboxType == domain.MailboxTypeICloud {
-		// Preserve the historical App-specific password normalization for the
-		// unchanged iCloud contract. Generic IMAP passwords are opaque and may
-		// legitimately contain leading or trailing spaces.
-		password = strings.TrimSpace(password)
-	}
 	if base.MailboxType == domain.MailboxTypeCustom {
 		suffix, suffixErr := domain.NormalizeEmailSuffix(base.EmailSuffix)
 		if suffixErr != nil {
@@ -1063,6 +1057,14 @@ func adminAPIAccountInputWithMailbox(name, email, username, password string, hos
 	if endpointErr == nil {
 		base.IMAPHost, base.IMAPPort = normalizedHost, normalizedPort
 	}
+	forwardedICloud := base.MailboxType == domain.MailboxTypeICloud &&
+		domain.UsesForwardedICloudIMAP(base)
+	if base.MailboxType == domain.MailboxTypeICloud && !forwardedICloud {
+		// Preserve the historical App-specific password normalization for a
+		// direct iCloud mailbox. Third-party forwarding IMAP passwords are opaque
+		// and may legitimately contain leading or trailing spaces.
+		password = strings.TrimSpace(password)
+	}
 	switch {
 	case utf8.RuneCountInString(base.Name) > 80:
 		return base, password, "备注不能超过 80 个字符"
@@ -1073,7 +1075,7 @@ func adminAPIAccountInputWithMailbox(name, email, username, password string, hos
 	case endpointErr != nil:
 		return base, password, "IMAP 服务地址无效: " + endpointErr.Error()
 	case base.PasswordCiphertext == "" && password == "":
-		if base.MailboxType == domain.MailboxTypeICloud {
+		if base.MailboxType == domain.MailboxTypeICloud && !forwardedICloud {
 			// Preserve the historical iCloud contract and diagnostics verbatim.
 			return base, password, "请填写 App 专用密码"
 		}

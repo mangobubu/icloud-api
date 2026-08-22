@@ -30,7 +30,7 @@ iCloud 主号 INBOX
 
 ## 快速启动
 
-要求 Docker Engine、Docker Compose v2。使用 iCloud 模式时，还需要可用的 iCloud 主号 App 专用密码；仅使用自定义邮箱模式时不需要。
+要求 Docker Engine、Docker Compose v2。直连 iCloud IMAP 时需要 iCloud 主号 App 专用密码；iCloud 转发第三方 IMAP 或自定义邮箱模式则填写对应邮箱服务的 IMAP 密码。
 
 ```bash
 docker compose up -d --build --wait
@@ -51,7 +51,17 @@ docker compose exec -T icloud-api cat /app/keys/public-imap-cert.pem
 
 使用 `admin` 和首次生成的密码登录随机管理路径，添加 iCloud 主号后同步或手动登记隐私邮箱。管理端支持创建邮箱分组，并在“全部隐私邮箱”或主号详情中把单个、勾选的隐私邮箱移动到所选分组；删除分组不会删除邮箱，只会将其恢复为未分组。公开接口说明位于 <http://127.0.0.1:8080/docs/>，机器可读契约见 [`docs/openapi.yaml`](docs/openapi.yaml)。
 
-每个主号可配置上游隐式 TLS IMAP 主机、端口和登录用户名，默认是 `imap.mail.me.com:993`。已有隐私邮箱后仍可修改这三项，但这代表切换邮箱来源：服务会清除该主号旧来源的同步游标、v1 快照、消费与 `Seen` 状态、v2 归档和 OTP 历史，轮换公开 IMAPS 的 `UIDVALIDITY`，再从新来源建立不回填历史的基线。单纯修改 IMAP 密码（iCloud 模式使用 App 专用密码）或重新启用主号只重置同步状态，不删除已有邮件。已有隐私邮箱后主号邮箱地址仍不可修改。
+每个主号可配置上游隐式 TLS IMAP 主机、端口和登录用户名，默认是 `imap.mail.me.com:993`。已有隐私邮箱后仍可修改这三项，但这代表切换邮箱来源：服务会清除该主号旧来源的同步游标、v1 快照、消费与 `Seen` 状态、v2 归档和 OTP 历史，轮换公开 IMAPS 的 `UIDVALIDITY`，再从新来源建立不回填历史的基线。单纯修改 IMAP 密码（直连 iCloud 使用 App 专用密码，第三方转发使用第三方 IMAP 密码）或重新启用主号只重置同步状态，不删除已有邮件。已有隐私邮箱后主号邮箱地址仍不可修改。
+
+收件规则分为三套：
+
+1. `mailbox_type=icloud` + 默认 `imap.mail.me.com:993` + iCloud 主号用户名：直连 iCloud IMAP，按 Apple 原始投递头匹配隐私邮箱。
+2. `mailbox_type=icloud` + 非默认 IMAP 来源（主机/端口或用户名不同于 iCloud 默认）：iCloud 隐私邮箱经转发后从第三方 IMAP 读取；仍保留 iCloud 类型，按 `X-ICLOUD-HME` 和转发链路投递头匹配。
+3. `mailbox_type=custom`：自定义域名邮箱，按 `X-Original-To`、`Original-Recipient`、`Delivered-To` 等原始投递头匹配本地地址。
+
+如果 iCloud 隐私邮箱已在 iCloud 设置中转发到第三方邮箱，`邮箱类型` 仍应选择“iCloud 隐私邮箱”，而 IMAP 主机和用户名应填写第三方邮箱的 IMAP 来源；用户名应使用最终物理投递目标/第三方 IMAP 登录邮箱（例如 `mango@example.com`）。服务会用 `X-ICLOUD-HME` 的 `p=`/`f=` 路由信息，并结合 `Delivered-To`、`X-Original-To`、`Original-Recipient` 以及常见 Apple 原始收件人头识别隐私邮箱。Apple 的 `f=` 可能是中间转发地址，不一定等于最终 `Delivered-To`，所以原始投递头中应同时能核对转发链和配置的最终目标。若转发服务删掉 `X-ICLOUD-HME` 和包含隐私地址的原始投递头、只在 `To/Cc` 留下隐私地址，默认安全策略不会信任该地址；仅可在理解伪造风险后显式启用弱收件人头。不要因为 IMAP 来源是第三方就把主号改成“自定义邮箱”，那会停用 iCloud 的地址同步和自动创建规则。
+
+以上三套规则只决定邮件取件与归属。Apple 隐私邮箱目录同步和自动创建仍按 Apple 返回的默认转发目标与 iCloud 主号邮箱做现有校验；如果 Apple 的默认转发目标是另一个中间地址（例如标头中的 `f=`），现有地址可以正常取件，但目录同步或自动创建可能报告转发目标不匹配。完整支持该场景需要单独保存 Apple 转发目标，不能用最终 IMAP 用户名代替中间地址。
 
 添加主号时也可以选择“自定义邮箱”。自定义模式单独保存邮箱后缀（例如 `example.com`），同一后缀只能配置一个主号；IMAP 密码使用 `imap_password` 提交并按原值加密保存。它不会调用 Apple，也不会改变 iCloud 隐私邮箱原有的每小时自动创建规则。在主号详情中输入生成数量即可批量生成随机地址，格式为 8–12 位小写英文字母和数字加 `@后缀`，同一批次和全局地址表都会阻止重复，地址也不能与主号的 IMAP 登录身份相同。单次最多生成 1000 个，可多次分批生成，`custom` 主号的累计数量不设上限。自定义地址的删除只清理本地记录，不会请求 Apple。
 
@@ -294,5 +304,5 @@ npm run build
 - 管理端、部署级 OAuth token、API Key、取码 URL、IMAP 密码、refresh token、主密钥、App 专用密码和备份都按敏感凭据管理。
 - URL 可能进入浏览器历史、代理日志和监控系统；legacy alias 可轮换 API Key 使旧直达链接失效，v2 alias 应轮换整套凭证。
 - 原始 MIME、主题和 HTML 都属于外部输入；展示 HTML 前应清理内容或放入严格隔离的沙箱。
-- 邮件归属依赖 iCloud 转发链路中的收件人头。保持 `ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS=false`，并用真实 Hide My Email 样本验收路由。
+- 邮件归属依赖 iCloud 转发链路中的收件人头。使用第三方转发邮箱时，应把 IMAP 用户名填写为最终物理投递/登录地址，以便在 Apple 原始收件人头被改写后仍能校验目标；保持 `ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS=false`，并用真实 Hide My Email 样本验收路由。
 - 在边缘代理设置请求速率、连接数和正文大小限制，限制管理路径的来源网络，并定期演练 PostgreSQL、keys 与 mail archive 的成组恢复。

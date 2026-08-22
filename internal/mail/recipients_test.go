@@ -135,6 +135,313 @@ func TestMatchingAliasIDsUsesAppleHMERouteBeforePhysicalRecipient(t *testing.T) 
 	}
 }
 
+func TestICloudReceiveModeSeparatesDirectAndForwardedIMAP(t *testing.T) {
+	tests := []struct {
+		name    string
+		account domain.Account
+		want    iCloudReceiveMode
+	}{
+		{
+			name: "default iCloud endpoint and primary username",
+			account: domain.Account{
+				Email:        "primary@icloud.com",
+				IMAPHost:     domain.DefaultIMAPHost,
+				IMAPPort:     domain.DefaultIMAPPort,
+				IMAPUsername: "primary@icloud.com",
+			},
+			want: iCloudReceiveDirect,
+		},
+		{
+			name: "third-party endpoint",
+			account: domain.Account{
+				Email:        "primary@icloud.com",
+				IMAPHost:     "imap.example.com",
+				IMAPPort:     993,
+				IMAPUsername: "mango@example.com",
+			},
+			want: iCloudReceiveForwarded,
+		},
+		{
+			name: "legacy in-memory account with forwarding username",
+			account: domain.Account{
+				Email:        "primary@icloud.com",
+				IMAPUsername: "mango@example.com",
+			},
+			want: iCloudReceiveForwarded,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := iCloudReceiveModeForAccount(test.account); got != test.want {
+				t.Fatalf("iCloud receive mode = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDirectICloudRouteDoesNotTrustUnconfiguredStrongForwardAddress(t *testing.T) {
+	header := stdmail.Header{
+		"X-Original-To":      {`other@icloud.com`},
+		"Delivered-To":       {`primary@icloud.com`},
+		"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+		icloudHMEHeaderField: {`p=hidden.alias@icloud.com; f=other@icloud.com; r=to`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPHost:     domain.DefaultIMAPHost,
+		IMAPPort:     domain.DefaultIMAPPort,
+		IMAPUsername: "primary@icloud.com",
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); len(got) != 0 {
+		t.Fatalf("direct iCloud route accepted unconfigured forwarding address: %#v", got)
+	}
+}
+
+func TestForwardedICloudRouteRequiresConfiguredFinalTargetEvidence(t *testing.T) {
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPHost:     "imap.example.com",
+		IMAPPort:     993,
+		IMAPUsername: "mango@example.com",
+	}
+	withoutFinalTarget := stdmail.Header{
+		"X-Original-To":      {`intermediate@example.com`},
+		"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+		icloudHMEHeaderField: {`p=hidden.alias@icloud.com; f=intermediate@example.com; r=to`},
+	}
+	if got := matchingAliasIDsForAccount(withoutFinalTarget, aliases, account, false); len(got) != 0 {
+		t.Fatalf("forwarded route without final target matched: %#v", got)
+	}
+	withFinalTarget := stdmail.Header{
+		"X-Original-To":      {`intermediate@example.com`},
+		"Delivered-To":       {`mango@example.com`},
+		"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+		icloudHMEHeaderField: {`p=hidden.alias@icloud.com; f=intermediate@example.com; r=to`},
+	}
+	if got := matchingAliasIDsForAccount(withFinalTarget, aliases, account, false); !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("forwarded route with final target = %#v, want [7]", got)
+	}
+}
+
+func TestForwardedICloudHMERouteRejectsWeakOnlyDeliveryHeaders(t *testing.T) {
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPHost:     "imap.example.com",
+		IMAPPort:     993,
+		IMAPUsername: "mango@example.com",
+	}
+	for _, forwardAddress := range []string{"primary@icloud.com", "mango@example.com"} {
+		header := stdmail.Header{
+			"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+			icloudHMEHeaderField: {`p=hidden.alias@icloud.com; f=` + forwardAddress + `; r=to`},
+		}
+		if got := matchingAliasIDsForAccount(header, aliases, account, false); len(got) != 0 {
+			t.Fatalf("forwarded weak-only HME route %s matched: %#v", forwardAddress, got)
+		}
+	}
+}
+
+func TestForwardedICloudHMERouteRequiresThirdPartyFinalTarget(t *testing.T) {
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPHost:     "imap.example.com",
+		IMAPPort:     993,
+		IMAPUsername: "mango@example.com",
+	}
+	header := stdmail.Header{
+		"X-Original-To":      {`primary@icloud.com`},
+		"Delivered-To":       {`primary@icloud.com`},
+		"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+		icloudHMEHeaderField: {`p=hidden.alias@icloud.com; f=primary@icloud.com; r=to`},
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); len(got) != 0 {
+		t.Fatalf("forwarded route accepted iCloud primary as final target: %#v", got)
+	}
+}
+
+func TestHMERouteAcceptsEquivalentOriginalRecipientHeaderVariants(t *testing.T) {
+	header := stdmail.Header{
+		"Original-Recipient":   {`rfc822; primary@icloud.com`},
+		"X-Original-Recipient": {`rfc822; primary@icloud.com`},
+		"To":                   {`Hide My Email <hidden.alias@icloud.com>`},
+		icloudHMEHeaderField:   {`p=hidden.alias@icloud.com; f=primary@icloud.com; r=to`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{Email: "primary@icloud.com"}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("equivalent original recipient headers = %#v, want [7]", got)
+	}
+}
+
+func TestAppleRecipientVariantsAcceptBareAddressValues(t *testing.T) {
+	for _, field := range []string{"X-Apple-Original-Recipient", "Final-Recipient"} {
+		t.Run(field, func(t *testing.T) {
+			header := stdmail.Header{field: {`primary@icloud.com`}}
+			if got := RecipientAddresses(header); !reflect.DeepEqual(got, []string{"primary@icloud.com"}) {
+				t.Fatalf("%s addresses = %#v, want [primary@icloud.com]", field, got)
+			}
+		})
+	}
+}
+
+func TestMatchingAliasIDsAcceptsHMERouteWithRewrittenOriginalRecipient(t *testing.T) {
+	header := stdmail.Header{
+		"Original-Recipient": {`rfc822; mango@mgbubu.com`},
+		"To":                 {`Hide My Email <hidden.alias@icloud.com>`},
+		icloudHMEHeaderField: {`p=hidden.alias@icloud.com; d=; f=primary@icloud.com; r=to`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPUsername: "mango@mgbubu.com",
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("rewritten HME original recipient matching = %#v, want [7]", got)
+	}
+}
+
+func TestMatchingAliasIDsUsesPastedICloudForwardingHeaders(t *testing.T) {
+	// This is the routing subset from the reported message. Apple records the
+	// forwarding address in X-ICLOUD-HME and X-Original-To, while the final
+	// domain mailbox appears in Delivered-To.
+	header := stdmail.Header{
+		"Delivered-To":  {`mango@mgbubu.com`},
+		"X-Original-To": {`ling@mgbubu.com`},
+		"To":            {`Hide My Email <benefit.gimmes.2y@icloud.com>`},
+		icloudHMEHeaderField: {
+			`p=benefit.gimmes.2y@icloud.com; d=; f=ling@mgbubu.com; r=to; s=noreply@tm.openai.com`,
+		},
+	}
+	aliases := map[string][]int64{"benefit.gimmes.2y@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "chenxiuzhan2026@icloud.com",
+		IMAPHost:     "mgbubu.com",
+		IMAPPort:     993,
+		IMAPUsername: "mango@mgbubu.com",
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("pasted iCloud forwarding headers matched = %#v, want [7]", got)
+	}
+	if got, determinate := classifyArchiveRecipientAliases(header, aliases, account, false); !determinate || !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("pasted iCloud archive classification = %#v, %v, want [7], true", got, determinate)
+	}
+}
+
+func TestICloudForwardedMailboxRecoversAliasFromVisibleRecipient(t *testing.T) {
+	header := stdmail.Header{
+		"To":           {`Hide My Email <hidden.alias@icloud.com>`},
+		"Delivered-To": {`mango@mgbubu.com`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPUsername: "mango@mgbubu.com",
+	}
+
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); len(got) != 0 {
+		t.Fatalf("default forwarding route trusted visible-only alias: %#v", got)
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, true); !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("opt-in forwarded iCloud matching = %#v, want [7]", got)
+	}
+	if got, determinate := classifyArchiveRecipientAliases(header, aliases, account, true); !determinate || !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("opt-in forwarded iCloud archive matching = %#v, %v, want [7], true", got, determinate)
+	}
+}
+
+func TestICloudForwardedMailboxRejectsWrongPhysicalTarget(t *testing.T) {
+	header := stdmail.Header{
+		"To":           {`hidden.alias@icloud.com`},
+		"Delivered-To": {`different@example.com`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPUsername: "mango@mgbubu.com",
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); len(got) != 0 {
+		t.Fatalf("wrong forwarded target matched alias: %#v", got)
+	}
+}
+
+func TestICloudForwardedMailboxUsesAppleOriginalHeaders(t *testing.T) {
+	header := stdmail.Header{
+		"X-Apple-Original-To": {`hidden.alias@icloud.com`},
+		"To":                  {`hidden.alias@icloud.com`},
+		"Delivered-To":        {`mango@mgbubu.com`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPUsername: "mango@mgbubu.com",
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("Apple original recipient matching = %#v, want [7]", got)
+	}
+}
+
+func TestICloudForwardedMailboxSupportsRFC822AppleOriginalRecipient(t *testing.T) {
+	header := stdmail.Header{
+		"X-Apple-Original-Recipient": {`rfc822; hidden.alias@icloud.com`},
+		"Delivered-To":               {`mango@mgbubu.com`},
+		"To":                         {`hidden.alias@icloud.com`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPUsername: "mango@mgbubu.com",
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); !reflect.DeepEqual(got, []int64{7}) {
+		t.Fatalf("Apple RFC822 recipient matching = %#v, want [7]", got)
+	}
+}
+
+func TestICloudForwardedMailboxDoesNotTreatVisibleRecipientAsStrongWithoutTarget(t *testing.T) {
+	header := stdmail.Header{
+		"To":           {`hidden.alias@icloud.com`},
+		"Delivered-To": {`mango@mgbubu.com`},
+	}
+	aliases := map[string][]int64{"hidden.alias@icloud.com": {7}}
+	account := domain.Account{MailboxType: domain.MailboxTypeICloud, Email: "primary@icloud.com"}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); len(got) != 0 {
+		t.Fatalf("unconfigured forwarding target matched alias: %#v", got)
+	}
+}
+
+func TestICloudForwardedMailboxRejectsConflictingVisibleAlias(t *testing.T) {
+	header := stdmail.Header{
+		"To":           {`first.alias@icloud.com`},
+		"Cc":           {`second.alias@icloud.com`},
+		"Delivered-To": {`mango@mgbubu.com`},
+	}
+	aliases := map[string][]int64{
+		"first.alias@icloud.com":  {1},
+		"second.alias@icloud.com": {2},
+	}
+	account := domain.Account{
+		MailboxType:  domain.MailboxTypeICloud,
+		Email:        "primary@icloud.com",
+		IMAPUsername: "mango@mgbubu.com",
+	}
+	if got := matchingAliasIDsForAccount(header, aliases, account, false); len(got) != 0 {
+		t.Fatalf("conflicting forwarded aliases matched: %#v", got)
+	}
+}
+
 func TestMatchingAliasIDsHandlesRawAppleHeaderCasing(t *testing.T) {
 	header := stdmail.Header{
 		"Original-recipient": {`rfc822;primary@icloud.com`},

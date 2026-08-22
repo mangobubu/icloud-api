@@ -15,6 +15,17 @@ info:
     ASCII 小写英文字母和数字作为本地部分，批量内和数据库中均禁止重复；该流程不调用 Apple，原 iCloud
     自动创建计划和限流规则保持不变。
 
+    收件路由有三套：`mailbox_type=icloud` 加默认 `imap.mail.me.com:993` 是直连 iCloud IMAP；
+    `mailbox_type=icloud` 加非默认 IMAP 来源（主机/端口或用户名不同于 iCloud 默认）是 iCloud 隐私邮箱转发到第三方 IMAP；
+    `mailbox_type=custom` 是自定义域名邮箱，按原始投递收件人头匹配本地地址。
+
+    如果 iCloud 隐私邮箱转发到第三方邮箱，仍应保持 `mailbox_type=icloud`，并将上游
+    `imap_username` 填为第三方 IMAP 登录/最终物理投递目标地址（若该邮箱服务允许使用邮箱地址登录）。同步会优先使用
+    `X-ICLOUD-HME` 的 `p=`/`f=` 路由信息，再结合 `Delivered-To`、`X-Original-To`、
+    `Original-Recipient` 和常见 Apple 原始收件人头恢复隐私邮箱归属；Apple 的 `f=` 可以是中间
+    转发地址，不必与最终 `Delivered-To` 相同。若只在 `To/Cc` 留下隐私地址，必须显式启用弱收件人头才会匹配。
+    这些规则只控制邮件取件与归属；Apple 目录同步和自动创建仍使用现有的主号默认转发目标校验。
+
     IMAPS 用户名是隐私邮箱地址。客户端可以使用本服务签发的 IMAP 密码登录，
     或通过 `POST /oauth2/v2.0/token` 获取一小时访问令牌后使用 XOAUTH2。
     邮箱只有只读 INBOX，支持 LIST、STATUS、SELECT/EXAMINE、SEARCH、
@@ -318,8 +329,9 @@ paths:
       description: |
         添加用于主号级邮件同步的账户。`imap_host` 和 `imap_port` 可分别指定隐式 TLS
         IMAP 服务；省略时分别使用 `imap.mail.me.com` 和 `993`，显式传入 `null` 则返回 400。
-        iCloud 模式保持原有 Apple 规则；选择 `custom` 后须填写 `email_suffix`，并在主号详情
-        中按数量生成 8–12 位小写英文字母和数字随机邮箱。IMAP 密码只会加密保存，不会出现在响应或日志中。
+        iCloud 模式保持原有 Apple 规则；若邮件由 iCloud 转发到第三方邮箱，仍选择 `icloud`，并应
+        将 `imap_username` 填为第三方 IMAP 登录/最终物理投递目标地址，以便校验投递标头。选择 `custom` 后须填写 `email_suffix`，
+        并在主号详情中按数量生成 8–12 位小写英文字母和数字随机邮箱。IMAP 密码只会加密保存，不会出现在响应或日志中。
       security:
         - adminSession: []
       parameters:
@@ -455,7 +467,7 @@ paths:
         返回 400。规范化后的 IMAP 主机、端口或用户名实际发生变化后，服务会清除该主号旧邮箱
         来源的同步游标、兼容快照、消费历史、待处理 `\Seen` 任务、v2 归档和 OTP 历史，轮换
         公开 IMAPS 的 `UIDVALIDITY`，并在下次同步确认前把主号及所属隐私邮箱的同步状态重置为
-        `pending`。修改 IMAP 密码（iCloud 模式为 App 专用密码）也会重置同步状态，但保留已有邮件；`imap_password` 省略、
+        `pending`。修改 IMAP 密码（直连 iCloud 为 App 专用密码，第三方转发为第三方 IMAP 密码）也会重置同步状态，但保留已有邮件；`imap_password` 省略、
         传 `null` 或传空字符串时均保留当前密码。
         已有隐私邮箱后，仅主号邮箱及邮箱模式/后缀不可修改；IMAP 主机、端口和用户名仍可修改。
       security:
@@ -1188,7 +1200,9 @@ components:
           minLength: 1
           default: imap.mail.me.com
           description: |
-            隐式 TLS IMAP 主机名或 IP 地址，省略时使用 `imap.mail.me.com`；显式 `null` 无效。
+            隐式 TLS IMAP 主机名或 IP 地址，省略时使用 `imap.mail.me.com`。对 iCloud 隐私邮箱而言，
+            使用默认主机和主号用户名表示直连 iCloud；填写第三方主机（或非主号 IMAP 用户名）表示
+            转发第三方 IMAP 路由。显式 `null` 无效。
             服务会先去除首尾空白，之后在去除末尾根点前要求值最多 253 字节，并拒绝主机内部
             空白；IPv6 地址必须不带方括号。服务不接受 URL scheme、用户信息、端口、路径、查询
             或 fragment；DNS 标签只能包含字母、数字和连字符，且不能以连字符开头或结尾。DNS
@@ -1207,7 +1221,7 @@ components:
           type: string
           minLength: 1
           writeOnly: true
-          description: IMAP 密码；custom 模式按原值加密保存，iCloud 模式保持旧规则并去除首尾空白。不会在响应中返回。
+          description: IMAP 密码；直连 iCloud 使用 App 专用密码并去除首尾空白；iCloud 转发第三方 IMAP 和 custom 模式按原值加密保存。不会在响应中返回。
 
     AdminAccountResponse:
       type: object
@@ -1266,7 +1280,9 @@ components:
           type: string
           minLength: 1
           description: |
-            新的隐式 TLS IMAP 主机名或 IP 地址；省略时保留当前主机，显式 `null` 无效。服务会
+            新的隐式 TLS IMAP 主机名或 IP 地址；省略时保留当前主机。对 iCloud 隐私邮箱而言，
+            使用默认主机和主号用户名表示直连 iCloud；填写第三方主机（或非主号 IMAP 用户名）表示
+            转发第三方 IMAP 路由。显式 `null` 无效。服务会
             先去除首尾空白，之后在去除末尾根点前要求值最多 253 字节，并拒绝主机内部空白；
             IPv6 地址必须不带方括号。显式空字符串也无效。不接受 URL scheme、用户信息、端口、
             路径、查询或 fragment；DNS 标签只能包含字母、数字和连字符，且不能以连字符开头或
@@ -1280,15 +1296,16 @@ components:
           type: string
           minLength: 1
           description: |
-            IMAP 登录用户名；服务会去除首尾空白，已有隐私邮箱时仍可修改。规范化后的值实际变化
-            会清理旧邮箱来源的同步游标、兼容快照、消费历史、待处理 `\Seen` 任务、v2 归档和
-            OTP 历史，轮换公开 IMAPS 的 UIDVALIDITY，并重置同步状态。
+            IMAP 登录用户名；服务会去除首尾空白，已有隐私邮箱时仍可修改。使用 iCloud 隐私邮箱
+            转发到第三方邮箱时，应把它填写为第三方 IMAP 登录/最终物理投递目标地址，以便同步校验投递标头。规范化后的值
+            实际变化会清理旧邮箱来源的同步游标、兼容快照、消费历史、待处理 `\Seen` 任务、v2 归档
+            和 OTP 历史，轮换公开 IMAPS 的 UIDVALIDITY，并重置同步状态。
         imap_password:
           type:
             - string
             - "null"
           writeOnly: true
-          description: 新 IMAP 密码；省略、传 `null` 或传空字符串时保留当前密码。
+          description: 新 IMAP 密码；直连 iCloud 使用 App 专用密码并去除首尾空白，iCloud 转发第三方 IMAP 和 custom 模式按原值保存；省略、传 `null` 或传空字符串时保留当前密码。
         enabled:
           type: boolean
           description: 是否启用该主号的邮件同步和所属隐私邮箱 Key。

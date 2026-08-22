@@ -127,6 +127,47 @@ export function normalizeIMAPEndpoint(host, port) {
   };
 }
 
+// iCloud accounts have two possible receive routes while the persisted
+// mailbox type remains "icloud": the default Apple IMAP source, or a
+// third-party IMAP source that receives iCloud's forwarding. Keep this
+// inference in one place so the form and detail views describe the same rule
+// used by the server's mailbox classifier.
+export function isForwardedICloudIMAP(input = {}) {
+  const mailboxType = String(
+    input.mailboxType ?? input.mailbox_type ?? input.provider ?? "icloud",
+  )
+    .trim()
+    .toLowerCase();
+  if (mailboxType === "custom") return false;
+  const endpoint = normalizeIMAPEndpoint(
+    input.imapHost ?? input.imap_host,
+    input.imapPort ?? input.imap_port,
+  );
+  if (
+    endpoint.host !== DEFAULT_IMAP_HOST ||
+    endpoint.port !== DEFAULT_IMAP_PORT
+  ) {
+    return true;
+  }
+  const email = String(input.email ?? "").trim().toLowerCase();
+  const username = String(
+    input.imapUsername ?? input.imap_username ?? "",
+  )
+    .trim()
+    .toLowerCase();
+  return Boolean(email && username && email !== username);
+}
+
+export function mailboxReceiveRule(input = {}) {
+  const mailboxType = String(
+    input.mailboxType ?? input.mailbox_type ?? input.provider ?? "icloud",
+  )
+    .trim()
+    .toLowerCase();
+  if (mailboxType === "custom") return "custom";
+  return isForwardedICloudIMAP(input) ? "icloud-forwarded" : "icloud-direct";
+}
+
 /** Return a Chinese validation message, or null when the host is valid. */
 export function validateIMAPHost(value) {
   const normalized = normalizedString(value);

@@ -152,6 +152,10 @@
 
         <dl class="detail-grid">
           <div>
+            <dt>收件规则</dt>
+            <dd>{{ receiveRuleLabel }}</dd>
+          </div>
+          <div>
             <dt>状态</dt>
             <dd><SyncStatus :item="account" /></dd>
           </div>
@@ -770,7 +774,7 @@ import {
   successMessage,
 } from "../utils/feedback.js";
 import { formatTime } from "../utils/format.js";
-import { formatIMAPEndpoint } from "../utils/imap.js";
+import { formatIMAPEndpoint, mailboxReceiveRule } from "../utils/imap.js";
 import { createLiveRefresh } from "../utils/liveRefresh.js";
 import {
   ALL_PAGE_SIZE,
@@ -833,6 +837,16 @@ const syncActive = computed(() => Boolean(account.value?.syncProgress?.active));
 const isCustomMailbox = computed(
   () => account.value?.mailboxType === "custom",
 );
+const receiveRuleLabel = computed(() => {
+  switch (mailboxReceiveRule(account.value || {})) {
+    case "custom":
+      return "自定义域名邮箱";
+    case "icloud-forwarded":
+      return "iCloud 隐私邮箱 + 转发第三方 IMAP";
+    default:
+      return "iCloud 隐私邮箱 + iCloud IMAP";
+  }
+});
 
 const aliasForm = reactive({ address: "", label: "" });
 const appleLoginForm = reactive({ appleId: "", password: "", region: "global" });
